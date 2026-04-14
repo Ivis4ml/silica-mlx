@@ -20,6 +20,7 @@ build/
 # Reference implementation (not part of VQBench)
 turboquant_plus/
 mini-sglang/
+vllm/
 
 
 # Environment
