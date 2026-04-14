@@ -21,6 +21,7 @@ build/
 turboquant_plus/
 mini-sglang/
 vllm/
+vqbench/
 
 
 # Environment
