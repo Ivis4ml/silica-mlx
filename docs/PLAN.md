@@ -2,9 +2,9 @@
 
 | Field        | Value                                   |
 | ------------ | --------------------------------------- |
-| Version      | v1.5.0                                  |
+| Version      | v1.5.1                                  |
 | Last updated | 2026-04-16                              |
-| Status       | Phase 0 planned                         |
+| Status       | Phase 0 in-progress                     |
 | Maintainer   | Xin Zhou                                |
 | Source       | `docs/PLAN.md` (single source of truth) |
 
@@ -83,6 +83,7 @@ On a single Apple Silicon Mac, let developers run 27B–31B-class models locally
 - Complex speculative schemes (DFlash / EAGLE / Medusa) — deferred to v0.2.
 - **PyTorch runtime dependency** (D-009): the inference hot path may not contain `torch.Tensor`; torch is allowed only as an optional dev dependency for offline weight conversion.
 - **CUDA / ROCm / XPU / TPU backends** (D-009): `csrc/`, CUDA kernels, and device-specific workers are out of scope.
+- **Multimodal input / output** (D-014): v0.1 runs the **text-only path** of multimodal checkpoints (Qwen3.5 family, Gemma4). Vision / audio / video encoder lifecycle, image / audio / video tokens, and non-text processors are v0.2. Multimodal checkpoints are expected to load with their vision / audio heads ignored or weight-skipped.
 
 ### 3.3 Target Hardware
 
@@ -97,7 +98,7 @@ On a single Apple Silicon Mac, let developers run 27B–31B-class models locally
 
 | Model             | Parameters                   | Role                             | First used  |
 | ----------------- | ---------------------------- | -------------------------------- | ----------- |
-| Qwen3-0.6B        | 0.6B                         | Dev / iteration bring-up model   | Phase 1     |
+| Qwen3.5-0.8B      | 0.8B                         | Dev / iteration bring-up model   | Phase 1     |
 | Qwen3.5-27B       | 27B                          | Dense production target          | Phase 3     |
 | Gemma4-31B        | 31B                          | Dense production target          | Phase 3     |
 | Qwen3.5-35B-A3B   | 35B total / 3B active        | MoE generality target (D-011)    | Phase 3     |
@@ -121,7 +122,7 @@ Stable principles. Changing any of them requires a new Decisions Log entry.
 
 6. **MLX-native hot path (hard constraint).** The inference hot path must be 100% MLX: every tensor is an `mx.array`, every op goes through MLX. `torch.Tensor` / `numpy.ndarray` are **not allowed** in the hot paths of `silica.engine` / `silica.mlx` / `silica.kvcache` / `silica.models` / `silica.scheduler`. Phase 1 may wrap `mlx-lm` **because mlx-lm is itself MLX-native**; replacing it with a torch-based wrapper is forbidden. vllm and transformers are **algorithm references only**, not runtime dependencies. See D-009.
 
-7. **Small over large in early phases.** Phase 1 starts with Qwen3-0.6B; Phase 3 switches to the target large models. Close the loop on small before scaling up.
+7. **Small over large in early phases.** Phase 1 starts with Qwen3.5-0.8B; Phase 3 switches to the target large models. Close the loop on small before scaling up.
 
 8. **Savings must be observable.** Any memory / streaming / acceleration saving must be visible to the scheduler (e.g. `KVCodec.logical_bytes` vs `resident_bytes`), otherwise the memory budgeter cannot translate the saving into "admit more requests / longer context".
 
@@ -236,7 +237,7 @@ class ModelAdapter(Protocol):
 
     def build(self, weight_provider: WeightProvider) -> Module: ...
     def kv_layout(self) -> KVLayout: ...                  # num_layers, n_kv_heads, head_dim, dtype
-    def attention_pattern(self) -> AttentionPattern: ...  # global / sliding / hybrid per layer
+    def attention_pattern(self) -> AttentionPattern: ...  # global / sliding / hybrid / recurrent / hybrid_deltanet per layer (D-015)
     def tokenizer(self) -> Tokenizer: ...
     def prefill(
         self, tokens: mx.array, kv_handle: KVHandle
@@ -247,9 +248,9 @@ class ModelAdapter(Protocol):
 ```
 
 **Key constraints:**
-1. `attention_pattern()` must be able to express Qwen3.5's hybrid attention — different layers use different cache routing, otherwise Phase 3 will be forced to rewrite the scheduler.
+1. `attention_pattern()` must be able to express Qwen3.5's **hybrid layering** (D-015) — **KV-attention layers** (`global` / `sliding` / `hybrid`) dispatch to `KVManager`-owned blocks via `kv_handle`; **recurrent layers** (`recurrent` for pure-linear, `hybrid_deltanet` for Qwen3.5's Gated-DeltaNet-over-Gated-Attention stack) dispatch to adapter-owned per-layer state carried via `state_delta`. The scheduler reads the pattern and routes per layer — Phase 3 cannot run Qwen3.5 targets without this extension.
 2. **KV mutation ownership belongs to `KVManager`, not the adapter.** `prefill` / `decode_step` read and write KV via `kv_handle` (issued by `KVManager`); they never hold block pointers directly, make residency decisions, or touch the prefix cache structure.
-3. `state_delta` carries **non-KV** runtime state only: sampling RNG, MoE router cache, position counter, sliding-window mask cursor, etc. **Counter-examples (forbidden inside `state_delta`)**: KV blocks / cache residency mutations / prefix cache pinning — these must go through `kv_handle` owned by `KVManager`.
+3. `state_delta` carries **non-KV** runtime state only: sampling RNG, MoE router cache, position counter, sliding-window mask cursor, and **DeltaNet per-layer recurrent state** (first-class tenant per D-015). **Counter-examples (forbidden inside `state_delta`)**: KV blocks / cache residency mutations / prefix cache pinning — these go through `kv_handle` owned by `KVManager`. **Recurrent-state ownership, `commit` / `rollback` semantics under speculative decoding, prefix-reuse key derivation, and inclusion in `KVManager.budget()` via `state_delta.recurrent_bytes()` are specified in D-015** — I-1 / I-2 signatures unchanged; contract extended.
 
 ### I-2 KVManager
 
@@ -350,29 +351,32 @@ Each Phase uses the same structure: `ID / Goal / Scope / Strategy / Deliverables
   - [ ] 11 sub-package skeletons + `__init__.py`.
   - [ ] `silica.core.request.Request` / `RequestState`.
   - [ ] `silica.core.sampling.SamplingParams`.
+  - [ ] `silica.core.sampler.Sampler` concrete class + `LogitProcessor` protocol (D-013); minimal processors `temperature` / `top_k` / `top_p` / `repetition_penalty` wired in the fixed order, plus a `greedy` fast path.
   - [ ] `silica.core.logger` + `silica.core.profiler`.
   - [ ] Five Protocols (I-1..I-5) + a stub implementation for each (`StubModelAdapter`, `NullKVManager`, `IdentityCodec`, `ResidentWeightProvider` stub, `NoopDraftEngine`).
   - [ ] `tests/test_interfaces.py` verifying Protocol shape + stub instantiation.
+  - [ ] `tests/test_sampler.py` verifying processor ordering (`temperature → repetition penalty → top-k → top-p → sample`, D-013) and greedy determinism.
   - [ ] `from silica import Engine` imports cleanly (even if it raises `NotImplementedError`).
 - **Acceptance:**
   - [ ] `uv pip install -e .` succeeds.
-  - [ ] `pytest tests/test_interfaces.py` passes.
+  - [ ] `pytest tests` passes (at minimum `tests/test_interfaces.py` and `tests/test_sampler.py`).
   - [ ] Unified metrics schema includes fields: `ttft_ms`, `prefill_tok_s`, `decode_tok_s`, `resident_mb`, `logical_kv_bytes`.
 - **Dependencies:** none.
-- **Status:** planned.
+- **Status:** in-progress (repo carries the 11 skeleton sub-packages; Protocols + stubs + sampler module pending).
 - **Notes:** foundation for everything else. Once interfaces are frozen, changes go through the Decisions Log.
 
 ### P-1 Phase 1 — Baseline Engine
 
 - **Goal:** a minimal runnable MLX-native inference main loop.
 - **Scope:** single request, greedy / temperature / top-p sampling, token streaming, minimal CLI.
-- **Strategy:** the Phase 1 `ModelAdapter` borrows from `mlx-lm` for (a) model-structure loading, (b) the tokenizer, (c) the weight loader (safetensors → `mx.array`), but **does not borrow** mlx-lm's rotating KV cache / prompt cache — the ownership boundary is fixed in **D-010** (which supplements D-004). KV is a `SimpleKVCache` (single request, non-paged), injected into the adapter's `prefill` / `decode_step` via `kv_handle`. P-2's `PagedKVCache` is a direct upgrade path, not a replacement for mlx-lm's internal cache. The first task of P-1 is a **day-1 smoke test**: verify that `mlx_lm.generate_step(cache=...)` or an equivalent entry point accepts an external cache object. The result determines the real cost of the remaining P-1 deliverables (see D-010 / R-6).
+- **Strategy:** the Phase 1 `ModelAdapter` borrows from `mlx-lm` for (a) model-structure loading, (b) the tokenizer, (c) the weight loader (safetensors → `mx.array`), but **does not borrow** mlx-lm's rotating KV cache / prompt cache — the ownership boundary is fixed in **D-010** (which supplements D-004). KV is a `SimpleKVCache` (single request, non-paged), injected into the adapter's `prefill` / `decode_step` via `kv_handle`. P-2's `PagedKVCache` is a direct upgrade path, not a replacement for mlx-lm's internal cache. The first tasks of P-1 are **two day-1 gates**: Gate A (D-010) verifies that `mlx_lm.generate_step(cache=...)` or an equivalent entry point accepts an external cache object; Gate B (D-014 / R-8) verifies that Qwen3.5-0.8B loads text-only with MTP disabled and tokenizer round-trips match the HF reference. Together these results determine the real cost of the remaining P-1 deliverables (see D-010 / D-014 / R-6 / R-8).
 - **Deliverables:**
-  - [ ] **Day-1 gate:** smoke test that `mlx_lm` accepts external cache injection (D-010). Resolve this blocker before expanding the deliverables below.
+  - [ ] **Day-1 gate A:** smoke test that `mlx_lm` accepts external cache injection (D-010). Resolve this blocker before expanding the deliverables below.
+  - [ ] **Day-1 gate B (D-014 / R-8):** Qwen3.5-0.8B text-only load probe — (a) checkpoint loads under mlx-lm (or a thin local loader if mlx-lm is incomplete) with multimodal heads skipped or weight-ignored; (b) MTP head can be disabled so `decode_step` yields exactly one token per call; (c) tokenizer round-trips match the HF reference on a fixed prompt fixture. Failure triggers R-8 mitigation (monkey-patch the load path, or fall back to Qwen3-0.6B and shift DeltaNet work to P-3).
   - [ ] `silica.engine.Engine.generate(prompt, sampling_params)` returning a token stream.
   - [ ] `silica.mlx.runner` wrapping mlx-lm's forward (external cache injected; mlx-lm's internal cache unused).
   - [ ] `silica.kvcache.simple.SimpleKVCache` (single-request; passed to the adapter as a `kv_handle`).
-  - [ ] `silica.server.cli`: `python -m silica run --model Qwen/Qwen3-0.6B --prompt "..."`.
+  - [ ] `silica.server.cli`: `python -m silica run --model Qwen/Qwen3.5-0.8B --prompt "..."`.
   - [ ] Basic sampling: greedy, temperature, top-p.
   - [ ] `silica.models.qwen3.Qwen3Adapter` (borrows mlx-lm structure, KV self-managed per D-010).
 - **Acceptance:**
@@ -381,7 +385,7 @@ Each Phase uses the same structure: `ID / Goal / Scope / Strategy / Deliverables
   - [ ] The profiler produces TTFT, decode tok/s, and resident memory.
 - **Dependencies:** P-0.
 - **Status:** planned.
-- **Notes:** dev-loop model is Qwen3-0.6B. Do not attempt 27B / 31B in Phase 1.
+- **Notes:** dev-loop model is Qwen3.5-0.8B. Do not attempt 27B / 31B in Phase 1. **P-1 scope constraints are fixed in D-014**: text-only path only (multimodal heads skipped per §3.2 Non-Goals); MTP is disabled (standard single-token decode — MTP as a draft source flows through I-5 `DraftEngine` and is a P-7 discussion); DeltaNet per-layer recurrent state is adapter-owned and carried via `state_delta` (D-015); paged KV and prefix cache are P-2 concerns, not P-1.
 
 ### P-2 Phase 2 — Mini-vLLM Core
 
@@ -390,11 +394,11 @@ Each Phase uses the same structure: `ID / Goal / Scope / Strategy / Deliverables
 - **Strategy:**
   - Default block size 16 tokens (re-evaluated after Phase 4 bench).
   - Radix prefix cache, taking cues from mini-sglang.
-  - Chunked prefill is deferred; add it in Phase 3 only if OOM forces it.
+  - Chunked prefill is not a P-2 deliverable; decision is measurement-gated under **Q-010** (triggers include fairness / TTFT, not only OOM). Resolved at P-4 bench exit via the TTFT-under-concurrency scenario; promoted to v0.1.5 / v0.2 only if the threshold is breached.
 - **Deliverables:**
   - [ ] `silica.kvcache.paged.PagedKVCache` implementing KVManager (I-2).
   - [ ] `silica.kvcache.prefix.RadixPrefixCache`.
-  - [ ] `silica.core.request.RequestState` state machine: `WAITING → PREFILL → DECODE → DONE/ABORTED`.
+  - [ ] `silica.core.request.RequestState` state machine: `WAITING → PREFILL → DECODE → DONE/ABORTED`, plus `PREEMPTED` as a side state reachable from `PREFILL` / `DECODE` when the scheduler evicts to honor the memory budget; re-admission returns to `WAITING` and reuses any still-valid prefix-cache blocks + `state_delta` snapshot.
   - [ ] `silica.scheduler.batcher.ContinuousBatcher`.
   - [ ] `silica.scheduler.budget.MemoryBudgeter`.
 - **Acceptance:**
@@ -420,14 +424,16 @@ Each Phase uses the same structure: `ID / Goal / Scope / Strategy / Deliverables
   - [ ] `silica.models.gemma4.Gemma4Adapter` (dense, Gemma4-31B).
   - [ ] `silica.models.qwen3_5_moe.Qwen35MoeAdapter` (MoE, Qwen3.5-35B-A3B).
   - [ ] `silica.models.gemma4_moe.Gemma4MoeAdapter` (MoE, gemma-4-26B-A4B).
-  - [ ] Hybrid implementation of `AttentionPattern`.
+  - [ ] `AttentionPattern` dispatch covering all v0.1 values — `global` / `sliding` / `hybrid` (KV-attention variants) **and** `recurrent` / `hybrid_deltanet` (D-015, Qwen3.5 path). The scheduler routes KV layers to `KVManager` and recurrent layers to the adapter-owned store.
+  - [ ] DeltaNet recurrent-layer forward + adapter-local per-request state store (keyed by `req_id` via `kv_handle`); `adapter.commit_state` / `adapter.rollback_state` / `adapter.state_from_prefix` / `adapter.free_state` helpers implemented per D-015 (P-7 will exercise commit/rollback; P-3 only needs the primitives in place).
   - [ ] MoE top-k gating + per-expert FFN aggregation (inference path, aux-loss ignored).
   - [ ] `silica.weights.resident.ResidentWeightProvider` (full residency; the MoE variant exposes `get_expert` per-expert access even if the underlying storage is fully resident).
   - [ ] Model registry: `silica.models.registry` (each entry marks `arch: dense | moe`; MoE entries require a MoE-capable `WeightProvider`).
 - **Acceptance:**
   - **Adapter structural correctness (fp16 parity on control model)** — P-3 exit criterion:
-    - [ ] On a fp16 control model (Qwen3-0.6B or Qwen3.5-4B), Silica adapter logits match the HuggingFace reference: `max |logit diff| < 1e-3` over the first 50 greedy-decoded tokens under the same tokenizer state and seed. This verifies adapter structural components (attention, RMSNorm, MoE routing, positional encoding) without quantization noise.
-    - [ ] Qwen3.5 hybrid attention cache-routing semantics are correct — unit tests cover per-layer dispatch according to `AttentionPattern`.
+    - [ ] On a fp16 control model (Qwen3.5-0.8B or Qwen3.5-4B), Silica adapter logits match the HuggingFace reference: `max |logit diff| < 1e-3` over the first 50 greedy-decoded tokens under the same tokenizer state and seed. This verifies adapter structural components (attention, RMSNorm, MoE routing, positional encoding) without quantization noise.
+    - [ ] Qwen3.5 hybrid attention cache-routing semantics are correct — unit tests cover per-layer dispatch according to `AttentionPattern` including `hybrid_deltanet` (KV layers → `KVManager`, recurrent layers → adapter-owned store).
+    - [ ] DeltaNet recurrent-state plumbing is exercised (D-015): (a) `StateDelta.recurrent_bytes()` returns non-zero for hybrid_deltanet models and matches the layer-count × hidden-state-bytes formula; (b) `adapter.state_from_prefix` returns a reusable `StateDelta` when the full KV prefix is reused and `None` otherwise (v0.1 rule); (c) a snapshot → mutation → `adapter.rollback_state` round-trip restores the pre-snapshot forward output bit-exactly (P-7 prerequisite, tested in isolation in P-3).
   - **Quantized big-model correctness** — P-3 exit criterion:
     - [ ] Qwen3.5-27B and Gemma4-31B load and execute at least one forward under the MLX-native 4-bit or 8-bit quantization path (D-005); manual resident caps and small batches are allowed.
     - [ ] **Teacher-forced next-token argmax agreement ≥ 98%** over the first 100 teacher-forced positions, against the `mlx-lm` reference at the same model + same quantization configuration, compared position-by-position on a fixed prefix. We do **not** compare against free-running generated sequences — sequence drift would mask or amplify real differences.
@@ -449,7 +455,7 @@ Each Phase uses the same structure: `ID / Goal / Scope / Strategy / Deliverables
 - **Strategy:** bench is a thin wrapper over `silica.engine.Engine`.
 - **Deliverables:**
   - [ ] `silica.bench.runner.BenchRunner`.
-  - [ ] `silica.bench.scenarios`: short-in/long-out; long-in/short-out; concurrent shared-prefix.
+  - [ ] `silica.bench.scenarios`: short-in/long-out; long-in/short-out; concurrent shared-prefix; **TTFT-under-concurrency** (one long-prompt request co-scheduled with short-prompt requests — resolves Q-010 chunked-prefill promotion).
   - [ ] Unified metrics schema: TTFT, prefill tok/s, decode tok/s, resident memory, logical KV bytes, quality.
   - [ ] Output: jsonl + markdown report.
   - [ ] `silica.bench.vqbench_baseline`: runs the ready-made vqbench scripts (`reproduce_qwen35_4b_headline.py` etc.) in a separate subprocess to collect PPL as a reference column. D-009 explicitly allows this "separate-process comparison" path; it serves the P-5 numeric cross-check acceptance.
@@ -482,7 +488,7 @@ Each Phase uses the same structure: `ID / Goal / Scope / Strategy / Deliverables
   - [ ] For the same scenario set, fp16 vs codec quality delta and memory savings are available from the bench in one command.
   - [ ] With BlockTQ on, the same memory budget admits more requests (quantitatively verifies Principle 8).
   - [ ] **Numeric cross-check against vqbench** — two independent thresholds, both must pass:
-    - **(a) Per-block reconstruction error.** Metric: **per-block relative Frobenius error** `||K_decoded - K_original||_F / ||K_original||_F` (same for V), computed block-by-block on a fixed calibration set. Silica MLX-native `BlockTQCodec` on Qwen3.5-0.6B (or larger), compared against the vqbench NumPy reference on the same calibration set under the same metric, must satisfy `ε_recon < 2 × fp16 round-trip baseline noise`, where the baseline is established by vqbench's own fp16 encode→decode round trip (order of magnitude near machine precision). Can be tightened at P-4 exit based on measured baseline noise.
+    - **(a) Per-block reconstruction error.** Metric: **per-block relative Frobenius error** `||K_decoded - K_original||_F / ||K_original||_F` (same for V), computed block-by-block on a fixed calibration set. Silica MLX-native `BlockTQCodec` on Qwen3.5-0.8B (or larger), compared against the vqbench NumPy reference on the same calibration set under the same metric, must satisfy `ε_recon < 2 × fp16 round-trip baseline noise`, where the baseline is established by vqbench's own fp16 encode→decode round trip (order of magnitude near machine precision). Can be tightened at P-4 exit based on measured baseline noise.
     - **(b) End-to-end PPL drift.** Under the Qwen3.5-4B `BlockTurboQuantMSE B=64` 4-bit K+V configuration, Silica `BlockTQCodec`'s end-to-end perplexity deviates from the `vqbench/REPORT.md` baseline by `ε_ppl < 0.01` absolute.
     - Both must pass; passing only one is insufficient.
 - **Dependencies:** P-4.
@@ -573,9 +579,9 @@ Whether Phase 8 floats in priority: see Q-002. Whether Phase 6 is pulled forward
 | ID  | Name                                    | Dependent Phases | Acceptance |
 | --- | --------------------------------------- | ---------------- | ---------- |
 | M-1 | Skeleton                                | P-0              | Interfaces frozen, stub tests pass |
-| M-2 | Single-request gen                      | P-1              | Qwen3-0.6B generates text |
+| M-2 | Single-request gen                      | P-1              | Qwen3.5-0.8B generates text |
 | M-3 | Multi-request core                      | P-2              | 8 concurrent requests + prefix cache hit |
-| M-4 | Big models adapter correct              | P-3              | Dense adapter structural correctness (fp16 parity on dense control model, max abs logit diff < 1e-3) + hybrid attention routing + quantized dense correctness (teacher-forced argmax agreement ≥ 98%, or fallback PPL drift < 0.1 absolute) + **MoE smoke test adapter correctness** (D-011: Qwen3.5-35B-A3B / gemma-4-26B-A4B structural correctness + fp16 parity on a MoE control model + per-expert `get_expert` call-path unit test). **Product memory-fit target** (dense 27B/31B @ 48 GB, 500 tokens): validated here **only if** Q-003 resolves to "int4 fits in 48 GB"; otherwise deferred to M-7. MoE memory-fit is not Q-003-gated (small active params, R-1 MoE mitigation). |
+| M-4 | Big models adapter correct              | P-3              | Dense adapter structural correctness (fp16 parity on dense control model, max abs logit diff < 1e-3) + hybrid attention routing (including `hybrid_deltanet` dispatch + DeltaNet recurrent-state plumbing per D-015: `StateDelta.recurrent_bytes()`, `adapter.state_from_prefix`, and snapshot→mutation→`adapter.rollback_state` round-trip) + quantized dense correctness (teacher-forced argmax agreement ≥ 98%, or fallback PPL drift < 0.1 absolute) + **MoE smoke test adapter correctness** (D-011: Qwen3.5-35B-A3B / gemma-4-26B-A4B structural correctness + fp16 parity on a MoE control model + per-expert `get_expert` call-path unit test). **Product memory-fit target** (dense 27B/31B @ 48 GB, 500 tokens): validated here **only if** Q-003 resolves to "int4 fits in 48 GB"; otherwise deferred to M-7. MoE memory-fit is not Q-003-gated (small active params, R-1 MoE mitigation). |
 | M-5 | Unified bench                           | P-4              | One command produces the baseline table |
 | M-6 | VQ on platform                          | P-5              | BlockTQ / RaBitQ wired in, savings quantifiable |
 | M-7 | Streaming weights + deferred memory-fit | P-6              | Under a 24 GB budget, Qwen3.5-27B int4 does not OOM; decode tok/s ≥ 70% of the `ResidentWeightProvider` baseline (see P-6 Acceptance). **If M-4 deferred the product memory-fit target** (Q-003 forced P-6 before P-3 exit), this milestone carries the real 27B/31B @ 48 GB 500-token validation. |
@@ -719,6 +725,69 @@ Append-only. New decisions go at the end; old ones are not edited. Revocations /
   - **§3.1 Scope / §3.4 Target Models updated in step.**
 - **References:** D-006, Principle 2, Principle 9, I-1, I-4, P-3, P-6, Q-003, R-1, M-4.
 
+### D-012 — Canonical `resident_bytes` measurement
+
+- **Date:** 2026-04-16.
+- **Status:** accepted.
+- **Decision:** `resident_bytes` (on `KVCodec.resident_bytes(num_blocks)` and `WeightProvider.resident_bytes()`) is defined as **physical bytes currently owned by the component in unified memory**, i.e. the sum of `mx.array` backing-storage sizes the component controls, measured **at the moment of the call**. It does **not** include: (a) transient decode scratch (codec decode intermediates freed before the next block call); (b) MLX allocator headroom / pool padding; (c) memory regions the OS has reclaimable-but-not-yet-reclaimed. The memory budgeter treats `sum(component.resident_bytes())` as the authoritative floor, and compares against a single target (`target_resident_bytes`, initialized to `0.9 × hardware unified-memory total` minus the reserved activation budget).
+- **Rationale:** Principle 8 says savings must be observable; if each component reports `resident_bytes` under a different definition (physical vs scratch-inclusive vs headroom-inclusive), the scheduler either double-counts or under-counts and admission control becomes unreliable. Pin the definition now so P-5 / P-6 implementations produce comparable numbers.
+- **Consequences:**
+  - Every `resident_bytes()` implementation adds a unit test that reports a steady-state value (no transient scratch) and is idempotent across repeated calls outside a modifying operation.
+  - The P-4 bench unified-metrics schema (`resident_mb`) is derived from this definition.
+  - If a future codec has genuinely unavoidable scratch during encode/decode that must be visible to the scheduler, the solution is a separate `scratch_bytes()` method, **not** polluting `resident_bytes`.
+- **References:** Principle 8, I-3, I-4, P-0 Acceptance (unified metrics schema), P-4 Deliverables.
+
+### D-013 — Sampler structure: separate class, not a sixth Protocol
+
+- **Date:** 2026-04-16.
+- **Status:** accepted.
+- **Decision:** Sampling lives in `silica.core.sampler.Sampler` as a **concrete class**, not as a sixth frozen interface (I-6). The Engine drives `logits → Sampler.sample(logits, sampling_params, rng_state) → token` between `ModelAdapter.decode_step` and the token-stream yield. Logit processors (temperature, top-p, top-k, repetition penalty, and future user-defined processors) compose inside the Sampler via a short `Sequence[LogitProcessor]` list with a stable ordering rule. `LogitProcessor` may be a **local lightweight `typing.Protocol`** in `silica.core.sampler` for type-hinting, but it is **not one of the five frozen core interfaces (I-1..I-5)** — §6 stays at five.
+- **Rationale:** only one sampling implementation exists (MLX-native, executed on the same device as logits); there is no FlashAttention / xformers-style multi-backend pressure. A Protocol without a second implementation to swap in is over-committing the interface surface — the same argument that kept compressed-domain attention out of I-3 in D-003. If v0.2 adds structured-output / grammar-constrained / compressed-domain-attention paths that need sampling to participate differently, re-open under Q-006 / Q-011 and promote then.
+- **Consequences:**
+  - §6 stays at **five** frozen interfaces (I-1..I-5) through v0.1.
+  - `silica.core.sampler` is a new module (not in the current `silica.core` sub-tree listed in P-0 deliverables) — P-0 deliverables expand by one file in v1.5.1.
+  - The logit-processor ordering rule is `temperature → repetition penalty → top-k → top-p → sample` (matches mlx-lm); any deviation requires a new entry.
+- **References:** D-003, Q-006, Q-011, P-0 Deliverables.
+
+### D-014 — P-1 scope constraints for Qwen3.5-0.8B dev-loop
+
+- **Date:** 2026-04-16.
+- **Status:** accepted.
+- **Decision:** With the P-1 dev-loop model set to **Qwen3.5-0.8B** (Gated DeltaNet + Gated Attention hybrid + MTP + multimodal), P-1 is pinned to the following simultaneous constraints:
+  1. **Text-only.** No processor / vision / audio lifecycle in P-1 (§3.2 Non-Goals). The checkpoint loads with its non-text heads either skipped on the loader side or left resident-but-unused.
+  2. **MTP disabled.** Qwen3.5's multi-token prediction head is turned off at load; P-1 decode path produces one token per step. Using MTP as a draft source for speculative decoding is a P-7 discussion (and may flow through I-5 `DraftEngine`), not a P-1 deliverable.
+  3. **DeltaNet recurrent state is adapter-owned and carried via `state_delta`** per D-015. P-1's `SimpleKVCache` handles KV-attention layers only; recurrent-layer state travels through the `prefill` / `decode_step` return tuple.
+  4. **Multi-head tokenizer parity with the HF reference is a P-1 acceptance prerequisite** — because Qwen3.5's tokenizer can differ from Qwen3's, the "greedy decoding is token-for-token identical to the mlx-lm reference" acceptance line depends on matching tokenizer state.
+- **Rationale:** empirical check on 2026-04-16: every Qwen3.5 target model (0.8B / 27B / 35B-A3B) uses the DeltaNet hybrid (HF model cards), so DeltaNet is not a P-1-only concern; it is core-engine concern. Separating the P-1 scope (this decision) from the interface-surface contract (D-015) avoids deferring architecture discovery into implementation.
+- **Consequences:**
+  - P-1 Strategy / Deliverables in §7 now reference this decision via the P-1 Notes block.
+  - D-004 (Phase 1 wraps mlx-lm for model structure + tokenizer + weight loader) still applies; D-010 (cache ownership boundary) still applies. D-014 adds the Qwen3.5-specific content to the shared borrowing surface.
+  - mlx-lm's Qwen3.5 support status becomes a P-1 day-1 gate alongside the D-010 cache-injection smoke test: if mlx-lm does not yet carry Qwen3.5 forward, P-1 cost revises upward (ties into R-2).
+  - If mlx-lm's Qwen3.5 support bundles MTP / multimodal heads in a way that cannot be cleanly disabled at load, P-1 monkey-patches the load path — same mitigation pattern as R-6.
+- **References:** D-004, D-009, D-010, D-015, §3.2, P-1, R-2, R-6.
+
+### D-015 — Recurrent state as a first-class `state_delta` tenant
+
+> **Resolution addendum (v1.5.1):** Prior-round state is not a new input to `I-1.prefill` / `I-1.decode_step`. Instead, **`kv_handle` carries request identity** (it is issued by `KVManager.reserve_for_prefill(req_id, ...)` / `append_slot(req_id, ...)` and binds to `req_id`), and the **adapter owns a per-request store keyed by that identity**. `StateDelta` is a **pure read-only snapshot** — it exposes only `recurrent_bytes() -> int` for scheduler budgeting and an opaque payload the engine does not mutate. All lifecycle operations are **adapter methods called by the engine** (non-frozen helpers, not part of I-1): `adapter.commit_state(req_id, n_accepted)`, `adapter.rollback_state(req_id, n_reject)`, `adapter.state_from_prefix(req_id, token_ids) -> StateDelta | None`, `adapter.free_state(req_id)`. This keeps I-1 Python signatures unchanged and closes the continuous-batching / speculative-decoding ambiguity. See also I-1 Key constraints #3 and I-2 incremental semantics.
+
+- **Date:** 2026-04-16.
+- **Status:** accepted.
+- **Decision:** `state_delta` (I-1 return tuple) carries **DeltaNet per-layer recurrent state** as a named, first-class tenant — not as an ad-hoc "non-KV runtime state" example. Concretely:
+  1. **Layout and ownership.** The adapter owns a per-request recurrent-state store keyed by `req_id` (obtained via `kv_handle`); it defines the concrete layout (e.g. `dict[int, mx.array]` keyed by layer index, each value is the recurrent hidden state of shape `(n_heads, head_dim, head_dim)` or the model-specific shape) and manages in-memory lifecycle. `StateDelta` returned from `prefill` / `decode_step` is a read-only snapshot — engine does not mutate it.
+  2. **`AttentionPattern` enum extension.** Values: `global` / `sliding` / `hybrid` (existing KV-attention variants); `recurrent` (pure linear / DeltaNet-only); `hybrid_deltanet` (Qwen3.5's alternating DeltaNet + Gated Attention stack, per-layer dispatch). The scheduler routes KV layers to `KVManager` and recurrent layers to the adapter-owned store.
+  3. **`commit` / `rollback` semantics.** Under speculative decoding (P-7), `KVManager.commit(req_id, n_accepted)` pairs with `adapter.commit_state(req_id, n_accepted)` (and `rollback` likewise with `adapter.rollback_state(req_id, n_reject)`) invoked by the engine on the same request. The adapter retains per-step snapshots during the draft window and collapses them on commit or restores the pre-draft state on rollback. These methods are **adapter-local helpers**, not part of I-1's frozen Python signatures.
+  4. **Prefix reuse.** Prefix-cache lookup (`KVManager.get_computed_blocks`) returns KV hits only; recurrent-state prefix reuse goes through `adapter.state_from_prefix(req_id, token_ids) -> StateDelta | None`, called by the engine when the KV prefix is non-empty. v0.1 starting rule: reuse recurrent state only when the **full** KV prefix is reused (no partial-prefix recurrent reuse); partial-prefix reuse is a v0.2 question.
+  5. **Budgeting.** `StateDelta.recurrent_bytes() -> int` (the only public method on `StateDelta`) is summed by the scheduler into `MemoryBudget.logical_bytes` and `MemoryBudget.resident_bytes` (D-012 canonical definition). For hybrid_deltanet models this is typically much smaller than KV (`num_recurrent_layers × hidden_state_bytes` per request, independent of sequence length), but it must be accounted for.
+  6. **Release.** On request completion / abort, the engine calls `adapter.free_state(req_id)` alongside `KVManager.free(req_id)`.
+- **Rationale:** Qwen3.5 / Qwen3.5-27B / Qwen3.5-35B-A3B all use DeltaNet hybrid (empirically confirmed on HF, 2026-04-16). Leaving recurrent state as an unspecified "etc." in `state_delta` would defer interface-surface decisions into P-3, when four adapters land at once — highest-blast-radius time. Pin the contract in v1.5.1 so P-0 can freeze at P-0 exit.
+- **Consequences:**
+  - I-1 `attention_pattern()` inline comment + Key constraints #1 and #3 updated in v1.5.1 (see §6 I-1).
+  - I-1 / I-2 Python Protocol signatures **unchanged** — the extension is purely contract text + `AttentionPattern` enum values + adapter-method conventions (`adapter.commit_state` / `adapter.rollback_state` / `adapter.state_from_prefix` / `adapter.free_state`); `StateDelta` itself only exposes `recurrent_bytes()`.
+  - P-3 MoE adapter work (D-011) and DeltaNet hybrid work are orthogonal; a MoE-DeltaNet model (e.g. Qwen3.5-35B-A3B) goes through both `get_expert` (D-011) and `state_delta`-recurrent (D-015) paths.
+  - The scheduler budget panel in §5.2 data flow expands from "KV via kv_handle from KVManager" to "KV via kv_handle from KVManager + recurrent via state_delta from adapter" — documented in v1.5.1 without redrawing.
+  - P-7 speculative decoding must exercise `adapter.commit_state` / `adapter.rollback_state` on DeltaNet layers in addition to `KVManager.commit` / `.rollback` on KV layers.
+- **References:** D-011, D-014, I-1, I-2, P-3, P-7, Q-008, M-4.
+
 ---
 
 ## 10. Open Questions
@@ -815,6 +884,46 @@ Resolved questions are not deleted. Mark `Status: resolved` and append a `Resolu
 - **Blocks:** design of the concrete P-5 `BlockTQCodec` constructor; may affect Q-001's granularity of auto-selection.
 - **Next step:** decide when P-5 starts. Current lean: Option A (most conservative, I-3 minimal).
 
+### Q-009 — MLX paged-attention kernel availability and quality
+
+- **Raised:** 2026-04-16.
+- **Status:** open.
+- **Question:** does MLX (or mlx-lm) provide a block-addressed / paged-attention kernel with acceptable decode-path throughput on Apple Silicon, or does Silica have to compose paged attention from `mx.` primitives (gather + per-request attention + scatter) at a known performance penalty?
+- **Context:** P-2 `PagedKVCache` is the core of the mini-vLLM engine; it requires attention to operate over block-indirected K/V rather than contiguous sequences. vLLM v1 leans on FlashAttention / FlashInfer CUDA kernels for this; Silica has **no CUDA** (D-009). If MLX does not expose an equivalent primitive, paged attention is hand-written over gathers and the decode-path tok/s baseline shifts downward — this affects every P-6 / P-7 tok/s acceptance ratio.
+- **Options:**
+  - **A. MLX has a usable paged-attention primitive.** P-2 wraps it; acceptance numbers unchanged.
+  - **B. MLX has no primitive; gather-based composition is performant enough.** P-2 proceeds; acceptance ratios re-baselined after P-4 bench.
+  - **C. MLX has no primitive; gather-based composition is unacceptably slow.** Paged KV degrades to larger block sizes (e.g. 64 or 128) to amortize; or P-2 scope narrows; or R-7 fires.
+- **Blocks:** P-2 exit, every downstream tok/s acceptance (P-6, P-7, P-4 bench).
+- **Next step:** micro-benchmark at P-0 exit or P-1 entry — the answer decides P-2's concrete block-size default and whether R-7 triggers.
+- **Pairs with:** R-7.
+
+### Q-010 — Chunked prefill: measurement-gated deferral vs promotion
+
+- **Raised:** 2026-04-16.
+- **Status:** open.
+- **Question:** should chunked prefill be a P-2 or P-3 deliverable, or stay deferred until OOM / fairness data forces it?
+- **Context:** target models advertise 256K+ context. Chunked prefill affects not just OOM but also scheduler fairness and TTFT — a long-prompt request will block short-prompt requests if prefill is un-chunked. However, chunked prefill is a non-trivial scheduler change (prefill is no longer a single batched forward; it interleaves with decode) and committing without measurement risks over-engineering. This mirrors D-003's rejection of compressed-domain attention in v0.1 on the same grounds.
+- **Options:**
+  - **A. Defer with measurement trigger.** Keep out of P-2 / P-3 deliverables; add a P-4 bench scenario ("long-in/short-out under shared-prefix concurrency") that measures prefill-induced TTFT stalls; if stalls exceed a threshold (e.g. TTFT p95 of a short-prompt request concurrent with a long-prompt request is > 5× the isolated baseline), promote chunked prefill to v0.1.5 / v0.2. **Current lean.**
+  - **B. Promote to P-2 deliverable unconditionally.** Aligns with vLLM v1 baseline behavior; risks scope creep in the most critical phase.
+  - **C. Promote to P-3 deliverable conditional on R-1 (memory fit).** If Q-003 forces P-6 ahead of P-3, chunked prefill rides the same window.
+- **Blocks:** P-2 / P-3 scope finalization; partially blocks long-context acceptance.
+- **Next step:** resolve at P-4 bench exit with the measured TTFT-under-concurrency data.
+
+### Q-011 — Structured-output / logit-processor boundary
+
+- **Raised:** 2026-04-16.
+- **Status:** open.
+- **Question:** where does structured generation (grammar / JSON-schema / regex-constrained decoding) live — inside the Sampler's `LogitProcessor` chain (D-013), or as a separate cross-cutting concern the engine orchestrates around sampling?
+- **Context:** P-8 deliverables list "an interface slot for structured generation / grammar (unimplemented)". D-013 resolved Sampler as a concrete class with a `Sequence[LogitProcessor]` chain; a grammar-constrained decoder is technically a logit processor (it masks logits that would violate the grammar), but in practice grammar state (e.g. LL-automaton step, outlines-style regex FSM) is per-request and persists across decode steps, which is closer to a `ModelAdapter.state_delta` tenant than to a stateless logit-op. The two framings lead to different interface surfaces in v0.2.
+- **Options:**
+  - **A. LogitProcessor with persistent state.** Add a per-request state slot to the `LogitProcessor` protocol; grammar processors carry their FSM state there. Minimal interface delta.
+  - **B. Separate `StructuredOutputController` interface** driven by the engine, orchestrated around `Sampler.sample`. Cleaner conceptually but a new interface.
+  - **C. Grammar state rides `state_delta`.** Consistent with D-015's framing (non-KV per-request state); weird conceptually because grammar is not part of the model.
+- **Blocks:** concrete structured-output implementation in v0.2 (not in v0.1 scope).
+- **Next step:** revisit when v0.2 planning begins; D-013 resolution leaves room for either framing.
+
 ---
 
 ## 11. Risks
@@ -827,6 +936,8 @@ Resolved questions are not deleted. Mark `Status: resolved` and append a `Resolu
 | R-4 | BlockTQ / RaBitQ decode overhead exceeds that of fp16 attention itself | P-5 | Q-001 auto-selection policy; v0.2 may consider a fast path |
 | R-5 | MLX / mlx-lm version churn makes dependency locking painful | all | Pin minimum versions in pyproject.toml + periodic CI upgrades |
 | R-6 | `mlx-lm` rejects external cache injection (D-010 day-1 smoke test fails) | P-1 | Monkey-patch / fork `mlx_lm.models.*` forward; worst case, P-1 cost is revised upward and the cache integration point is uniformly refactored before P-2 starts; record in P-1 Strategy Notes |
+| R-7 | MLX has no performant paged-attention primitive; hand-composed gather + per-request attention + scatter is materially slower than contiguous-sequence attention (pairs with Q-009) | P-2 | Micro-benchmark at P-0 exit / P-1 entry to pin the baseline; if penalty is > ~30%, raise block size (16 → 64 / 128) to amortize; if still unacceptable, re-scope P-2 to per-request contiguous caches with a clear upgrade path once MLX adds the primitive; P-6 / P-7 tok/s acceptance ratios re-baselined against the chosen path |
+| R-8 | `mlx-lm` does not yet carry Qwen3.5 (Gated DeltaNet + Gated Attention + MTP) forward cleanly, or bundles MTP / multimodal heads in a way that cannot be disabled at load (D-014) | P-1 | Day-1 gate alongside D-010 cache-injection smoke test; if mlx-lm's Qwen3.5 support is incomplete, monkey-patch the load path to skip multimodal heads and disable MTP; worst case, P-1 falls back to Qwen3-0.6B for the bring-up loop and the DeltaNet-specific work shifts to P-3 (explicitly re-opens D-014) |
 
 ---
 
@@ -859,6 +970,24 @@ Local reference implementations sit at the repo root. **Algorithm / architecture
 
 ## 13. Changelog
 
+- **v1.5.1** (2026-04-16): freeze-readiness pass — lands the gaps v1.5.0 carried forward, addresses the Qwen3.5-architecture implications of the dev-loop model switch, and restores changelog integrity. No structural redesign; interface signatures unchanged (I-1..I-5 Python Protocol shapes untouched).
+  - **Header:** `Status` "Phase 0 planned" → "Phase 0 in-progress" (repo already carries the 11 skeleton sub-packages per `chore: flatten package layout to ./silica and track initial skeleton`, so the prior label was stale).
+  - **Dev-loop model switch to Qwen3.5-0.8B (recorded here, not retroactively in v1.4.1).** Empirical check on 2026-04-16: `https://huggingface.co/Qwen/Qwen3.5-0.8B` (and Qwen3.5-27B / Qwen3.5-35B-A3B) model cards confirm **Gated DeltaNet + Gated Attention hybrid + MTP + multimodal**. DeltaNet is therefore a core-engine concern shared by P-1 dev-loop and P-3 production targets, not a P-1-only surprise. v1.4.1's historical changelog line was restored from `Qwen3.5-0.8B or Qwen3.5-4B` back to `Qwen3-0.6B or Qwen3.5-4B` per D-007 append-only integrity.
+  - **New §3.2 Non-Goal (multimodal):** v0.1 runs the text-only path of multimodal checkpoints; vision / audio / video encoder lifecycle is v0.2. Grounds D-014 and clears a scope ambiguity Codex flagged two rounds ago.
+  - **New D-012 (canonical `resident_bytes` measurement):** one definition for physical owned bytes in unified memory; excludes transient scratch / allocator headroom / reclaimable regions. Pinned so P-5 / P-6 produce comparable numbers. Lands v1.5.0's "carried-forward" item (3).
+  - **New D-013 (Sampler structure):** Sampler is a concrete class in `silica.core.sampler`, not a sixth Protocol. Logit processors compose in a `Sequence[LogitProcessor]` with a fixed ordering (`temperature → repetition penalty → top-k → top-p → sample`). §6 stays at five frozen interfaces. Lands v1.5.0's "carried-forward" item (2).
+  - **New D-014 (P-1 scope for Qwen3.5-0.8B):** text-only, MTP disabled, DeltaNet recurrent state adapter-owned, tokenizer-parity prerequisite; orthogonal to D-004 (mlx-lm wrap) and D-010 (cache boundary). Lands the new issue introduced by the v1.5.0 dev-loop model switch.
+  - **New D-015 (recurrent state as first-class `state_delta` tenant):** `AttentionPattern` enum extended with `recurrent` / `hybrid_deltanet`; per-layer ownership / `commit` / `rollback` / prefix-reuse / budgeting rules spelled out. I-1 / I-2 signatures unchanged — contract extended only. I-1 Key constraints #1 and #3 rewritten in §6. Scheduler memory-budget path expands to include `state_delta.recurrent_bytes()`.
+  - **New Q-009 (MLX paged-attention kernel availability):** micro-benchmark decision at P-0 exit / P-1 entry; decides P-2 block-size default and whether R-7 triggers. Lands v1.5.0's "carried-forward" item (1).
+  - **New Q-010 (chunked prefill):** measurement-gated deferral (current lean: Option A — add P-4 bench TTFT-under-concurrency scenario, promote only if threshold breached). Lands v1.5.0's "carried-forward" item (5) as a decision-pending question rather than a deliverable, mirroring D-003's framing.
+  - **New Q-011 (structured-output / logit-processor boundary):** three options sketched for v0.2 planning; v0.1 leaves the P-8 "interface slot for structured generation" unimplemented as stated. Lands v1.5.0's "carried-forward" item (6).
+  - **New R-7 (MLX paged-attention kernel risk):** pairs with Q-009; mitigation = micro-benchmark, block-size adjustment, or per-request contiguous caches with a clear upgrade path. Lands v1.5.0's "carried-forward" item (1) mitigation.
+  - **New R-8 (mlx-lm Qwen3.5 support gap):** pairs with D-014; day-1 gate next to the D-010 cache-injection smoke test; worst-case fallback is P-1 reverts to Qwen3-0.6B and DeltaNet shifts to P-3.
+  - **P-1 Notes:** extended to reference D-014 constraints (text-only, MTP-disabled, DeltaNet adapter-owned, tokenizer parity prerequisite).
+  - **P-2 RequestState:** state machine gains `PREEMPTED` as a side state reachable from `PREFILL` / `DECODE` under scheduler eviction; re-admission reuses still-valid prefix blocks and the last `state_delta` snapshot. Lands v1.5.0's "carried-forward" item (4). Anchored inline in P-2 rather than as a separate D entry (small, data-class-level change).
+  - **What is NOT changed:** I-1..I-5 Python Protocol signatures (only contract text and `AttentionPattern` enum); §5.1 module layout (other than the implicit addition of `silica.core.sampler.py` under D-013); §5.2 data flow (documented, not redrawn); §5.4 / §5.5 Reference Maps; D-001..D-011; Q-001..Q-008 resolutions and leans.
+  - **Cross-reference sync pass (post-landing, same-day):** five follow-up sync fixes after Codex round-4 review — (1) **D-015 resolution addendum:** prior-round `StateDelta` enters `decode_step` via `kv_handle`-carried request identity + adapter-internal per-request state store; I-1 signatures unchanged. (2) **P-0 deliverables:** added `silica.core.sampler.Sampler` + `LogitProcessor` + `tests/test_sampler.py` per D-013. (3) **P-0 Status:** "planned" → "in-progress" so the P-0 block matches the document header (CRUD convention). (4) **P-2 Strategy:** chunked-prefill deferral line rewritten to reference Q-010 (fairness / TTFT, not only OOM); P-4 Deliverables add a **TTFT-under-concurrency** bench scenario that resolves Q-010. (5) **P-1 Deliverables:** Day-1 gate split into **gate A** (D-010 cache injection) and **gate B** (D-014 / R-8: Qwen3.5-0.8B text-only load + MTP disabled + tokenizer parity).
+  - **Second sync pass (Codex round-5 review, same-day):** four more precision fixes — (6) **D-013 vs P-0 consistency:** D-013 clarifies `LogitProcessor` may be a local lightweight `typing.Protocol` for type hints; it is not one of the five frozen core interfaces (§6 stays at five). (7) **D-015 body / addendum alignment:** `commit` / `rollback` / `from_prefix` / `free` are **adapter methods** (`adapter.commit_state` / `adapter.rollback_state` / `adapter.state_from_prefix` / `adapter.free_state`), not methods on `StateDelta`. `StateDelta` is a read-only snapshot exposing only `recurrent_bytes() -> int`. D-015 items 1–5 rewritten to match; item 6 (`free_state`) added. (8) **P-0 Acceptance:** `pytest tests/test_interfaces.py` → `pytest tests` (covers `test_sampler.py` and future tests). (9) **P-3 Deliverables / Acceptance:** explicit `hybrid_deltanet` dispatch + recurrent-state plumbing; acceptance tests `StateDelta.recurrent_bytes()`, full-prefix-only recurrent reuse rule, and a snapshot→rollback round-trip bit-exactness (P-7 prerequisite, tested in P-3).
 - **v1.5.0** (2026-04-16): architecture scope generalized from dense-only to **MoE + Dense dual support**. On 2026-04-16 the user explicitly chose Option B ("architecture general + v0.1 must actually run at least one MoE target") over Option A ("interface-only, defer MoE testing to v0.2"). Changes are grouped by module; no structural redesign.
   - **New D-011**: v0.1 architecture generality fixed; references D-006 + Principle 2 + Principle 9; consequences make the Interface / Phase / Risk / Milestone impact surface explicit.
   - **Interface (I-4 WeightProvider)**: three per-expert granularity methods added — `get_expert(layer_idx, expert_id)` / `prefetch_experts(layer_idx, expert_ids)` / `release_expert(layer_idx, expert_id)`; dense implementations raise `NotImplementedError` (not a no-op, to prevent a MoE adapter from silently degrading onto a dense provider); key constraints add "MoE adapter FFN must go through `get_expert`; `get_layer` may not be used to pull all experts at once". I-1 / I-2 / I-3 / I-5 untouched.
