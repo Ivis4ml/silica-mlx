@@ -141,7 +141,7 @@ silica-mlx/
 ├── README.md
 ├── docs/
 │   └── PLAN.md                   # this file
-├── python/silica/
+├── silica/
 │   ├── __init__.py               # re-exports Engine, LLM
 │   ├── core/                     # Request, SamplingParams, Context, logging, profiling
 │   ├── mlx/                      # MLX array utilities, profiling hooks
