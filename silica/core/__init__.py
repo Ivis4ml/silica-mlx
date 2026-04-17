@@ -1,5 +1,6 @@
 """Silica core — data types, logging, profiling (no business logic)."""
 
+from silica.core.events import BatchEvent, EventKind
 from silica.core.logger import get_logger, setup_logging
 from silica.core.profiler import (
     MetricsRegistry,
@@ -18,6 +19,8 @@ from silica.core.sampler import LogitProcessor, Sampler
 from silica.core.sampling import SamplingParams
 
 __all__ = [
+    "BatchEvent",
+    "EventKind",
     "InvalidTransition",
     "LogitProcessor",
     "MetricsRegistry",

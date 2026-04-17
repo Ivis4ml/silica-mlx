@@ -41,15 +41,17 @@ Metrics populated per ``generate`` call:
 from __future__ import annotations
 
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 
 import mlx.core as mx
 
+from silica.core.events import BatchEvent
 from silica.core.profiler import MetricsRegistry
 from silica.core.sampler import Sampler
 from silica.core.sampling import SamplingParams
 from silica.kvcache.manager import KVHandle, KVManager
 from silica.models.adapter import ModelAdapter
+from silica.scheduler.batcher import ContinuousBatcher
 
 
 class Engine:
@@ -163,6 +165,87 @@ class Engine:
         rid = f"req-{self._req_counter}"
         self._req_counter += 1
         return rid
+
+    # --- P-2 Unit 16a: batched generation (B=1 for now) ---
+
+    def generate_batch(
+        self,
+        prompts: Sequence[str],
+        params: SamplingParams | list[SamplingParams] | None = None,
+    ) -> Iterator[BatchEvent]:
+        """Yield ``BatchEvent`` values driving ``ContinuousBatcher``.
+
+        P-2 Unit 16a **restricts B=1**: ``prompts`` must have length 1
+        (after empty-prompt filtering). 16b extends to B>1.
+
+        ``params`` accepts a single ``SamplingParams`` (homogeneous — the
+        P-2 supported case) or a list of length ``len(prompts)``. For
+        P-2 all elements of the list must be equal; heterogeneous lists
+        raise ``NotImplementedError`` — the union signature is reserved
+        so P-3 can land per-row logit stacks without breaking the API.
+
+        Empty prompts are skipped silently. Empty ``prompts`` iterable
+        yields nothing (matches ``Engine.generate`` convention).
+        """
+        prompts_list = list(prompts)
+        effective = _resolve_batch_params(prompts_list, params)
+        tokenizer = self._adapter.tokenizer()
+
+        batcher = ContinuousBatcher(
+            self._adapter,
+            sampler=self._sampler,
+            max_batch_size=1,
+        )
+
+        admitted_any = False
+        for req_index, prompt in enumerate(prompts_list):
+            prompt_ids = list(tokenizer.encode(prompt))
+            if not prompt_ids:
+                continue
+            batcher.add_request(req_index, prompt_ids, effective)
+            admitted_any = True
+
+        if not admitted_any:
+            return
+
+        while batcher.has_active():
+            for event in batcher.step():
+                yield event
+
+
+def _resolve_batch_params(
+    prompts: Sequence[str],
+    params: SamplingParams | list[SamplingParams] | None,
+) -> SamplingParams:
+    """Validate and reduce generate_batch's union-typed params argument.
+
+    Returns a single ``SamplingParams`` for P-2's homogeneous batch.
+    Heterogeneous lists raise ``NotImplementedError`` naming the phase
+    that will add per-row support (P-3).
+    """
+    if params is None:
+        return SamplingParams()
+    if isinstance(params, SamplingParams):
+        return params
+    if isinstance(params, list):
+        if len(params) != len(prompts):
+            raise ValueError(
+                f"params list length ({len(params)}) must equal "
+                f"prompts length ({len(prompts)})"
+            )
+        if not params:
+            return SamplingParams()
+        first = params[0]
+        if not all(p == first for p in params):
+            raise NotImplementedError(
+                "Heterogeneous SamplingParams per row arrives in P-3; "
+                "P-2 requires all rows to share the same params."
+            )
+        return first
+    raise TypeError(
+        f"params must be SamplingParams | list[SamplingParams] | None, "
+        f"got {type(params).__name__}"
+    )
 
 
 __all__ = ["Engine"]
