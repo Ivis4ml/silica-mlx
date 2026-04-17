@@ -49,9 +49,12 @@ backend lands with step 3 (RadixPrefixCache refactor).
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import mlx.core as mx
+
+if TYPE_CHECKING:
+    from silica.kvcache.paged import PagedKVCache
 
 
 @runtime_checkable
@@ -103,6 +106,27 @@ class PrefixBlockStore(Protocol):
 
         Called from ``RadixPrefixCache.release``. Does NOT touch
         source refs or detached storage.
+        """
+        ...
+
+    def hit_refs(self, block_id: int) -> int:
+        """Current live-hit refcount for ``block_id`` (0 if none).
+
+        Load-bearing for ``RadixPrefixCache.evict_until``: the tree
+        walks candidate nodes and skips any whose block still has a
+        live hit. Without this query evict_until would have to probe
+        the store via ``release_source`` and catch ``RuntimeError``,
+        which turns an O(1) check into O(1) + exception machinery.
+        """
+        ...
+
+    def has_detached(self, block_id: int) -> bool:
+        """Whether detached K/V is currently registered for ``block_id``.
+
+        Load-bearing for ``RadixPrefixCache.evict_until``: the tree
+        must call ``release_detached`` only when there is something
+        to release. Paged-backend implementations return ``False``
+        unconditionally; Synthetic checks its ``_detached`` dict.
         """
         ...
 
@@ -252,12 +276,6 @@ class SyntheticPrefixBlockStore:
             )
         del self._detached[block_id]
 
-    # --- debug / inspection helpers (not part of the Protocol) ---
-
-    def source_refs(self, block_id: int) -> int:
-        """Current source refcount for ``block_id`` (0 if none)."""
-        return self._source_refs.get(block_id, 0)
-
     def hit_refs(self, block_id: int) -> int:
         """Current hit refcount for ``block_id`` (0 if none)."""
         return self._hit_refs.get(block_id, 0)
@@ -266,9 +284,139 @@ class SyntheticPrefixBlockStore:
         """Whether detached K/V is currently registered for ``block_id``."""
         return block_id in self._detached
 
+    # --- debug / inspection helpers (not part of the Protocol) ---
+
+    def source_refs(self, block_id: int) -> int:
+        """Current source refcount for ``block_id`` (0 if none)."""
+        return self._source_refs.get(block_id, 0)
+
     def live_block_ids(self) -> frozenset[int]:
         """Snapshot of all block ids with nonzero source refs."""
         return frozenset(self._source_refs.keys())
 
 
-__all__ = ["PrefixBlockStore", "SyntheticPrefixBlockStore"]
+class PagedPrefixBlockStore:
+    """``PrefixBlockStore`` that adapts a ``PagedKVCache`` for RadixPrefixCache.
+
+    Block ids are **allocated by the caller** (via
+    ``PagedKVCache.reserve_for_prefill`` / ``append_slot``), not by this
+    store. ``allocate_id`` raises — the Paged path uses
+    ``RadixPrefixCache.insert(tokens, block_ids)`` where the caller
+    supplies ids; ``insert_detached`` is a Synthetic-only admission
+    path.
+
+    Detached K/V is not modelled in the Paged backend; the
+    paged-attention kernel track will define its own detached-K/V
+    semantics once that P-2 Opening trigger fires. Until then
+    ``register_detached`` / ``fetch_detached`` / ``release_detached``
+    raise ``NotImplementedError``; ``has_detached`` returns ``False``
+    unconditionally so ``evict_until`` can loop without special-casing.
+
+    Under the hood this store maintains its own source / hit counter
+    dicts and forwards refcount changes to ``PagedKVCache.incref /
+    decref`` — the aggregate kv refcount ("any holder at all?") still
+    drives the physical free-pool, while the split source / hit view
+    preserves the L-1 / L-2 invariants that ``evict_until`` depends
+    on. This mirrors what RadixPrefixCache's own ``_live_hits`` dict
+    did before step 3.
+    """
+
+    def __init__(self, kv: "PagedKVCache") -> None:
+        self._kv = kv
+        self.block_size = kv.block_size
+        self._source_refs: dict[int, int] = {}
+        self._hit_refs: dict[int, int] = {}
+
+    def allocate_id(self) -> int:
+        raise NotImplementedError(
+            "PagedPrefixBlockStore does not allocate block ids; the "
+            "caller supplies them from PagedKVCache.reserve_for_prefill "
+            "or append_slot. Use RadixPrefixCache.insert(tokens, "
+            "block_ids) for the Paged admission path — insert_detached "
+            "is Synthetic-only."
+        )
+
+    def retain_source(self, block_id: int) -> None:
+        self._kv.incref(block_id)
+        self._source_refs[block_id] = self._source_refs.get(block_id, 0) + 1
+
+    def release_source(self, block_id: int) -> None:
+        if block_id not in self._source_refs:
+            raise KeyError(f"block {block_id}: no outstanding source ref")
+        new_count = self._source_refs[block_id] - 1
+        if new_count > 0:
+            self._kv.decref(block_id)
+            self._source_refs[block_id] = new_count
+            return
+        # Transition to zero — L-2 guard (L-3 N/A; no detached in Paged).
+        hit = self._hit_refs.get(block_id, 0)
+        if hit > 0:
+            raise RuntimeError(
+                f"block {block_id}: cannot release_source while "
+                f"hit_refs={hit} (would strand live prefix-cache hits)"
+            )
+        self._kv.decref(block_id)
+        del self._source_refs[block_id]
+
+    def retain_hit(self, block_id: int) -> None:
+        if block_id not in self._source_refs:
+            raise KeyError(
+                f"block {block_id}: no source ref; retain_hit requires "
+                f"the block to be live in the radix tree (L-2 ⊆ L-1)"
+            )
+        self._kv.incref(block_id)
+        self._hit_refs[block_id] = self._hit_refs.get(block_id, 0) + 1
+
+    def release_hit(self, block_id: int) -> None:
+        count = self._hit_refs.get(block_id, 0)
+        if count <= 0:
+            raise KeyError(
+                f"block {block_id}: no outstanding hit ref "
+                f"(mismatched release — caller bug)"
+            )
+        self._kv.decref(block_id)
+        if count == 1:
+            del self._hit_refs[block_id]
+        else:
+            self._hit_refs[block_id] = count - 1
+
+    def hit_refs(self, block_id: int) -> int:
+        return self._hit_refs.get(block_id, 0)
+
+    def has_detached(self, block_id: int) -> bool:
+        return False
+
+    def register_detached(
+        self,
+        block_id: int,
+        per_layer_kv: Sequence[tuple[mx.array, mx.array]],
+    ) -> None:
+        raise NotImplementedError(
+            "PagedPrefixBlockStore does not store detached K/V; the "
+            "paged-attention kernel track owns that model (see "
+            "docs/P2_OPENING.md — trigger-gated future track)."
+        )
+
+    def fetch_detached(
+        self, block_id: int
+    ) -> Sequence[tuple[mx.array, mx.array]]:
+        raise NotImplementedError(
+            "PagedPrefixBlockStore does not store detached K/V."
+        )
+
+    def release_detached(self, block_id: int) -> None:
+        raise NotImplementedError(
+            "PagedPrefixBlockStore does not store detached K/V."
+        )
+
+    # --- debug / inspection helpers (not part of the Protocol) ---
+
+    def source_refs(self, block_id: int) -> int:
+        return self._source_refs.get(block_id, 0)
+
+
+__all__ = [
+    "PagedPrefixBlockStore",
+    "PrefixBlockStore",
+    "SyntheticPrefixBlockStore",
+]

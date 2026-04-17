@@ -1,52 +1,57 @@
-"""silica.kvcache.prefix — RadixPrefixCache for P-2 shared-prefix cache (Unit #14).
+"""silica.kvcache.prefix — RadixPrefixCache for P-2 shared-prefix cache.
 
-Block-granular trie keyed by blocks of ``block_size`` tokens. Each tree node
-holds one block id; edges are always exactly ``block_size`` tokens long.
-Inspired by mini-sglang's prefix tree — no cross-reference to runtime
-mini-sglang code (D-009: no non-MLX runtime imports).
+Block-granular trie keyed by blocks of ``block_size`` tokens. Each tree
+node holds one block id; edges are always exactly ``block_size`` tokens
+long. Inspired by mini-sglang's prefix tree — no cross-reference to
+runtime mini-sglang code (D-009: no non-MLX runtime imports).
 
 **Physical semantics — option B (copy-on-admit), per docs/P2_OPENING.md v2.1:**
 
-A prefix hit means: on admission, the batcher copies the source blocks' K/V
-into the new request's fresh batch row, skipping that prefix's forward
-compute. The source blocks are **not** shared across live requests at the
-physical level; they are retained as copy sources that survive their
-originating request via refcount pinning.
+A prefix hit means: on admission, the batcher copies the source blocks'
+K/V into the new request's fresh batch row, skipping that prefix's
+forward compute. The source blocks are **not** shared across live
+requests at the physical level; they are retained as copy sources that
+survive their originating request via refcount pinning.
 
-**Refcount protocol (load-bearing for option B):**
+**Backend seam — PrefixBlockStore Protocol (Unit 16c.2 step 3):**
 
-- ``insert(tokens, block_ids)``: for each newly-added node, call
-  ``kv.incref(block_id)``. This pins the block as a prefix source. The
-  owning request's subsequent ``kv.free`` decrements its own ref but
-  the prefix-cache ref keeps the block alive.
-- ``lookup(tokens) -> PrefixHit``: for each hit block, call
-  ``kv.incref(block_id)`` and increment a **local** ``_live_hits``
-  counter (independent of ``kv._refcount``). The live-hits counter
-  drives eviction decisions — a node cannot be evicted while any live
-  request still holds its block as a hit.
-- ``release(block_ids)``: paired with lookup; decrements ``_live_hits``
-  and ``kv.decref(block_id)``. Called once the live request has copied
-  the K/V into its own row (or finished).
-- ``evict_until(n)``: walks LRU for leaf nodes with ``_live_hits == 0``;
-  on each eviction, removes the node from the tree and ``kv.decref``s
-  its block (releasing the prefix-source hold). If no other holder
-  remains, the block returns to the free pool via PagedKVCache.
+Prior to 16c.2, this class depended concretely on ``PagedKVCache`` and
+called ``kv.incref`` / ``kv.decref`` with the aggregate refcount
+collapsing "I am a radix source" and "I am a live hit" into one number.
+Step 3 inverts the dependency: RadixPrefixCache now holds a
+``PrefixBlockStore`` (see ``silica.kvcache.store``) with four explicit
+retain/release methods (``retain_source`` / ``release_source`` /
+``retain_hit`` / ``release_hit``). Two implementations:
 
-**Why two refcount views (``kv._refcount`` vs PC's ``_live_hits``):**
+- ``PagedPrefixBlockStore`` — wraps ``PagedKVCache``, preserves today's
+  refcount / evict behaviour bit-for-bit; caller supplies block ids via
+  ``insert(tokens, block_ids)``.
+- ``SyntheticPrefixBlockStore`` — allocates its own ids and stores
+  detached per-layer K/V slices; enables ``insert_detached`` for
+  16c.2's BatchKVCache admission path.
 
-``kv._refcount`` sums every retention source (owning req + PC's prefix role
-+ live hits) without distinguishing them. The eviction decision needs a
-PC-specific view: "is this block still holding someone's copy-source hit?"
-That information is not recoverable from the aggregate. Unifying them
-would be a premature optimisation that makes eviction undecidable.
+**Two radix operations for lookup (Unit 16c.2 step 3):**
+
+- ``peek(tokens)`` — side-effect-free walk. No ``retain_hit``, no
+  LRU touch, no ``self.hits`` increment. Use during admission planning
+  before you have decided to actually copy K/V.
+- ``lookup(tokens)`` — retained walk. Retains each hit block via
+  ``store.retain_hit`` and advances LRU + ``self.hits``. Must be paired
+  with a later ``release(block_ids)``.
+
+Keeping the walk atomic inside the class (not split across
+``peek``-then-external-``retain_hit``) guarantees every future change
+to "what happens on a hit" travels through one code path.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 
+import mlx.core as mx
+
 from silica.kvcache.manager import PrefixHit
-from silica.kvcache.paged import PagedKVCache
+from silica.kvcache.store import PrefixBlockStore
 
 _CHUNK = tuple[int, ...]
 
@@ -82,33 +87,29 @@ class RadixPrefixCache:
         self,
         *,
         block_size: int,
-        kv: PagedKVCache,
+        store: PrefixBlockStore,
     ) -> None:
         if block_size <= 0:
             raise ValueError(f"block_size must be > 0, got {block_size}")
-        if kv.block_size != block_size:
+        if store.block_size != block_size:
             raise ValueError(
-                f"block_size mismatch: pc={block_size} vs kv={kv.block_size}"
+                f"block_size mismatch: pc={block_size} vs store={store.block_size}"
             )
         self._block_size = block_size
-        self._kv = kv
+        self._store = store
         self._root = _Node(parent=None, tokens=(), block_id=-1)
         self._tick = 0
-        # Per-block live-hit count (independent of kv.refcount — see module doc).
-        self._live_hits: dict[int, int] = {}
         self.hits: int = 0
 
     # --- public surface ---
 
-    def lookup(self, tokens: Sequence[int]) -> PrefixHit:
-        """Walk the tree, return the longest block-aligned prefix match.
+    def peek(self, tokens: Sequence[int]) -> PrefixHit:
+        """Walk the tree, return the longest block-aligned match
+        **without any side effects**.
 
-        For each hit block: incref in ``kv`` and increment local
-        ``_live_hits``. Caller is responsible for the paired ``release``
-        once the live request has consumed (copied) the hit data.
-
-        Non-block-aligned trailing tokens do not contribute — a partial
-        trailing block is not retainable under this scheme.
+        No ``retain_hit``, no ``self.hits`` increment, no LRU touch.
+        Used by the admission planner to size the prefix hit before
+        committing to the copy-on-admit path.
         """
         node = self._root
         hit_blocks: list[int] = []
@@ -120,10 +121,28 @@ class RadixPrefixCache:
             if child is None:
                 break
             hit_blocks.append(child.block_id)
-            self._kv.incref(child.block_id)
-            self._live_hits[child.block_id] = (
-                self._live_hits.get(child.block_id, 0) + 1
-            )
+            node = child
+            idx += self._block_size
+        return PrefixHit(block_ids=tuple(hit_blocks), num_hit_tokens=idx)
+
+    def lookup(self, tokens: Sequence[int]) -> PrefixHit:
+        """Walk the tree and **retain** each hit block in the store.
+
+        Caller is responsible for a later ``release(block_ids)`` once
+        the hit K/V has been copied (or the admission has aborted).
+        Non-block-aligned trailing tokens do not contribute.
+        """
+        node = self._root
+        hit_blocks: list[int] = []
+        idx = 0
+        n = len(tokens)
+        while idx + self._block_size <= n:
+            chunk = tuple(tokens[idx : idx + self._block_size])
+            child = node.children.get(chunk)
+            if child is None:
+                break
+            hit_blocks.append(child.block_id)
+            self._store.retain_hit(child.block_id)
             self._touch(child)
             node = child
             idx += self._block_size
@@ -134,18 +153,16 @@ class RadixPrefixCache:
     def insert(
         self, tokens: Sequence[int], block_ids: Sequence[int]
     ) -> None:
-        """Add the caller's blocks to the tree at block-aligned prefix points.
+        """Add caller-allocated blocks to the tree at block-aligned prefix points.
 
-        Partial trailing blocks (tokens not aligned to ``block_size``) are
-        discarded — only whole blocks can be copy sources under option B.
+        Used by the Paged backend path where block ids come from
+        ``PagedKVCache.reserve_for_prefill`` / ``append_slot``.
+        Partial trailing blocks are discarded. Idempotent on
+        already-covered prefixes: a duplicate insert reuses the existing
+        block id; the caller's corresponding block stays with its
+        owning request.
 
-        Idempotent on already-covered prefixes: if the tree already contains
-        a node for a given (parent, chunk) pair, the new block id is **not**
-        added to the tree. The caller's block stays with its owning
-        request; the tree continues to use the existing block as source.
-
-        For each newly-added node the block is ``kv.incref``'d, pinning it
-        against the owning request's eventual ``free``.
+        For each newly-added node the block is ``store.retain_source``'d.
         """
         n_blocks_want = len(block_ids)
         n_blocks_feasible = min(n_blocks_want, len(tokens) // self._block_size)
@@ -166,41 +183,93 @@ class RadixPrefixCache:
                 tokens=chunk,
                 block_id=block_ids[i],
             )
+            self._store.retain_source(block_ids[i])
             self._touch(new_node)
             node.children[chunk] = new_node
-            self._kv.incref(block_ids[i])
             node = new_node
+
+    def insert_detached(
+        self,
+        tokens: Sequence[int],
+        detached_blocks: Sequence[Sequence[tuple[mx.array, mx.array]]],
+    ) -> tuple[int, ...]:
+        """Add tokens as aligned-block nodes with attached K/V slices.
+
+        ``detached_blocks`` is indexed ``[block_idx][layer_idx]`` →
+        ``(K, V)``. Precondition: at least one entry per aligned block
+        in ``tokens`` and every inner sequence has length ``num_layers``.
+        Extra trailing blocks beyond ``len(tokens) // block_size`` are
+        silently discarded (token layer is the authority).
+
+        For each **new** node: ``store.allocate_id`` → ``retain_source``
+        → ``register_detached(block_id, detached_blocks[i])``. For
+        **duplicate-prefix** nodes (the tree already has a matching
+        child): the existing node is touched; the caller's corresponding
+        entry in ``detached_blocks`` is NOT registered and becomes
+        GC-eligible when the caller's outer list goes out of scope.
+
+        Returns a tuple of the block ids **actually newly inserted**
+        (empty tuple for a fully duplicate insert).
+        """
+        n_aligned_blocks = len(tokens) // self._block_size
+        if n_aligned_blocks == 0:
+            return ()
+        if len(detached_blocks) < n_aligned_blocks:
+            raise ValueError(
+                "detached_blocks must cover every aligned token block: "
+                f"got {len(detached_blocks)}, need {n_aligned_blocks}"
+            )
+
+        node = self._root
+        new_ids: list[int] = []
+        for i in range(n_aligned_blocks):
+            start = i * self._block_size
+            chunk = tuple(tokens[start : start + self._block_size])
+            existing = node.children.get(chunk)
+            if existing is not None:
+                self._touch(existing)
+                node = existing
+                continue
+            new_id = self._store.allocate_id()
+            self._store.retain_source(new_id)
+            try:
+                self._store.register_detached(new_id, detached_blocks[i])
+            except Exception:
+                self._store.release_source(new_id)
+                raise
+            new_node = _Node(
+                parent=node,
+                tokens=chunk,
+                block_id=new_id,
+            )
+            self._touch(new_node)
+            node.children[chunk] = new_node
+            new_ids.append(new_id)
+            node = new_node
+        return tuple(new_ids)
 
     def release(self, block_ids: Sequence[int]) -> None:
         """Release a set of hit blocks (paired with a prior ``lookup``).
 
-        Decrements ``_live_hits`` and ``kv.decref``s each block.
+        Delegates to ``store.release_hit`` — does NOT touch source refs
+        or detached storage.
 
-        Raises ``KeyError`` if any block is not currently held as a live
-        hit — mismatched release indicates a caller bug (D-011 loud-fail).
+        Raises ``KeyError`` if any block has no outstanding hit — a
+        mismatched release indicates a caller bug (D-011 loud-fail).
         """
         for b in block_ids:
-            count = self._live_hits.get(b)
-            if not count:
-                raise KeyError(
-                    f"block {b} has no outstanding live-hit in prefix cache"
-                )
-            if count == 1:
-                del self._live_hits[b]
-            else:
-                self._live_hits[b] = count - 1
-            self._kv.decref(b)
+            self._store.release_hit(b)
 
     def evict_until(self, n_blocks: int) -> int:
         """Evict LRU leaf nodes with zero live hits until ``n_blocks`` freed.
 
-        Walks candidate nodes in ascending access order, evicting each
-        leaf whose block has no outstanding live hit. Non-leaf nodes and
-        nodes whose block is still held by a live request are skipped.
+        Returns the actual number of blocks freed (may be < ``n_blocks``
+        if the tree runs out of evictable nodes).
 
-        Returns the actual number of blocks freed (may be < ``n_blocks`` if
-        the tree runs out of evictable nodes — the caller must be prepared
-        for this partial-return case).
+        Per-node eviction order: ``release_detached`` (if any) THEN
+        ``release_source``. The store's transition-to-zero guards
+        enforce this order — reversing would raise in the synthetic
+        backend. See ``docs/P2_UNIT_16C_2_PREP.md`` §2 (L-3 ⊆ L-1).
         """
         freed = 0
         while freed < n_blocks:
@@ -218,8 +287,13 @@ class RadixPrefixCache:
         return sum(1 for _ in self._walk_non_root())
 
     def live_hits(self, block_id: int) -> int:
-        """Current live-hit count for ``block_id`` (0 if none)."""
-        return self._live_hits.get(block_id, 0)
+        """Current live-hit count for ``block_id`` (0 if none).
+
+        Delegates to ``store.hit_refs``; kept as a method on the cache
+        so existing callers / tests written against the pre-step-3
+        interface continue to work.
+        """
+        return self._store.hit_refs(block_id)
 
     # --- internals ---
 
@@ -233,7 +307,7 @@ class RadixPrefixCache:
         for node in self._walk_non_root():
             if node.children:
                 continue  # non-leaf; evicting would orphan the subtree
-            if self._live_hits.get(node.block_id, 0) > 0:
+            if self._store.hit_refs(node.block_id) > 0:
                 continue  # still held by a live hit
             if best is None or node.access_tick < best_tick:
                 best = node
@@ -246,7 +320,9 @@ class RadixPrefixCache:
         assert parent is not None
         assert not node.children
         del parent.children[node.tokens]
-        self._kv.decref(node.block_id)
+        if self._store.has_detached(node.block_id):
+            self._store.release_detached(node.block_id)
+        self._store.release_source(node.block_id)
 
     def _walk_non_root(self) -> list[_Node]:
         out: list[_Node] = []

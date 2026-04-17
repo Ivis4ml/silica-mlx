@@ -12,6 +12,7 @@ import pytest
 
 from silica.kvcache.paged import PagedKVCache
 from silica.kvcache.prefix import RadixPrefixCache
+from silica.kvcache.store import PagedPrefixBlockStore
 from silica.scheduler.budget import (
     AdmitAfterEvictDecision,
     AdmitAfterPreemptDecision,
@@ -53,7 +54,9 @@ def _make(
     weights_bytes: int = 0,
 ) -> tuple[MemoryBudgeter, PagedKVCache, RadixPrefixCache]:
     kv = _kv(num_blocks=num_blocks)
-    pc = RadixPrefixCache(block_size=kv.block_size, kv=kv)
+    pc = RadixPrefixCache(
+        block_size=kv.block_size, store=PagedPrefixBlockStore(kv)
+    )
     bpt = _bytes_per_token_from_kv(kv)
     b = MemoryBudgeter(
         kv=kv,
@@ -80,7 +83,9 @@ def _make(
 )
 def test_constructor_validates_inputs(field: str, bad_value: int) -> None:
     kv = _kv()
-    pc = RadixPrefixCache(block_size=kv.block_size, kv=kv)
+    pc = RadixPrefixCache(
+        block_size=kv.block_size, store=PagedPrefixBlockStore(kv)
+    )
     kwargs: dict[str, object] = {
         "kv": kv,
         "prefix_cache": pc,

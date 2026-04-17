@@ -1,10 +1,12 @@
-"""Tests for silica.kvcache.prefix — RadixPrefixCache (P-2 Unit #14).
+"""Tests for silica.kvcache.prefix — RadixPrefixCache (P-2 Unit #14 + 16c.2 step 3).
 
-Exercises the block-granular radix trie + refcount discipline using a
-real PagedKVCache fixture (Unit #13). Each test's "source blocks" are
-produced by reserving a dummy request, inserting its blocks into the
-prefix cache, then freeing the request — after which only the prefix
-cache's refcount hold keeps the blocks alive.
+Exercises the block-granular radix trie + refcount discipline via the
+``PagedPrefixBlockStore`` adapter (which wraps a real ``PagedKVCache``
+fixture under the 16c.2 ``PrefixBlockStore`` Protocol). Each test's
+"source blocks" are produced by reserving a dummy request, inserting
+its blocks into the prefix cache, then freeing the request — after
+which only the prefix cache's refcount hold (now expressed through
+``store.retain_source``) keeps the blocks alive.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ import pytest
 from silica.kvcache.manager import PrefixHit
 from silica.kvcache.paged import PagedKVCache
 from silica.kvcache.prefix import RadixPrefixCache
+from silica.kvcache.store import PagedPrefixBlockStore
 
 BLOCK_SIZE = 4  # small for test math: 4 tokens / block
 
@@ -31,7 +34,9 @@ def _kv(*, num_blocks: int = 16, max_batch_size: int = 4) -> PagedKVCache:
 
 
 def _pc(kv: PagedKVCache) -> RadixPrefixCache:
-    return RadixPrefixCache(block_size=kv.block_size, kv=kv)
+    return RadixPrefixCache(
+        block_size=kv.block_size, store=PagedPrefixBlockStore(kv)
+    )
 
 
 def _install_source(
@@ -56,13 +61,14 @@ def _install_source(
 def test_rejects_non_positive_block_size() -> None:
     kv = _kv()
     with pytest.raises(ValueError, match="block_size must be > 0"):
-        RadixPrefixCache(block_size=0, kv=kv)
+        RadixPrefixCache(block_size=0, store=PagedPrefixBlockStore(kv))
 
 
-def test_rejects_mismatched_block_size_vs_kv() -> None:
+def test_rejects_mismatched_block_size_vs_store() -> None:
     kv = _kv()
     with pytest.raises(ValueError, match="block_size mismatch"):
-        RadixPrefixCache(block_size=8, kv=kv)  # kv is 4
+        # kv (and its wrapping store) is 4; cache asks for 8.
+        RadixPrefixCache(block_size=8, store=PagedPrefixBlockStore(kv))
 
 
 # --- empty cache ---
@@ -152,6 +158,14 @@ def test_insert_drops_partial_trailing_block() -> None:
     kv.free("src")
 
 
+def test_insert_failure_does_not_leave_tree_node() -> None:
+    kv = _kv()
+    pc = _pc(kv)
+    with pytest.raises(KeyError, match="cannot incref"):
+        pc.insert([1, 2, 3, 4], [999])
+    assert pc.node_count() == 0
+
+
 def test_double_insert_same_prefix_is_idempotent() -> None:
     """Second insert of same prefix does not add new nodes or re-incref."""
     kv = _kv()
@@ -220,7 +234,7 @@ def test_release_decrements_live_hits_and_kv_refcount() -> None:
 def test_release_raises_on_untracked_block() -> None:
     kv = _kv()
     pc = _pc(kv)
-    with pytest.raises(KeyError, match="no outstanding live-hit"):
+    with pytest.raises(KeyError, match="no outstanding hit ref"):
         pc.release([0])
 
 
