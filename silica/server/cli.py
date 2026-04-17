@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Sequence
+from typing import Any
 
 from silica.core.sampling import SamplingParams
 from silica.engine import Engine
@@ -69,7 +70,23 @@ def _run(args: argparse.Namespace) -> int:
 
     generated: list[int] = list(engine.generate(args.prompt, params))
     print(args.prompt + tokenizer.decode(generated))
+    _print_metrics(engine.metrics.snapshot())
     return 0
+
+
+def _print_metrics(snapshot: Any) -> None:
+    """Print engine metrics to stderr as a single line, skipping None fields."""
+    parts: list[str] = []
+    if snapshot.ttft_ms is not None:
+        parts.append(f"ttft={snapshot.ttft_ms:.1f}ms")
+    if snapshot.prefill_tok_s is not None:
+        parts.append(f"prefill={snapshot.prefill_tok_s:.1f}tok/s")
+    if snapshot.decode_tok_s is not None:
+        parts.append(f"decode={snapshot.decode_tok_s:.1f}tok/s")
+    if snapshot.resident_mb is not None:
+        parts.append(f"resident={snapshot.resident_mb:.1f}MB")
+    if parts:
+        print("[metrics] " + " ".join(parts), file=sys.stderr)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

@@ -60,6 +60,7 @@ same:
   `_BaseCache.update_and_fetch`.
 
 Token-for-token match under two independent control flows confirms that:
+
 - `cache_list(req_id)` hands the same list object mlx-lm would have built
   internally (D-010 clean injection — verified at Gate A, now verified at
   model scale).
@@ -73,10 +74,27 @@ Token-for-token match under two independent control flows confirms that:
 
 ## Decision log update
 
+- **PLAN.md §7 P-1 Acceptance criterion #1** ("Generates text reliably"):
+  **satisfied** — CLI end-to-end confirmed on Qwen3.5-0.8B (" Paris." as
+  expected completion of "The capital of France is").
 - **PLAN.md §7 P-1 Acceptance criterion #2** (greedy parity with mlx-lm):
   **satisfied** at 2026-04-16 for Qwen3.5-0.8B / 32 tokens / seed-free greedy.
+- **PLAN.md §7 P-1 Acceptance criterion #3** ("The profiler produces TTFT,
+  decode tok/s, and resident memory"): **satisfied**. `Engine.generate`
+  populates the P-0 ``MetricsRegistry`` per-instance and the CLI emits a
+  summary line (e.g. ``[metrics] ttft=29.9ms prefill=167.4tok/s
+  decode=115.6tok/s resident=22.7MB`` on M5 Pro / Qwen3.5-0.8B fp16).
 - **D-004** (borrow mlx-lm loader) and **D-010** (borrow mlx-lm forward, own
   the cache) are jointly validated at full model scale.
-- Remaining P-1 acceptance items: #1 "generates text reliably" (covered by
-  CLI end-to-end); #3 "profiler produces TTFT / decode tok-s / resident MB"
-  (deferred — profiler hooks exist in P-0 but the CLI does not yet emit them).
+- **All three P-1 acceptance items green** — M-2 milestone (Single-request
+  gen) is ready to tag.
+
+## Reference metrics (M5 Pro, Qwen3.5-0.8B fp16, `max_tokens=20`)
+
+```text
+[metrics] ttft=29.9ms prefill=167.4tok/s decode=115.6tok/s resident=22.7MB
+```
+
+These are single-run non-statistical numbers — P-4 bench harness produces
+confidence-interval-grade measurements; these are PLAN acceptance floor
+checks ("metrics are *produced*", not "at target throughput").

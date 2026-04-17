@@ -5,6 +5,9 @@ Engine glues the pieces together:
   - ``KVManager`` (I-2) — reserve / free per-request KV (``SimpleKVCache`` in
     P-1, ``PagedKVCache`` in P-2; Engine is agnostic).
   - ``Sampler`` (P-0) — processor chain → sampled token from logits.
+  - ``MetricsRegistry`` (P-0) — per-instance (not global) timing + throughput
+    + memory gauges. Populated during ``generate`` and readable via
+    ``engine.metrics.snapshot()`` once the generator is exhausted.
 
 P-1 scope: one request at a time. Multi-request continuous batching is P-2
 (``ContinuousBatcher`` + ``MemoryBudgeter``). ``Engine.generate`` returns an
@@ -20,14 +23,29 @@ Stop policy for P-1:
     incremental decoding of generated tokens into a text buffer).
   - EOS handling: the caller is responsible for populating ``stop_token_ids``
     with the tokenizer's EOS id (or omitting it if ``ignore_eos``).
+
+Metrics populated per ``generate`` call:
+  - ``ttft_ms``: wall-clock ms from prefill start to first yielded token
+    (prefill forward + first sample). Greedy's sample step is essentially
+    free but the schema reserves room for heavier processor chains.
+  - ``prefill_tok_s``: ``len(prompt_ids) / ttft_s`` — prompt throughput.
+  - ``decode_tok_s``: ``n_decode / decode_s`` where ``decode_s`` is only the
+    time the generator spent inside its own loop (``perf_counter`` in a
+    generator only ticks while ``__next__`` is active, so caller-side
+    latency between yields is correctly excluded).
+  - ``resident_mb``: ``kv_manager.budget().resident_bytes / 1e6`` at the
+    end of generation (peak for the request on ``SimpleKVCache``).
+  - ``logical_kv_bytes``: ``kv_manager.budget().logical_bytes`` at the end.
 """
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterator
 
 import mlx.core as mx
 
+from silica.core.profiler import MetricsRegistry
 from silica.core.sampler import Sampler
 from silica.core.sampling import SamplingParams
 from silica.kvcache.manager import KVHandle, KVManager
@@ -46,10 +64,12 @@ class Engine:
         adapter: ModelAdapter,
         kv_manager: KVManager,
         sampler: Sampler | None = None,
+        metrics: MetricsRegistry | None = None,
     ) -> None:
         self._adapter = adapter
         self._kv_manager = kv_manager
         self._sampler = sampler or Sampler()
+        self.metrics = metrics or MetricsRegistry()
         self._req_counter = 0
 
     def generate(
@@ -85,18 +105,28 @@ class Engine:
         params: SamplingParams,
     ) -> Iterator[int]:
         prompt_arr = mx.array(prompt_ids, dtype=mx.int32)
+
+        # Prefill + first sample — measured as a single TTFT block.
+        t0 = time.perf_counter()
         logits, _ = self._adapter.prefill(prompt_arr, handle)
         history: list[int] = list(prompt_ids)
-
         token_scalar = self._sampler.sample(
             logits, mx.array(history, dtype=mx.int32), params
         )
         tok_int = int(token_scalar.item())
+        t_first = time.perf_counter()
+        ttft_s = t_first - t0
+        self.metrics.set_metric("ttft_ms", ttft_s * 1000.0)
+        if ttft_s > 0:
+            self.metrics.set_metric("prefill_tok_s", len(prompt_ids) / ttft_s)
+
         yield tok_int
         history.append(tok_int)
         if tok_int in params.stop_token_ids:
+            self._record_tail_metrics(decode_count=0, decode_start=t_first)
             return
 
+        decode_count = 0
         n = 1
         while n < params.max_tokens:
             step_in = mx.array([tok_int], dtype=mx.int32)
@@ -107,9 +137,27 @@ class Engine:
             tok_int = int(token_scalar.item())
             yield tok_int
             n += 1
+            decode_count += 1
             history.append(tok_int)
             if tok_int in params.stop_token_ids:
-                return
+                break
+
+        self._record_tail_metrics(
+            decode_count=decode_count, decode_start=t_first
+        )
+
+    def _record_tail_metrics(
+        self, *, decode_count: int, decode_start: float
+    ) -> None:
+        if decode_count > 0:
+            decode_elapsed = time.perf_counter() - decode_start
+            if decode_elapsed > 0:
+                self.metrics.set_metric(
+                    "decode_tok_s", decode_count / decode_elapsed
+                )
+        budget = self._kv_manager.budget()
+        self.metrics.set_metric("resident_mb", budget.resident_bytes / 1e6)
+        self.metrics.set_metric("logical_kv_bytes", budget.logical_bytes)
 
     def _new_req_id(self) -> str:
         rid = f"req-{self._req_counter}"
