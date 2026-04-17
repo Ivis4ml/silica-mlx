@@ -8,11 +8,17 @@ from silica.core.profiler import (
     registry,
     time_block,
 )
-from silica.core.request import Request, RequestState, RequestStatus
+from silica.core.request import (
+    InvalidTransition,
+    Request,
+    RequestState,
+    RequestStatus,
+)
 from silica.core.sampler import LogitProcessor, Sampler
 from silica.core.sampling import SamplingParams
 
 __all__ = [
+    "InvalidTransition",
     "LogitProcessor",
     "MetricsRegistry",
     "Request",
