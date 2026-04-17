@@ -110,14 +110,13 @@ class ContinuousBatcher:
         self._max_batch_size = max_batch_size
         self._rows: list[_BatchRow] = []
         self._batch_cache: list[BatchKVCache] | None = None
-        # Cohort-sealing flags (16b). Admission is closed on the first
-        # step() call; after that add_request raises NotImplementedError
-        # naming Unit 16c as the phase that will add mid-run admission.
-        self._admission_closed: bool = False
+        # Cohort-prep flag. First step() seals the pre-step cohort and
+        # allocates the batched cache; subsequent add_request calls go
+        # to the waiting queue instead of directly into self._rows
+        # (16c.1 step 3 enables this mid-run admission path).
         self._cohort_prepared: bool = False
-        # Waiting queue (16c.1). Populated by add_request; drained by the
-        # admit phase of step(). In 16b paths it stays empty — 16c.1
-        # mid-run admission wires it into step() in a subsequent patch.
+        # Waiting queue (16c.1). Populated by mid-run add_request calls;
+        # drained by the admit phase of step().
         self._waiting_queue: deque[_PendingAdmit] = deque()
         # Slot table (16c.1): req_index → current row index. Rebuilt
         # after every filter (§1 I-3). Kept as an observable field so
@@ -132,25 +131,53 @@ class ContinuousBatcher:
         prompt_ids: list[int],
         params: SamplingParams,
     ) -> None:
-        """Enqueue a request into the current cohort (pre-step only).
+        """Enqueue a request for admission.
+
+        Two paths:
+
+        - **Pre-step (cohort not yet prepared)**: request is appended
+          directly to ``self._rows``, same as 16b. ``_prepare_cohort``
+          will seal them as the initial cohort on the first ``step``
+          call. This is what 16a/16b test fixtures rely on.
+        - **Mid-run (cohort already prepared)**: request is appended to
+          ``_waiting_queue``. Phase 2 of a later ``step`` pops it, runs
+          its own batched prefill, and extends main via
+          ``BatchKVCache.extend``.
 
         Raises:
-            NotImplementedError: if ``step()`` has already been called
-                (cohort sealed; mid-run admission is Unit 16c).
-            RuntimeError: if the batch has already hit ``max_batch_size``.
+            RuntimeError: when cohort is pre-step AND ``self._rows`` is
+                already at ``max_batch_size``. Mid-run requests are
+                accepted into the unbounded waiting backlog; active
+                physical-row capacity is enforced later by the admit
+                phase.
             ValueError: if ``prompt_ids`` is empty.
         """
-        if self._admission_closed:
-            raise NotImplementedError(
-                "Cohort is sealed (step() has been called); mid-run "
-                "admission arrives in Unit 16c."
+        if not prompt_ids:
+            raise ValueError("prompt_ids must be non-empty")
+
+        if self._cohort_prepared:
+            # Mid-run admission: enqueue as backlog. ``max_batch_size``
+            # bounds **active physical rows**, not queue length — the
+            # waiting queue is an unbounded backlog that the admit
+            # phase drains up to whatever capacity remains after the
+            # preceding reclaim. Capping the queue here would make the
+            # canonical "submit N > max_batch_size prompts, admit as
+            # slots free" pattern (prep doc §3 16c.1 acceptance)
+            # impossible to express naturally.
+            self._waiting_queue.append(
+                _PendingAdmit(
+                    req_index=req_index,
+                    prompt_ids=tuple(prompt_ids),
+                    params=params,
+                )
             )
+            return
+
+        # Pre-step admission: direct append (16b-compatible path).
         if len(self._rows) >= self._max_batch_size:
             raise RuntimeError(
                 f"ContinuousBatcher capacity {self._max_batch_size} reached"
             )
-        if not prompt_ids:
-            raise ValueError("prompt_ids must be non-empty")
         request = Request(
             prompt="",  # text not carried through the batcher
             sampling_params=params,
@@ -196,29 +223,36 @@ class ContinuousBatcher:
     def step(self) -> list[BatchEvent]:
         """Advance the cohort by one scheduler iteration.
 
-        Phase order (16c.1 step 2 onwards):
+        Phase order (16c.1 step 3 onwards):
 
           1. **Reclaim** — drop terminal rows from ``self._rows`` and
              from the batched cache. If all rows were terminal, reset
-             the batched cache to ``None`` so a future admit can
-             install a fresh one instead of extending into stale
-             physical rows. Docs: §1 I-5 + §4 Reclaim flow.
-          2. (16c.1 step 3) Admit — drain the waiting queue into new
-             rows via extend. Not yet wired in step 2.
+             the batched cache to ``None`` so Phase 2 can install a
+             fresh one instead of extending into stale physical rows.
+             Docs: §1 I-5 + §4 Reclaim flow.
+          2. **Admit** — drain the waiting queue (respecting
+             ``max_batch_size``) into newly-admitted rows; run one
+             batched prefill for those rows; extend main cache with
+             the result (or replace it if main is None).
           3. **Forward** — one batched prefill (if any row is PREFILL)
-             or one batched decode (otherwise).
-
-        The first call still seals admission and prepares the batched
-        cache via ``_prepare_cohort`` before reclaim runs.
+             or one batched decode (otherwise). Skipped when Phase 2
+             ran admissions this step (prefill T vs decode T=1 can't
+             mix; existing DECODE rows idle this step).
         """
         if not self._cohort_prepared:
             self._prepare_cohort()
 
-        # Phase 1: reclaim deferred terminals (16c.1 step 2).
+        # Phase 1: reclaim deferred terminals.
         self._reclaim_terminated()
 
-        # Phase 3: forward. Admit phase (16c.1 step 3) will slot in
-        # between Phase 1 and Phase 3 once mid-run admission is wired.
+        # Phase 2: mid-run admission (if waiting queue non-empty).
+        admit_events = self._admit_waiting_requests()
+        if admit_events:
+            # Admit ran its own batched prefill forward; existing DECODE
+            # rows idle this step so prefill-T vs decode-T=1 don't mix.
+            return admit_events
+
+        # Phase 3: batched forward for the incumbent cohort.
         if not self.has_active():
             return []
         if any(r.state.status == RequestStatus.PREFILL for r in self._rows):
@@ -228,13 +262,16 @@ class ContinuousBatcher:
     # --- phase methods ---
 
     def _prepare_cohort(self) -> None:
-        """Seal admission; allocate BatchKVCache with per-row left_padding.
+        """Seal the initial cohort; allocate BatchKVCache with per-row
+        left_padding.
 
         Rows with shorter prompts get more left padding so that, after
         the prefill forward, the ``offset[i] == T_max - left_padding[i]``
         equals each row's true prompt length.
+
+        After this runs, subsequent ``add_request`` calls go to the
+        waiting queue (mid-run admission path, see Phase 2).
         """
-        self._admission_closed = True
         self._cohort_prepared = True
         if not self._rows:
             return
@@ -324,7 +361,24 @@ class ContinuousBatcher:
         *,
         is_prefill: bool,
     ) -> list[BatchEvent]:
-        """Per-row sample / emit / state-transition over a ``(B, V)`` tensor.
+        """Sample / emit / transition over ``self._rows`` (Phase 3 forward).
+
+        Wraps :py:meth:`_sample_and_emit_rows` with the incumbent row
+        list. Phase 2 admit uses the underlying helper directly on the
+        newly-admitted subset.
+        """
+        return self._sample_and_emit_rows(
+            self._rows, batched_logits, is_prefill=is_prefill
+        )
+
+    def _sample_and_emit_rows(
+        self,
+        rows: list[_BatchRow],
+        batched_logits: mx.array,
+        *,
+        is_prefill: bool,
+    ) -> list[BatchEvent]:
+        """Per-row sample / emit / transition over an explicit row list.
 
         Terminal rows are skipped — they occupied a slot in the forward
         (to keep ``_idx`` in lockstep) but contribute no token event.
@@ -332,7 +386,7 @@ class ContinuousBatcher:
         according to stop / max_tokens rules.
         """
         events: list[BatchEvent] = []
-        for i, row in enumerate(self._rows):
+        for i, row in enumerate(rows):
             if row.state.is_terminal:
                 continue
             row_logits = batched_logits[i]  # (V,)
@@ -356,6 +410,86 @@ class ContinuousBatcher:
                     RequestStatus.DECODE, reason="prefill_done"
                 )
             # Plain DECODE continuation: no transition; stays DECODE.
+        return events
+
+    def _admit_waiting_requests(self) -> list[BatchEvent]:
+        """Phase 2 — drain up to ``max_batch_size − len(self._rows)``
+        requests from ``_waiting_queue`` and run one batched prefill
+        for them.
+
+        Extends main batched cache with the K new rows, or replaces
+        main outright when main is ``None`` (post all-terminal reclaim).
+
+        Returns: emitted events (K token events + any done events
+        from rows that hit stop / max_tokens on the first token). An
+        empty list means no admission fired this step — the caller
+        then proceeds to Phase 3 forward.
+        """
+        capacity = self._max_batch_size - len(self._rows)
+        if capacity <= 0 or not self._waiting_queue:
+            return []
+
+        # Pop up to `capacity` pending admits.
+        admitted: list[_BatchRow] = []
+        while admitted.__len__() < capacity and self._waiting_queue:
+            pending = self._waiting_queue.popleft()
+            request = Request(
+                prompt="",
+                sampling_params=pending.params,
+                request_id=f"req-{pending.req_index}",
+                token_ids=pending.prompt_ids,
+            )
+            state = RequestState(request=request)
+            # New rows start in PREFILL; _sample_and_emit_rows transitions
+            # them to DECODE (or DONE) after sampling.
+            state.transition(RequestStatus.PREFILL, reason="admit-mid-run")
+            admitted.append(
+                _BatchRow(
+                    req_index=pending.req_index,
+                    req_id=f"req-{pending.req_index}",
+                    prompt_ids=list(pending.prompt_ids),
+                    params=pending.params,
+                    state=state,
+                )
+            )
+
+        if not admitted:
+            return []
+
+        # Build fresh B=K BatchKVCache directly (prep doc §4 Fix 5 — no
+        # merge-of-empty-KVCaches). Mirrors 16b's _prepare_cohort layout
+        # but sized for the admit subset.
+        num_layers = self._adapter.config.num_layers
+        k_prompt_lens = [len(r.prompt_ids) for r in admitted]
+        k_max_len = max(k_prompt_lens)
+        k_left_padding = [k_max_len - n for n in k_prompt_lens]
+        k_batch_cache = [
+            BatchKVCache(left_padding=k_left_padding) for _ in range(num_layers)
+        ]
+
+        # Left-padded (K, k_max_len) token tensor for the admit subset.
+        pad = self._pad_token_id()
+        rows_2d: list[list[int]] = []
+        for r in admitted:
+            n_pad = k_max_len - len(r.prompt_ids)
+            rows_2d.append([pad] * n_pad + list(r.prompt_ids))
+        tokens = mx.array(rows_2d, dtype=mx.int32)
+
+        # One batched prefill forward over just the admitted rows.
+        logits = forward_batched(self._model, tokens, list(k_batch_cache))
+        events = self._sample_and_emit_rows(admitted, logits, is_prefill=True)
+
+        # Stitch into main cache. Two regimes:
+        #   (a) main is None (post all-terminal reclaim): replace.
+        #   (b) main has live rows: extend per layer.
+        if self._batch_cache is None:
+            self._batch_cache = k_batch_cache
+        else:
+            for layer in range(num_layers):
+                self._batch_cache[layer].extend(k_batch_cache[layer])
+
+        self._rows.extend(admitted)
+        self._rebuild_slot_table()
         return events
 
     # --- tensor construction helpers ---

@@ -235,14 +235,19 @@ def test_add_request_rejects_empty_prompt() -> None:
         b.add_request(0, [], _greedy())
 
 
-def test_add_request_after_step_raises_16c() -> None:
-    """Cohort is sealed on the first step() call; further admits are 16c."""
-    adapter = _ScriptedAdapter(script=[1, 2])
+def test_add_request_after_step_goes_to_waiting_queue() -> None:
+    """Post-step add_request now enqueues for mid-run admission (16c.1
+    step 3). The request lands in the waiting queue rather than
+    self._rows until Phase 2 drains it on a later step."""
+    adapter = _ScriptedAdapter(script=[(1,), (2,)])
     b = ContinuousBatcher(adapter, max_batch_size=2)
     b.add_request(0, [10, 11], _greedy(max_tokens=3))
-    b.step()  # seals cohort
-    with pytest.raises(NotImplementedError, match="16c"):
-        b.add_request(1, [20, 21], _greedy())
+    b.step()  # cohort prepared; row 0 admitted pre-step
+    # Post-step admit: request goes into the queue, not into self._rows.
+    b.add_request(1, [20, 21], _greedy(max_tokens=3))
+    assert len(b._waiting_queue) == 1  # type: ignore[attr-defined]
+    assert len(b._rows) == 1  # type: ignore[attr-defined]
+    assert b._waiting_queue[0].req_index == 1  # type: ignore[attr-defined]
 
 
 # --- step loop ---------------------------------------------------------------
@@ -615,3 +620,164 @@ def test_engine_drain_uses_has_work_not_has_active() -> None:
     step2 = b.step()
     assert step2 == []  # reclaim runs, no forward to emit
     assert not b.has_work()
+
+
+# --- Mid-run admit via extend (Unit 16c.1 step 3) --------------------------
+
+
+def test_mid_run_add_request_enters_waiting_queue() -> None:
+    """Post-prepare, add_request populates _waiting_queue (not self._rows)."""
+    adapter = _ScriptedAdapter(script=[(1,)])
+    b = ContinuousBatcher(adapter, max_batch_size=2)
+    b.add_request(0, [1], _greedy(max_tokens=3))
+    b.step()
+    b.add_request(1, [2, 3], _greedy(max_tokens=3))
+    assert len(b._waiting_queue) == 1  # type: ignore[attr-defined]
+    assert len(b._rows) == 1  # type: ignore[attr-defined]
+
+
+def test_mid_run_admit_phase_runs_batched_prefill() -> None:
+    """Phase 2 pops the waiting queue and runs its own batched prefill."""
+    # step 1 prefill: B=1 (row 0); sample 5, DECODE.
+    # admit of row 1 happens after step 1.
+    # step 2 phase 2: prefill of row 1 (B=1 for the new admit only);
+    #                 sample 9, emit; return from step (skip decode).
+    # step 3 phase 3: decode for B=2 (old row 0 + new row 1). They
+    #                 generate their next tokens.
+    adapter = _ScriptedAdapter(script=[(5,), (9,), (10, 11)])
+    b = ContinuousBatcher(adapter, max_batch_size=2)
+    b.add_request(0, [1, 2], _greedy(max_tokens=10))
+    events1 = b.step()
+    prefill_forward_count = adapter._model.forward_calls  # should be 1
+    assert prefill_forward_count == 1
+    tok_row0_step1 = [e for e in events1 if e.req_index == 0 and e.kind == "token"]
+    assert tok_row0_step1[0].token_id == 5
+
+    # Mid-run admit row 1.
+    b.add_request(1, [3, 4, 5], _greedy(max_tokens=10))
+    events2 = b.step()
+    # Phase 2 ran its own prefill forward → forward_calls += 1.
+    assert adapter._model.forward_calls == 2
+    # Only newly-admitted row emitted this step; incumbent decode idled.
+    tok_row1_step2 = [e for e in events2 if e.req_index == 1 and e.kind == "token"]
+    tok_row0_step2 = [e for e in events2 if e.req_index == 0 and e.kind == "token"]
+    assert len(tok_row1_step2) == 1
+    assert tok_row1_step2[0].token_id == 9
+    assert tok_row0_step2 == []  # row 0 idled this step
+
+    # Next step: joint decode for B=2.
+    events3 = b.step()
+    assert adapter._model.forward_calls == 3
+    tok_by_req = {
+        e.req_index: e.token_id for e in events3 if e.kind == "token"
+    }
+    assert tok_by_req == {0: 10, 1: 11}
+
+
+def test_mid_run_admit_extends_main_cache_preserving_incumbent_indices() -> None:
+    """After extend, incumbent rows' indices are unchanged and new rows
+    append at the tail (I-2 from prep doc)."""
+    adapter = _ScriptedAdapter(script=[(5, 7), (9,), (11, 12, 13)])
+    b = ContinuousBatcher(adapter, max_batch_size=3)
+    b.add_request(0, [1], _greedy(max_tokens=10))
+    b.add_request(2, [2], _greedy(max_tokens=10))
+    b.step()  # prefill B=2 for rows 0, 2
+    assert b._slot_table == {0: 0, 2: 1}  # type: ignore[attr-defined]
+
+    b.add_request(5, [3], _greedy(max_tokens=10))
+    b.step()  # admit row 5; prefill B=1 for just row 5; extend into main
+    # Incumbent rows' indices preserved; new row appended at idx 2.
+    assert b._slot_table == {0: 0, 2: 1, 5: 2}  # type: ignore[attr-defined]
+    assert len(b._rows) == 3  # type: ignore[attr-defined]
+
+
+def test_mid_run_admit_after_full_termination_replaces_main_cache() -> None:
+    """Reclaim sets main cache to None when all rows terminate; next
+    admit replaces main rather than extending into stale rows."""
+    adapter = _ScriptedAdapter(script=[(7,), (13,)])
+    b = ContinuousBatcher(adapter, max_batch_size=2)
+    b.add_request(0, [1], _greedy(max_tokens=1))  # finishes in step 1
+    b.step()  # row 0 DONE
+    # Queue a new request; on step 2, reclaim empties the cache and
+    # admit installs a fresh one.
+    b.add_request(1, [2, 3], _greedy(max_tokens=10))
+    b.step()
+    assert b._batch_cache is not None  # type: ignore[attr-defined]
+    # New row is at index 0 (fresh slot).
+    assert b._slot_table == {1: 0}  # type: ignore[attr-defined]
+    assert len(b._rows) == 1  # type: ignore[attr-defined]
+
+
+def test_pre_step_admit_respects_capacity() -> None:
+    """Pre-step direct admission honors max_batch_size because those
+    requests immediately occupy self._rows."""
+    adapter = _ScriptedAdapter()
+    b = ContinuousBatcher(adapter, max_batch_size=2)
+    b.add_request(0, [1], _greedy())  # pre-step, direct
+    # Second pre-step direct admit fills capacity.
+    b.add_request(1, [2], _greedy())
+    # Third, also pre-step → capacity exceeded → RuntimeError.
+    with pytest.raises(RuntimeError, match="capacity"):
+        b.add_request(2, [3], _greedy())
+
+
+def test_waiting_queue_is_unbounded_backlog() -> None:
+    """Per prep doc §3 16c.1 acceptance: max_batch_size bounds ACTIVE
+    rows, not queue length. Enqueuing beyond capacity is legal — the
+    admit phase drains up to the available capacity per step."""
+    adapter = _ScriptedAdapter(script=[(1,), (2,)])
+    b = ContinuousBatcher(adapter, max_batch_size=2)
+    b.add_request(0, [1], _greedy(max_tokens=10))
+    b.step()  # cohort prepared; active rows = 1
+    # Queue three more beyond what capacity allows at any single step.
+    b.add_request(1, [2], _greedy(max_tokens=10))
+    b.add_request(2, [3], _greedy(max_tokens=10))
+    b.add_request(3, [4], _greedy(max_tokens=10))
+    assert len(b._waiting_queue) == 3  # type: ignore[attr-defined]
+    # Active rows unchanged; all excess is in backlog.
+    assert len(b._rows) == 1  # type: ignore[attr-defined]
+
+
+def test_admit_drains_only_up_to_available_capacity() -> None:
+    """Phase 2 admits ``max_batch_size - len(self._rows)`` at a time;
+    rest stay in queue for later steps."""
+    # max_batch_size=2; 1 row in flight (pre-step admit); queue 3 more
+    # post-step. Next step: admit fills the one remaining slot; queue
+    # still has 2. After the active row finishes + reclaims, another
+    # admit fills its slot; etc.
+    adapter = _ScriptedAdapter(
+        script=[(5,), (7,), (8, 9), (10, 11), (12,), (13,)]
+    )
+    b = ContinuousBatcher(adapter, max_batch_size=2)
+    b.add_request(0, [1], _greedy(max_tokens=2))
+    b.step()  # prefill row 0 (B=1); active=1
+    b.add_request(1, [2], _greedy(max_tokens=2))
+    b.add_request(2, [3], _greedy(max_tokens=2))
+    # Queue now: [1, 2]; capacity remaining = 1.
+    b.step()  # admits only row 1 (1 of 2 queued)
+    assert len(b._rows) == 2  # type: ignore[attr-defined]
+    assert len(b._waiting_queue) == 1  # type: ignore[attr-defined]
+    assert b._waiting_queue[0].req_index == 2  # type: ignore[attr-defined]
+
+
+def test_pending_reclaim_row_does_not_block_queue_admit() -> None:
+    """max_batch_size=1; the single row finishes but hasn't been reclaimed
+    yet; a new add_request must still succeed (queue is backlog, not
+    capped by active rows). The next step reclaims the terminal and
+    admits the queued request."""
+    adapter = _ScriptedAdapter(script=[(5,), (9,)])
+    b = ContinuousBatcher(adapter, max_batch_size=1)
+    b.add_request(0, [1], _greedy(max_tokens=1))
+    b.step()  # row 0 DONE; still in self._rows pending reclaim
+    assert not b.has_active()
+    assert len(b._rows) == 1  # type: ignore[attr-defined]
+
+    # Queuing now must succeed regardless of active row count.
+    b.add_request(1, [2], _greedy(max_tokens=1))
+    assert len(b._waiting_queue) == 1  # type: ignore[attr-defined]
+
+    # Next step: reclaim drops row 0 → capacity=1 → admit drains queue.
+    b.step()
+    assert len(b._rows) == 1  # type: ignore[attr-defined]
+    assert b._rows[0].req_index == 1  # type: ignore[attr-defined]
+    assert len(b._waiting_queue) == 0  # type: ignore[attr-defined]
