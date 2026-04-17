@@ -30,6 +30,88 @@ This guardrail exists so that "P-2 passed" cannot be read as "Silica has
 universal batched generation". The P-1 Qwen3.5-0.8B single-request path
 remains fully functional and untouched in parallel.
 
+## Model integration in three layers (v2.3)
+
+Starting at v2.3, Silica treats model support as a three-layer stack
+rather than a single "adapter" abstraction:
+
+**Layer 1 — Family adapters** (``silica/models/<family>.py``).  One file
+per model family: ``qwen3.py`` (pure KV), ``qwen3_5.py`` (hybrid
+DeltaNet + MTP + multimodal sanitize), later ``kimi.py`` / ``glm.py`` /
+``minimax.py`` / ``mamba.py`` / ``deepseek.py`` / MoE variants. Each
+class owns its family's quirks (attribute-name drift, layer-kind
+classification, loader sanitise details) and satisfies I-1
+``ModelAdapter``. A family adapter is **honest about what its model
+is** via ``attention_pattern()`` (``GLOBAL`` / ``SLIDING`` /
+``HYBRID_DELTANET`` / ``RECURRENT``) — it does not hide kind
+distinctions behind a uniform façade.
+
+**Layer 2 — Factory registry** (``silica.models.factory``).
+``adapter_for_repo(repo)`` dispatches on ``model.model_type`` through a
+small dict in ``_ADAPTERS``. The CLI and any "given a repo string,
+give me an adapter" caller go through this layer; callers who know the
+family use the concrete class directly (``Qwen3Adapter.from_hf_repo``).
+Adding a new family is a **new file + one dict entry**, not an edit
+to an existing adapter.
+
+**Layer 3 — Capability gate** (scheduler / batcher). Execution-layer
+components do **not** ask "is this a Qwen3Adapter?" — they ask "does
+this adapter's ``attention_pattern`` fit my supported kinds?" Concretely
+for P-2:
+
+- ``ContinuousBatcher.__init__`` inspects ``adapter.attention_pattern()``.
+- If every per-layer kind is ``AttentionKind.GLOBAL``, it proceeds.
+- If any layer is ``HYBRID_DELTANET`` / ``RECURRENT`` / ``SLIDING``, it
+  raises ``NotImplementedError`` naming the unsupported kind and the
+  phase that will handle it (DeltaNet → P-3; sliding → P-2 Q-013 probe).
+
+This capability-based gate is why family adapters don't need a
+"supports_p2_batching" boolean — the ``AttentionPattern`` already
+carries the truth, and the scheduler asks the right question. The
+alternative ("batcher checks `isinstance(adapter, Qwen3Adapter)`") would
+couple the batcher to every family class and re-create the conditional
+泥潭 the family split was meant to prevent.
+
+**Forward-compat**: when Mamba / linear-attention / MoE / speculative
+draft adapters land, they only need to (a) write their family file, (b)
+register it, (c) expose a truthful ``attention_pattern``. The
+capability gate decides which schedulers can drive them; no scheduler
+code mentions them by name.
+
+**Planned evolution (vLLM cross-reference, 2026-04-17 review).** The
+three-layer stack as shipped in v1.5.2 is the minimum that makes the
+Qwen3 / Qwen3.5 split clean. A follow-up iteration — opened before P-3
+adapters land (Kimi / GLM / MiniMax / Mamba / MoE variants) — should
+adopt two more elements of vLLM's proven pattern:
+
+1. **Dispatch key upgrade.** Prefer HF ``config.architectures[0]``
+   (e.g. ``Qwen3ForCausalLM``, ``KimiLinearForCausalLM``,
+   ``MambaForCausalLM``, ``Qwen3_5ForConditionalGeneration``) over the
+   current ``model.model_type`` fallback. Architecture class name
+   distinguishes cases that share ``model_type`` but differ in task
+   head (e.g. a model_type used for both ``*ForCausalLM`` and
+   ``*ForConditionalGeneration``). Factory registry keeps both tables;
+   architecture preferred, model_type fallback.
+2. **``ModelCapabilities`` summary.** Each family adapter exposes a
+   structured capability record (``is_moe``, ``is_hybrid``,
+   ``is_attention_free``, ``supports_prefix_cache``,
+   ``supports_batch_kv``, ``has_recurrent_state``, ``is_multimodal``,
+   ``supports_lora``) — lightweight counterpart to vLLM's ``_ModelInfo``
+   marker mixins (``IsHybrid``, ``IsAttentionFree``,
+   ``MixtureOfExperts``, ``HasInnerState``,
+   ``SupportsMambaPrefixCaching``, …). Schedulers use capability fields
+   for coarse-grained eligibility checks instead of re-deriving those
+   checks from enum contents every time; ``attention_pattern`` remains
+   the truthful per-layer routing metadata for code paths that need that
+   detail.
+
+These two items are **not** P-2 blockers — the capability gate via
+``attention_pattern`` is sufficient for Unit 16a-d. The upgrade opens
+when the third or fourth family lands (whichever of Kimi / GLM /
+MiniMax / Mamba / MoE comes first) and the current dict becomes
+uncomfortable. P-3 Deliverables line in ``PLAN.md`` v1.5.2 already
+reserves the slot for this upgrade.
+
 ## Pre-P-2 probes (cheap closures of opens)
 
 ### Q-009 → closed: MLX has no native paged-attention kernel
@@ -549,12 +631,33 @@ natural point to re-evaluate against real numbers.
   cache_list) -> (B, V)` returning per-row last-position logits.
   ``forward`` becomes an adapter that wraps ``forward_batched`` with
   ``tokens[None]`` / ``logits[0]`` so P-1 callers stay unchanged.
-- `silica.models.qwen3.Qwen3Adapter` — gains a batched prefill / decode_step
-  path, but the single-request methods stay identical.
+- `silica.models.qwen3.Qwen3Adapter` (plain-KV family) and
+  `silica.models.qwen3_5.Qwen3_5Adapter` (hybrid family) — **v2.3 splits
+  the original single ``Qwen3Adapter`` into per-generation classes** so
+  future families (Qwen4, DeepSeek, Kimi, GLM, MiniMax) each get their
+  own module without a growing conditional. P-2 Unit 16a-d uses the
+  plain ``Qwen3Adapter`` via ``silica.models.factory.adapter_for_repo``;
+  ``Qwen3_5Adapter`` stays on the P-1 single-request path; its batched
+  path is a P-3 concern (DeltaNet ``BatchRecurrentStateStore``).
 - I-1..I-5 Protocol signatures — **frozen per P-0 exit**. No change.
 
 ## Amendment ledger
 
+- **v2.3 (2026-04-17, after Qwen3-0.6B preload)**: Formalised model
+  integration as a **three-layer stack** (see
+  §"Model integration in three layers"): family adapters (one file per
+  family) + factory registry + capability gate at the scheduler. Split
+  the original single ``Qwen3Adapter`` into ``Qwen3Adapter`` (plain KV)
+  and ``Qwen3_5Adapter`` (hybrid) as the first two family adapters, and
+  added ``silica.models.factory.adapter_for_repo`` as the registry
+  entry point. The capability-gate layer becomes load-bearing in Unit
+  16a: the batcher accepts/rejects adapters based on their
+  ``attention_pattern``, not on their class identity. Motivation: the
+  Qwen3-0.6B preload revealed that plain Qwen3 and Qwen3.5 use
+  materially different mlx-lm attribute names and materially different
+  runtime semantics (pure KV vs DeltaNet hybrid + MTP + multimodal);
+  keeping them in one class would grow a conditional on every future
+  family (Kimi, GLM, MiniMax, Mamba, MoE, …).
 - **v2.2 (2026-04-17, after Gate-0.5)**: Layer-A row invariant changed
   from "row fixed for lifetime" to "slot_table stable within no-filter
   interval"; option-B eager-extract requirement spelled out;

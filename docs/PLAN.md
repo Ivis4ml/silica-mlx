@@ -2,8 +2,8 @@
 
 | Field        | Value                                   |
 | ------------ | --------------------------------------- |
-| Version      | v1.5.1                                  |
-| Last updated | 2026-04-16                              |
+| Version      | v1.5.2                                  |
+| Last updated | 2026-04-17                              |
 | Status       | Phase 0 in-progress                     |
 | Maintainer   | Xin Zhou                                |
 | Source       | `docs/PLAN.md` (single source of truth) |
@@ -149,7 +149,7 @@ silica-mlx/
 │   ├── engine/                   # Engine class, generate() loop
 │   ├── scheduler/                # ContinuousBatcher, request lifecycle, memory budget
 │   ├── kvcache/                  # PagedKVCache, PrefixCache, KVCodec Protocol
-│   ├── models/                   # ModelAdapter Protocol + Qwen3.5 / Gemma4 adapters
+│   ├── models/                   # ModelAdapter Protocol + per-family adapters + factory
 │   ├── weights/                  # WeightProvider Protocol + Resident/Streaming impls (residency & prefetch)
 │   ├── vq/                       # BlockTQ, RaBitQ codecs
 │   ├── speculative/              # DraftEngine Protocol + Noop/DraftTarget impls
@@ -378,7 +378,7 @@ Each Phase uses the same structure: `ID / Goal / Scope / Strategy / Deliverables
   - [ ] `silica.kvcache.simple.SimpleKVCache` (single-request; passed to the adapter as a `kv_handle`).
   - [ ] `silica.server.cli`: `python -m silica run --model Qwen/Qwen3.5-0.8B --prompt "..."`.
   - [ ] Basic sampling: greedy, temperature, top-p.
-  - [ ] `silica.models.qwen3.Qwen3Adapter` (borrows mlx-lm structure, KV self-managed per D-010).
+  - [ ] `silica.models.qwen3_5.Qwen3_5Adapter` for Qwen3.5-0.8B (hybrid DeltaNet + MTP + multimodal sanitize). Plain-Qwen3 family lives in `silica.models.qwen3.Qwen3Adapter` (used as the P-2 dev-loop model); adapters are selected by `silica.models.factory.adapter_for_repo(repo)`. See `docs/P2_OPENING.md` §"Model integration in three layers" for the family adapter + factory registry + capability gate split.
 - **Acceptance:**
   - [ ] Generates text reliably.
   - [ ] Greedy decoding is token-for-token identical to the mlx-lm reference implementation (fixed seed, same model).
@@ -420,15 +420,15 @@ Each Phase uses the same structure: `ID / Goal / Scope / Strategy / Deliverables
   - **MoE adapter FFN execution goes through `WeightProvider.get_expert` / `prefetch_experts` to load the active top-k experts** (D-011 constraint). The Phase 3 `ResidentWeightProvider` still holds everything resident for MoE, but the `get_expert` call path must be real — otherwise P-6's per-expert residency cannot be wired in.
   - MoE adapters are inference-only: top-k routing + gate softmax normalization are computed, but aux-loss / load-balancing (training-only) is not.
 - **Deliverables:**
-  - [ ] `silica.models.qwen3_5.Qwen35Adapter` (dense, Qwen3.5-27B).
-  - [ ] `silica.models.gemma4.Gemma4Adapter` (dense, Gemma4-31B).
-  - [ ] `silica.models.qwen3_5_moe.Qwen35MoeAdapter` (MoE, Qwen3.5-35B-A3B).
-  - [ ] `silica.models.gemma4_moe.Gemma4MoeAdapter` (MoE, gemma-4-26B-A4B).
+  - [ ] `silica.models.qwen3_5.Qwen3_5Adapter` reused at Qwen3.5-27B scale (dense, already wired at P-1 for 0.8B). Underscore-separated class name matches the mlx-lm `qwen3_5` module naming.
+  - [ ] `silica.models.gemma4.Gemma4Adapter` (dense, Gemma4-31B) — new family file.
+  - [ ] `silica.models.qwen3_5_moe.Qwen3_5MoeAdapter` (MoE, Qwen3.5-35B-A3B) — new family file; MoE variants get their own module distinct from dense siblings so routing + expert prefetch code stays local to the family that needs it.
+  - [ ] `silica.models.gemma4_moe.Gemma4MoeAdapter` (MoE, gemma-4-26B-A4B) — new family file.
   - [ ] `AttentionPattern` dispatch covering all v0.1 values — `global` / `sliding` / `hybrid` (KV-attention variants) **and** `recurrent` / `hybrid_deltanet` (D-015, Qwen3.5 path). The scheduler routes KV layers to `KVManager` and recurrent layers to the adapter-owned store.
   - [ ] DeltaNet recurrent-layer forward + adapter-local per-request state store (keyed by `req_id` via `kv_handle`); `adapter.commit_state` / `adapter.rollback_state` / `adapter.state_from_prefix` / `adapter.free_state` helpers implemented per D-015 (P-7 will exercise commit/rollback; P-3 only needs the primitives in place).
   - [ ] MoE top-k gating + per-expert FFN aggregation (inference path, aux-loss ignored).
   - [ ] `silica.weights.resident.ResidentWeightProvider` (full residency; the MoE variant exposes `get_expert` per-expert access even if the underlying storage is fully resident).
-  - [ ] Model registry: `silica.models.registry` (each entry marks `arch: dense | moe`; MoE entries require a MoE-capable `WeightProvider`).
+  - [ ] Model factory registry: `silica.models.factory` (already in place since v1.5.2 with `model_type` dispatch; P-3 extends it to prefer HF `config.architectures[0]` keying — e.g. `Qwen3ForCausalLM`, `Qwen3_5ForConditionalGeneration`, `Qwen3_5MoeForConditionalGeneration` — with `model_type` as a fallback. Each registry entry carries a `ModelCapabilities` summary (`is_moe`, `is_hybrid`, `is_attention_free`, `supports_prefix_cache`, `supports_batch_kv`, …) so schedulers gate on capabilities rather than adapter class. MoE entries require a MoE-capable `WeightProvider`.)
 - **Acceptance:**
   - **Adapter structural correctness (fp16 parity on control model)** — P-3 exit criterion:
     - [ ] On a fp16 control model (Qwen3.5-0.8B or Qwen3.5-4B), Silica adapter logits match the HuggingFace reference: `max |logit diff| < 1e-3` over the first 50 greedy-decoded tokens under the same tokenizer state and seed. This verifies adapter structural components (attention, RMSNorm, MoE routing, positional encoding) without quantization noise.
@@ -970,6 +970,13 @@ Local reference implementations sit at the repo root. **Algorithm / architecture
 
 ## 13. Changelog
 
+- **v1.5.2** (2026-04-17): model-integration refactor — formalise the three-layer stack (family adapter + factory registry + capability gate) surfaced by the P-2 Qwen3-0.6B preload. No interface or principle changes; clarifies deliverable-level class naming and §5.1 layout. Triggered by: plain Qwen3 and Qwen3.5 share mlx-lm's `qwen3*.py` neighbourhood but differ in attribute names (`n_kv_heads` vs `num_key_value_heads`) AND runtime semantics (pure KV vs DeltaNet hybrid + MTP + multimodal sanitize); keeping them in a single `Qwen3Adapter` class would grow a conditional on every future family (Kimi, GLM, MiniMax, Mamba, MoE, …).
+  - **§5.1 models/:** description updated from "ModelAdapter Protocol + Qwen3.5 / Gemma4 adapters" to "ModelAdapter Protocol + per-family adapters + factory" — matches the new three-layer stack.
+  - **§7 P-1 Deliverables:** the adapter entry now explicitly names `silica.models.qwen3_5.Qwen3_5Adapter` as the P-1 class (Qwen3.5-0.8B hybrid), with `silica.models.qwen3.Qwen3Adapter` named separately as the plain-KV P-2 dev-loop adapter and `silica.models.factory.adapter_for_repo(repo)` as the dispatch entry. References `docs/P2_OPENING.md` §"Model integration in three layers".
+  - **§7 P-3 Deliverables:** class names migrated from `Qwen35Adapter` / `Qwen35MoeAdapter` to `Qwen3_5Adapter` / `Qwen3_5MoeAdapter` — underscore-separated naming matches mlx-lm's `qwen3_5` module convention and keeps capital-number boundaries readable. MoE variants explicitly labelled as **new family files** distinct from dense siblings, consistent with "one file per family" principle.
+  - **Decision log — no new D entries required.** The three-layer stack formalises what D-011 (architecture generality) and D-015 (per-family attention-kind dispatch) already imply; adding a new D entry would be redundant. The capability-gate principle is an implementation-level concretion of "scheduler unaware of concrete implementations" (Principle 5 / I-1..I-5 boundary).
+  - **What is NOT changed:** I-1..I-5 Python Protocol signatures; `AttentionPattern` enum values; existing D / Q / R / M identifiers; P-0 through P-7 acceptance lines; principles §4.
+  - **References:** `docs/P2_PRELOAD.md` (probe + Qwen3-0.6B baseline); `docs/P2_OPENING.md` §"Model integration in three layers" (v2.3 amendment); commit history shows the refactor as two commits on 2026-04-17 (refactor + preload).
 - **v1.5.1** (2026-04-16): freeze-readiness pass — lands the gaps v1.5.0 carried forward, addresses the Qwen3.5-architecture implications of the dev-loop model switch, and restores changelog integrity. No structural redesign; interface signatures unchanged (I-1..I-5 Python Protocol shapes untouched).
   - **Header:** `Status` "Phase 0 planned" → "Phase 0 in-progress" (repo already carries the 11 skeleton sub-packages per `chore: flatten package layout to ./silica and track initial skeleton`, so the prior label was stale).
   - **Dev-loop model switch to Qwen3.5-0.8B (recorded here, not retroactively in v1.4.1).** Empirical check on 2026-04-16: `https://huggingface.co/Qwen/Qwen3.5-0.8B` (and Qwen3.5-27B / Qwen3.5-35B-A3B) model cards confirm **Gated DeltaNet + Gated Attention hybrid + MTP + multimodal**. DeltaNet is therefore a core-engine concern shared by P-1 dev-loop and P-3 production targets, not a P-1-only surprise. v1.4.1's historical changelog line was restored from `Qwen3.5-0.8B or Qwen3.5-4B` back to `Qwen3-0.6B or Qwen3.5-4B` per D-007 append-only integrity.
