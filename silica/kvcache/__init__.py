@@ -12,6 +12,7 @@ from silica.kvcache.manager import (
 from silica.kvcache.paged import PagedKVCache, RowState
 from silica.kvcache.prefix import RadixPrefixCache
 from silica.kvcache.simple import SimpleKVCache
+from silica.kvcache.store import PrefixBlockStore, SyntheticPrefixBlockStore
 
 __all__ = [
     "BlockList",
@@ -23,8 +24,10 @@ __all__ = [
     "MemoryBudget",
     "NullKVManager",
     "PagedKVCache",
+    "PrefixBlockStore",
     "PrefixHit",
     "RadixPrefixCache",
     "RowState",
     "SimpleKVCache",
+    "SyntheticPrefixBlockStore",
 ]
