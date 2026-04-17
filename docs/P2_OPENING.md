@@ -54,6 +54,17 @@ is mlx-lm's ``BatchKVCache`` — a flat contiguous tensor per layer, sharded
 per request along the batch axis. A "real" paged SDPA is a P-5+ item gated
 on MLX upstream adding the kernel or Silica writing its own Metal kernel.
 
+**Policy statement (imported from external review):** *Native paged-attention
+on MLX is a planned backend replacement path, not a P-2 dependency. P-2
+validates engine semantics on dense batched KV; kernel-level paging is
+revisited only after functional acceptance and profiling show it is the
+dominant bottleneck.* MLX does expose `mlx.core.fast.metal_kernel` as a
+public custom-kernel entry point, and there is active community interest
+(2025-05 and 2025-12 PagedAttention issues on the MLX repo report
+promising Metal benchmarks), so the path exists — the judgment is timing,
+not feasibility. Trigger conditions for opening a kernel track are listed
+in §Risks / opens.
+
 ### New finding — mlx-lm has no batched ArraysCache (DeltaNet)
 
 Inspection of `mlx_lm/models/cache.py`:
@@ -478,11 +489,38 @@ collateral** — `scripts/acceptance_p2_budget.py`
 
 | ID | Description | Mitigation |
 | --- | --- | --- |
-| R-7 (triggered) | No native MLX paged-attention kernel | Logical paging over BatchKVCache; kernel is a P-5+ item |
+| R-7 (triggered) | No native MLX paged-attention kernel | Logical paging over BatchKVCache; kernel track is trigger-gated (see below) |
 | R-NEW (DeltaNet batching) | mlx-lm has no BatchArraysCache; Qwen3.5 hybrid cannot batch | P-2 uses Qwen3-0.6B; P-3 introduces BatchRecurrentStateStore |
 | R-NEW (padded vs ragged batch) | `BatchKVCache` uses left-padding; wasted compute when request lengths vary | Accept for P-2; ragged-batch is a P-4 optimisation |
 | R-NEW (prefix cache + DeltaNet) | Radix cache only works for KV-attention layers; recurrent state is per-request | Document explicitly; prefix hits for DeltaNet models are P-3 |
-| PLAN impact | R-NEW rows above should fold into PLAN.md as R-9 / R-10 / R-11 and new Q (DeltaNet batch-state) | Separate PLAN.md update PR after this proposal is approved |
+| R-NEW (upstream cache churn) | mlx-lm has in-flight fixes touching BatchKVCache offset behaviour (PR circa 2026-04) and a 2026-03 custom-kernel use-after-free under lazy graph composition | Gate-0 verifies the current mlx-lm 0.31.2 behaviour empirically; if the offset bug is still live, pin to a post-fix version or cherry-pick |
+| PLAN impact | R-NEW rows above fold into PLAN.md as R-9 / R-10 / R-11 / R-12 and new Q entries | Separate PLAN.md update PR after this proposal is approved |
+
+### Paged-attention kernel — trigger-gated future track
+
+Instead of a parallel spike during P-2, a native paged-attention backend
+(either an MLX upstream landing or a Silica-owned `mlx.core.fast.metal_kernel`
+implementation) is opened **only** when all of the following are true:
+
+1. P-2 dense-batch path is functionally correct (acceptance passed).
+2. Profiling on a representative workload shows attention IO / KV copy
+   dominates end-to-end latency — not scheduler overhead, not tokenizer
+   overhead, not sampling.
+3. Option-B prefix copying is demonstrably causing memory-bound rejection
+   of admissible workloads (e.g. 8 agentic requests on a 2k shared prompt
+   overflow the cap purely because of prefix duplication).
+4. Either MLX upstream ships a paged SDPA that we can retrofit behind the
+   existing Protocol, or the team is willing to own a Metal kernel
+   including its stability envelope (the 2026-03 custom-kernel bug report
+   suggests this envelope is still moving).
+
+**Not starting it in P-2 is a focus decision, not a technical one.** The
+three largest unknowns in P-2 are scheduler state transitions, prefix-
+refcount correctness, and preemption cleanup — all *orthogonal* to the
+attention kernel. Adding a Metal-kernel spike in parallel couples those
+unknowns to kernel correctness and MLX lazy-execution semantics, making
+any failure harder to attribute. P-4 bench exit (or P-5 entry) is the
+natural point to re-evaluate against real numbers.
 
 ## What stays untouched
 
@@ -504,8 +542,10 @@ collateral** — `scripts/acceptance_p2_budget.py`
 - **New D-016**: P-2 dev-loop model is Qwen3-0.6B; DeltaNet batching via
   adapter-owned ``BatchRecurrentStateStore`` shifts to P-3.
 - **New Q-011**: contiguous-per-request vs physically-paged storage — when
-  does (or does) MLX grow a paged-attention kernel that would let us
-  retrofit? Revisit at P-5 entry.
+  (and whether) MLX grows a paged-attention kernel that lets us retrofit.
+  Revisit at **P-4 bench exit or P-5 entry**, whichever comes first. Opening
+  the kernel track requires the four trigger conditions in §Risks / opens
+  to be simultaneously true.
 - **Update R-7, R-8** with current status.
 - **Append R-9 / R-10 / R-11** per the table above.
 
