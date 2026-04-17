@@ -26,7 +26,7 @@ from typing import Any
 
 from silica.core.sampling import SamplingParams
 from silica.engine import Engine
-from silica.models.qwen3 import Qwen3Adapter
+from silica.models.factory import adapter_for_repo
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -54,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _run(args: argparse.Namespace) -> int:
-    adapter, kv = Qwen3Adapter.from_hf_repo(args.model)
+    adapter, kv = adapter_for_repo(args.model)
     engine = Engine(adapter, kv)
     tokenizer = adapter.tokenizer()
     eos_ids = tuple(sorted(getattr(tokenizer, "eos_token_ids", set()) or ()))

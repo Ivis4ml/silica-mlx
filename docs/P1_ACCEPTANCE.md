@@ -21,7 +21,7 @@ running the reference first does not contaminate the candidate.
 | Leg | Path under test | Cache |
 | --- | --- | --- |
 | A (reference) | `mlx_lm.generate.generate_step(prompt_arr, model, max_tokens=32)` | mlx-lm's default `make_prompt_cache(model)` |
-| B (candidate) | `silica.engine.Engine.generate(prompt, SamplingParams(temperature=0.0, max_tokens=32))` wiring `Qwen3Adapter` + `SimpleKVCache` + P-0 `Sampler` greedy fast path | `SimpleKVCache.from_model(model)` |
+| B (candidate) | `silica.engine.Engine.generate(prompt, SamplingParams(temperature=0.0, max_tokens=32))` wiring `Qwen3_5Adapter` (hybrid family — see note below) + `SimpleKVCache` + P-0 `Sampler` greedy fast path | `SimpleKVCache.from_model(model)` |
 
 Prompt: `"The capital of France is"` (fixed).
 
@@ -68,9 +68,18 @@ Token-for-token match under two independent control flows confirms that:
   `(1, T, V)` → `(V,)` slicing is consistent with mlx-lm's `logits[:, -1, :]`.
 - Silica's `Sampler` greedy fast path (`temperature <= 0`) reproduces the
   reference sampler exactly.
-- `Qwen3Adapter`'s per-layer dispatch lines up with the heterogeneous
+- `Qwen3_5Adapter`'s per-layer dispatch lines up with the heterogeneous
   `18 ArraysCache + 6 KVCache` list — any cross-wiring between DeltaNet and
   full-attention layers would immediately desynchronise the cache contents.
+
+**Note on adapter naming.** The original P-1 acceptance run used an
+adapter named ``Qwen3Adapter`` that covered both the plain Qwen3 and
+the hybrid Qwen3.5 families. On 2026-04-17 that class was split per
+model generation: ``silica.models.qwen3.Qwen3Adapter`` now owns the
+plain-KV path only, and ``silica.models.qwen3_5.Qwen3_5Adapter`` owns
+the hybrid Qwen3.5 path. The probe script and its output above refer to
+the current (post-split) name; the git history preserves the original
+run as-was.
 
 ## Decision log update
 

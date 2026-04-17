@@ -1,14 +1,13 @@
-"""Tests for silica.models.qwen3 — I-1 Qwen3Adapter wiring (P-1, D-015).
+"""Tests for silica.models.qwen3 — I-1 Qwen3Adapter (plain KV).
 
-Uses a fake mlx-lm-shaped model so we can exercise the adapter's Silica-side
-translation (ModelConfig / KVLayout / AttentionPattern / prefill / decode)
-without requiring the 1.77 GB Qwen3.5-0.8B checkpoint. End-to-end load +
-greedy parity with mlx-lm is the P-1 acceptance test (task #8).
+Uses a fake mlx-lm-qwen3-shaped model. Real-model end-to-end load +
+P-1 Engine.generate baseline is in ``scripts/probe_p2_preload.py``.
+Hybrid Qwen3.5 tests live in ``tests/test_qwen3_5_adapter.py``.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import mlx.core as mx
@@ -28,59 +27,38 @@ from silica.models.adapter import (
 from silica.models.qwen3 import Qwen3Adapter
 from silica.weights.resident import ResidentWeightProvider
 
-# --- fakes that mirror the shape of mlx-lm's qwen3_5.Model ---
+# --- plain-Qwen3-shaped fakes ---
 
 
 @dataclass
-class _FakeSelfAttn:
-    num_key_value_heads: int = 2
-    head_dim: int = 8
+class _PlainSelfAttn:
+    """Mirrors plain Qwen3 Attention: ``n_kv_heads`` (NOT ``num_key_value_heads``)."""
+
+    n_kv_heads: int = 8
 
 
 @dataclass
-class _FakeLayer:
-    is_linear: bool = False
-    self_attn: _FakeSelfAttn | None = None
+class _PlainLayer:
+    self_attn: _PlainSelfAttn | None = None
 
 
 @dataclass
-class _FakeArgs:
-    text_config: dict[str, Any] = field(
-        default_factory=lambda: {"hidden_size": 1024, "num_hidden_layers": 4}
-    )
+class _PlainArgs:
+    hidden_size: int = 1024
+    num_attention_heads: int = 16
+    head_dim: int = 128  # Qwen3-0.6B uses head_dim=128, not hidden/heads=64
 
 
-class _FakeQwenModel:
-    """Minimal stand-in for mlx_lm.models.qwen3_5.Model.
+class _PlainQwenModel:
+    """Minimal stand-in for mlx_lm.models.qwen3.Model (plain Qwen3)."""
 
-    Has the attributes the adapter inspects (`model_type`, `args`, `layers`)
-    and a callable forward that updates the per-layer cache entries for
-    non-linear layers so `runner.forward` exercise is realistic.
-    """
+    VOCAB = 32
 
-    def __init__(
-        self,
-        n_linear: int = 2,
-        n_full: int = 2,
-        vocab_size: int = 32,
-        n_kv_heads: int = 2,
-        head_dim: int = 8,
-    ) -> None:
-        self.model_type = "qwen3_5"
-        self.args = _FakeArgs()
-        self._vocab_size = vocab_size
-        self._n_kv_heads = n_kv_heads
-        self._head_dim = head_dim
+    def __init__(self, n_layers: int = 4) -> None:
+        self.model_type = "qwen3"
+        self.args = _PlainArgs()
         self.layers = [
-            _FakeLayer(is_linear=True) for _ in range(n_linear)
-        ] + [
-            _FakeLayer(
-                is_linear=False,
-                self_attn=_FakeSelfAttn(
-                    num_key_value_heads=n_kv_heads, head_dim=head_dim
-                ),
-            )
-            for _ in range(n_full)
+            _PlainLayer(self_attn=_PlainSelfAttn()) for _ in range(n_layers)
         ]
 
     def __call__(
@@ -88,18 +66,18 @@ class _FakeQwenModel:
     ) -> mx.array:
         B, T = tokens.shape
         if cache is not None:
-            for i, layer in enumerate(self.layers):
-                if not layer.is_linear and cache[i] is not None:
+            for i in range(len(self.layers)):
+                if cache[i] is not None:
+                    n_kv = self.args.__dict__  # for mypy — use args fields
                     k = mx.zeros(
-                        (B, self._n_kv_heads, T, self._head_dim),
+                        (B, self.args.hidden_size // self.args.head_dim,
+                         T, self.args.head_dim),
                         dtype=mx.float16,
                     )
-                    v = mx.zeros(
-                        (B, self._n_kv_heads, T, self._head_dim),
-                        dtype=mx.float16,
-                    )
+                    v = mx.zeros(k.shape, dtype=mx.float16)
+                    del n_kv
                     cache[i].update_and_fetch(k, v)
-        return mx.zeros((B, T, self._vocab_size), dtype=mx.float16)
+        return mx.zeros((B, T, self.VOCAB), dtype=mx.float16)
 
 
 class _FakeTokenizer:
@@ -112,12 +90,12 @@ class _FakeTokenizer:
         return "stub"
 
 
-def _make_adapter_and_kv() -> tuple[Qwen3Adapter, SimpleKVCache, _FakeQwenModel]:
-    model = _FakeQwenModel(n_linear=2, n_full=2)
+def _make_adapter_and_kv(
+    n_layers: int = 4,
+) -> tuple[Qwen3Adapter, SimpleKVCache, _PlainQwenModel]:
+    model = _PlainQwenModel(n_layers=n_layers)
     tokenizer = _FakeTokenizer()
-    # Build a hand-crafted cache list — 4 entries, all KVCache for simplicity.
-    # (ArraysCache would also work; the adapter doesn't inspect types.)
-    kv = SimpleKVCache([KVCache(), KVCache(), KVCache(), KVCache()])
+    kv = SimpleKVCache([KVCache() for _ in range(n_layers)])
     adapter = Qwen3Adapter(model, tokenizer, kv_manager=kv)
     return adapter, kv, model
 
@@ -130,63 +108,82 @@ def test_adapter_satisfies_model_adapter_protocol() -> None:
     assert isinstance(adapter, ModelAdapter)
 
 
-def test_adapter_exposes_config_attribute() -> None:
+def test_adapter_exposes_config_attribute_from_flat_args() -> None:
+    """Plain Qwen3 has ``hidden_size`` on ``model.args`` (not in text_config)."""
     adapter, _, _ = _make_adapter_and_kv()
     assert isinstance(adapter.config, ModelConfig)
-    assert adapter.config.model_name == "qwen3_5"
+    assert adapter.config.model_name == "qwen3"
     assert adapter.config.num_layers == 4
     assert adapter.config.hidden_size == 1024
     assert adapter.config.vocab_size == 32
 
 
-# --- kv_layout ---
+# --- kv_layout (plain-Qwen3 naming) ---
 
 
-def test_kv_layout_reads_from_first_full_attention_layer() -> None:
+def test_kv_layout_reads_n_kv_heads_attribute() -> None:
+    """Qwen3-0.6B uses ``self_attn.n_kv_heads``, not ``num_key_value_heads``."""
     adapter, _, _ = _make_adapter_and_kv()
     layout = adapter.kv_layout()
     assert isinstance(layout, KVLayout)
     assert layout.num_layers == 4
-    assert layout.n_kv_heads == 2
-    assert layout.head_dim == 8
+    assert layout.n_kv_heads == 8
+    assert layout.head_dim == 128  # from args.head_dim, NOT hidden/heads=64
     assert layout.dtype == mx.float16
 
 
-def test_kv_layout_all_linear_returns_zeros() -> None:
-    """Pure-DeltaNet hypothetical model: no full-attention, KVLayout zeroes."""
-    model = _FakeQwenModel(n_linear=3, n_full=0)
-    kv = SimpleKVCache([KVCache(), KVCache(), KVCache()])
-    adapter = Qwen3Adapter(model, _FakeTokenizer(), kv_manager=kv)
+def test_kv_layout_falls_back_to_hidden_div_heads_when_head_dim_absent() -> None:
+    """When args.head_dim is absent, derive from hidden_size / num_attention_heads."""
+
+    @dataclass
+    class _ArgsNoHeadDim:
+        hidden_size: int = 1024
+        num_attention_heads: int = 16
+
+    class _Model:
+        def __init__(self) -> None:
+            self.model_type = "qwen3"
+            self.args = _ArgsNoHeadDim()
+            self.layers = [_PlainLayer(self_attn=_PlainSelfAttn()) for _ in range(4)]
+
+    kv = SimpleKVCache([KVCache() for _ in range(4)])
+    adapter = Qwen3Adapter(_Model(), _FakeTokenizer(), kv_manager=kv)
+    assert adapter.kv_layout().head_dim == 64  # 1024 // 16
+
+
+def test_kv_layout_returns_zeros_for_empty_layer_stack() -> None:
+    class _EmptyModel:
+        def __init__(self) -> None:
+            self.model_type = "qwen3"
+            self.args = _PlainArgs()
+            self.layers: list[Any] = []
+
+    kv = SimpleKVCache([])
+    adapter = Qwen3Adapter(_EmptyModel(), _FakeTokenizer(), kv_manager=kv)
     layout = adapter.kv_layout()
-    assert layout.num_layers == 3
+    assert layout.num_layers == 0
     assert layout.n_kv_heads == 0
     assert layout.head_dim == 0
 
 
-# --- attention_pattern (D-015) ---
+# --- attention_pattern: plain Qwen3 is all GLOBAL, no hybrid ---
 
 
-def test_attention_pattern_maps_is_linear_to_hybrid_deltanet() -> None:
-    """Linear layers → HYBRID_DELTANET; full → GLOBAL."""
-    adapter, _, _ = _make_adapter_and_kv()
+def test_attention_pattern_all_global() -> None:
+    adapter, _, _ = _make_adapter_and_kv(n_layers=6)
     pattern = adapter.attention_pattern()
     assert isinstance(pattern, AttentionPattern)
-    # 2 linear + 2 full, order preserved
-    assert pattern.per_layer == (
-        AttentionKind.HYBRID_DELTANET,
-        AttentionKind.HYBRID_DELTANET,
-        AttentionKind.GLOBAL,
-        AttentionKind.GLOBAL,
-    )
+    assert pattern.per_layer == tuple(AttentionKind.GLOBAL for _ in range(6))
 
 
-def test_attention_pattern_length_matches_num_layers() -> None:
-    adapter, _, _ = _make_adapter_and_kv()
-    pattern = adapter.attention_pattern()
-    assert len(pattern.per_layer) == adapter.config.num_layers
+def test_attention_pattern_contains_no_hybrid_deltanet() -> None:
+    adapter, _, _ = _make_adapter_and_kv(n_layers=28)
+    kinds = set(adapter.attention_pattern().per_layer)
+    assert AttentionKind.HYBRID_DELTANET not in kinds
+    assert AttentionKind.RECURRENT not in kinds
 
 
-# --- tokenizer ---
+# --- tokenizer / build ---
 
 
 def test_tokenizer_passes_through() -> None:
@@ -194,9 +191,6 @@ def test_tokenizer_passes_through() -> None:
     tok = adapter.tokenizer()
     assert tok.vocab_size == 32
     assert tok.encode("x") == [1, 2, 3]
-
-
-# --- build() ---
 
 
 def test_build_returns_injected_model_ignores_weight_provider() -> None:
@@ -214,7 +208,7 @@ def test_prefill_returns_logits_and_state_delta() -> None:
     handle = KVHandle(req_id="req-a")
     tokens = mx.array([1, 2, 3], dtype=mx.int32)
     logits, delta = adapter.prefill(tokens, handle)
-    assert logits.shape == (adapter.config.vocab_size,)
+    assert logits.shape == (_PlainQwenModel.VOCAB,)
     assert isinstance(delta, StateDelta)
     assert delta.recurrent_bytes() == 0
 
@@ -225,25 +219,23 @@ def test_decode_step_returns_logits_and_state_delta() -> None:
     handle = KVHandle(req_id="req-a")
     token = mx.array([7], dtype=mx.int32)
     logits, delta = adapter.decode_step(token, handle)
-    assert logits.shape == (adapter.config.vocab_size,)
+    assert logits.shape == (_PlainQwenModel.VOCAB,)
     assert isinstance(delta, StateDelta)
 
 
 def test_prefill_then_decode_accumulates_cache() -> None:
-    """After prefill (T=3) + decode (T=1), full-attention cache offsets == 4."""
     adapter, kv, _ = _make_adapter_and_kv()
     kv.reserve_for_prefill("req-a", [1, 2, 3])
     handle = KVHandle(req_id="req-a")
     adapter.prefill(mx.array([1, 2, 3], dtype=mx.int32), handle)
     adapter.decode_step(mx.array([4], dtype=mx.int32), handle)
     cache_list = kv.cache_list("req-a")
-    # Last two entries are the full-attention KVCaches.
-    assert cache_list[2].offset == 4
-    assert cache_list[3].offset == 4
+    # All layers use full-attention KVCache; every entry's offset == 4.
+    for c in cache_list:
+        assert c.offset == 4
 
 
 def test_prefill_requires_kv_handle_owner() -> None:
-    """If handle's req_id doesn't match SimpleKVCache owner, access fails."""
     adapter, kv, _ = _make_adapter_and_kv()
     kv.reserve_for_prefill("req-a", [1])
     handle = KVHandle(req_id="req-b")

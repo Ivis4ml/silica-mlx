@@ -123,7 +123,9 @@ RESULT: PASS — Qwen3.5-0.8B loads text-only, MTP disabled, tokenizer matches H
    `6/24 = 25%` of a pure-attention 24-layer baseline — a significant headroom
    that should be reflected in scheduler capacity estimates.
 
-2. **P-1 `Qwen3Adapter` delegates loading to mlx-lm, not a parallel loader.**
+2. **P-1 `Qwen3_5Adapter` delegates loading to mlx-lm, not a parallel loader.**
+   (Renamed from ``Qwen3Adapter`` on 2026-04-17 when the plain-Qwen3 family
+   got its own class; see ``docs/P2_PRELOAD.md`` for the split.)
    The MTP norm-shift (+1.0) is a non-obvious correctness detail that would
    silently regress under any re-implementation; D-004's "borrow the weight
    loader" is load-correctness-critical, not ergonomic.

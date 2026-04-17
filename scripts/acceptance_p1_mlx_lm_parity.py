@@ -9,7 +9,7 @@ Loads Qwen3.5-0.8B once, then generates against a fixed prompt + fixed
   A) ``mlx_lm.generate.generate_step(prompt, model, ...)`` with mlx-lm's own
      internal cache — the reference.
   B) ``silica.engine.Engine.generate(prompt_text, ...)`` wiring
-     ``Qwen3Adapter`` + ``SimpleKVCache`` + P-0 ``Sampler`` — the candidate.
+     ``Qwen3_5Adapter`` + ``SimpleKVCache`` + P-0 ``Sampler`` — the candidate.
 
 Both paths use the same ``model`` object (MLX forward is cache-scoped and
 does not mutate the module) so any divergence isolates to Silica's
@@ -32,7 +32,7 @@ from mlx_lm.utils import load  # noqa: E402
 from silica.core.sampling import SamplingParams  # noqa: E402
 from silica.engine import Engine  # noqa: E402
 from silica.kvcache.simple import SimpleKVCache  # noqa: E402
-from silica.models.qwen3 import Qwen3Adapter  # noqa: E402
+from silica.models.qwen3_5 import Qwen3_5Adapter  # noqa: E402
 
 REPO = "Qwen/Qwen3.5-0.8B"
 PROMPT = "The capital of France is"
@@ -58,7 +58,7 @@ def _silica_candidate(
     model: Any, tokenizer: Any, prompt: str, max_tokens: int
 ) -> list[int]:
     kv = SimpleKVCache.from_model(model)
-    adapter = Qwen3Adapter(model, tokenizer, kv_manager=kv)
+    adapter = Qwen3_5Adapter(model, tokenizer, kv_manager=kv)
     engine = Engine(adapter, kv)
     params = SamplingParams(temperature=0.0, max_tokens=max_tokens)
     return list(engine.generate(prompt, params))

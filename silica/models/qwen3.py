@@ -1,26 +1,34 @@
-"""silica.models.qwen3 — Qwen3.5 I-1 ModelAdapter (P-1 D-004 + D-010 + D-014).
+"""silica.models.qwen3 — I-1 adapter for the plain Qwen3 family (pure KV).
 
-P-1 adapter for the Qwen3.5 family (dev-loop model: Qwen3.5-0.8B; validated at
-Gate B, see ``docs/P1_DAY1_GATE_B.md``). Borrows mlx-lm's ``load()`` for model
-structure + tokenizer + weight loading (D-004), but routes KV cache through
-Silica's ``SimpleKVCache`` (D-010 clean injection, confirmed at Gate A).
+Scope: Qwen3 models with pure GQA causal attention — 0.6B / 4B / 7B /
+14B / 32B ... — that mlx-lm ships under ``mlx_lm.models.qwen3``. These
+are the P-2 dev-loop targets because all layers share one cache type
+(``KVCache``), which is what the batched ``ContinuousBatcher`` is built
+for.
 
-Per-layer attention dispatch (D-015): ``model.layers[i].is_linear`` toggles
-between Gated DeltaNet (``HYBRID_DELTANET``) and full attention (``GLOBAL``).
-Qwen3.5-0.8B is 18 linear + 6 full; other sizes share the same is_linear flag
-and should work unchanged.
+For hybrid Qwen3.5 (DeltaNet + GQA + MTP + multimodal) use
+``silica.models.qwen3_5.Qwen3_5Adapter``; it lives in a separate module
+so plain-family adapter logic never drifts to accommodate hybrid
+concerns (and vice versa). Adding a new family (Qwen4, DeepSeek, Kimi,
+GLM, MiniMax, …) is a new file per family — not a growing conditional
+in this one.
 
-P-1 scope (D-014):
-  - Text-only. Multimodal heads auto-filtered by mlx-lm's ``sanitize()``.
-  - MTP disabled. ``sanitize()`` drops MTP weights and applies a +1.0 RMSNorm
-    shift — non-obvious weight-correctness logic that makes D-004's
-    loader-borrowing load-correctness-critical, not ergonomic.
-  - DeltaNet recurrent state lives inside mlx-lm's ``ArraysCache`` entries,
-    which are held by ``SimpleKVCache``'s per-layer list. The adapter does
-    not surface recurrent state through ``StateDelta`` at P-1; accounting is
-    a P-3 ``MemoryBudgeter`` concern.
-  - Tokenizer is mlx-lm's ``TokenizerWrapper`` over HF ``AutoTokenizer`` —
-    structurally satisfies Silica's ``Tokenizer`` protocol (Gate B (c)).
+Plain-Qwen3 traits this adapter handles:
+
+- `model.model_type == "qwen3"`.
+- All layers are GQA KV attention → every entry in ``AttentionPattern``
+  is ``AttentionKind.GLOBAL``.
+- `self_attn.n_kv_heads` (NOT ``num_key_value_heads`` — that name is
+  Qwen3.5's).
+- `head_dim` can be stored as `self_attn.head_dim`, `model.args.head_dim`,
+  or absent; fall back to ``hidden_size // num_attention_heads`` in the
+  absent case. Qwen3-0.6B specifically uses
+  ``args.head_dim = 128`` (larger than the naive 64 = 1024 / 16);
+  reading ``args.head_dim`` primary is load-bearing for P-2
+  ``MemoryBudgeter.bytes_per_token`` accuracy.
+- `model.args.hidden_size` is on ``args`` directly (flat), not under
+  ``args.text_config``.
+- No MTP, no multimodal, no RMSNorm +1.0 sanitize (those are Qwen3.5).
 """
 
 from __future__ import annotations
@@ -46,18 +54,7 @@ from silica.weights.provider import WeightProvider
 
 
 class Qwen3Adapter:
-    """I-1 ModelAdapter for Qwen3.5 (Gated DeltaNet + Gated Attention hybrid).
-
-    Usage:
-
-        model, tokenizer = mlx_lm.load("Qwen/Qwen3.5-0.8B")
-        kv = SimpleKVCache.from_model(model)
-        adapter = Qwen3Adapter(model, tokenizer, kv_manager=kv)
-
-    Or the one-shot factory:
-
-        adapter, kv = Qwen3Adapter.from_hf_repo("Qwen/Qwen3.5-0.8B")
-    """
+    """I-1 ModelAdapter for the plain Qwen3 family (pure KV attention)."""
 
     config: ModelConfig
 
@@ -76,31 +73,13 @@ class Qwen3Adapter:
 
     @classmethod
     def from_hf_repo(cls, repo: str) -> tuple[Qwen3Adapter, SimpleKVCache]:
-        """Load ``repo`` via mlx-lm, build ``SimpleKVCache`` + adapter.
-
-        Returns ``(adapter, kv)`` so the Engine can drive both. The KVManager
-        is built here so ``SimpleKVCache.from_model`` is called exactly once
-        on the post-load, post-sanitize model.
-        """
-        # mlx-lm load() returns Union[2tuple, 3tuple] without @overload;
-        # with return_config omitted we get the 2-tuple variant at runtime.
+        """Load ``repo`` via mlx-lm, build ``SimpleKVCache`` + adapter."""
         model, tokenizer = _mlx_lm_load(repo)  # type: ignore[misc]
         kv = SimpleKVCache.from_model(model)
         return cls(model, tokenizer, kv_manager=kv), kv
 
-    # --- I-1 ModelAdapter Protocol surface ---
-
     def build(self, weight_provider: WeightProvider) -> Module:
-        """Return the already-loaded mlx-lm model.
-
-        D-004 / D-010 note: P-1 borrows mlx-lm's loader (including its
-        Qwen3.5-specific ``sanitize()`` — which filters vision + MTP weights
-        and applies the +1.0 RMSNorm shift). ``weight_provider`` is accepted
-        for Protocol conformance but not used; mlx-lm has already consumed
-        the safetensors by the time the adapter is constructed. P-3 revisits
-        this when ``WeightProvider`` needs to own the bytes for MoE + VQ +
-        NVMe residency.
-        """
+        """Return the already-loaded mlx-lm model (D-004: borrow the loader)."""
         del weight_provider
         return self._model
 
@@ -111,8 +90,6 @@ class Qwen3Adapter:
         return self._attention_pattern
 
     def tokenizer(self) -> Tokenizer:
-        # mlx-lm's TokenizerWrapper is structurally a Tokenizer; mlx-lm stubs
-        # expose it as Any, so mypy cannot verify the structural cast.
         return self._tokenizer  # type: ignore[no-any-return]
 
     def prefill(
@@ -129,36 +106,38 @@ class Qwen3Adapter:
         logits = forward(self._model, token, cache_list)
         return logits, StateDelta()
 
-    # --- Silica config builders ---
+    # --- family-specific metadata extraction ---
 
     @staticmethod
     def _build_config(model: Any, tokenizer: Any) -> ModelConfig:
-        text_config = Qwen3Adapter._text_config_dict(model)
+        """Read hidden_size from flat ``model.args`` (plain-Qwen3 layout)."""
+        args = getattr(model, "args", None)
+        hidden_size = int(getattr(args, "hidden_size", 0) or 0) if args else 0
         return ModelConfig(
-            model_name=str(getattr(model, "model_type", "qwen3_5")),
+            model_name=str(getattr(model, "model_type", "qwen3")),
             num_layers=len(model.layers),
-            hidden_size=int(text_config.get("hidden_size", 0) or 0),
+            hidden_size=hidden_size,
             vocab_size=int(getattr(tokenizer, "vocab_size", 0) or 0),
-            extra={"text_config_keys": sorted(text_config.keys())},
+            extra={},
         )
 
     @staticmethod
     def _build_kv_layout(model: Any) -> KVLayout:
-        """Extract KV shape from the first full-attention (non-linear) layer.
-
-        For a pure-recurrent stack (hypothetical future Qwen variant with no
-        full-attention layers) this returns zeros; paged KV is then trivial.
-        """
+        """KV shape from plain-Qwen3 attributes (``n_kv_heads``, ``args.head_dim``)."""
         for layer in model.layers:
-            if not getattr(layer, "is_linear", False):
-                sa = getattr(layer, "self_attn", None)
-                if sa is not None:
-                    return KVLayout(
-                        num_layers=len(model.layers),
-                        n_kv_heads=int(getattr(sa, "num_key_value_heads", 0) or 0),
-                        head_dim=int(getattr(sa, "head_dim", 0) or 0),
-                        dtype=mx.float16,
-                    )
+            sa = getattr(layer, "self_attn", None)
+            if sa is None:
+                continue
+            n_kv = int(getattr(sa, "n_kv_heads", 0) or 0)
+            head_dim = int(getattr(sa, "head_dim", 0) or 0)
+            if head_dim == 0:
+                head_dim = Qwen3Adapter._head_dim_from_args(model)
+            return KVLayout(
+                num_layers=len(model.layers),
+                n_kv_heads=n_kv,
+                head_dim=head_dim,
+                dtype=mx.float16,
+            )
         return KVLayout(
             num_layers=len(model.layers),
             n_kv_heads=0,
@@ -167,34 +146,21 @@ class Qwen3Adapter:
         )
 
     @staticmethod
-    def _build_attention_pattern(model: Any) -> AttentionPattern:
-        """Per-layer AttentionKind for Qwen3.5 (D-015).
-
-        ``layer.is_linear`` is the mlx-lm-native toggle for DeltaNet vs full
-        attention layers. Full attention in Qwen3.5 is causal (no sliding
-        window at config level — verified against ``mlx_lm/models/qwen3_5.py``
-        ``create_attention_mask`` call), so GLOBAL is the correct tag.
-        """
-        kinds = tuple(
-            AttentionKind.HYBRID_DELTANET
-            if getattr(layer, "is_linear", False)
-            else AttentionKind.GLOBAL
-            for layer in model.layers
-        )
-        return AttentionPattern(per_layer=kinds)
-
-    @staticmethod
-    def _text_config_dict(model: Any) -> dict[str, Any]:
-        """Normalise ``model.args.text_config`` to a dict.
-
-        mlx-lm stores Qwen3.5's text-config as a raw dict on the ``ModelArgs``
-        dataclass (``from_dict`` preserves the dict). Return an empty dict if
-        the model is a fake / malformed fixture; callers default gracefully.
-        """
+    def _head_dim_from_args(model: Any) -> int:
+        """``args.head_dim`` primary; fall back to ``hidden / num_heads``."""
         args = getattr(model, "args", None)
         if args is None:
-            return {}
-        raw = getattr(args, "text_config", None)
-        if isinstance(raw, dict):
-            return raw
-        return {}
+            return 0
+        h = int(getattr(args, "head_dim", 0) or 0)
+        if h > 0:
+            return h
+        hidden = int(getattr(args, "hidden_size", 0) or 0)
+        heads = int(getattr(args, "num_attention_heads", 1) or 1)
+        return hidden // max(heads, 1)
+
+    @staticmethod
+    def _build_attention_pattern(model: Any) -> AttentionPattern:
+        """Plain Qwen3 is pure KV — every layer is ``GLOBAL``."""
+        return AttentionPattern(
+            per_layer=tuple(AttentionKind.GLOBAL for _ in model.layers)
+        )
