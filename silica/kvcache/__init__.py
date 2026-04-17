@@ -9,6 +9,7 @@ from silica.kvcache.manager import (
     NullKVManager,
     PrefixHit,
 )
+from silica.kvcache.simple import SimpleKVCache
 
 __all__ = [
     "BlockList",
@@ -20,4 +21,5 @@ __all__ = [
     "MemoryBudget",
     "NullKVManager",
     "PrefixHit",
+    "SimpleKVCache",
 ]
