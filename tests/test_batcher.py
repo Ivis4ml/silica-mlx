@@ -1,13 +1,15 @@
-"""Tests for silica.scheduler.batcher.ContinuousBatcher (P-2 Unit 16a).
+"""Tests for silica.scheduler.batcher.ContinuousBatcher (P-2 Units 16a / 16b).
 
-Exercises the B=1 scaffolding with scripted adapters so correctness is
-observable without any real-model dependency. Capability-gate tests use
-minimal attention-pattern fixtures; step-loop tests use a scripted
-forward that returns peaked logits on a pre-set queue of next tokens.
+B=1 scaffolding and fixed-cohort B>1 behavior are exercised with
+scripted adapters so correctness is observable without any real-model
+dependency. Capability-gate tests use minimal attention-pattern
+fixtures; step-loop tests use scripted forwards that return peaked
+logits from a pre-set queue of next-token targets.
 
-Real-model (Qwen3-0.6B) oracle parity lives in
-``tests/test_p2_preload_parity.py`` (skipped when the checkpoint is
-not cached).
+Real-model (Qwen3-0.6B) B=1 oracle parity lives in
+``tests/test_p2_preload_parity.py``; B>1 batched parity lives in
+``tests/test_p2_batched_parity.py``. Both are skipped when the
+checkpoint is not cached.
 """
 
 from __future__ import annotations
@@ -33,6 +35,9 @@ from silica.scheduler.batcher import ContinuousBatcher
 # --- scripted adapter ---------------------------------------------------------
 
 
+_ScriptStep = int | Sequence[int]
+
+
 class _ScriptedTokenizer:
     vocab_size = 32
 
@@ -44,15 +49,19 @@ class _ScriptedTokenizer:
 
 
 class _ScriptedModel:
-    """mlx-lm-shaped model. Returns peaked logits at positions driven by a
-    per-instance ``script`` queue; pops one target id per forward call."""
+    """mlx-lm-shaped model.
+
+    Returns peaked logits at positions driven by a per-instance
+    ``script`` queue. Each script step can be a scalar target (broadcast
+    to every row) or a sequence of per-row targets.
+    """
 
     VOCAB = 32
     N_KV = 1
     HEAD_DIM = 4
 
-    def __init__(self, script: Sequence[int]) -> None:
-        self.script: list[int] = list(script)
+    def __init__(self, script: Sequence[_ScriptStep]) -> None:
+        self.script: list[_ScriptStep] = list(script)
         self.forward_calls = 0
         self.last_T: int | None = None
 
@@ -66,14 +75,37 @@ class _ScriptedModel:
             k = mx.zeros((B, self.N_KV, T, self.HEAD_DIM), dtype=mx.float16)
             v = mx.zeros((B, self.N_KV, T, self.HEAD_DIM), dtype=mx.float16)
             cache[0].update_and_fetch(k, v)
-        target = self.script.pop(0) if self.script else 0
-        one_hot = mx.zeros((self.VOCAB,), dtype=mx.float32)
-        one_hot[target] = 1.0
-        # Broadcast to (B, T, V); the last-position slice will read ``target``.
-        return mx.broadcast_to(
-            one_hot.reshape(1, 1, self.VOCAB),
-            (B, T, self.VOCAB),
-        )
+        target: _ScriptStep = self.script.pop(0) if self.script else 0
+        return self._logits_for_target(target, B=B, T=T)
+
+    def _logits_for_target(
+        self, target: _ScriptStep, *, B: int, T: int
+    ) -> mx.array:
+        """Build ``(B, T, V)`` logits for scalar or per-row targets."""
+        if isinstance(target, int):
+            one_hot = mx.zeros((self.VOCAB,), dtype=mx.float32)
+            one_hot[target] = 1.0
+            # Broadcast to (B, T, V); the last-position slice reads ``target``.
+            return mx.broadcast_to(
+                one_hot.reshape(1, 1, self.VOCAB),
+                (B, T, self.VOCAB),
+            )
+        targets = list(target)
+        if len(targets) != B:
+            raise AssertionError(
+                f"per-row script step has {len(targets)} targets for B={B}"
+            )
+        rows: list[mx.array] = []
+        for tok in targets:
+            row_hot = mx.zeros((self.VOCAB,), dtype=mx.float32)
+            row_hot[int(tok)] = 1.0
+            rows.append(
+                mx.broadcast_to(
+                    row_hot.reshape(1, self.VOCAB),
+                    (T, self.VOCAB),
+                )
+            )
+        return mx.stack(rows, axis=0)
 
 
 class _ScriptedAdapter:
@@ -82,7 +114,7 @@ class _ScriptedAdapter:
     def __init__(
         self,
         n_layers: int = 2,
-        script: Sequence[int] = (),
+        script: Sequence[_ScriptStep] = (),
         attention_pattern: AttentionPattern | None = None,
     ) -> None:
         self.config = ModelConfig(
@@ -176,20 +208,23 @@ def test_capability_gate_error_names_phase_for_sliding() -> None:
         ContinuousBatcher(adapter)
 
 
-# --- max_batch_size restriction ---------------------------------------------
+# --- admission / cohort rules -----------------------------------------------
 
 
-def test_max_batch_size_greater_than_1_raises() -> None:
+def test_max_batch_size_below_1_raises() -> None:
     adapter = _ScriptedAdapter()
-    with pytest.raises(NotImplementedError, match="16b"):
-        ContinuousBatcher(adapter, max_batch_size=2)
+    with pytest.raises(ValueError, match=">= 1"):
+        ContinuousBatcher(adapter, max_batch_size=0)
 
 
-def test_add_request_beyond_capacity_raises() -> None:
-    adapter = _ScriptedAdapter(script=[1, 2, 3, 4])
-    b = ContinuousBatcher(adapter)
+def test_add_request_at_capacity_raises_runtime() -> None:
+    """Capacity exhaustion is a resource condition — RuntimeError, not
+    NotImplementedError. 16c / 16d may grow the cohort dynamically, but
+    that is orthogonal to static capacity."""
+    adapter = _ScriptedAdapter(script=[1, 2])
+    b = ContinuousBatcher(adapter, max_batch_size=1)
     b.add_request(0, [10, 11], _greedy())
-    with pytest.raises(NotImplementedError, match="16b"):
+    with pytest.raises(RuntimeError, match="capacity"):
         b.add_request(1, [20, 21], _greedy())
 
 
@@ -198,6 +233,16 @@ def test_add_request_rejects_empty_prompt() -> None:
     b = ContinuousBatcher(adapter)
     with pytest.raises(ValueError, match="non-empty"):
         b.add_request(0, [], _greedy())
+
+
+def test_add_request_after_step_raises_16c() -> None:
+    """Cohort is sealed on the first step() call; further admits are 16c."""
+    adapter = _ScriptedAdapter(script=[1, 2])
+    b = ContinuousBatcher(adapter, max_batch_size=2)
+    b.add_request(0, [10, 11], _greedy(max_tokens=3))
+    b.step()  # seals cohort
+    with pytest.raises(NotImplementedError, match="16c"):
+        b.add_request(1, [20, 21], _greedy())
 
 
 # --- step loop ---------------------------------------------------------------
@@ -321,3 +366,119 @@ def test_prefill_short_circuits_to_done_on_first_stop_token() -> None:
     assert [e.kind for e in events] == ["token", "done"]
     row = b._rows[0]  # type: ignore[attr-defined]
     assert row.state.status == RequestStatus.DONE
+
+
+# --- B>1 cohort (Unit 16b) -------------------------------------------------
+
+
+def test_prefill_is_one_batched_forward_across_all_rows() -> None:
+    """3 rows with varying prompt lengths must go through one prefill call,
+    not B separate forwards — the point of Unit 16b."""
+    adapter = _ScriptedAdapter(script=[1, 2, 3])
+    b = ContinuousBatcher(adapter, max_batch_size=3)
+    b.add_request(0, [10, 11, 12, 13, 14], _greedy(max_tokens=1))  # T=5
+    b.add_request(1, [20, 21, 22], _greedy(max_tokens=1))           # T=3
+    b.add_request(2, [30, 31, 32, 33, 34, 35, 36], _greedy(max_tokens=1))  # T=7
+    b.step()
+    # Exactly one model() invocation for the cohort's prefill.
+    assert adapter._model.forward_calls == 1
+
+
+def test_prefill_tokens_are_left_padded_to_T_max() -> None:
+    """Shortest prompt gets the most left-padding; tensor shape is (B, T_max)."""
+    adapter = _ScriptedAdapter(script=[1, 2, 3])
+    b = ContinuousBatcher(adapter, max_batch_size=3)
+    b.add_request(0, [10, 11, 12, 13, 14], _greedy(max_tokens=1))  # len 5
+    b.add_request(1, [20, 21, 22], _greedy(max_tokens=1))          # len 3
+    b.add_request(2, [30, 31, 32, 33, 34, 35, 36], _greedy(max_tokens=1))  # len 7
+    b.step()
+    # The scripted model records the last tokens it saw via last_T.
+    assert adapter._model.last_T == 7  # T_max
+
+
+def test_batch_cache_left_padding_matches_prompt_lengths() -> None:
+    """BatchKVCache[left_padding][i] == T_max - len(prompt_i)."""
+    adapter = _ScriptedAdapter(script=[1])
+    b = ContinuousBatcher(adapter, max_batch_size=3)
+    b.add_request(0, [10, 11, 12, 13, 14], _greedy(max_tokens=1))  # len 5
+    b.add_request(1, [20, 21, 22], _greedy(max_tokens=1))          # len 3
+    b.add_request(2, [30, 31, 32, 33, 34, 35, 36], _greedy(max_tokens=1))  # len 7
+    b.step()
+    cache = b._batch_cache[0]  # type: ignore[index]
+    # tolist() returns Any by mlx stubs; narrowed via assert for mypy.
+    left_padding_raw = cache.left_padding.tolist()
+    assert isinstance(left_padding_raw, list)
+    # T_max = 7; expected left_padding = [7-5, 7-3, 7-7] = [2, 4, 0].
+    assert left_padding_raw == [2, 4, 0]
+
+
+def test_decode_is_one_batched_forward_at_T1() -> None:
+    """Decode step feeds (B, 1), regardless of any mid-cohort terminations."""
+    adapter = _ScriptedAdapter(script=[1, 2, 3, 4])
+    b = ContinuousBatcher(adapter, max_batch_size=2)
+    b.add_request(0, [10, 11], _greedy(max_tokens=3))
+    b.add_request(1, [20], _greedy(max_tokens=3))
+    b.step()  # prefill, one forward
+    calls_after_prefill = adapter._model.forward_calls
+    b.step()  # decode, one forward for the whole batch
+    assert adapter._model.forward_calls == calls_after_prefill + 1
+    assert adapter._model.last_T == 1
+
+
+def test_done_row_does_not_emit_more_tokens_or_append_to_generated() -> None:
+    """A row that finishes early must stop emitting AND stop growing
+    row.generated even while its slot stays in the batched forward."""
+    # Script: prefill -> 11 (row_0 stops on this), decode -> 22.
+    # Row 0 has stop=(11,). Row 1 has max_tokens=3, no stop.
+    adapter = _ScriptedAdapter(script=[11, 22, 22])
+    b = ContinuousBatcher(adapter, max_batch_size=2)
+    b.add_request(0, [1], _greedy(max_tokens=16, stop=(11,)))
+    b.add_request(1, [2], _greedy(max_tokens=3))
+    # Step 1: prefill → both rows sample 11. Row 0 sees stop → DONE.
+    events_1 = b.step()
+    row_0_tokens = [e for e in events_1 if e.req_index == 0 and e.kind == "token"]
+    row_0_dones = [e for e in events_1 if e.req_index == 0 and e.kind == "done"]
+    assert len(row_0_tokens) == 1 and row_0_tokens[0].token_id == 11
+    assert len(row_0_dones) == 1
+    row_0 = b._rows[0]  # type: ignore[attr-defined]
+    assert len(row_0.generated) == 1  # frozen at 1
+
+    # Step 2: decode. Row 0 is terminal, row 1 continues.
+    events_2 = b.step()
+    row_0_events = [e for e in events_2 if e.req_index == 0]
+    row_1_events = [e for e in events_2 if e.req_index == 1]
+    assert row_0_events == []  # DONE row emits nothing
+    row_1_tokens = [e for e in row_1_events if e.kind == "token"]
+    assert len(row_1_tokens) == 1
+
+    # Row 0's generated STILL has only 1 token (placeholder feed didn't append).
+    assert len(row_0.generated) == 1
+
+
+def test_done_row_keeps_batch_axis_stable_until_all_terminal() -> None:
+    """Terminal rows stay in the batch (placeholder feed); batch axis B stays
+    constant until every row is terminal."""
+    # Row 0 stops immediately, row 1 runs 3 tokens.
+    adapter = _ScriptedAdapter(script=[15, 5, 5])
+    b = ContinuousBatcher(adapter, max_batch_size=2)
+    b.add_request(0, [1], _greedy(max_tokens=16, stop=(15,)))
+    b.add_request(1, [2], _greedy(max_tokens=3))
+    _drain(b)
+    # Both rows appear in every forward: 1 prefill + 2 decodes = 3 calls.
+    assert adapter._model.forward_calls == 3
+
+
+def test_b_gt_1_per_row_sampling_is_independent() -> None:
+    """Each row samples its own row-i logits; req_index is preserved on events."""
+    adapter = _ScriptedAdapter(script=[(6, 8, 10)])
+    b = ContinuousBatcher(adapter, max_batch_size=3)
+    b.add_request(10, [1, 2], _greedy(max_tokens=1))  # high req_index → 10
+    b.add_request(20, [3, 4], _greedy(max_tokens=1))  # 20
+    b.add_request(30, [5, 6], _greedy(max_tokens=1))  # 30
+    events = b.step()
+    tokens_by_req = {
+        e.req_index: e.token_id
+        for e in events
+        if e.kind == "token" and e.token_id is not None
+    }
+    assert tokens_by_req == {10: 6, 20: 8, 30: 10}

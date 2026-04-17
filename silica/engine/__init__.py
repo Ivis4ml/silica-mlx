@@ -166,7 +166,7 @@ class Engine:
         self._req_counter += 1
         return rid
 
-    # --- P-2 Unit 16a: batched generation (B=1 for now) ---
+    # --- P-2 Units 16a / 16b: batched generation ---
 
     def generate_batch(
         self,
@@ -175,8 +175,10 @@ class Engine:
     ) -> Iterator[BatchEvent]:
         """Yield ``BatchEvent`` values driving ``ContinuousBatcher``.
 
-        P-2 Unit 16a **restricts B=1**: ``prompts`` must have length 1
-        (after empty-prompt filtering). 16b extends to B>1.
+        P-2 Unit 16b: all non-empty prompts admit at step 0 as a fixed
+        cohort; mid-run admission (16c) and preemption (16d) are not
+        yet available. Cohort size is whatever ``prompts`` contains
+        after empty-prompt filtering.
 
         ``params`` accepts a single ``SamplingParams`` (homogeneous — the
         P-2 supported case) or a list of length ``len(prompts)``. For
@@ -184,29 +186,30 @@ class Engine:
         raise ``NotImplementedError`` — the union signature is reserved
         so P-3 can land per-row logit stacks without breaking the API.
 
-        Empty prompts are skipped silently. Empty ``prompts`` iterable
-        yields nothing (matches ``Engine.generate`` convention).
+        Empty prompts are skipped silently (their indices are preserved
+        — "`['', 'hi']`" yields events for req_index=1 only). Empty
+        ``prompts`` iterable yields nothing.
         """
         prompts_list = list(prompts)
         effective = _resolve_batch_params(prompts_list, params)
         tokenizer = self._adapter.tokenizer()
 
+        # Pre-tokenize and drop empties while preserving original req_index.
+        admissions: list[tuple[int, list[int]]] = []
+        for req_index, prompt in enumerate(prompts_list):
+            prompt_ids = list(tokenizer.encode(prompt))
+            if prompt_ids:
+                admissions.append((req_index, prompt_ids))
+        if not admissions:
+            return
+
         batcher = ContinuousBatcher(
             self._adapter,
             sampler=self._sampler,
-            max_batch_size=1,
+            max_batch_size=len(admissions),
         )
-
-        admitted_any = False
-        for req_index, prompt in enumerate(prompts_list):
-            prompt_ids = list(tokenizer.encode(prompt))
-            if not prompt_ids:
-                continue
+        for req_index, prompt_ids in admissions:
             batcher.add_request(req_index, prompt_ids, effective)
-            admitted_any = True
-
-        if not admitted_any:
-            return
 
         while batcher.has_active():
             for event in batcher.step():

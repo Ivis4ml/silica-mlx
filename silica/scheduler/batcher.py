@@ -1,14 +1,20 @@
-"""silica.scheduler.batcher — ContinuousBatcher step loop (Unit 16a).
+"""silica.scheduler.batcher — ContinuousBatcher step loop (Units 16a / 16b).
 
 P-2 Opening v2.3 fixes the shape this class will take over Units 16a-d:
 
-  - **16a** (this file): B=1 scaffolding. Build the step-loop phases
+  - **16a** (shipped): B=1 scaffolding. Build the step-loop phases
     (admission / prefill / decode / sample / finalize), the BatchEvent
     stream, the capability gate, and the slot_table + BatchKVCache
-    wiring. Output must be token-identical to P-1's ``Engine.generate``
-    when driven with one request.
-  - **16b**: B>1 mid-cohort admission (all rows admitted at step 0);
-    left-padding across prompts of different lengths.
+    wiring. Output is token-identical to P-1's ``Engine.generate`` on
+    Qwen3-0.6B (acceptance in ``tests/test_p2_preload_parity.py``).
+  - **16b** (this revision): fixed-cohort B>1. All rows admit at step 0
+    via ``add_request`` (admission closes on the first ``step`` call —
+    subsequent calls raise ``NotImplementedError("... 16c")``). Prefill
+    runs as **one** batched forward over the left-padded ``(B, T_max)``
+    token tensor; decode as **one** batched ``(B, 1)`` forward per
+    step. Unit tests pin row isolation and left-padding arithmetic;
+    real-model parity is against direct mlx-lm batched execution because
+    B>1 fp16 batched SDPA can drift from B=1 solo generations.
   - **16c**: mid-run admission via ``BatchKVCache.extend`` + prefix
     cache integration (``RadixPrefixCache.lookup`` + copy source K/V
     into the new row).
@@ -16,23 +22,19 @@ P-2 Opening v2.3 fixes the shape this class will take over Units 16a-d:
     ``RequestState.transition(PREEMPTED)`` + re-admission cycle; abort
     with ``BatchEvent.aborted`` on ``RejectDecision``.
 
-16a wilfully restricts ``max_batch_size`` to 1. Adding a second request
-raises ``NotImplementedError("B > 1 arrives in Unit 16b")`` by design —
-the restriction is what lets 16a stand as a P-1 oracle-parity layer.
-
 Capability gate (Layer 3 of the v2.3 three-layer stack): the batcher
 rejects adapters whose ``attention_pattern`` contains any kind other
-than ``AttentionKind.GLOBAL``. This means:
-  - Plain Qwen3 family: accepted (all GLOBAL).
-  - Qwen3.5 hybrid family: rejected (contains ``HYBRID_DELTANET``).
-    Revisit in P-3 via ``BatchRecurrentStateStore``.
-  - Sliding-window families: rejected until Q-013 probe.
-  - Attention-free / Mamba: rejected until a dedicated scheduler lands.
+than ``AttentionKind.GLOBAL``. Mamba / DeltaNet / sliding / hybrid
+families refuse themselves at this gate; the batcher never checks
+``isinstance``.
 
-Scope note: 16a uses ``BatchKVCache`` even at B=1 to keep the batched
-path load-bearing from day one. Using ``SimpleKVCache`` at B=1 and
-swapping later would hide shape bugs; building on the final cache
-shape now surfaces them immediately.
+Scope note: 16b retains 16a's BatchKVCache-from-day-one choice and adds
+per-row ``left_padding`` arithmetic. Rows that reach a terminal state
+mid-cohort are kept in the batch — they continue to occupy their slot
+in the batched forward (fed a placeholder pad token) but are NOT
+sampled or emitted from. The row's ``generated`` list freezes on
+termination. Actually filtering out finished rows (reclaiming slots /
+reshuffling indices) is 16d's filter+re-index path.
 """
 
 from __future__ import annotations
@@ -57,7 +59,11 @@ class _BatchRow:
     """Per-row state held by the batcher (internal).
 
     One row = one request. The row persists from admission through
-    DECODE / DONE / ABORTED / PREEMPTED. In 16a there is at most one.
+    DECODE / DONE / ABORTED / PREEMPTED. ``generated`` only stores
+    tokens that were sampled and emitted — placeholder feeds used to
+    keep ``_idx`` in lockstep after the row terminates do NOT append
+    here (so ``len(generated)`` keeps a clean "how many tokens did this
+    row actually produce" reading at any point).
     """
 
     req_index: int
@@ -69,7 +75,7 @@ class _BatchRow:
 
 
 class ContinuousBatcher:
-    """P-2 scheduler step loop — Unit 16a B=1 scaffolding."""
+    """P-2 scheduler step loop — Units 16a (B=1) + 16b (fixed-cohort B>1)."""
 
     def __init__(
         self,
@@ -79,10 +85,9 @@ class ContinuousBatcher:
         weight_provider: WeightProvider | None = None,
         max_batch_size: int = 1,
     ) -> None:
-        if max_batch_size != 1:
-            raise NotImplementedError(
-                f"ContinuousBatcher 16a supports max_batch_size=1 only, "
-                f"got {max_batch_size}. B > 1 arrives in Unit 16b."
+        if max_batch_size < 1:
+            raise ValueError(
+                f"max_batch_size must be >= 1, got {max_batch_size}"
             )
         self._enforce_capability_gate(adapter)
         self._adapter = adapter
@@ -90,10 +95,12 @@ class ContinuousBatcher:
         self._model = adapter.build(weight_provider or ResidentWeightProvider())
         self._max_batch_size = max_batch_size
         self._rows: list[_BatchRow] = []
-        # BatchKVCache is allocated lazily on first admission (we need the
-        # adapter's layer count — known at adapter construction — but we
-        # defer the allocation so an unused batcher holds no KV memory).
         self._batch_cache: list[BatchKVCache] | None = None
+        # Cohort-sealing flags (16b). Admission is closed on the first
+        # step() call; after that add_request raises NotImplementedError
+        # naming Unit 16c as the phase that will add mid-run admission.
+        self._admission_closed: bool = False
+        self._cohort_prepared: bool = False
 
     # --- public admission / stepping surface ---
 
@@ -103,15 +110,22 @@ class ContinuousBatcher:
         prompt_ids: list[int],
         params: SamplingParams,
     ) -> None:
-        """Enqueue a new request for the current batch.
+        """Enqueue a request into the current cohort (pre-step only).
 
-        Raises ``NotImplementedError`` once the batch hits
-        ``max_batch_size`` (16a: 1). P-2 Unit 16b relaxes this.
+        Raises:
+            NotImplementedError: if ``step()`` has already been called
+                (cohort sealed; mid-run admission is Unit 16c).
+            RuntimeError: if the batch has already hit ``max_batch_size``.
+            ValueError: if ``prompt_ids`` is empty.
         """
-        if len(self._rows) >= self._max_batch_size:
+        if self._admission_closed:
             raise NotImplementedError(
-                f"ContinuousBatcher max_batch_size={self._max_batch_size} "
-                f"reached; B > 1 arrives in Unit 16b."
+                "Cohort is sealed (step() has been called); mid-run "
+                "admission arrives in Unit 16c."
+            )
+        if len(self._rows) >= self._max_batch_size:
+            raise RuntimeError(
+                f"ContinuousBatcher capacity {self._max_batch_size} reached"
             )
         if not prompt_ids:
             raise ValueError("prompt_ids must be non-empty")
@@ -122,106 +136,164 @@ class ContinuousBatcher:
             token_ids=tuple(prompt_ids),
         )
         state = RequestState(request=request)
-        row = _BatchRow(
-            req_index=req_index,
-            req_id=f"req-{req_index}",
-            prompt_ids=list(prompt_ids),
-            params=params,
-            state=state,
+        self._rows.append(
+            _BatchRow(
+                req_index=req_index,
+                req_id=f"req-{req_index}",
+                prompt_ids=list(prompt_ids),
+                params=params,
+                state=state,
+            )
         )
-        self._rows.append(row)
 
     def has_active(self) -> bool:
         """True iff at least one row is not in a terminal state."""
         return any(not r.state.is_terminal for r in self._rows)
 
     def step(self) -> list[BatchEvent]:
-        """Advance every non-terminal row by one scheduler iteration.
+        """Advance the cohort by one scheduler iteration.
 
-        Per-row behaviour:
-          WAITING  → admit → PREFILL.
-          PREFILL  → one batched forward over the prompt; sample the
-                     first token; emit ``BatchEvent.token``; transition
-                     to DECODE (or DONE if a stop token was hit first).
-          DECODE   → one batched forward on the last generated token;
-                     sample; emit token; transition DONE on stop /
-                     max_tokens.
-          terminal → skipped.
-
-        A row at most progresses one state per step, so 16a-oracle
-        parity with P-1's ``Engine.generate`` is obvious: each step
-        yields exactly one token per active row.
+        The first call seals admission and prepares the batched cache
+        (``_prepare_cohort``). Each call then does **one** batched
+        forward — prefill on the first step (over the full left-padded
+        ``(B, T_max)`` prompt tensor) and decode on all subsequent steps
+        (over a ``(B, 1)`` tensor of either last-generated tokens or
+        pad tokens for already-terminal rows).
         """
-        events: list[BatchEvent] = []
+        if not self._cohort_prepared:
+            self._prepare_cohort()
+        if not self.has_active():
+            return []
+        if any(r.state.status == RequestStatus.PREFILL for r in self._rows):
+            return self._prefill_phase()
+        return self._decode_phase()
+
+    # --- phase methods ---
+
+    def _prepare_cohort(self) -> None:
+        """Seal admission; allocate BatchKVCache with per-row left_padding.
+
+        Rows with shorter prompts get more left padding so that, after
+        the prefill forward, the ``offset[i] == T_max - left_padding[i]``
+        equals each row's true prompt length.
+        """
+        self._admission_closed = True
+        self._cohort_prepared = True
+        if not self._rows:
+            return
+        max_prompt_len = max(len(r.prompt_ids) for r in self._rows)
+        left_padding = [
+            max_prompt_len - len(r.prompt_ids) for r in self._rows
+        ]
+        num_layers = self._adapter.config.num_layers
+        self._batch_cache = [
+            BatchKVCache(left_padding=left_padding) for _ in range(num_layers)
+        ]
         for row in self._rows:
-            if row.state.is_terminal:
-                continue
-            if row.state.status == RequestStatus.WAITING:
-                self._admit_row(row)
-            if row.state.status == RequestStatus.PREFILL:
-                events.extend(self._prefill_row(row))
-            elif row.state.status == RequestStatus.DECODE:
-                events.extend(self._decode_row(row))
-        return events
+            row.state.transition(RequestStatus.PREFILL, reason="admit-cohort")
 
-    # --- phase methods (step() calls these in order) ---
-
-    def _admit_row(self, row: _BatchRow) -> None:
-        """WAITING → PREFILL; lazily allocate the batched cache."""
-        row.state.transition(RequestStatus.PREFILL, reason="admit")
-        if self._batch_cache is None:
-            num_layers = self._adapter.config.num_layers
-            self._batch_cache = [
-                BatchKVCache(left_padding=[0]) for _ in range(num_layers)
-            ]
-
-    def _prefill_row(self, row: _BatchRow) -> list[BatchEvent]:
-        """Run prefill forward, sample first token, transition out."""
+    def _prefill_phase(self) -> list[BatchEvent]:
+        """One batched forward over the left-padded prompt tensor."""
         assert self._batch_cache is not None
-        prompt_arr = mx.array(row.prompt_ids, dtype=mx.int32)
-        tokens_2d = prompt_arr[None]  # (1, T)
+        tokens = self._build_prefill_tokens()  # (B, T_max)
         logits = forward_batched(
-            self._model, tokens_2d, list(self._batch_cache)
-        )  # (1, V)
-        return self._sample_and_emit(row, logits, is_prefill=True)
+            self._model, tokens, list(self._batch_cache)
+        )  # (B, V)
+        return self._sample_and_emit_batched(logits, is_prefill=True)
 
-    def _decode_row(self, row: _BatchRow) -> list[BatchEvent]:
-        """Run decode forward on the last sampled token; sample next."""
+    def _decode_phase(self) -> list[BatchEvent]:
+        """One batched forward at ``T=1`` over all rows.
+
+        Terminal rows are fed ``pad_token_id`` as a placeholder so the
+        batch axis stays fixed (16d's filter path is what actually
+        reclaims terminal slots). Their output logits are discarded.
+        """
         assert self._batch_cache is not None
-        last_tok = row.generated[-1]
-        step_in = mx.array([[last_tok]], dtype=mx.int32)  # (1, 1)
+        tokens = self._build_decode_tokens()  # (B, 1)
         logits = forward_batched(
-            self._model, step_in, list(self._batch_cache)
-        )  # (1, V)
-        return self._sample_and_emit(row, logits, is_prefill=False)
+            self._model, tokens, list(self._batch_cache)
+        )  # (B, V)
+        return self._sample_and_emit_batched(logits, is_prefill=False)
 
-    def _sample_and_emit(
+    def _sample_and_emit_batched(
         self,
-        row: _BatchRow,
         batched_logits: mx.array,
         *,
         is_prefill: bool,
     ) -> list[BatchEvent]:
-        """Shared sample + emit + state-transition tail for prefill and decode."""
-        row_logits = batched_logits[0]  # (V,)
-        history_ids = list(row.prompt_ids) + list(row.generated)
-        history = mx.array(history_ids, dtype=mx.int32)
-        token_scalar = self._sampler.sample(row_logits, history, row.params)
-        tok = int(token_scalar.item())
-        row.generated.append(tok)
+        """Per-row sample / emit / state-transition over a ``(B, V)`` tensor.
 
-        events: list[BatchEvent] = [BatchEvent.token(row.req_index, tok)]
+        Terminal rows are skipped — they occupied a slot in the forward
+        (to keep ``_idx`` in lockstep) but contribute no token event.
+        Live rows sample, append to ``row.generated``, and transition
+        according to stop / max_tokens rules.
+        """
+        events: list[BatchEvent] = []
+        for i, row in enumerate(self._rows):
+            if row.state.is_terminal:
+                continue
+            row_logits = batched_logits[i]  # (V,)
+            history_ids = list(row.prompt_ids) + list(row.generated)
+            history = mx.array(history_ids, dtype=mx.int32)
+            token_scalar = self._sampler.sample(
+                row_logits, history, row.params
+            )
+            tok = int(token_scalar.item())
+            row.generated.append(tok)
+            events.append(BatchEvent.token(row.req_index, tok))
 
-        if tok in row.params.stop_token_ids:
-            row.state.transition(RequestStatus.DONE, reason="stop_token")
-            events.append(BatchEvent.done(row.req_index, "stop_token"))
-        elif len(row.generated) >= row.params.max_tokens:
-            row.state.transition(RequestStatus.DONE, reason="max_tokens")
-            events.append(BatchEvent.done(row.req_index, "max_tokens"))
-        elif is_prefill:
-            row.state.transition(RequestStatus.DECODE, reason="prefill_done")
-        # Plain DECODE continuation: no transition; next step runs decode.
+            if tok in row.params.stop_token_ids:
+                row.state.transition(RequestStatus.DONE, reason="stop_token")
+                events.append(BatchEvent.done(row.req_index, "stop_token"))
+            elif len(row.generated) >= row.params.max_tokens:
+                row.state.transition(RequestStatus.DONE, reason="max_tokens")
+                events.append(BatchEvent.done(row.req_index, "max_tokens"))
+            elif is_prefill:
+                row.state.transition(
+                    RequestStatus.DECODE, reason="prefill_done"
+                )
+            # Plain DECODE continuation: no transition; stays DECODE.
         return events
+
+    # --- tensor construction helpers ---
+
+    def _build_prefill_tokens(self) -> mx.array:
+        """Construct the left-padded ``(B, T_max)`` prompt tensor."""
+        max_len = max(len(r.prompt_ids) for r in self._rows)
+        pad = self._pad_token_id()
+        rows_2d: list[list[int]] = []
+        for row in self._rows:
+            pad_amt = max_len - len(row.prompt_ids)
+            rows_2d.append([pad] * pad_amt + list(row.prompt_ids))
+        return mx.array(rows_2d, dtype=mx.int32)
+
+    def _build_decode_tokens(self) -> mx.array:
+        """Construct the ``(B, 1)`` next-step token tensor.
+
+        Live rows feed their last generated token; terminal rows feed
+        ``_pad_token_id`` to keep the batch axis fixed without
+        polluting ``row.generated``.
+        """
+        pad = self._pad_token_id()
+        rows_2d: list[list[int]] = []
+        for row in self._rows:
+            if row.state.is_terminal:
+                rows_2d.append([pad])
+            else:
+                rows_2d.append([row.generated[-1]])
+        return mx.array(rows_2d, dtype=mx.int32)
+
+    def _pad_token_id(self) -> int:
+        """Placeholder token id for left-padded and terminal-row slots.
+
+        Hardcoded to 0 in 16b — the left-padded positions are masked
+        out by the attention mask (BatchKVCache's left_padding metadata
+        drives the mask) and terminal rows' logits are discarded, so
+        the numerical effect is unobservable. Encapsulated as a method
+        so a future ``Tokenizer`` Protocol extension that exposes
+        ``pad_token_id`` can be wired in at one call site.
+        """
+        return 0
 
     # --- capability gate ---
 

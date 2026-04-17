@@ -159,18 +159,27 @@ def test_all_empty_prompts_yield_nothing() -> None:
     assert events == []
 
 
-# --- B>1 restriction ---
+# --- B>1 cohort ---
 
 
-def test_multiple_non_empty_prompts_raise_until_unit_16b() -> None:
-    engine = _make_engine(script=[1] * 10)
-    with pytest.raises(NotImplementedError, match="16b"):
-        # Start iterating so the generator actually runs through add_request.
-        list(engine.generate_batch(["hi", "there"], _greedy()))
+def test_multiple_prompts_produce_per_row_events() -> None:
+    """Two non-empty prompts admit as a cohort; per-row events come through."""
+    # This Engine-level fixture is intentionally coarse: each batched forward
+    # pops ONE target and all rows in the batch see the SAME target that step.
+    # With max_tokens=2, B=2 we get 2 forwards:
+    # prefill pops target_a → both rows sample target_a;
+    # decode pops target_b → both rows sample target_b.
+    # Row-specific logits are covered in tests/test_batcher.py.
+    engine = _make_engine(script=[5, 7])
+    events = list(engine.generate_batch(["hi", "there"], _greedy(max_tokens=2)))
+    row_0 = [e.token_id for e in events if e.kind == "token" and e.req_index == 0]
+    row_1 = [e.token_id for e in events if e.kind == "token" and e.req_index == 1]
+    assert row_0 == [5, 7]
+    assert row_1 == [5, 7]
 
 
-def test_one_empty_and_one_real_prompt_is_b1_not_b2() -> None:
-    """Empty prompts are skipped, so ["", "hi"] is effectively B=1."""
+def test_one_empty_and_one_real_prompt_is_b1() -> None:
+    """Empty prompts are skipped; ["", "hi"] runs as B=1 at req_index=1."""
     engine = _make_engine(script=[9])
     events = list(engine.generate_batch(["", "hi"], _greedy(max_tokens=1)))
     tokens = [e for e in events if e.kind == "token"]
