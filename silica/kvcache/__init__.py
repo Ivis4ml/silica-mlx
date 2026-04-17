@@ -10,6 +10,7 @@ from silica.kvcache.manager import (
     PrefixHit,
 )
 from silica.kvcache.paged import PagedKVCache, RowState
+from silica.kvcache.prefix import RadixPrefixCache
 from silica.kvcache.simple import SimpleKVCache
 
 __all__ = [
@@ -23,6 +24,7 @@ __all__ = [
     "NullKVManager",
     "PagedKVCache",
     "PrefixHit",
+    "RadixPrefixCache",
     "RowState",
     "SimpleKVCache",
 ]
