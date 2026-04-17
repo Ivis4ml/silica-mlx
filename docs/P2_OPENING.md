@@ -194,13 +194,21 @@ slot_table:  dict[req_id, int]          # req_id → batch_row
 row_state:   list[RowState]             # row index → {FREE, RESERVED, ACTIVE}
 ```
 
-**Invariant for P-2:** a request's row is **fixed for its lifetime**. On
-admit we allocate a FREE row and move it to RESERVED; prefill transitions
-it to ACTIVE; on DONE / ABORTED / free the row returns to FREE. No mid-
-request row compaction — a finishing request's row may leave a hole which
-future admissions fill, but live requests never move. This is a deliberate
-P-2 simplification: compaction is an optimisation; the skeleton does not
-need it and debugging without compaction is dramatically easier.
+**Invariant for P-2 (v2.2, updated per Gate-0.5):** The ``slot_table``
+mapping is **stable within a contiguous no-filter interval**. Concretely:
+
+- `extend` (admission) preserves existing rows' indices and appends new
+  rows at `[B_self, B_self+1, …]` — no reshuffle, no slot rebuild.
+- `filter([kept_indices])` (preempt / release) **re-indexes** kept rows
+  to `0..len(kept)-1` in the order of the indices list; the scheduler
+  rebuilds `slot_table` from that ordering immediately after the call.
+
+The earlier ``row_state`` with RESERVED/ACTIVE/FREE states is retained
+for semantic clarity but **does not** imply the physical row persists
+when FREE — we compact via `filter` rather than keeping row holes, which
+matches mlx-lm's `BatchKVCache` behaviour (there is no in-place "empty
+the row" primitive; the only way to reclaim is `filter`). Gate-0.5
+confirmed this compaction is cheap (~0.6 ms / op at B=8).
 
 #### Layer B: logical page table (the prefix-cache metadata)
 
@@ -261,6 +269,14 @@ share physical K / V pages. Concretely:
   A block with prefix-cache refcount > 0 cannot be reclaimed to the free
   list — it survives beyond its originating request's lifetime so that
   future admissions can copy from it.
+- **Eager-extract requirement (v2.2, per Gate-0.5):** When the owning
+  request of a pinned block transitions to DONE / ABORTED / PREEMPTED,
+  the scheduler must call `BatchKVCache.extract(row)` to detach that
+  request's K/V **before** the `filter` call that drops the row —
+  otherwise the K/V is lost with the filtered row. The detached
+  per-layer `KVCache` is stored inside `RadixPrefixCache` (keyed by
+  block id); on a later prefix hit the batcher copies from this detached
+  storage into the new request's row.
 - On admit, the batcher calls `lookup(tokens)`; the returned blocks are
   copied into the new request's row (cheap — a slice assignment per
   layer), and the source blocks' refcount stays pinned.
@@ -528,12 +544,27 @@ natural point to re-evaluate against real numbers.
   in P-2; they are model-agnostic and batch-agnostic.
 - `silica.kvcache.simple.SimpleKVCache` — stays as the single-request path.
   P-1's Engine.generate remains fully functional on Qwen3.5.
-- `silica.mlx.runner.forward` — gets extended to handle batched `(B, T)`
-  input (trivially — shape check relaxation), but the function body is
-  unchanged semantically.
+- `silica.mlx.runner` — the single-request `forward((T,), cache_list)
+  -> (V,)` stays; **v2.2** adds a sibling `forward_batched((B, T),
+  cache_list) -> (B, V)` returning per-row last-position logits.
+  ``forward`` becomes an adapter that wraps ``forward_batched`` with
+  ``tokens[None]`` / ``logits[0]`` so P-1 callers stay unchanged.
 - `silica.models.qwen3.Qwen3Adapter` — gains a batched prefill / decode_step
   path, but the single-request methods stay identical.
 - I-1..I-5 Protocol signatures — **frozen per P-0 exit**. No change.
+
+## Amendment ledger
+
+- **v2.2 (2026-04-17, after Gate-0.5)**: Layer-A row invariant changed
+  from "row fixed for lifetime" to "slot_table stable within no-filter
+  interval"; option-B eager-extract requirement spelled out;
+  `runner.forward_batched` signature added. See `docs/P2_GATE_0_5.md`
+  for the primitives and probe results that drove these changes.
+- **v2.1 (2026-04-16)**: Hard scope statement; option-B prefix semantics;
+  slot_table + row_state invariant (original form); pure-FSM
+  RequestState; BatchEvent / union-params signature; reserved vs resident
+  split; Gate-0 upgraded to blocking; acceptance sharpened.
+- **v2 (2026-04-16)**: First full proposal after review of v1.
 
 ## Proposed decision-log delta (for subsequent PLAN.md update)
 
