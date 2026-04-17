@@ -211,13 +211,12 @@ class Engine:
         for req_index, prompt_ids in admissions:
             batcher.add_request(req_index, prompt_ids, effective)
 
-        # Uses has_active for now (16b semantics). Unit 16c.1 step 2
-        # will flip this to has_work() once reclaim is implemented —
-        # see ``docs/P2_UNIT_16C_PREP.md`` §1 I-5. Switching prematurely
-        # would infinite-loop because step() currently returns [] when
-        # has_active is False but has_work stays True from terminal-
-        # pending-reclaim rows.
-        while batcher.has_active():
+        # Uses has_work (not has_active) so cohort-drain completes even
+        # when the last sample phase terminates every row — the step()
+        # after the last active row handles deferred reclaim, which
+        # empties ``self._rows`` and flips has_work to False. See
+        # ``docs/P2_UNIT_16C_PREP.md`` §1 I-5.
+        while batcher.has_work():
             for event in batcher.step():
                 yield event
 

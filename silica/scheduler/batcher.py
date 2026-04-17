@@ -119,6 +119,10 @@ class ContinuousBatcher:
         # admit phase of step(). In 16b paths it stays empty — 16c.1
         # mid-run admission wires it into step() in a subsequent patch.
         self._waiting_queue: deque[_PendingAdmit] = deque()
+        # Slot table (16c.1): req_index → current row index. Rebuilt
+        # after every filter (§1 I-3). Kept as an observable field so
+        # tests can verify post-reclaim coherence directly.
+        self._slot_table: dict[int, int] = {}
 
     # --- public admission / stepping surface ---
 
@@ -154,6 +158,7 @@ class ContinuousBatcher:
             token_ids=tuple(prompt_ids),
         )
         state = RequestState(request=request)
+        new_row_idx = len(self._rows)
         self._rows.append(
             _BatchRow(
                 req_index=req_index,
@@ -163,6 +168,7 @@ class ContinuousBatcher:
                 state=state,
             )
         )
+        self._slot_table[req_index] = new_row_idx
 
     def has_active(self) -> bool:
         """True iff at least one row is not in a terminal state.
@@ -190,15 +196,29 @@ class ContinuousBatcher:
     def step(self) -> list[BatchEvent]:
         """Advance the cohort by one scheduler iteration.
 
-        The first call seals admission and prepares the batched cache
-        (``_prepare_cohort``). Each call then does **one** batched
-        forward — prefill on the first step (over the full left-padded
-        ``(B, T_max)`` prompt tensor) and decode on all subsequent steps
-        (over a ``(B, 1)`` tensor of either last-generated tokens or
-        pad tokens for already-terminal rows).
+        Phase order (16c.1 step 2 onwards):
+
+          1. **Reclaim** — drop terminal rows from ``self._rows`` and
+             from the batched cache. If all rows were terminal, reset
+             the batched cache to ``None`` so a future admit can
+             install a fresh one instead of extending into stale
+             physical rows. Docs: §1 I-5 + §4 Reclaim flow.
+          2. (16c.1 step 3) Admit — drain the waiting queue into new
+             rows via extend. Not yet wired in step 2.
+          3. **Forward** — one batched prefill (if any row is PREFILL)
+             or one batched decode (otherwise).
+
+        The first call still seals admission and prepares the batched
+        cache via ``_prepare_cohort`` before reclaim runs.
         """
         if not self._cohort_prepared:
             self._prepare_cohort()
+
+        # Phase 1: reclaim deferred terminals (16c.1 step 2).
+        self._reclaim_terminated()
+
+        # Phase 3: forward. Admit phase (16c.1 step 3) will slot in
+        # between Phase 1 and Phase 3 once mid-run admission is wired.
         if not self.has_active():
             return []
         if any(r.state.status == RequestStatus.PREFILL for r in self._rows):
@@ -228,6 +248,52 @@ class ContinuousBatcher:
         ]
         for row in self._rows:
             row.state.transition(RequestStatus.PREFILL, reason="admit-cohort")
+
+    def _reclaim_terminated(self) -> None:
+        """Drop terminal rows from the batch before the forward phase.
+
+        Per ``docs/P2_UNIT_16C_PREP.md`` §4 Reclaim flow:
+
+          - If no row is terminal, no-op (cheap path; most steps).
+          - Otherwise compute ``kept`` and either (a) ``filter(kept)`` on
+            each layer's BatchKVCache + prune ``self._rows`` and
+            rebuild ``self._slot_table`` (partial reclaim), or (b)
+            reset ``self._batch_cache = None`` entirely if ``kept`` is
+            empty — extending into a batch of all-stale rows would
+            corrupt future admissions (§4 Fix 2).
+
+        Called at the top of every ``step()`` (after ``_prepare_cohort``).
+        16c.2 will add an eager-extract hook here, *before* ``filter``,
+        to detach pinned K/V for the prefix cache.
+        """
+        if not any(r.state.is_terminal for r in self._rows):
+            return
+        kept = [i for i, r in enumerate(self._rows) if not r.state.is_terminal]
+        if not kept:
+            # Every row terminated in the last step. The batched cache
+            # is full of stale K/V no live row owns; extending into it
+            # would put new rows after the stale rows, corrupting
+            # slot_table. Drop it — Phase 2 admit (16c.1 step 3) will
+            # install a fresh cache on the next admission wave.
+            self._rows = []
+            self._slot_table = {}
+            self._batch_cache = None
+            return
+        assert self._batch_cache is not None
+        for layer_cache in self._batch_cache:
+            layer_cache.filter(kept)
+        self._rows = [self._rows[i] for i in kept]
+        self._rebuild_slot_table()
+
+    def _rebuild_slot_table(self) -> None:
+        """Re-derive ``slot_table`` from the current ``self._rows``.
+
+        Must be called after any operation that reshuffles
+        ``self._rows`` — notably ``filter`` (which mlx-lm's BatchKVCache
+        re-indexes to ``0..K-1``) and, in 16c.1 step 3, ``extend`` (to
+        record the newly-admitted rows' indices).
+        """
+        self._slot_table = {row.req_index: i for i, row in enumerate(self._rows)}
 
     def _prefill_phase(self) -> list[BatchEvent]:
         """One batched forward over the left-padded prompt tensor."""

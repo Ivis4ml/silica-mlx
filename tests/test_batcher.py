@@ -541,3 +541,77 @@ def test_has_work_true_when_waiting_queue_populated() -> None:
     )
     assert not b.has_active()
     assert b.has_work()
+
+
+# --- Reclaim phase (Unit 16c.1 step 2) -------------------------------------
+
+
+def test_slot_table_populated_on_admission() -> None:
+    adapter = _ScriptedAdapter()
+    b = ContinuousBatcher(adapter, max_batch_size=3)
+    b.add_request(10, [1, 2], _greedy())
+    b.add_request(20, [3, 4], _greedy())
+    b.add_request(30, [5, 6], _greedy())
+    assert b._slot_table == {10: 0, 20: 1, 30: 2}  # type: ignore[attr-defined]
+
+
+def test_reclaim_drops_terminal_rows_and_rebuilds_slot_table() -> None:
+    """One row finishes mid-cohort; the next step() reclaims it and
+    slot_table re-indexes the survivors."""
+    # step 1 prefill: B=3 (all three rows); row 10 hits max_tokens=1 → DONE.
+    # step 2 decode: B=2 after reclaim (rows 20, 30 only).
+    adapter = _ScriptedAdapter(script=[(7, 8, 9), (11, 12)])
+    b = ContinuousBatcher(adapter, max_batch_size=3)
+    b.add_request(10, [1, 2], _greedy(max_tokens=1))
+    b.add_request(20, [3, 4], _greedy(max_tokens=3))
+    b.add_request(30, [5, 6], _greedy(max_tokens=3))
+    b.step()  # prefill
+    # Row 10 terminal; still in self._rows pending reclaim.
+    assert len(b._rows) == 3  # type: ignore[attr-defined]
+    # Next step's reclaim phase fires first, then decode runs at B=2.
+    b.step()
+    assert len(b._rows) == 2  # type: ignore[attr-defined]
+    # Survivors re-indexed 0..K-1 in kept order.
+    assert b._slot_table == {20: 0, 30: 1}  # type: ignore[attr-defined]
+    assert [r.req_index for r in b._rows] == [20, 30]  # type: ignore[attr-defined]
+
+
+def test_reclaim_with_all_terminal_resets_batch_cache_to_none() -> None:
+    """If every row terminates, reclaim must null the batch cache so a
+    future admit installs a fresh one (not extend into stale rows).
+    §4 Fix 2 from P2_UNIT_16C_PREP.md."""
+    adapter = _ScriptedAdapter(script=[(7, 11)])  # both rows sample and finish
+    b = ContinuousBatcher(adapter, max_batch_size=2)
+    b.add_request(10, [1], _greedy(max_tokens=1))  # finishes immediately
+    b.add_request(20, [2], _greedy(max_tokens=1))  # finishes immediately
+    b.step()  # both DONE
+    # Terminal rows still in self._rows; batch_cache still allocated.
+    assert b._batch_cache is not None  # type: ignore[attr-defined]
+    # Next step's reclaim fires with kept=[] → full reset.
+    b.step()
+    assert b._rows == []  # type: ignore[attr-defined]
+    assert b._slot_table == {}  # type: ignore[attr-defined]
+    assert b._batch_cache is None  # type: ignore[attr-defined]
+    assert not b.has_work()
+
+
+def test_engine_drain_uses_has_work_not_has_active() -> None:
+    """After step 2, Engine's drain loop runs a trailing step() to reclaim
+    the last terminal rows before exiting. Observable via total event
+    count + final batcher state."""
+    # Engine-level test lives in test_engine_generate_batch.py; here we
+    # just verify that the batcher drains cleanly when called directly.
+    adapter = _ScriptedAdapter(script=[5])
+    b = ContinuousBatcher(adapter)
+    b.add_request(0, [1, 2], _greedy(max_tokens=1))
+
+    step1 = b.step()
+    assert len(step1) == 2  # token + done
+    # Terminal row pending reclaim; has_work still True.
+    assert not b.has_active()
+    assert b.has_work()
+
+    # One more step → reclaim empties self._rows.
+    step2 = b.step()
+    assert step2 == []  # reclaim runs, no forward to emit
+    assert not b.has_work()
