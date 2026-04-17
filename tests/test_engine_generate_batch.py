@@ -236,5 +236,62 @@ def test_params_wrong_type_raises() -> None:
         list(engine.generate_batch(["hi"], "not-params"))  # type: ignore[arg-type]
 
 
+# --- Queue-bounded admission (Unit 16c.1 step 4) --------------------------
+
+
+def test_max_batch_size_knob_rejects_below_one() -> None:
+    engine = _make_engine(script=[])
+    with pytest.raises(ValueError, match="must be >= 1"):
+        list(engine.generate_batch(["hi"], _greedy(), max_batch_size=0))
+
+
+def test_max_batch_size_default_admits_all() -> None:
+    """No explicit max_batch_size → all non-empty prompts admit at step 0
+    (16b default preserved)."""
+    engine = _make_engine(script=[5])
+    events = list(
+        engine.generate_batch(
+            ["hi", "there", "world"], _greedy(max_tokens=1)
+        )
+    )
+    tokens = [e for e in events if e.kind == "token"]
+    assert {e.req_index for e in tokens} == {0, 1, 2}
+
+
+def test_queue_bounded_admission_drains_backlog() -> None:
+    """4 prompts with max_batch_size=2: first 2 admit at step 0, next 2
+    admit as the initial cohort finishes and reclaims free slots."""
+    engine = _make_engine(script=[5] * 20)
+    events = list(
+        engine.generate_batch(
+            ["p0", "p1", "p2", "p3"],
+            _greedy(max_tokens=1),
+            max_batch_size=2,
+        )
+    )
+    # All 4 requests eventually emit their 1 token and terminate.
+    tokens_by_req = {e.req_index: e.token_id for e in events if e.kind == "token"}
+    dones_by_req = {e.req_index for e in events if e.kind == "done"}
+    assert tokens_by_req == {0: 5, 1: 5, 2: 5, 3: 5}
+    assert dones_by_req == {0, 1, 2, 3}
+
+
+def test_queue_bounded_preserves_req_index_ordering() -> None:
+    """Mid-run admits preserve original req_index (not reshuffled)."""
+    engine = _make_engine(script=[5] * 20)
+    events = list(
+        engine.generate_batch(
+            ["p0", "p1", "p2"],
+            _greedy(max_tokens=1),
+            max_batch_size=1,
+        )
+    )
+    # First event per req_index ordering: 0, 1, 2 in queue order.
+    first_token_req_indices = [
+        e.req_index for e in events if e.kind == "token"
+    ]
+    assert first_token_req_indices == [0, 1, 2]
+
+
 # --- P-1 regression coverage lives in tests/test_engine.py; this file
 #     focuses on the generate_batch (P-2 Unit 16a) surface exclusively. ---

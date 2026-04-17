@@ -145,6 +145,50 @@ def test_silica_batched_matches_mlx_lm_direct_batched() -> None:
 
 
 @pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
+def test_eight_concurrent_with_queue_bounded_admission() -> None:
+    """PLAN §7 P-2 acceptance #1: 8 concurrent requests run stably.
+
+    With max_batch_size=4, the first 4 prompts admit as the initial
+    cohort; the remaining 4 sit in the waiting queue and admit as
+    slots free via reclaim. All 8 eventually terminate; per-row
+    tokens are deterministic across runs.
+    """
+    adapter, kv = Qwen3Adapter.from_hf_repo(REPO)
+    params = SamplingParams(temperature=0.0, max_tokens=MAX_TOKENS)
+    prompts = [
+        f"The capital of country {i} is" for i in range(8)
+    ]
+
+    engine = Engine(adapter, kv)
+    events = list(
+        engine.generate_batch(prompts, params, max_batch_size=4)
+    )
+
+    # Every req_index emits a done event.
+    dones = {e.req_index: e.finish_reason for e in events if e.kind == "done"}
+    assert dones == dict.fromkeys(range(8), "max_tokens")
+
+    # Each request produces exactly MAX_TOKENS tokens.
+    tokens_by_req: dict[int, list[int]] = {i: [] for i in range(8)}
+    for e in events:
+        if e.kind == "token" and e.token_id is not None:
+            tokens_by_req[e.req_index].append(e.token_id)
+    for i in range(8):
+        assert len(tokens_by_req[i]) == MAX_TOKENS
+
+    # Determinism: same input → same tokens across a fresh Engine/batcher.
+    engine2 = Engine(adapter, kv)
+    events2 = list(
+        engine2.generate_batch(prompts, params, max_batch_size=4)
+    )
+    tokens_by_req2: dict[int, list[int]] = {i: [] for i in range(8)}
+    for e in events2:
+        if e.kind == "token" and e.token_id is not None:
+            tokens_by_req2[e.req_index].append(e.token_id)
+    assert tokens_by_req == tokens_by_req2
+
+
+@pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
 def test_left_padding_does_not_corrupt_any_row() -> None:
     """With unequal prompt lengths, verify that the cohort still runs
     without error and produces deterministic output equal to a

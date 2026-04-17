@@ -166,29 +166,40 @@ class Engine:
         self._req_counter += 1
         return rid
 
-    # --- P-2 Units 16a / 16b: batched generation ---
+    # --- P-2 Units 16a / 16b / 16c.1: batched generation ---
 
     def generate_batch(
         self,
         prompts: Sequence[str],
         params: SamplingParams | list[SamplingParams] | None = None,
+        *,
+        max_batch_size: int | None = None,
     ) -> Iterator[BatchEvent]:
         """Yield ``BatchEvent`` values driving ``ContinuousBatcher``.
 
-        P-2 Unit 16b: all non-empty prompts admit at step 0 as a fixed
-        cohort; mid-run admission (16c) and preemption (16d) are not
-        yet available. Cohort size is whatever ``prompts`` contains
-        after empty-prompt filtering.
+        As of Unit 16c.1, the batcher supports **queue-bounded
+        admission**: if ``len(prompts)`` exceeds ``max_batch_size``,
+        the first ``max_batch_size`` prompts admit as the initial
+        cohort, the rest sit in the waiting queue, and the admit
+        phase drains the backlog as slots free via reclaim. Mid-run
+        admission uses ``BatchKVCache.extend``.
 
-        ``params`` accepts a single ``SamplingParams`` (homogeneous — the
-        P-2 supported case) or a list of length ``len(prompts)``. For
-        P-2 all elements of the list must be equal; heterogeneous lists
-        raise ``NotImplementedError`` — the union signature is reserved
-        so P-3 can land per-row logit stacks without breaking the API.
+        Args:
+            prompts: one or more prompts. Empty strings are skipped
+                silently (their ``req_index`` stays mapped to the
+                original position in the list).
+            params: a single ``SamplingParams`` (homogeneous, the P-2
+                supported case) or a list of length ``len(prompts)``.
+                For P-2 all elements of the list must be equal;
+                heterogeneous lists raise ``NotImplementedError``.
+            max_batch_size: optional cap on **active physical rows**
+                (not queue length). Defaults to the number of
+                non-empty prompts so all admit at step 0 — preserving
+                the fixed-cohort 16b behaviour for small batches.
+                Callers testing queue-bounded admission explicitly
+                pass e.g. ``max_batch_size=4`` with 8 prompts.
 
-        Empty prompts are skipped silently (their indices are preserved
-        — "`['', 'hi']`" yields events for req_index=1 only). Empty
-        ``prompts`` iterable yields nothing.
+        Empty ``prompts`` iterable yields nothing.
         """
         prompts_list = list(prompts)
         effective = _resolve_batch_params(prompts_list, params)
@@ -203,13 +214,39 @@ class Engine:
         if not admissions:
             return
 
+        effective_batch_size = (
+            max_batch_size if max_batch_size is not None else len(admissions)
+        )
+        if effective_batch_size < 1:
+            raise ValueError(
+                f"max_batch_size must be >= 1, got {max_batch_size}"
+            )
+
         batcher = ContinuousBatcher(
             self._adapter,
             sampler=self._sampler,
-            max_batch_size=len(admissions),
+            max_batch_size=effective_batch_size,
         )
-        for req_index, prompt_ids in admissions:
-            batcher.add_request(req_index, prompt_ids, effective)
+        # First ``effective_batch_size`` admits go pre-step (direct
+        # append); the remainder queue for mid-run admission. The
+        # split matches what ``ContinuousBatcher.add_request`` does
+        # based on the ``_cohort_prepared`` flag, but we drive it
+        # explicitly here so the initial cohort is deterministic.
+        for i, (req_index, prompt_ids) in enumerate(admissions):
+            if i < effective_batch_size:
+                batcher.add_request(req_index, prompt_ids, effective)
+        # Remaining prompts: prepare cohort via a bootstrap step so
+        # subsequent add_request calls route to the waiting queue.
+        remainder = admissions[effective_batch_size:]
+        if remainder:
+            # The first step() call seals the pre-step cohort; we peel
+            # one step's events out for the caller and then queue the
+            # backlog, which the ongoing drain loop will admit as
+            # slots free.
+            for event in batcher.step():
+                yield event
+            for req_index, prompt_ids in remainder:
+                batcher.add_request(req_index, prompt_ids, effective)
 
         # Uses has_work (not has_active) so cohort-drain completes even
         # when the last sample phase terminates every row — the step()
