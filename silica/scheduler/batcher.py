@@ -39,6 +39,7 @@ reshuffling indices) is 16d's filter+re-index path.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 
 import mlx.core as mx
@@ -52,6 +53,19 @@ from silica.mlx.runner import forward_batched
 from silica.models.adapter import AttentionKind, ModelAdapter
 from silica.weights.provider import WeightProvider
 from silica.weights.resident import ResidentWeightProvider
+
+
+@dataclass(frozen=True)
+class _PendingAdmit:
+    """One request waiting for cohort admission (16c.1).
+
+    Only held in the batcher's waiting queue; popped into an active
+    ``_BatchRow`` during the admit phase of some future ``step()``.
+    """
+
+    req_index: int
+    prompt_ids: tuple[int, ...]
+    params: SamplingParams
 
 
 @dataclass
@@ -101,6 +115,10 @@ class ContinuousBatcher:
         # naming Unit 16c as the phase that will add mid-run admission.
         self._admission_closed: bool = False
         self._cohort_prepared: bool = False
+        # Waiting queue (16c.1). Populated by add_request; drained by the
+        # admit phase of step(). In 16b paths it stays empty — 16c.1
+        # mid-run admission wires it into step() in a subsequent patch.
+        self._waiting_queue: deque[_PendingAdmit] = deque()
 
     # --- public admission / stepping surface ---
 
@@ -147,8 +165,27 @@ class ContinuousBatcher:
         )
 
     def has_active(self) -> bool:
-        """True iff at least one row is not in a terminal state."""
+        """True iff at least one row is not in a terminal state.
+
+        Literal semantics — used by internal phase decisions. After
+        16c.1 step 2 lands reclaim, Engine's drain loop should use
+        :py:meth:`has_work` because terminal rows pending reclaim keep
+        ``self._rows`` populated even when ``has_active()`` is already
+        False.
+        """
         return any(not r.state.is_terminal for r in self._rows)
+
+    def has_work(self) -> bool:
+        """True iff anything remains that the next ``step`` could do.
+
+        Covers three distinct states: an active row, a terminal row
+        that has not yet been reclaimed (deferred reclaim — see
+        ``docs/P2_UNIT_16C_PREP.md`` §1 I-5), or a pending request in
+        the waiting queue. ``Engine.generate_batch`` will loop on this
+        once 16c.1 step 2 lands reclaim, so the cohort drains cleanly
+        even when the last sample phase terminates every row.
+        """
+        return bool(self._waiting_queue) or bool(self._rows)
 
     def step(self) -> list[BatchEvent]:
         """Advance the cohort by one scheduler iteration.

@@ -482,3 +482,62 @@ def test_b_gt_1_per_row_sampling_is_independent() -> None:
         if e.kind == "token" and e.token_id is not None
     }
     assert tokens_by_req == {10: 6, 20: 8, 30: 10}
+
+
+# --- has_active / has_work predicate split (Unit 16c.1 step 1) -------------
+
+
+def test_has_active_and_has_work_false_before_any_request() -> None:
+    """Empty batcher: neither predicate is True."""
+    b = ContinuousBatcher(_ScriptedAdapter())
+    assert not b.has_active()
+    assert not b.has_work()
+
+
+def test_has_work_tracks_active_rows() -> None:
+    """Adding a (pre-admit) row registers as both active and work."""
+    adapter = _ScriptedAdapter(script=[1])
+    b = ContinuousBatcher(adapter)
+    b.add_request(0, [1, 2], _greedy(max_tokens=1))
+    assert b.has_active()
+    assert b.has_work()
+
+
+def test_has_active_false_has_work_true_on_pending_reclaim() -> None:
+    """After the last sample phase terminates the last row, has_active goes
+    False but has_work stays True — the terminal row is still in
+    self._rows awaiting deferred reclaim at the next step start."""
+    adapter = _ScriptedAdapter(script=[5])
+    b = ContinuousBatcher(adapter)
+    b.add_request(0, [1, 2], _greedy(max_tokens=1))
+    b.step()  # prefill → sample → max_tokens hit → DONE; row stays in self._rows
+    assert not b.has_active()
+    # Terminal rows still occupy self._rows; has_work must report True so
+    # Engine.generate_batch's drain loop continues to the reclaim step
+    # (which will be added in 16c.1 step 2).
+    assert b.has_work()
+
+
+def test_has_work_false_after_rows_cleared() -> None:
+    """If terminal rows are drained manually, has_work turns False."""
+    adapter = _ScriptedAdapter(script=[5])
+    b = ContinuousBatcher(adapter)
+    b.add_request(0, [1, 2], _greedy(max_tokens=1))
+    b.step()
+    # Simulate reclaim (16c.1 step 2 patch will make this automatic).
+    b._rows.clear()  # type: ignore[attr-defined]
+    assert not b.has_active()
+    assert not b.has_work()
+
+
+def test_has_work_true_when_waiting_queue_populated() -> None:
+    """A pending admit in _waiting_queue counts as work even if no active
+    rows exist yet. Forward-compat for 16c.1 step 3."""
+    from silica.scheduler.batcher import _PendingAdmit
+
+    b = ContinuousBatcher(_ScriptedAdapter())
+    b._waiting_queue.append(  # type: ignore[attr-defined]
+        _PendingAdmit(req_index=0, prompt_ids=(1,), params=_greedy())
+    )
+    assert not b.has_active()
+    assert b.has_work()
