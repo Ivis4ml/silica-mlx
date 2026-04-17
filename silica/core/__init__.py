@@ -1,5 +1,29 @@
 """Silica core — data types, logging, profiling (no business logic)."""
 
+from silica.core.logger import get_logger, setup_logging
+from silica.core.profiler import (
+    MetricsRegistry,
+    TimingRecord,
+    UnifiedMetrics,
+    registry,
+    time_block,
+)
 from silica.core.request import Request, RequestState, RequestStatus
+from silica.core.sampler import LogitProcessor, Sampler
+from silica.core.sampling import SamplingParams
 
-__all__ = ["Request", "RequestState", "RequestStatus"]
+__all__ = [
+    "LogitProcessor",
+    "MetricsRegistry",
+    "Request",
+    "RequestState",
+    "RequestStatus",
+    "Sampler",
+    "SamplingParams",
+    "TimingRecord",
+    "UnifiedMetrics",
+    "get_logger",
+    "registry",
+    "setup_logging",
+    "time_block",
+]
