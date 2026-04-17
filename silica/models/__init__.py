@@ -11,6 +11,7 @@ from silica.models.adapter import (
     StubModelAdapter,
     Tokenizer,
 )
+from silica.models.qwen3 import Qwen3Adapter
 
 __all__ = [
     "AttentionKind",
@@ -19,6 +20,7 @@ __all__ = [
     "ModelAdapter",
     "ModelConfig",
     "Module",
+    "Qwen3Adapter",
     "StateDelta",
     "StubModelAdapter",
     "Tokenizer",
