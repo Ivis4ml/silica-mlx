@@ -43,12 +43,14 @@ import pytest
 from mlx_lm.models.cache import BatchKVCache
 from mlx_lm.utils import load
 
+from silica.core.events import BatchEvent
 from silica.core.sampling import SamplingParams
 from silica.engine import Engine
 from silica.kvcache.prefix import RadixPrefixCache
 from silica.kvcache.store import SyntheticPrefixBlockStore
 from silica.models.qwen3 import Qwen3Adapter
 from silica.scheduler.batcher import ContinuousBatcher
+from silica.scheduler.budget import MemoryBudgeter
 
 REPO = "Qwen/Qwen3-0.6B"
 MAX_TOKENS = 10
@@ -344,3 +346,144 @@ def test_shared_prefix_reduces_forward_tokens() -> None:
             f"baseline {baseline_tokens[req_idx]} — seeded cache path "
             f"diverged from uaf-accumulated path"
         )
+
+
+# --- 16d-4e: PLAN §7 P-2 acceptance #3 ---------------------------------------
+
+
+@pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
+@pytest.mark.parametrize(
+    "branch",
+    [
+        pytest.param("preempt", id="preempt-branch"),
+        pytest.param("reject", id="reject-branch"),
+    ],
+)
+def test_budget_overflow_aborts_cleanly(branch: str) -> None:
+    """PLAN §7 P-2 acceptance #3: budget overflow is handled cleanly.
+
+    Two parametrisations cover both branches of the budgeter ladder on
+    the same Qwen3-0.6B forward path:
+
+      preempt-branch:
+        3 equally-sized requests; cap = 2 * worst_per_req. r0+r1 admit
+        via the initial cohort; r2 arrives mid-run and the budgeter
+        returns AdmitAfterPreempt(r1). r1 re-enters the waiting queue
+        as a replay pending and eventually re-admits via plain
+        AdmitDecision after r0+r2 terminate and reclaim frees
+        headroom. PLAN §7 "queues cleanly" reading of acceptance #3.
+        Expected: batcher.preempts >= 1, batcher.aborts == 0, all 3
+        req_indexes emit exactly one done event.
+
+      reject-branch:
+        1 small + 1 huge request; cap = worst_small. r0 admits; r1's
+        worst exceeds cap even after preempting r0 (freed=worst_small
+        < worst_huge - headroom) → RejectDecision →
+        BatchEvent.aborted(req_index=1, "budget-exhausted"). r0 still
+        terminates normally. PLAN §7 "aborts cleanly" reading of
+        acceptance #3. Expected: batcher.aborts >= 1, done for
+        req_index=0 only, aborted event for req_index=1 carries
+        finish_reason="budget-exhausted".
+
+    max_batch_size=3 throughout — preempt is byte-capacity freeing,
+    not slot-capacity; slot_gate with a matching max_batch_size would
+    short-circuit Phase A before the budgeter is consulted.
+    """
+    adapter, _ = Qwen3Adapter.from_hf_repo(REPO)
+    pc = RadixPrefixCache(
+        block_size=16,
+        store=SyntheticPrefixBlockStore(block_size=16),
+    )
+
+    # Compute bytes-per-token directly from the adapter so the cap
+    # arithmetic is stable across any Qwen3-0.6B kv-layout change.
+    layout = adapter.kv_layout()
+    bpt = (
+        2
+        * layout.num_layers
+        * layout.n_kv_heads
+        * layout.head_dim
+        * layout.dtype.size
+    )
+
+    prompt_len = 5
+    small_max = 4
+    huge_max = 40  # used via SamplingParams below; the budgeter will
+    # compute worst_huge = (prompt_len + huge_max) * bpt internally
+    # when the mid-run admit fires.
+    worst_small = (prompt_len + small_max) * bpt
+
+    if branch == "preempt":
+        cap = 2 * worst_small
+    else:  # reject — cap fits r0 exactly; r1's huge worst exceeds
+        #   cap + freed_from_preempt.
+        cap = worst_small
+
+    budgeter = MemoryBudgeter.for_adapter(
+        adapter, prefix_cache=pc, weights_bytes=0, cap_bytes=cap
+    )
+    batcher = ContinuousBatcher(
+        adapter,
+        max_batch_size=3,
+        prefix_cache=pc,
+        budgeter=budgeter,
+    )
+
+    # Synthetic prompts — determinism matters more than token content.
+    def _prompt(i: int) -> list[int]:
+        return list(range(100 * (i + 1), 100 * (i + 1) + prompt_len))
+
+    params_small = SamplingParams(temperature=0.0, max_tokens=small_max)
+    params_huge = SamplingParams(temperature=0.0, max_tokens=huge_max)
+
+    events: list[BatchEvent] = []
+
+    if branch == "preempt":
+        # Initial cohort: r0 + r1 (both pre-step, bypasses budgeter).
+        batcher.add_request(0, _prompt(0), params_small)
+        batcher.add_request(1, _prompt(1), params_small)
+        events.extend(batcher.step())  # batched prefill for r0+r1
+        # Install the cohort's reservations manually — pre-step admits
+        # never consult the budgeter (prep doc §4.2 scope).
+        budgeter.apply_admit("req-0", worst_small)
+        budgeter.apply_admit("req-1", worst_small)
+        # r2 arrives mid-run → Phase A preempts r1.
+        batcher.add_request(2, _prompt(2), params_small)
+    else:
+        # Initial cohort: r0 only. r1 mid-run, huge max_tokens →
+        # budgeter returns RejectDecision.
+        batcher.add_request(0, _prompt(0), params_small)
+        events.extend(batcher.step())
+        budgeter.apply_admit("req-0", worst_small)
+        batcher.add_request(1, _prompt(1), params_huge)
+
+    # Drain to terminal.
+    while batcher.has_work():
+        events.extend(batcher.step())
+
+    dones = [e for e in events if e.kind == "done"]
+    aborteds = [e for e in events if e.kind == "aborted"]
+
+    if branch == "preempt":
+        # All 3 reqs reach terminal via done.
+        assert batcher.preempts >= 1
+        assert batcher.aborts == 0
+        assert len(aborteds) == 0
+        assert {e.req_index for e in dones} == {0, 1, 2}
+        # Exactly one done per req_index — preempt+replay must not
+        # surface as a second terminal event (B-3/B-4).
+        dones_by_req: dict[int, int] = {}
+        for e in dones:
+            dones_by_req[e.req_index] = dones_by_req.get(e.req_index, 0) + 1
+        assert dones_by_req == {0: 1, 1: 1, 2: 1}
+    else:
+        # r0 done; r1 aborted with budget-exhausted.
+        assert batcher.aborts >= 1
+        assert batcher.preempts == 0
+        assert {e.req_index for e in dones} == {0}
+        r1_aborts = [
+            e
+            for e in aborteds
+            if e.req_index == 1 and e.finish_reason == "budget-exhausted"
+        ]
+        assert len(r1_aborts) == 1
