@@ -33,6 +33,7 @@ from silica.models.adapter import (
     StateDelta,
 )
 from silica.scheduler.batcher import ContinuousBatcher
+from silica.scheduler.budget import MemoryBudgeter
 
 # --- scripted adapter ---------------------------------------------------------
 
@@ -1299,3 +1300,263 @@ def test_mixed_hit_and_miss_rows_in_one_admit_call() -> None:
     done_by_req = {e.req_index for e in events if e.kind == "done"}
     assert 0 in tokens_by_req and 0 in done_by_req
     assert 1 in tokens_by_req and 1 in done_by_req
+
+
+# --- 16d-2b: budgeter admit + reject plumbing --------------------------------
+#
+# Covers the batcher-side of 16d-2b: ContinuousBatcher.__init__ gains a
+# ``budgeter`` kwarg, and ``_admit_waiting_requests`` is refactored into
+# Phase A (decide + apply per-pending, pop-one-at-a-time) + Phase B
+# (execute grouped by hit/miss). These tests pin the contract for
+# AdmitDecision / RejectDecision only — AdmitAfterEvict /
+# AdmitAfterPreempt raise NotImplementedError (16d-3 / 16d-4 install
+# them) and are not exercised here.
+
+def _budgeter_for_adapter(
+    adapter: "_ScriptedAdapter",
+    *,
+    cap_bytes: int,
+    weights_bytes: int = 0,
+    block_size: int = 4,
+) -> MemoryBudgeter:
+    """Budgeter + standalone prefix cache for budgeter-only tests.
+
+    Note the prefix cache used HERE (for the budgeter's evict-accounting)
+    is separate from any ``prefix_cache`` kwarg passed to the batcher —
+    these tests don't install a batcher-side cache, so every admission
+    routes through the miss cohort path.
+    """
+    pc = RadixPrefixCache(
+        block_size=block_size,
+        store=SyntheticPrefixBlockStore(block_size=block_size),
+    )
+    return MemoryBudgeter.for_adapter(
+        adapter,  # type: ignore[arg-type]
+        prefix_cache=pc,
+        weights_bytes=weights_bytes,
+        cap_bytes=cap_bytes,
+    )
+
+
+def test_budgeter_none_matches_16c2_behaviour() -> None:
+    """B-1: ``budgeter=None`` is bit-identical to not passing the kwarg.
+
+    Every observable (event stream + all 16d counters) matches between
+    an explicit-None and a default-None batcher. Passing the kwarg must
+    not change the admission path.
+    """
+    adapter1 = _ScriptedAdapter(script=(5, 7))
+    b1 = ContinuousBatcher(adapter1, max_batch_size=1, budgeter=None)
+    b1.add_request(0, [1, 2], _greedy(max_tokens=2))
+    events1: list[BatchEvent] = []
+    while b1.has_work():
+        events1.extend(b1.step())
+
+    adapter2 = _ScriptedAdapter(script=(5, 7))
+    b2 = ContinuousBatcher(adapter2, max_batch_size=1)
+    b2.add_request(0, [1, 2], _greedy(max_tokens=2))
+    events2: list[BatchEvent] = []
+    while b2.has_work():
+        events2.extend(b2.step())
+
+    assert [
+        (e.kind, e.req_index, e.token_id, e.finish_reason) for e in events1
+    ] == [
+        (e.kind, e.req_index, e.token_id, e.finish_reason) for e in events2
+    ]
+    assert b1.aborts == b2.aborts == 0
+    assert b1.evictions == b2.evictions == 0
+    assert b1.preempts == b2.preempts == 0
+
+
+def test_admit_decision_proceeds_as_before() -> None:
+    """AdmitDecision path is a pass-through: with a generously-sized
+    budgeter, admissions produce a normal token + done stream and the
+    reservation is released on terminal."""
+    adapter = _admit_adapter(script=(5,))
+    budgeter = _budgeter_for_adapter(adapter, cap_bytes=100_000)
+    b = ContinuousBatcher(adapter, max_batch_size=1, budgeter=budgeter)
+    # Seal the empty initial cohort so the next add_request is queued
+    # as backlog (mid-run admission → Phase A).
+    b.step()
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=1))
+    events: list[BatchEvent] = []
+    while b.has_work():
+        events.extend(b.step())
+    # One token, one done — same as the no-budgeter path.
+    assert [e.kind for e in events] == ["token", "done"]
+    assert b.aborts == 0
+    # Terminal release fired via _reclaim_terminated → reserved_bytes
+    # returns to 0.
+    assert budgeter.reserved_bytes() == 0
+
+
+def test_admit_decision_commits_reservation_before_next_admit() -> None:
+    """B-8 end-to-end — Phase A commits each admission's reservation
+    before the next iteration's ``admit()`` call. Setup: three pendings
+    where two fit together but the third cannot fit even after
+    preempting the newest. Budgeter returns Reject for r3; if B-8 were
+    violated (apply_admit deferred to after the loop), r3 would see
+    full headroom and admit incorrectly, yielding 3 rows and aborts=0.
+
+    bytes_per_token = 16 (n_layers=1 adapter). cap = 1600.
+      - r1, r2: n_prompt=5 + max_tokens=45 = 50 tokens → worst=800.
+      - r3:     n_prompt=5 + max_tokens=70 = 75 tokens → worst=1200.
+    After r1, r2 apply: headroom = 0. r3.admit: fit 1200>0 no; evict
+    n/a (no pc); preempt r2 freed=800, 1200 > 0+800 → Reject.
+    """
+    # Script: one per-row tuple consumed by the 2-row miss-cohort forward
+    # that fires for the (r1, r2) accepted list.
+    adapter = _admit_adapter(script=((5, 7),))
+    budgeter = _budgeter_for_adapter(adapter, cap_bytes=1600)
+    b = ContinuousBatcher(adapter, max_batch_size=3, budgeter=budgeter)
+    b.step()  # seal empty cohort
+
+    b.add_request(1, [1, 2, 3, 4, 5], _greedy(max_tokens=45))
+    b.add_request(2, [1, 2, 3, 4, 5], _greedy(max_tokens=45))
+    b.add_request(3, [1, 2, 3, 4, 5], _greedy(max_tokens=70))
+
+    events = b.step()
+
+    # r1, r2 admitted; r3 rejected.
+    assert b.aborts == 1
+    assert len(b._rows) == 2  # type: ignore[attr-defined]
+    assert budgeter.reserved_bytes() == 1600  # 800 + 800
+    # Aborted event for r3 specifically.
+    aborted = [e for e in events if e.kind == "aborted"]
+    assert len(aborted) == 1
+    assert aborted[0].req_index == 3
+    assert aborted[0].finish_reason == "budget-exhausted"
+    # r1 and r2 emitted tokens (Phase B ran the miss cohort forward).
+    token_indices = {e.req_index for e in events if e.kind == "token"}
+    assert token_indices == {1, 2}
+
+
+def test_admit_body_raise_releases_reservation() -> None:
+    """B-6'(c): if the Phase B miss-cohort forward raises AFTER
+    apply_admit committed, the except handler must release the
+    reservation — otherwise the budgeter leaks and subsequent
+    admissions see phantom headroom pressure.
+    """
+    adapter = _admit_adapter(script=(0,))
+    budgeter = _budgeter_for_adapter(adapter, cap_bytes=100_000)
+    b = ContinuousBatcher(adapter, max_batch_size=1, budgeter=budgeter)
+    b.step()  # seal empty cohort
+
+    class _Exploder:
+        def __call__(
+            self, tokens: mx.array, cache: list[Any] | None = None
+        ) -> mx.array:
+            raise RuntimeError("boom")
+
+    # Replace BATCHER's model reference (not adapter._model); the
+    # batcher snapshotted adapter.build() at ctor time.
+    b._model = _Exploder()  # type: ignore[assignment]
+
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=2))
+    assert budgeter.reserved_bytes() == 0  # pre-condition
+    with pytest.raises(RuntimeError, match="boom"):
+        b.step()
+    # Even though apply_admit committed inside Phase A, the except
+    # block in Phase B's miss-cohort branch released it on the raise.
+    assert budgeter.reserved_bytes() == 0
+
+
+def test_reject_decision_emits_aborted_event() -> None:
+    """A RejectDecision yields BatchEvent.aborted with
+    finish_reason='budget-exhausted'."""
+    adapter = _admit_adapter(script=(5,))
+    # cap=1 byte; bpt=16 → any request rejects.
+    budgeter = _budgeter_for_adapter(adapter, cap_bytes=1)
+    b = ContinuousBatcher(adapter, max_batch_size=1, budgeter=budgeter)
+    b.step()  # seal empty cohort
+
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=2))
+    events = b.step()
+
+    aborted = [e for e in events if e.kind == "aborted"]
+    assert len(aborted) == 1
+    assert aborted[0].req_index == 0
+    assert aborted[0].finish_reason == "budget-exhausted"
+    assert aborted[0].token_id is None
+
+
+def test_reject_does_not_create_batch_row() -> None:
+    """A rejected admission must not materialise a _BatchRow or extend
+    the batched cache. After a reject-only step, _rows stays empty."""
+    adapter = _admit_adapter(script=(5,))
+    budgeter = _budgeter_for_adapter(adapter, cap_bytes=1)
+    b = ContinuousBatcher(adapter, max_batch_size=1, budgeter=budgeter)
+    b.step()
+
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=2))
+    b.step()
+
+    assert b._rows == []  # type: ignore[attr-defined]
+    assert b._batch_cache is None  # type: ignore[attr-defined]
+
+
+def test_reject_increments_aborts_counter() -> None:
+    """Each RejectDecision bumps ``self.aborts`` by exactly one."""
+    adapter = _admit_adapter(script=(5,))
+    budgeter = _budgeter_for_adapter(adapter, cap_bytes=1)
+    b = ContinuousBatcher(adapter, max_batch_size=2, budgeter=budgeter)
+    b.step()
+
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=2))
+    b.add_request(1, [1, 2, 3, 4], _greedy(max_tokens=2))
+    b.step()
+
+    assert b.aborts == 2
+
+
+def test_reject_does_not_call_apply_admit() -> None:
+    """B-6' / Q-4: a rejected admission never touches reserved_bytes —
+    it was never ``apply_admit``'d, so there is no reservation to release.
+    After a reject-only step, reserved_bytes stays at 0.
+    """
+    adapter = _admit_adapter(script=(5,))
+    budgeter = _budgeter_for_adapter(adapter, cap_bytes=1)
+    b = ContinuousBatcher(adapter, max_batch_size=1, budgeter=budgeter)
+    b.step()
+
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=2))
+    b.step()
+
+    assert budgeter.reserved_bytes() == 0
+    assert budgeter.active_requests() == []
+
+
+def test_reject_event_does_not_block_later_queue_items() -> None:
+    """Phase A's reject branch uses ``continue``, not ``break`` — a
+    reject on one pending must NOT short-circuit the loop. Queue
+    [huge, small] with cap sized to fit the small request: huge rejects,
+    small admits, Phase B runs the miss cohort for small.
+    """
+    adapter = _admit_adapter(script=(5,))
+    # cap = (4+2)*16 = 96: exactly the small request's worst-case bytes.
+    budgeter = _budgeter_for_adapter(adapter, cap_bytes=96)
+    b = ContinuousBatcher(adapter, max_batch_size=2, budgeter=budgeter)
+    b.step()  # seal empty cohort
+
+    # Huge request (worst = (4+100)*16 = 1664 >> 96 → reject).
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=100))
+    # Small request fits exactly (worst = 96).
+    b.add_request(1, [10, 20, 30, 40], _greedy(max_tokens=2))
+
+    events = b.step()
+
+    # Huge aborted, small admitted — same step, same event list.
+    assert b.aborts == 1
+    assert len(b._rows) == 1  # type: ignore[attr-defined]
+    assert b._rows[0].req_index == 1  # type: ignore[attr-defined]
+
+    aborted = [e for e in events if e.kind == "aborted"]
+    assert len(aborted) == 1
+    assert aborted[0].req_index == 0
+
+    tokens = [e for e in events if e.kind == "token"]
+    assert len(tokens) == 1
+    assert tokens[0].req_index == 1
+    # Small's reservation committed; huge's did not.
+    assert budgeter.reserved_bytes() == 96

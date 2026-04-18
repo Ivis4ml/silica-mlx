@@ -52,6 +52,13 @@ from silica.core.sampling import SamplingParams
 from silica.kvcache.prefix import RadixPrefixCache
 from silica.mlx.runner import forward_batched
 from silica.models.adapter import AttentionKind, ModelAdapter
+from silica.scheduler.budget import (
+    AdmitAfterEvictDecision,
+    AdmitAfterPreemptDecision,
+    AdmitDecision,
+    MemoryBudgeter,
+    RejectDecision,
+)
 from silica.scheduler.seed_kv import build_seeded_batch_kv
 from silica.weights.provider import WeightProvider
 from silica.weights.resident import ResidentWeightProvider
@@ -101,6 +108,7 @@ class ContinuousBatcher:
         weight_provider: WeightProvider | None = None,
         max_batch_size: int = 1,
         prefix_cache: RadixPrefixCache | None = None,
+        budgeter: MemoryBudgeter | None = None,
     ) -> None:
         if max_batch_size < 1:
             raise ValueError(
@@ -138,6 +146,20 @@ class ContinuousBatcher:
         # these counters.
         self.forward_prompt_tokens: int = 0
         self.prefix_hits: int = 0
+        # 16d-2b: optional budget-aware admission policy. When None
+        # (default), every admission proceeds as in 16c.2 — no budget
+        # check (invariant B-1: no-budgeter bit-identical to 16c.2).
+        # When set, _admit_waiting_requests consults budgeter.admit per
+        # pending and routes to admit / reject / evict / preempt.
+        # 16d-2b wires only admit + reject; evict/preempt decisions
+        # raise NotImplementedError (16d-3 / 16d-4 will install them).
+        self._budgeter: MemoryBudgeter | None = budgeter
+        # 16d counters paralleling 16c.2's hits/forward counters.
+        # ``aborts`` increments on RejectDecision; ``evictions`` and
+        # ``preempts`` remain 0 until 16d-3 / 16d-4 wire them.
+        self.aborts: int = 0
+        self.evictions: int = 0
+        self.preempts: int = 0
 
     # --- public admission / stepping surface ---
 
@@ -340,6 +362,17 @@ class ContinuousBatcher:
         if self._prefix_cache is not None and self._batch_cache is not None:
             for row_idx in terminated:
                 self._extract_and_insert_prefix(row_idx)
+
+        # 16d-2b: release budgeter reservations for terminal rows BEFORE
+        # the filter / cache drop (B-6' terminal branch). Release is
+        # bookkeeping only — ordering relative to the extract loop above
+        # does not matter for correctness, but both must precede the
+        # destructive filter / cache-None mutations so a mid-release
+        # raise cannot leave the batcher with kept rows whose
+        # reservations have been lost.
+        if self._budgeter is not None:
+            for row_idx in terminated:
+                self._budgeter.release(self._rows[row_idx].req_id)
 
         if not kept:
             # Every row terminated in the last step. The batched cache
@@ -549,45 +582,125 @@ class ContinuousBatcher:
         """Phase 2 — drain up to ``max_batch_size − len(self._rows)``
         requests from ``_waiting_queue``.
 
-        16c.2 step 4 sub-commit 3 splits the admits into two phases:
+        Two phases (prep doc docs/P2_UNIT_16D_PREP.md §4.2):
 
-          - **hit rows** (per-row): those whose ``prompt_ids`` have a
-            non-zero block-aligned prefix match in ``self._prefix_cache``.
-            Each goes through ``_admit_single_hit_row``, which seeds a
-            per-row ``BatchKVCache`` from detached K/V and runs the
-            forward only over the suffix.
-          - **miss rows** (batched): the rest go through
-            ``_admit_miss_cohort``, which is the pre-step-4 K-row
-            cohort-prefill path.
+          **Phase A — decide + apply (per-pending, pop-one-at-a-time).**
+          Per pending popped from the queue, consult
+          ``self._budgeter.admit`` (when configured) and route:
 
-        Events are emitted in phase-grouped order (hit rows first,
-        then miss cohort) — **not** admitted-queue order. See
-        docs/P2_UNIT_16C_2_STEP_4_SKELETON.md §5 S-7 for the rationale.
+            - ``AdmitDecision``           → ``apply_admit`` immediately,
+              then push onto the accepted list. Committing the
+              reservation BEFORE the next iteration's ``admit()`` runs
+              is invariant B-8 — otherwise a batch of small pendings
+              each sees the same initial headroom and over-admits.
+            - ``RejectDecision``          → emit ``BatchEvent.aborted``,
+              bump ``self.aborts``, do NOT ``apply_admit`` (Q-4 / B-6';
+              aborted admissions never touch the reservation tally).
+            - ``AdmitAfterEvictDecision`` / ``AdmitAfterPreemptDecision``
+              → raise ``NotImplementedError`` with 16d-3 / 16d-4
+              markers. These decisions are already recognised by the
+              budgeter but their apply paths belong to later sub-commits.
+              A later raise is more honest than a temporary "treat as
+              reject" fallback — the latter would create a short-lived
+              semantics the next sub-commit has to invalidate.
 
-        Returns emitted events. An empty list means no admission fired
-        this step — the caller then proceeds to Phase 3 forward.
+          When ``self._budgeter is None``, every popped pending is
+          accepted without a decision — behaviour is bit-identical to
+          16c.2 (invariant B-1).
+
+          **Phase B — execute (grouped by hit/miss).**
+          16c.2's hit/miss split runs over the accepted list:
+
+            - **hit rows** (per-row): non-zero block-aligned prefix
+              match in ``self._prefix_cache`` → ``_admit_single_hit_row``.
+            - **miss rows** (batched): the rest → ``_admit_miss_cohort``
+              (single batched prefill over K miss rows).
+
+          Events emit in phase-grouped order (hit rows first, then miss
+          cohort) — same convention as 16c.2 (S-7). Aborted events from
+          Phase A prepend this stream.
+
+          **Release-on-raise (B-6' (c)).** If ``_admit_single_hit_row``
+          or ``_admit_miss_cohort`` raises after their pendings had
+          ``apply_admit`` called, the ``except`` block releases only the
+          reservation of the rows that did not commit to ``self._rows``.
+          Successfully-committed rows in the same step keep their
+          reservations (they ARE real admitted requests and will be
+          released on their own terminal path via ``_reclaim_terminated``).
+
+        Returns the emitted events. An empty list means no admission or
+        rejection fired this step; a non-empty list can include any mix
+        of aborted events (Phase A) and token/done events (Phase B) —
+        the caller's step() early-returns on non-empty, so the incumbent
+        decode forward skips this step.
         """
         capacity = self._max_batch_size - len(self._rows)
         if capacity <= 0 or not self._waiting_queue:
             return []
 
-        # Pop up to `capacity` pending admits.
-        admitted_pending: list[_PendingAdmit] = []
-        while len(admitted_pending) < capacity and self._waiting_queue:
-            admitted_pending.append(self._waiting_queue.popleft())
-        if not admitted_pending:
-            return []
+        events: list[BatchEvent] = []
+        accepted: list[_PendingAdmit] = []
 
-        # Split into hit / miss. With no prefix_cache installed, every
-        # admission routes to the miss path and behaviour is bit-
-        # identical to sub-commit 2 (invariant S-6).
+        # Phase A — decide + apply.
+        while len(accepted) < capacity and self._waiting_queue:
+            pending = self._waiting_queue.popleft()
+
+            if self._budgeter is None:
+                accepted.append(pending)
+                continue
+
+            req_id = f"req-{pending.req_index}"
+            decision = self._budgeter.admit(
+                req_id=req_id,
+                n_prompt=len(pending.prompt_ids),
+                max_tokens=pending.params.max_tokens,
+            )
+            match decision:
+                case AdmitDecision():
+                    # B-8: commit reservation BEFORE the next iteration's
+                    # admit() call observes reserved_bytes.
+                    self._budgeter.apply_admit(
+                        req_id, decision.reserved_delta
+                    )
+                    accepted.append(pending)
+                case RejectDecision():
+                    events.append(
+                        BatchEvent.aborted(
+                            pending.req_index, decision.reason
+                        )
+                    )
+                    self.aborts += 1
+                case AdmitAfterEvictDecision():
+                    raise NotImplementedError(
+                        "16d-3: AdmitAfterEvictDecision apply path — "
+                        "evict + admit wiring arrives in 16d-3"
+                    )
+                case AdmitAfterPreemptDecision():
+                    raise NotImplementedError(
+                        "16d-4: AdmitAfterPreemptDecision apply path — "
+                        "preempt + re-admit arrives in 16d-4"
+                    )
+                case _:
+                    raise AssertionError(
+                        f"unhandled AdmissionDecision type: "
+                        f"{type(decision).__name__}"
+                    )
+
+        if not accepted:
+            # Every pending rejected (events non-empty) or the queue was
+            # empty after capacity check (events also empty). Either way
+            # Phase B has nothing to execute; return what Phase A emitted.
+            return events
+
+        # Phase B — execute. Split accepted into hit / miss. With no
+        # prefix_cache installed, every admission routes to the miss path.
         hit_rows: list[tuple[_PendingAdmit, int]] = []
         miss_rows: list[_PendingAdmit] = []
         if self._prefix_cache is None:
-            miss_rows = admitted_pending
+            miss_rows = list(accepted)
         else:
             block_size = self._prefix_cache.block_size
-            for pending in admitted_pending:
+            for pending in accepted:
                 raw = self._prefix_cache.peek(pending.prompt_ids)
                 # S-5 edge 1: reserve at least one token for suffix
                 # prefill so first-token logits are available.
@@ -603,13 +716,34 @@ class ContinuousBatcher:
                 else:
                     hit_rows.append((pending, usable))
 
-        events: list[BatchEvent] = []
-        # Phase 1 — hit rows, per-row seeded admission.
+        # Phase B.1 — hit rows, per-row seeded admission.
         for pending, usable in hit_rows:
-            events.extend(self._admit_single_hit_row(pending, usable))
-        # Phase 2 — miss cohort, one batched prefill over K miss rows.
+            try:
+                events.extend(
+                    self._admit_single_hit_row(pending, usable)
+                )
+            except Exception:
+                # B-6' (c): release THIS row's reservation. Prior hit
+                # rows already committed stay reserved; tail rows (not
+                # yet executed) also leak reservations, which is
+                # acceptable because a body-raise means the batcher is
+                # no longer in a coherent reusable state.
+                if self._budgeter is not None:
+                    self._budgeter.release(f"req-{pending.req_index}")
+                raise
+        # Phase B.2 — miss cohort, one batched prefill over K miss rows.
         if miss_rows:
-            events.extend(self._admit_miss_cohort(miss_rows))
+            try:
+                events.extend(self._admit_miss_cohort(miss_rows))
+            except Exception:
+                # Miss cohort is atomic (one forward for all K rows);
+                # on raise, release every miss row's reservation together.
+                if self._budgeter is not None:
+                    for pending in miss_rows:
+                        self._budgeter.release(
+                            f"req-{pending.req_index}"
+                        )
+                raise
 
         # One slot_table rebuild suffices after both phases' mutations.
         self._rebuild_slot_table()
