@@ -103,6 +103,11 @@ class RadixPrefixCache:
 
     # --- public surface ---
 
+    @property
+    def block_size(self) -> int:
+        """Token count per radix block."""
+        return self._block_size
+
     def peek(self, tokens: Sequence[int]) -> PrefixHit:
         """Walk the tree, return the longest block-aligned match
         **without any side effects**.

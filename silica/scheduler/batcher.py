@@ -315,12 +315,31 @@ class ContinuousBatcher:
             corrupt future admissions (§4 Fix 2).
 
         Called at the top of every ``step()`` (after ``_prepare_cohort``).
-        16c.2 will add an eager-extract hook here, *before* ``filter``,
-        to detach pinned K/V for the prefix cache.
+
+        16c.2 step 4 sub-commit 2 hooks the eager-extract path here,
+        **before** filter / cache drop: for each terminating row,
+        slice its block-aligned prefix K/V out of the current batch
+        cache and register with ``self._prefix_cache.insert_detached``.
+        The slice is materialised via ``mx.eval`` so filter's
+        shift-left mutation (or the all-terminal cache drop) cannot
+        corrupt it afterwards (Gate-0.75 probe B is the physical
+        evidence; invariant S-3b pins the rule).
         """
         if not any(r.state.is_terminal for r in self._rows):
             return
         kept = [i for i, r in enumerate(self._rows) if not r.state.is_terminal]
+        terminated = [
+            i for i, r in enumerate(self._rows) if r.state.is_terminal
+        ]
+
+        # 16c.2 step 4 sub-commit 2: extract prefix K/V BEFORE filter.
+        # Extract runs for every terminating row regardless of whether
+        # we will filter or drop the whole cache. Gated on cache being
+        # present because sub-commit 1's init left it None.
+        if self._prefix_cache is not None and self._batch_cache is not None:
+            for row_idx in terminated:
+                self._extract_and_insert_prefix(row_idx)
+
         if not kept:
             # Every row terminated in the last step. The batched cache
             # is full of stale K/V no live row owns; extending into it
@@ -336,6 +355,98 @@ class ContinuousBatcher:
             layer_cache.filter(kept)
         self._rows = [self._rows[i] for i in kept]
         self._rebuild_slot_table()
+
+    def _extract_and_insert_prefix(self, row_idx: int) -> None:
+        """Slice a terminating row's block-aligned prefix K/V out of the
+        current batched cache and register it with ``self._prefix_cache``
+        (16c.2 step 4 sub-commit 2).
+
+        Caller guarantees ``self._prefix_cache is not None`` and
+        ``self._batch_cache is not None``. Safe to call before the
+        reclaim's filter / drop step (Gate-0.75 probe B proved
+        ``mx.contiguous`` + ``mx.eval`` slices survive the source's
+        subsequent filter).
+
+        Two subtleties pinned by the prep doc (S-3a, S-3b):
+
+          - **Cache contents vs accounting.** mlx-lm's cache holds K/V
+            for ``prompt_ids + generated[:-1]``. ``row.generated[-1]``
+            was sampled from the previous forward's logits and has
+            not yet been fed through any forward; its K/V is NOT in
+            cache. Using ``prompt_ids + generated`` as the source of
+            "computed ids" would push an extra token into the radix
+            tree with no backing K/V, corrupting future hits.
+          - **Left-padding offset.** Each layer's ``keys`` tensor is
+            shaped ``(B, H, T_max, D)`` with row ``row_idx``'s logical
+            token 0 at axis-2 index ``left_padding[row_idx]``. Slicing
+            from axis-2 zero would pull pad values.
+
+        No-ops when the aligned prefix is shorter than one block —
+        a partial trailing block is not retainable under option B.
+        """
+        assert self._prefix_cache is not None
+        assert self._batch_cache is not None
+
+        row = self._rows[row_idx]
+        if row.generated:
+            computed_ids: list[int] = list(row.prompt_ids) + list(
+                row.generated[:-1]
+            )
+        else:
+            computed_ids = list(row.prompt_ids)
+
+        # S-3a: cache's own authoritative accounting must agree.
+        computed_len = int(self._batch_cache[0].offset[row_idx].item())
+        assert len(computed_ids) == computed_len, (
+            f"row {row_idx}: computed_ids len {len(computed_ids)} != "
+            f"offset[row_idx] {computed_len} — sampler/forward drift"
+        )
+
+        block_size = self._prefix_cache.block_size
+        aligned_tokens = (computed_len // block_size) * block_size
+        if aligned_tokens < block_size:
+            return
+
+        # S-3b: every layer's BatchKVCache shares the same left_padding
+        # vector (they evolve together under extend/filter), so layer 0
+        # is authoritative for this row.
+        base = int(self._batch_cache[0].left_padding[row_idx].item())
+
+        tokens_prefix = computed_ids[:aligned_tokens]
+        num_layers = len(self._batch_cache)
+        detached_blocks: list[list[tuple[mx.array, mx.array]]] = []
+        for b_idx in range(aligned_tokens // block_size):
+            start = b_idx * block_size
+            end = start + block_size
+            per_layer: list[tuple[mx.array, mx.array]] = []
+            for layer_idx in range(num_layers):
+                layer_cache = self._batch_cache[layer_idx]
+                keys = layer_cache.keys
+                values = layer_cache.values
+                if keys is None or values is None:
+                    raise AssertionError(
+                        f"row {row_idx} layer {layer_idx}: "
+                        "cache tensors are not initialised"
+                    )
+                k = mx.contiguous(
+                    keys[
+                        row_idx : row_idx + 1, :, base + start : base + end, :
+                    ]
+                )
+                v = mx.contiguous(
+                    values[
+                        row_idx : row_idx + 1, :, base + start : base + end, :
+                    ]
+                )
+                per_layer.append((k, v))
+            detached_blocks.append(per_layer)
+
+        # S-3b eager materialisation: force each slice to its own
+        # backing memory BEFORE the source cache's filter / drop.
+        mx.eval(
+            *[arr for pl in detached_blocks for (k, v) in pl for arr in (k, v)]
+        )
+        self._prefix_cache.insert_detached(tokens_prefix, detached_blocks)
 
     def _rebuild_slot_table(self) -> None:
         """Re-derive ``slot_table`` from the current ``self._rows``.

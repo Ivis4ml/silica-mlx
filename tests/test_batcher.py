@@ -23,6 +23,8 @@ import pytest
 from silica.core.events import BatchEvent
 from silica.core.request import RequestStatus
 from silica.core.sampling import SamplingParams
+from silica.kvcache.prefix import RadixPrefixCache
+from silica.kvcache.store import SyntheticPrefixBlockStore
 from silica.models.adapter import (
     AttentionKind,
     AttentionPattern,
@@ -785,9 +787,6 @@ def test_pending_reclaim_row_does_not_block_queue_admit() -> None:
 
 # --- 16c.2 step 4 sub-commit 1: ctor wiring + S-6 no-op invariance ---
 
-from silica.kvcache.prefix import RadixPrefixCache
-from silica.kvcache.store import SyntheticPrefixBlockStore
-
 
 def _make_prefix_cache(block_size: int = 16) -> RadixPrefixCache:
     return RadixPrefixCache(
@@ -844,16 +843,159 @@ def test_s6_no_cache_path_matches_16c1_behaviour() -> None:
     assert b2.prefix_hits == 0
 
 
-def test_s6_unused_prefix_cache_does_not_mutate() -> None:
-    """Passing a prefix_cache but never hitting its admission path (no
-    code path uses it yet in sub-commit 1) leaves the cache untouched.
-    Sub-commits 2-3 will start mutating it; this test will be rewritten
-    then."""
+def test_s6_unused_prefix_cache_still_works_on_sub_block_prompt() -> None:
+    """A prompt shorter than one block-aligned prefix cannot populate
+    the cache even if prefix_cache is non-None — sub-commit 2's
+    reclaim hook no-ops when aligned_tokens < block_size.
+    """
     adapter = _ScriptedAdapter(script=(5,))
-    pc = _make_prefix_cache()
+    # block_size=4 but prompt is only 2 tokens → no aligned block.
+    pc = _make_prefix_cache(block_size=4)
     b = ContinuousBatcher(adapter, max_batch_size=1, prefix_cache=pc)
-    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=1))
+    b.add_request(0, [1, 2], _greedy(max_tokens=1))
     while b.has_work():
         b.step()
     assert pc.hits == 0
     assert pc.node_count() == 0
+
+
+# --- 16c.2 step 4 sub-commit 2: reclaim-path insert_detached ---
+
+
+def _reclaim_adapter(script: Sequence[_ScriptStep] = ()) -> "_ScriptedAdapter":
+    """Single-layer scripted adapter; the reclaim tests need every layer
+    written by forward() (the scripted model only writes cache[0]), so
+    n_layers=1 avoids the "layer 1 is None" artefact. Multi-layer
+    correctness is covered by the real-model acceptance in sub-commit 4."""
+    return _ScriptedAdapter(n_layers=1, script=script)
+
+
+def test_reclaim_with_no_cache_does_not_mutate_prefix_state() -> None:
+    """If prefix_cache is None (S-6) the reclaim hook never fires."""
+    adapter = _reclaim_adapter(script=(5,))
+    b = ContinuousBatcher(adapter, max_batch_size=1)
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=1))
+    while b.has_work():
+        b.step()
+    # No prefix_cache to assert on, but b should still be in a clean state.
+    assert not b.has_work()
+    assert b._batch_cache is None  # type: ignore[attr-defined]
+
+
+def test_reclaim_extracts_and_inserts_detached_before_filter() -> None:
+    """After a row terminates, its block-aligned prefix tokens must be
+    in the radix tree with backing detached K/V in the store."""
+    adapter = _reclaim_adapter(script=(5,))
+    pc = _make_prefix_cache(block_size=4)
+    b = ContinuousBatcher(adapter, max_batch_size=1, prefix_cache=pc)
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=1))
+    while b.has_work():
+        b.step()
+    # prompt_ids = [1,2,3,4] (4 tokens = 1 block @ block_size=4)
+    # generated = [5] → cache contents = prompt_ids + generated[:-1] = [1,2,3,4]
+    # aligned_tokens = 4 → exactly one block retainable.
+    assert pc.node_count() == 1
+    peeked = pc.peek([1, 2, 3, 4])
+    assert peeked.num_hit_tokens == 4
+    (bid,) = peeked.block_ids
+    assert pc._store.has_detached(bid)  # type: ignore[attr-defined]
+
+
+def test_reclaim_excludes_unfed_last_generated_token() -> None:
+    """S-3a: computed_ids = prompt_ids + generated[:-1]. The final
+    sampled token was never fed through a forward; its K/V is NOT in
+    cache. The radix tree must reflect that — only prompt_ids is
+    aligned-retainable here."""
+    adapter = _reclaim_adapter(script=(5,))
+    pc = _make_prefix_cache(block_size=4)
+    b = ContinuousBatcher(adapter, max_batch_size=1, prefix_cache=pc)
+    # Prompt is exactly 1 block; generated will add 1 token (the sampled 5).
+    # If the helper used prompt_ids + generated, the tree would contain
+    # tokens [1,2,3,4,5] but only 4 of them in cache — corrupting future
+    # hits on [1,2,3,4]. Correct behaviour: tree contains [1,2,3,4].
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=1))
+    while b.has_work():
+        b.step()
+    # Peek with exactly the prompt succeeds.
+    assert pc.peek([1, 2, 3, 4]).num_hit_tokens == 4
+    # Peek with prompt + sampled token should NOT find a second block
+    # (the next chunk [5, *, *, *] is not in the tree).
+    assert pc.peek([1, 2, 3, 4, 5, 6, 7, 8]).num_hit_tokens == 4
+
+
+def test_reclaim_unaligned_terminal_prefix_drops_partial_block() -> None:
+    """Aligned tokens < block_size → no insertion. A sub-block prefix
+    is not retainable under option B."""
+    adapter = _reclaim_adapter(script=(5,))
+    pc = _make_prefix_cache(block_size=4)
+    b = ContinuousBatcher(adapter, max_batch_size=1, prefix_cache=pc)
+    b.add_request(0, [1, 2, 3], _greedy(max_tokens=1))  # only 3 tokens
+    while b.has_work():
+        b.step()
+    assert pc.node_count() == 0
+
+
+def test_reclaim_full_terminal_cohort_handles_all_None_main_cache() -> None:
+    """All-terminal path: extract runs BEFORE batch_cache is dropped;
+    the cache-None reset must not skip insertion."""
+    adapter = _reclaim_adapter(script=(5,))
+    pc = _make_prefix_cache(block_size=4)
+    b = ContinuousBatcher(adapter, max_batch_size=1, prefix_cache=pc)
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=1))
+    # Drive to completion — after step 1 the only row is DONE; step 2's
+    # reclaim phase is the all-terminal path.
+    while b.has_work():
+        b.step()
+    # Main cache was dropped (all-terminal), but prefix cache DOES have
+    # the detached K/V.
+    assert b._batch_cache is None  # type: ignore[attr-defined]
+    assert pc.node_count() == 1
+    assert pc.peek([1, 2, 3, 4]).num_hit_tokens == 4
+
+
+def test_reclaim_extract_respects_left_padding() -> None:
+    """S-3b: axis-2 slice base = left_padding[row_idx]. Two rows with
+    different prompt lengths → non-zero left_padding on the shorter
+    row. The extracted K/V for the shorter row must come from the
+    post-padding region, not the zero-filled prefix."""
+    adapter = _reclaim_adapter(script=(5, 7))
+    pc = _make_prefix_cache(block_size=4)
+    b = ContinuousBatcher(adapter, max_batch_size=2, prefix_cache=pc)
+    # Row 0: 4-token prompt (0 left-padding).
+    # Row 1: 8-token prompt (forces row 0 to have left_padding=4).
+    # Both max_tokens=1 so both terminate on step 1; step 2 reclaim
+    # sees left_padding = [4, 0] on the incumbent cache.
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=1))
+    b.add_request(1, [10, 20, 30, 40, 50, 60, 70, 80], _greedy(max_tokens=1))
+    while b.has_work():
+        b.step()
+    # Row 0's 4 tokens form one aligned block.
+    # Row 1's 8 tokens form two aligned blocks.
+    # Total: 3 distinct radix nodes.
+    assert pc.node_count() == 3
+    assert pc.peek([1, 2, 3, 4]).num_hit_tokens == 4
+    assert pc.peek([10, 20, 30, 40, 50, 60, 70, 80]).num_hit_tokens == 8
+
+
+def test_reclaim_insert_detached_is_filter_safe() -> None:
+    """Regression guard on Gate-0.75 probe B: after reclaim, the detached
+    K/V must be bit-identical to what was in the source cache before
+    filter. Drive this by terminating row 0 while row 1 survives, which
+    forces the partial-filter path."""
+    # Script interpretation:
+    #   step 1 (prefill B=2): row 0 → 5 (terminates), row 1 → 7
+    #   step 2 decode (B=1 after reclaim): row 1 → 11 (terminates)
+    adapter = _reclaim_adapter(script=((5, 7), 11))
+    pc = _make_prefix_cache(block_size=4)
+    b = ContinuousBatcher(adapter, max_batch_size=2, prefix_cache=pc)
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=1))  # terminates step 1
+    b.add_request(1, [10, 20, 30, 40], _greedy(max_tokens=2))  # continues
+    while b.has_work():
+        b.step()
+    # Both rows' 4-token prompts aligned; both blocks registered.
+    # Row 0 inserted at partial-filter time (step 2 reclaim, row 1 kept).
+    # Row 1 inserted at all-terminal time (step 3 reclaim, row 1 DONE).
+    assert pc.node_count() == 2
+    # Peek returns hit for both prompts.
+    assert pc.peek([1, 2, 3, 4]).num_hit_tokens == 4
+    assert pc.peek([10, 20, 30, 40]).num_hit_tokens == 4

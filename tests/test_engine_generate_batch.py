@@ -17,6 +17,8 @@ from silica.core.events import BatchEvent
 from silica.core.sampling import SamplingParams
 from silica.engine import Engine
 from silica.kvcache.manager import NullKVManager
+from silica.kvcache.prefix import RadixPrefixCache
+from silica.kvcache.store import SyntheticPrefixBlockStore
 from silica.models.adapter import (
     AttentionKind,
     AttentionPattern,
@@ -294,9 +296,6 @@ def test_queue_bounded_preserves_req_index_ordering() -> None:
 
 
 # --- prefix_cache kwarg (16c.2 step 4 sub-commit 1) ----------------------
-
-from silica.kvcache.prefix import RadixPrefixCache
-from silica.kvcache.store import SyntheticPrefixBlockStore
 
 
 def test_prefix_cache_kwarg_accepts_none_as_default() -> None:
