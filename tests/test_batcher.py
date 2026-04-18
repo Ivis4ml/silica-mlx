@@ -32,7 +32,7 @@ from silica.models.adapter import (
     ModelConfig,
     StateDelta,
 )
-from silica.scheduler.batcher import ContinuousBatcher
+from silica.scheduler.batcher import ContinuousBatcher, _PendingAdmit
 from silica.scheduler.budget import MemoryBudgeter
 
 # --- scripted adapter ---------------------------------------------------------
@@ -1724,3 +1724,67 @@ def test_evict_underrun_does_not_block_later_queue_items() -> None:
 
     # filler (96) + r1 (96) = 192; r0 never reserved.
     assert budgeter.reserved_bytes() == 192
+
+
+# --- 16d-4a: _PendingAdmit.is_replay + _find_row_by_req_id helper -----------
+#
+# Prep for 16d-4b/c/d preempt wiring. Pure data + read-only helper;
+# no batcher behaviour changes land here. The explicit is_replay=True
+# round-trip test specifically guards against a field-name typo at
+# 16d-4c's appendleft(_PendingAdmit(..., is_replay=True)) site — a
+# misspelling would silently fall through default=False and evade B-9.
+
+def test_pending_admit_is_replay_defaults_to_false() -> None:
+    """Default for ``is_replay`` is False — every existing construction
+    site (add_request, _admit_*) continues to produce non-replay
+    pendings without modification."""
+    pending = _PendingAdmit(
+        req_index=0,
+        prompt_ids=(1, 2, 3),
+        params=_greedy(max_tokens=4),
+    )
+    assert pending.is_replay is False
+
+
+def test_pending_admit_explicit_is_replay_true_round_trips() -> None:
+    """Explicit ``is_replay=True`` is preserved. Guards against a
+    field-name typo at 16d-4c's re-enqueue site: if the field were
+    renamed or misspelled, this test would catch it BEFORE a B-9
+    regression could sneak in."""
+    pending = _PendingAdmit(
+        req_index=0,
+        prompt_ids=(1, 2, 3),
+        params=_greedy(max_tokens=4),
+        is_replay=True,
+    )
+    assert pending.is_replay is True
+
+
+def test_find_row_by_req_id_returns_row_idx_when_present() -> None:
+    """Scan finds the row by its ``req_id`` string and returns its
+    current index in ``self._rows``."""
+    adapter = _ScriptedAdapter()
+    b = ContinuousBatcher(adapter, max_batch_size=3)
+    # Pre-step add_request populates self._rows directly; row.req_id
+    # format is ``f"req-{req_index}"``.
+    b.add_request(0, [1, 2, 3], _greedy(max_tokens=2))
+    b.add_request(5, [4, 5, 6], _greedy(max_tokens=2))
+    b.add_request(7, [7, 8, 9], _greedy(max_tokens=2))
+
+    assert b._find_row_by_req_id("req-0") == 0  # type: ignore[attr-defined]
+    assert b._find_row_by_req_id("req-5") == 1  # type: ignore[attr-defined]
+    assert b._find_row_by_req_id("req-7") == 2  # type: ignore[attr-defined]
+
+
+def test_find_row_by_req_id_returns_none_when_missing() -> None:
+    """Scan returns None for a req_id that no current row carries —
+    covers both empty ``self._rows`` and populated-but-no-match."""
+    adapter = _ScriptedAdapter()
+    b = ContinuousBatcher(adapter, max_batch_size=2)
+
+    # Empty-rows case.
+    assert b._find_row_by_req_id("req-0") is None  # type: ignore[attr-defined]
+
+    # Populated-but-no-match case.
+    b.add_request(0, [1, 2, 3], _greedy(max_tokens=2))
+    assert b._find_row_by_req_id("req-99") is None  # type: ignore[attr-defined]

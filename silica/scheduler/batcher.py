@@ -83,11 +83,19 @@ class _PendingAdmit:
 
     Only held in the batcher's waiting queue; popped into an active
     ``_BatchRow`` during the admit phase of some future ``step()``.
+
+    ``is_replay`` (16d-4a): ``True`` when the pending was re-enqueued
+    by ``_apply_preempt`` (16d-4c lands the re-enqueue flow). Replays
+    are excluded from triggering further preempts — Phase A's B-9
+    anti-ping-pong rule (16d-4c/d) keys off this flag. Default
+    ``False`` keeps every existing ``add_request`` / ``_admit_*``
+    construction site unchanged.
     """
 
     req_index: int
     prompt_ids: tuple[int, ...]
     params: SamplingParams
+    is_replay: bool = False
 
 
 @dataclass
@@ -504,6 +512,28 @@ class ContinuousBatcher:
         record the newly-admitted rows' indices).
         """
         self._slot_table = {row.req_index: i for i, row in enumerate(self._rows)}
+
+    def _find_row_by_req_id(self, req_id: str) -> int | None:
+        """Return the current row index for ``req_id``, or None if absent.
+
+        Linear scan over ``self._rows``. The active row count is bounded
+        by ``max_batch_size`` (single-digit in practice), so asymptotic
+        cost is trivial; keeping the implementation simple beats parsing
+        the ``"req-{N}"`` id format, which would couple this method to a
+        naming convention only ``add_request`` / ``_admit_*`` currently
+        know about.
+
+        Used by 16d-4's preempt path (lands in 16d-4b/c) to resolve the
+        victim row from the budgeter's
+        ``AdmitAfterPreemptDecision.preempt_req_id`` string. The row
+        index is the identity the caller actually needs — a row object
+        post-filter would invite confusion about whether it still
+        represents an active slot.
+        """
+        for row_idx, row in enumerate(self._rows):
+            if row.req_id == req_id:
+                return row_idx
+        return None
 
     def _prefill_phase(self) -> list[BatchEvent]:
         """One batched forward over the left-padded prompt tensor."""
