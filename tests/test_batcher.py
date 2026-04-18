@@ -1980,3 +1980,258 @@ def test_preempt_active_row_rebuilds_slot_table() -> None:
     assert victim.req_index == 5
     assert b._slot_table == {0: 0, 7: 1}  # type: ignore[attr-defined]
     assert len(b._rows) == 2  # type: ignore[attr-defined]
+
+
+# --- 16d-4c: _apply_preempt + Phase A preempt wiring + B-9 ------------------
+#
+# _apply_preempt wraps _preempt_active_row with composite prompt
+# construction + replay _PendingAdmit re-enqueue. Phase A's
+# AdmitAfterPreemptDecision branch consumes this helper with two
+# fallbacks: B-7 (victim missing → requeue triggering) and B-9
+# (replay pending can't trigger further preempts).
+
+
+def test_apply_preempt_builds_replay_pending_from_composite_prompt() -> None:
+    """Merged assertion: _apply_preempt's replay _PendingAdmit carries
+    ``prompt_ids = original + generated`` (B-5, no [:-1] trim), params
+    with ``max_tokens = original_max_tokens - len(generated)`` (Q-2
+    algebra: replay reserves the same bytes as the original), and
+    ``is_replay=True``; it is ``appendleft``'d so it sits at queue
+    front."""
+    adapter = _admit_adapter(script=(5,))
+    b = ContinuousBatcher(adapter, max_batch_size=1)
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=5))
+    b.step()  # prefill → generated=[5], DECODE
+    assert b._rows[0].generated == [5]  # type: ignore[attr-defined]
+
+    ok = b._apply_preempt("req-0")  # type: ignore[attr-defined]
+
+    assert ok is True
+    assert len(b._waiting_queue) == 1  # type: ignore[attr-defined]
+    replay = b._waiting_queue[0]  # type: ignore[attr-defined]
+    assert replay.req_index == 0
+    assert list(replay.prompt_ids) == [1, 2, 3, 4, 5]  # prompt + generated
+    # Q-2: original max_tokens (5) minus generated length (1) = 4.
+    assert replay.params.max_tokens == 4
+    assert replay.is_replay is True
+
+
+def test_apply_preempt_returns_false_on_missing_victim() -> None:
+    """B-7 at the helper level: when the victim req_id has no active
+    row, _apply_preempt returns False and mutates nothing."""
+    adapter = _admit_adapter(script=())
+    b = ContinuousBatcher(adapter, max_batch_size=1)
+
+    ok = b._apply_preempt("req-99")  # type: ignore[attr-defined]
+
+    assert ok is False
+    assert len(b._waiting_queue) == 0  # type: ignore[attr-defined]
+
+
+def test_apply_preempt_returns_false_before_batch_cache_prepared() -> None:
+    """A pre-step row is not an active batch row yet: self._rows is
+    populated, but BatchKVCache has not been allocated. Treat it as
+    non-preemptable and return False rather than asserting."""
+    adapter = _admit_adapter(script=())
+    b = ContinuousBatcher(adapter, max_batch_size=1)
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=5))
+
+    ok = b._apply_preempt("req-0")  # type: ignore[attr-defined]
+
+    assert ok is False
+    assert len(b._rows) == 1  # type: ignore[attr-defined]
+    assert b._batch_cache is None  # type: ignore[attr-defined]
+    assert len(b._waiting_queue) == 0  # type: ignore[attr-defined]
+
+
+def test_apply_preempt_victim_at_max_tokens_raises_assertion_error() -> None:
+    """Loud-fail tripwire: remaining <= 0 means the budgeter picked a
+    victim that should already be DONE. The check runs BEFORE any
+    state mutation, so the batcher is coherent after the raise — no
+    half-preempt, no dangling replay pending."""
+    adapter = _admit_adapter(script=(5,))
+    b = ContinuousBatcher(adapter, max_batch_size=1)
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=2))
+    b.step()  # prefill → generated=[5], DECODE
+    # Manually push generated to equal max_tokens while bypassing the
+    # auto-DONE transition in _sample_and_emit_rows — simulates the
+    # "budgeter picked a maxed-out victim" condition without reaching
+    # into the budgeter.
+    b._rows[0].generated.append(7)  # type: ignore[attr-defined]
+    assert len(b._rows[0].generated) == 2  # type: ignore[attr-defined]
+
+    pre_rows = len(b._rows)  # type: ignore[attr-defined]
+    pre_queue = len(b._waiting_queue)  # type: ignore[attr-defined]
+
+    with pytest.raises(AssertionError, match="should have been DONE"):
+        b._apply_preempt("req-0")  # type: ignore[attr-defined]
+
+    # State unchanged — no half-preempt, no dangling replay pending.
+    assert len(b._rows) == pre_rows  # type: ignore[attr-defined]
+    assert len(b._waiting_queue) == pre_queue  # type: ignore[attr-defined]
+
+
+def test_phase_a_preempt_admits_triggering_with_consistent_budget_accounting_and_counter() -> None:
+    """Happy-path Phase A preempt: fresh pending gets
+    AdmitAfterPreemptDecision, _apply_preempt releases the victim's
+    reservation, Phase A apply_admit's the triggering pending's own
+    reservation, preempts counter bumps.
+
+    Math: bpt=16, n_prompt=4, max_tokens=5 → worst = 9 * 16 = 144.
+    cap=144. Pre-existing victim manually reserved at 144 → headroom=0.
+    Fresh pending worst=144: fit 144>0 no; evict n/a (no evictable
+    blocks); preempt victim freed=144, 144 <= 0+144 → AdmitAfterPreempt.
+    """
+    pc = _make_prefix_cache(block_size=4)
+    adapter = _admit_adapter(script=(7, 9))
+    budgeter = MemoryBudgeter.for_adapter(
+        adapter, prefix_cache=pc, weights_bytes=0, cap_bytes=144
+    )
+    # max_batch_size=2 is deliberate: Phase A gates admissions on slot
+    # capacity (``max_batch_size - len(self._rows)``). Preempt frees
+    # BYTES under the budget cap, not physical row slots, so with
+    # max_batch_size=1 and one active row capacity=0 would short-circuit
+    # Phase A before the budgeter is consulted.
+    b = ContinuousBatcher(
+        adapter, max_batch_size=2, prefix_cache=pc, budgeter=budgeter
+    )
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=5))
+    b.step()  # prefill → generated=[7], DECODE
+    # Initial cohort bypasses the budgeter — record the victim's
+    # reservation manually (in 4d/e this comes naturally via Phase A).
+    budgeter.apply_admit("req-0", 144)
+
+    # Mid-run fresh admission routes through _admit_waiting_requests.
+    b.add_request(1, [10, 20, 30, 40], _greedy(max_tokens=5))
+    b.step()  # Phase A preempt + admit req-1.
+
+    assert b.preempts == 1
+    assert b.aborts == 0
+    # Victim replaced by the triggering pending.
+    assert len(b._rows) == 1  # type: ignore[attr-defined]
+    assert b._rows[0].req_index == 1  # type: ignore[attr-defined]
+    # Budget accounting: victim released, triggering applied. Final
+    # reserved_bytes reflects only the triggering pending.
+    assert budgeter.active_requests() == ["req-1"]
+    assert budgeter.reserved_bytes() == 144
+    # Replay pending sits at queue front with composite prompt +
+    # is_replay flag, ready for the next step's admit phase.
+    assert len(b._waiting_queue) == 1  # type: ignore[attr-defined]
+    replay = b._waiting_queue[0]  # type: ignore[attr-defined]
+    assert replay.req_index == 0
+    assert list(replay.prompt_ids) == [1, 2, 3, 4, 7]
+    assert replay.is_replay is True
+    assert replay.params.max_tokens == 4
+
+
+def test_phase_a_preempt_missing_victim_requeues_triggering_at_front() -> None:
+    """B-7: budgeter picks a victim that is not in self._rows (phantom
+    reservation simulating a same-step race). _apply_preempt returns
+    False; Phase A appendleft's the triggering pending and breaks so
+    next step retries with fresh state."""
+    pc = _make_prefix_cache(block_size=4)
+    adapter = _admit_adapter(script=())
+    budgeter = MemoryBudgeter.for_adapter(
+        adapter, prefix_cache=pc, weights_bytes=0, cap_bytes=144
+    )
+    # Phantom — budgeter thinks req-ghost exists, self._rows never had it.
+    budgeter.apply_admit("req-ghost", 144)
+    b = ContinuousBatcher(
+        adapter, max_batch_size=1, prefix_cache=pc, budgeter=budgeter
+    )
+    b.step()  # seal empty cohort
+
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=5))
+    events = b.step()
+
+    assert b.preempts == 0
+    assert b.aborts == 0
+    # Triggering pending back at queue front as FRESH (is_replay=False).
+    assert len(b._waiting_queue) == 1  # type: ignore[attr-defined]
+    assert b._waiting_queue[0].req_index == 0  # type: ignore[attr-defined]
+    assert b._waiting_queue[0].is_replay is False  # type: ignore[attr-defined]
+    # No row admitted this step.
+    assert len(b._rows) == 0  # type: ignore[attr-defined]
+    # Phantom reservation never released (distinct from the happy path).
+    assert budgeter.reserved_bytes() == 144
+    # No events emitted — the break fired before Phase B ran.
+    assert events == []
+
+
+def test_replay_pending_with_active_rows_requeues_at_front() -> None:
+    """B-9 wait path: a replay pending that gets
+    AdmitAfterPreemptDecision with self._rows non-empty must requeue
+    itself at queue front and break. Active rows are left to terminate
+    naturally; the next step retries the replay against freed headroom."""
+    pc = _make_prefix_cache(block_size=4)
+    adapter = _admit_adapter(script=(7, 9))
+    budgeter = MemoryBudgeter.for_adapter(
+        adapter, prefix_cache=pc, weights_bytes=0, cap_bytes=144
+    )
+    b = ContinuousBatcher(
+        adapter, max_batch_size=2, prefix_cache=pc, budgeter=budgeter
+    )
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=5))
+    b.step()  # prefill → generated=[7], DECODE
+    budgeter.apply_admit("req-0", 144)
+    # Manually enqueue a replay pending. In a full 4c run this would
+    # have landed here via a prior step's _apply_preempt.
+    b._waiting_queue.append(  # type: ignore[attr-defined]
+        _PendingAdmit(
+            req_index=1,
+            prompt_ids=(10, 20, 30, 40),
+            params=_greedy(max_tokens=5),
+            is_replay=True,
+        )
+    )
+
+    b.step()  # Phase A → B-9 wait → break. Phase 3 decode runs.
+
+    assert b.preempts == 0
+    assert b.aborts == 0
+    # Replay still at queue front with replay flag intact.
+    assert len(b._waiting_queue) == 1  # type: ignore[attr-defined]
+    replay = b._waiting_queue[0]  # type: ignore[attr-defined]
+    assert replay.req_index == 1
+    assert replay.is_replay is True
+    # Active row survived and advanced (decode phase ran after admit break).
+    assert len(b._rows) == 1  # type: ignore[attr-defined]
+    assert b._rows[0].req_index == 0  # type: ignore[attr-defined]
+
+
+def test_replay_pending_with_no_active_rows_aborts_budget_exhausted() -> None:
+    """B-9 terminate path: a replay pending that gets
+    AdmitAfterPreemptDecision AND self._rows is empty has no waiting
+    strategy — emit BatchEvent.aborted with "budget-exhausted" and
+    move on."""
+    pc = _make_prefix_cache(block_size=4)
+    adapter = _admit_adapter(script=())
+    budgeter = MemoryBudgeter.for_adapter(
+        adapter, prefix_cache=pc, weights_bytes=0, cap_bytes=144
+    )
+    # Phantom reservation produces a non-empty preempt-victim list in
+    # the budgeter WITHOUT populating self._rows. Replay pending with
+    # similar cap pressure will get AdmitAfterPreempt for the phantom.
+    budgeter.apply_admit("req-ghost", 144)
+    b = ContinuousBatcher(
+        adapter, max_batch_size=2, prefix_cache=pc, budgeter=budgeter
+    )
+    b._waiting_queue.append(  # type: ignore[attr-defined]
+        _PendingAdmit(
+            req_index=1,
+            prompt_ids=(10, 20, 30, 40),
+            params=_greedy(max_tokens=5),
+            is_replay=True,
+        )
+    )
+
+    events = b.step()
+
+    assert b.aborts == 1
+    assert b.preempts == 0
+    assert len(b._rows) == 0  # type: ignore[attr-defined]
+    assert len(b._waiting_queue) == 0  # type: ignore[attr-defined]
+    aborted = [e for e in events if e.kind == "aborted"]
+    assert len(aborted) == 1
+    assert aborted[0].req_index == 1
+    assert aborted[0].finish_reason == "budget-exhausted"

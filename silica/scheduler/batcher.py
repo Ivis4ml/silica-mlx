@@ -172,12 +172,12 @@ class ContinuousBatcher:
         # check (invariant B-1: no-budgeter bit-identical to 16c.2).
         # When set, _admit_waiting_requests consults budgeter.admit per
         # pending and routes to admit / reject / evict / preempt.
-        # 16d-2b wires only admit + reject; evict/preempt decisions
-        # raise NotImplementedError (16d-3 / 16d-4 will install them).
+        # 16d-3 wires evict; 16d-4c wires preempt + replay requeue.
         self._budgeter: MemoryBudgeter | None = budgeter
         # 16d counters paralleling 16c.2's hits/forward counters.
-        # ``aborts`` increments on RejectDecision; ``evictions`` and
-        # ``preempts`` remain 0 until 16d-3 / 16d-4 wire them.
+        # ``aborts`` increments on RejectDecision / budget failure,
+        # ``evictions`` on successful evict decisions, and ``preempts``
+        # on successful fresh-pending preempts.
         self.aborts: int = 0
         self.evictions: int = 0
         self.preempts: int = 0
@@ -609,6 +609,79 @@ class ContinuousBatcher:
 
         return victim_row
 
+    def _apply_preempt(self, victim_req_id: str) -> bool:
+        """Preempt ``victim_req_id`` and re-enqueue it as a replay (16d-4c).
+
+        Wraps ``_preempt_active_row`` with step 5 of prep doc
+        ``P2_UNIT_16D_PREP.md`` §4.4:
+
+          - ``composite_prompt = prompt_ids + generated`` (full — no
+            ``[:-1]`` trim). B-5: every token the victim emitted was
+            observed by the caller via ``BatchEvent.token``; the replay
+            must resume at the NEXT position to avoid duplicating the
+            last emitted token on the caller side.
+          - ``replay_params = params.model_copy(update={"max_tokens":
+            remaining})`` where ``remaining = max_tokens - len(generated)``.
+            Q-2 algebra: ``(len(composite) + remaining) == (n_prompt +
+            max_tokens)`` — the replay's worst-case bytes equal the
+            original's, so the budgeter's admission decision at re-admit
+            time matches the original's shape.
+          - ``appendleft`` the replay ``_PendingAdmit`` with
+            ``is_replay=True`` so Phase A's B-9 rule excludes it from
+            triggering further preempts.
+
+        Returns True on successful preempt + re-enqueue, False when
+        the victim has already left the active batch (B-7 race;
+        caller requeues its triggering admission).
+
+        Raises AssertionError when ``remaining <= 0`` — the budgeter
+        picked a victim at its max_tokens cap that should have already
+        transitioned to DONE. The check runs BEFORE any state mutation
+        so the loud-fail leaves the batcher in a coherent state (no
+        half-preempted row, no dangling replay pending).
+        """
+        # Pre-check: find victim + validate remaining BEFORE mutating
+        # state. This duplicates one _find_row_by_req_id scan vs pushing
+        # the check into _preempt_active_row, but keeps the helper's
+        # "does extract + filter" semantics honest and keeps the
+        # AssertionError tripwire non-destructive.
+        if self._batch_cache is None:
+            return False
+        victim_row_idx = self._find_row_by_req_id(victim_req_id)
+        if victim_row_idx is None:
+            return False
+        victim_row = self._rows[victim_row_idx]
+        remaining = (
+            victim_row.params.max_tokens - len(victim_row.generated)
+        )
+        if remaining <= 0:
+            raise AssertionError(
+                f"preempt victim {victim_req_id}: remaining tokens = "
+                f"{remaining} (victim should have been DONE)"
+            )
+
+        detached = self._preempt_active_row(victim_req_id)
+        # The second lookup inside _preempt_active_row scans the same
+        # self._rows we just read; no mutation in between so a None
+        # here would be a consistency violation.
+        assert detached is not None
+
+        composite_prompt = tuple(
+            list(detached.prompt_ids) + list(detached.generated)
+        )
+        replay_params = detached.params.model_copy(
+            update={"max_tokens": remaining}
+        )
+        self._waiting_queue.appendleft(
+            _PendingAdmit(
+                req_index=detached.req_index,
+                prompt_ids=composite_prompt,
+                params=replay_params,
+                is_replay=True,
+            )
+        )
+        return True
+
     def _prefill_phase(self) -> list[BatchEvent]:
         """One batched forward over the left-padded prompt tensor."""
         assert self._batch_cache is not None
@@ -713,13 +786,13 @@ class ContinuousBatcher:
             - ``RejectDecision``          → emit ``BatchEvent.aborted``,
               bump ``self.aborts``, do NOT ``apply_admit`` (Q-4 / B-6';
               aborted admissions never touch the reservation tally).
-            - ``AdmitAfterEvictDecision`` / ``AdmitAfterPreemptDecision``
-              → raise ``NotImplementedError`` with 16d-3 / 16d-4
-              markers. These decisions are already recognised by the
-              budgeter but their apply paths belong to later sub-commits.
-              A later raise is more honest than a temporary "treat as
-              reject" fallback — the latter would create a short-lived
-              semantics the next sub-commit has to invalidate.
+            - ``AdmitAfterEvictDecision`` → evict first, then
+              ``apply_admit``. Evict underrun aborts this admission
+              without reserving it (B-2).
+            - ``AdmitAfterPreemptDecision`` → fresh pendings may
+              preempt one active row, requeue that victim as replay,
+              then ``apply_admit`` the triggering pending. Replay
+              pendings never preempt again (B-9).
 
           When ``self._budgeter is None``, every popped pending is
           accepted without a decision — behaviour is bit-identical to
@@ -812,11 +885,40 @@ class ContinuousBatcher:
                     )
                     accepted.append(pending)
                 case AdmitAfterPreemptDecision():
-                    raise NotImplementedError(
-                        "16d-4c: AdmitAfterPreemptDecision apply path — "
-                        "_preempt_active_row lands in 16d-4b (pure state), "
-                        "_apply_preempt + re-enqueue in 16d-4c"
+                    if pending.is_replay:
+                        # B-9 anti-ping-pong: a replay admission CANNOT
+                        # trigger further preempts. Two sub-branches:
+                        if self._rows:
+                            # Active rows exist — wait for one to
+                            # terminate naturally, then retry this
+                            # pending. Only the current pending is
+                            # requeued; the untouched suffix of the
+                            # waiting queue is preserved by the
+                            # pop-one-at-a-time loop shape.
+                            self._waiting_queue.appendleft(pending)
+                            break
+                        # No active rows to wait on — the replay is
+                        # genuinely unfittable under this cap.
+                        events.append(
+                            BatchEvent.aborted(
+                                pending.req_index, "budget-exhausted"
+                            )
+                        )
+                        self.aborts += 1
+                        continue
+                    # Fresh (non-replay) pending may trigger preempt.
+                    if not self._apply_preempt(decision.preempt_req_id):
+                        # B-7: victim was not in self._rows (race with
+                        # reclaim, same-step termination, etc.). Requeue
+                        # this triggering admission at queue front and
+                        # break so next step retries with fresh state.
+                        self._waiting_queue.appendleft(pending)
+                        break
+                    self.preempts += 1
+                    self._budgeter.apply_admit(
+                        req_id, decision.reserved_delta
                     )
+                    accepted.append(pending)
                 case _:
                     raise AssertionError(
                         f"unhandled AdmissionDecision type: "
