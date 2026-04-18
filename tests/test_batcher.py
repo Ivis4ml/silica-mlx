@@ -2235,3 +2235,187 @@ def test_replay_pending_with_no_active_rows_aborts_budget_exhausted() -> None:
     assert len(aborted) == 1
     assert aborted[0].req_index == 1
     assert aborted[0].finish_reason == "budget-exhausted"
+
+
+# --- 16d-4d: preempt/replay end-to-end scripted tests -----------------------
+#
+# Three high-signal scripted tests that drive full preempt + replay
+# cycles across multiple steps. No real model — 4e covers Qwen3-0.6B
+# acceptance separately.
+#
+# Shared scenario (bpt=16): cap=192, fits exactly 2 requests. Three
+# 4-token-prompt / max_tokens=2 requests arrive; r0+r1 start as the
+# initial cohort, r2 arrives mid-run and triggers preempt of r1
+# (FIFO-newest by admission order). r1's replay re-admits after r0+r2
+# terminate.
+#
+# max_batch_size=3 throughout — preempt is byte-capacity freeing, not
+# slot-capacity; with max_batch_size=2 Phase A's slot gate would
+# short-circuit BEFORE the budgeter is consulted.
+
+
+def test_preempt_without_prefix_cache_replays_via_full_prefill() -> None:
+    """Theme 1 — degradation: without a prefix_cache, preempt still
+    completes, but the victim's prompt work is lost. The replay
+    re-admits through the miss path and prefills the FULL composite
+    prompt. Observable: ``forward_prompt_tokens`` grows by the
+    composite length, not by a prefix-hit suffix length.
+
+    Math (bpt=16):
+      - step 1: prefill r0+r1 cohort → 4+4 = 8 prompt tokens.
+      - step 2: admit miss for r2 → 4 prompt tokens; Phase A preempts r1.
+      - step 3: decode on [r0, r2] → both DONE at max_tokens=2. Decode
+        does not bump the counter.
+      - step 4: reclaim drops r0+r2; admit miss for replay_r1 with
+        5-token composite prompt (original 4 + 1 generated) → 5
+        prompt tokens. max_tokens=1 (remaining) → DONE on first sample.
+      - Total forward_prompt_tokens = 8 + 4 + 5 = 17.
+    """
+    # Scripted forwards across the run:
+    #   (5, 6) — step 1 cohort prefill (2 rows, per-row target each)
+    #   7      — step 2 admit miss for r2 (1 row scalar)
+    #   (8, 9) — step 3 decode for [r0, r2]
+    #   10     — step 4 admit miss for replay_r1 (1 row scalar)
+    adapter = _admit_adapter(script=((5, 6), 7, (8, 9), 10))
+    # Budgeter needs a prefix_cache arg; use one the batcher doesn't
+    # see so the batcher's hit path never fires.
+    budgeter_pc = _make_prefix_cache(block_size=4)
+    budgeter = MemoryBudgeter.for_adapter(
+        adapter, prefix_cache=budgeter_pc, weights_bytes=0, cap_bytes=192
+    )
+    b = ContinuousBatcher(
+        adapter,
+        max_batch_size=3,
+        prefix_cache=None,  # THE degradation condition.
+        budgeter=budgeter,
+    )
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=2))
+    b.add_request(1, [10, 20, 30, 40], _greedy(max_tokens=2))
+    b.step()  # step 1: prefill cohort r0+r1
+    # Initial cohort bypasses the budgeter; install reservations
+    # manually so the mid-run admit for r2 sees correct headroom.
+    budgeter.apply_admit("req-0", 96)
+    budgeter.apply_admit("req-1", 96)
+
+    b.add_request(2, [100, 200, 300, 400], _greedy(max_tokens=2))
+    events: list[BatchEvent] = []
+    while b.has_work():
+        events.extend(b.step())
+
+    assert b.aborts == 0
+    assert b.preempts == 1
+    # Every req reached terminal exactly once.
+    dones = [e for e in events if e.kind == "done"]
+    assert {e.req_index for e in dones} == {0, 1, 2}
+    assert len(dones) == 3
+    # Degradation signature: replay's composite prompt (5 tokens) was
+    # prefilled in full because there was no prefix_cache. With a pc
+    # this would shrink to a 1-token suffix via the hit path.
+    assert b.forward_prompt_tokens == 17
+    assert b.prefix_hits == 0
+
+
+def test_replay_waits_then_readmits_after_active_row_terminates() -> None:
+    """B-9 wait convergence, step-by-step observation. After preempt
+    the replay sits at queue front; each wait step keeps it there with
+    ``is_replay=True``. Once active rows terminate and reclaim frees
+    headroom, the replay's next admit is a plain ``AdmitDecision`` —
+    ``preempts`` does NOT bump a second time.
+    """
+    adapter = _admit_adapter(script=((5, 6), 7, (8, 9), 10))
+    budgeter_pc = _make_prefix_cache(block_size=4)
+    budgeter = MemoryBudgeter.for_adapter(
+        adapter, prefix_cache=budgeter_pc, weights_bytes=0, cap_bytes=192
+    )
+    b = ContinuousBatcher(
+        adapter, max_batch_size=3, prefix_cache=None, budgeter=budgeter
+    )
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=2))
+    b.add_request(1, [10, 20, 30, 40], _greedy(max_tokens=2))
+    b.step()  # step 1: prefill cohort
+    budgeter.apply_admit("req-0", 96)
+    budgeter.apply_admit("req-1", 96)
+
+    b.add_request(2, [100, 200, 300, 400], _greedy(max_tokens=2))
+    b.step()  # step 2: preempt r1 for r2
+
+    # Preempt fired; replay sits at queue front.
+    assert b.preempts == 1
+    assert len(b._waiting_queue) == 1  # type: ignore[attr-defined]
+    replay = b._waiting_queue[0]  # type: ignore[attr-defined]
+    assert replay.req_index == 1
+    assert replay.is_replay is True
+    assert len(b._rows) == 2  # type: ignore[attr-defined]
+    assert {r.req_index for r in b._rows} == {0, 2}  # type: ignore[attr-defined]
+
+    # step 3: Phase A pops replay, gets AdmitAfterPreempt (budget still
+    # tight), hits the B-9 wait branch → appendleft + break. Phase 3
+    # decode runs on [r0, r2], both transition DONE at max_tokens=2.
+    b.step()
+    assert len(b._waiting_queue) == 1  # type: ignore[attr-defined]
+    assert b._waiting_queue[0].is_replay is True  # type: ignore[attr-defined]
+    # Both active rows are terminal, awaiting reclaim next step.
+    assert all(
+        r.state.is_terminal for r in b._rows  # type: ignore[attr-defined]
+    )
+    assert b.preempts == 1  # B-9 wait did NOT count as a preempt
+
+    # step 4: reclaim drops r0+r2 (budgeter releases both, so
+    # reserved_bytes drops to 0). Phase A: replay admits via plain
+    # AdmitDecision — headroom 192 fits the 96-byte replay.
+    b.step()
+    assert len(b._waiting_queue) == 0  # type: ignore[attr-defined]
+    assert len(b._rows) == 1  # type: ignore[attr-defined]
+    # The admitted row IS the replay (req_index=1).
+    assert b._rows[0].req_index == 1  # type: ignore[attr-defined]
+    # Replay forward sampled its only token → max_tokens=1 → DONE.
+    assert b._rows[0].state.is_terminal  # type: ignore[attr-defined]
+    # Crucial: re-admit was AdmitDecision, not AdmitAfterPreempt —
+    # preempts counter stayed at 1.
+    assert b.preempts == 1
+
+
+def test_preempt_replay_cycle_eventually_terminal_for_every_req() -> None:
+    """B-3 + B-4: per-req event contract across the full cycle. Every
+    req_index gets exactly ONE terminal event (done or aborted); the
+    event taxonomy stays {token, done, aborted} (no "preempted" kind
+    — preempt is counter-observable, not event-observable).
+    """
+    adapter = _admit_adapter(script=((5, 6), 7, (8, 9), 10))
+    budgeter_pc = _make_prefix_cache(block_size=4)
+    budgeter = MemoryBudgeter.for_adapter(
+        adapter, prefix_cache=budgeter_pc, weights_bytes=0, cap_bytes=192
+    )
+    b = ContinuousBatcher(
+        adapter, max_batch_size=3, prefix_cache=None, budgeter=budgeter
+    )
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=2))
+    b.add_request(1, [10, 20, 30, 40], _greedy(max_tokens=2))
+    b.step()
+    budgeter.apply_admit("req-0", 96)
+    budgeter.apply_admit("req-1", 96)
+
+    b.add_request(2, [100, 200, 300, 400], _greedy(max_tokens=2))
+
+    events: list[BatchEvent] = []
+    while b.has_work():
+        events.extend(b.step())
+
+    # B-4: event taxonomy is the token/done/aborted set only.
+    assert all(e.kind in {"token", "done", "aborted"} for e in events)
+
+    # Each req_index reaches terminal exactly once.
+    terminal_by_req: dict[int, list[BatchEvent]] = {}
+    for e in events:
+        if e.kind in {"done", "aborted"}:
+            terminal_by_req.setdefault(e.req_index, []).append(e)
+    assert set(terminal_by_req.keys()) == {0, 1, 2}
+    for req_index, terminals in terminal_by_req.items():
+        assert len(terminals) == 1, (
+            f"req {req_index} has {len(terminals)} terminal events; "
+            f"preempt must NOT surface as a second terminal"
+        )
+
+    # Counter observables hold.
+    assert b.preempts >= 1
+    assert b.aborts == 0
