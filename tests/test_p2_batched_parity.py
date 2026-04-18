@@ -43,9 +43,13 @@ import pytest
 from mlx_lm.models.cache import BatchKVCache
 from mlx_lm.utils import load
 
+from silica.core.events import BatchEvent
 from silica.core.sampling import SamplingParams
 from silica.engine import Engine
+from silica.kvcache.prefix import RadixPrefixCache
+from silica.kvcache.store import SyntheticPrefixBlockStore
 from silica.models.qwen3 import Qwen3Adapter
+from silica.scheduler.batcher import ContinuousBatcher
 
 REPO = "Qwen/Qwen3-0.6B"
 MAX_TOKENS = 10
@@ -238,3 +242,106 @@ def test_left_padding_does_not_corrupt_any_row() -> None:
 
     assert silica[0] == direct[0]
     assert silica[1] == direct[1]
+
+
+# --- 16c.2 step 4 sub-commit 4: PLAN §7 #2 acceptance --------------------
+
+
+@pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
+def test_shared_prefix_reduces_forward_tokens() -> None:
+    """PLAN §7 P-2 acceptance #2: shared-prefix admissions go through the
+    hit path and reduce total forward_prompt_tokens by a closed-form
+    amount. Drives ``ContinuousBatcher`` directly — Engine.generate_batch
+    hides the batcher so the counter would not be reachable through it.
+
+    Setup (per docs/P2_UNIT_16C_2_PREP.md §5 edge 5):
+      block_size   = 16
+      prefix_len   = 128  (8 aligned blocks)
+      suffix_len   = 16   (1 aligned block, unique per request)
+      max_tokens   = 1    (one sampled token per row — keeps runtime small)
+      4 staggered admissions via max_batch_size=1.
+
+    First request goes through the initial-cohort miss path (cache
+    empty; see skeleton §9 scope note). Requests 1-3 are mid-run admits
+    and take the hit path. Closed-form accounting:
+
+      usable_hit = block_size * (prefix_len // block_size) = 128
+      forward_prompt_tokens
+        = (prefix_len + suffix_len)                # req 0 miss, full prefill
+        + 3 * (prefix_len + suffix_len - 128)      # reqs 1-3 hit, 16-tok suffix
+        = 144 + 3 * 16 = 192.
+
+    Baseline (no prefix_cache): 4 * (prefix_len + suffix_len) = 576.
+
+    Correctness cross-check: per-row output tokens with cache must
+    match the no-cache baseline bit-exactly — the hit path should be
+    numerically indistinguishable from accumulating K/V via
+    update_and_fetch (Gate-0.75 probe A pinned this at the BatchKVCache
+    level; this test extends the invariant end-to-end through Qwen3
+    forward kernels).
+    """
+    block_size = 16
+    prefix_len = 128
+    suffix_len = 16
+    prompt_len = prefix_len + suffix_len
+
+    # Synthetic token ids — simpler than tokenizing a specific string
+    # to exactly 144 tokens. Real Qwen3 accepts any valid id; at
+    # max_tokens=1 greedy sampling the specific values do not matter
+    # for correctness as long as they are deterministic.
+    shared_prefix = list(range(1, prefix_len + 1))
+    prompts: list[list[int]] = [
+        shared_prefix + list(range(1000 + i * 100, 1000 + i * 100 + suffix_len))
+        for i in range(4)
+    ]
+
+    params = SamplingParams(temperature=0.0, max_tokens=1)
+
+    def _drive(
+        prefix_cache: RadixPrefixCache | None,
+    ) -> tuple[ContinuousBatcher, dict[int, list[int]]]:
+        adapter, _ = Qwen3Adapter.from_hf_repo(REPO)
+        batcher = ContinuousBatcher(
+            adapter, max_batch_size=1, prefix_cache=prefix_cache
+        )
+        emitted: dict[int, list[int]] = {}
+        for req_idx in range(4):
+            batcher.add_request(req_idx, prompts[req_idx], params)
+            while batcher.has_work():
+                for event in batcher.step():
+                    if event.kind == "token" and event.token_id is not None:
+                        emitted.setdefault(event.req_index, []).append(
+                            event.token_id
+                        )
+        return batcher, emitted
+
+    # Baseline: no prefix cache. Every admission goes through miss path.
+    baseline_b, baseline_tokens = _drive(None)
+    assert baseline_b.prefix_hits == 0
+    assert baseline_b.forward_prompt_tokens == 4 * prompt_len  # 576
+
+    # With prefix cache.
+    pc = RadixPrefixCache(
+        block_size=block_size,
+        store=SyntheticPrefixBlockStore(block_size=block_size),
+    )
+    hit_b, hit_tokens = _drive(pc)
+
+    # Closed-form assertions. The formula deliberately does NOT assume
+    # "first prompt also hits" — req 0 goes through miss (empty cache
+    # at its admission time; skeleton §9 scope limit).
+    usable_hit = block_size * (prefix_len // block_size)  # 128
+    expected_forward = prompt_len + 3 * (prompt_len - usable_hit)
+    assert hit_b.forward_prompt_tokens == expected_forward  # 192
+    assert hit_b.prefix_hits == 3
+    assert pc.hits == 3
+
+    # Correctness: per-row sampled tokens must match the no-cache run
+    # bit-exactly across all 4 requests.
+    assert sorted(hit_tokens.keys()) == [0, 1, 2, 3]
+    for req_idx in range(4):
+        assert hit_tokens[req_idx] == baseline_tokens[req_idx], (
+            f"req {req_idx}: cache-on {hit_tokens[req_idx]} != "
+            f"baseline {baseline_tokens[req_idx]} — seeded cache path "
+            f"diverged from uaf-accumulated path"
+        )
