@@ -1,24 +1,32 @@
-"""silica.scheduler.budget — MemoryBudgeter (P-2 Unit #15).
+"""silica.scheduler.budget — MemoryBudgeter (P-2 Unit #15 / #16d).
 
 Admission + preemption **policy** layer. Returns decision objects rather
 than mutating state directly — ``ContinuousBatcher`` (Unit #16) is the
-single place that applies decisions against ``PagedKVCache`` and
-``RadixPrefixCache``. Separating decide / apply keeps this unit testable
-without wiring up real caches.
+single place that applies decisions. Separating decide / apply keeps
+this unit testable without wiring up real caches.
+
+**16d-1 refactor:** the budgeter originally took ``kv: PagedKVCache`` for
+its ``block_size``. Under Option B (docs/P2_OPENING.md v2.1), the
+batcher uses ``BatchKVCache`` not ``PagedKVCache``, and the budgeter
+never actually queried kv residency at decision time — it only needed
+``block_size``. We now take ``block_size: int`` directly, keep
+``prefix_cache`` (still required for ``_count_evictable_prefix_blocks``),
+and offer a ``for_adapter`` convenience factory so callers do not
+recompute ``bytes_per_token``.
 
 Two accountings (docs/P2_OPENING.md v2.1 §MemoryBudgeter):
 
-  - **resident_bytes** — D-012 canonical; read from ``PagedKVCache.budget``
-    each query. Reflects reality.
+  - **resident_bytes** — D-012 canonical; a non-normative reference for
+    what the kv backend actually holds. Not read at decision time.
   - **reserved_bytes** — admission-time upper bound. For each admitted
     (non-terminated) request, the budgeter records
     ``(n_prompt + max_tokens) * bytes_per_token``. Conflating this with
     resident makes admission systematically over-admit; keeping the split
     is the main reason this class exists.
 
-The ``weights`` and ``bytes_per_token`` inputs are provided by the
-ContinuousBatcher at construction time (it knows ``ModelConfig`` + quant
-profile). The budgeter does not read adapter state.
+The ``weights`` and ``bytes_per_token`` inputs are static construction
+inputs (caller knows ``ModelConfig`` + dtype). The budgeter does not
+read adapter state at decision time.
 
 Decision taxonomy:
 
@@ -49,9 +57,12 @@ of subtle scheduler bug P-2 is specifically trying to avoid.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-from silica.kvcache.paged import PagedKVCache
 from silica.kvcache.prefix import RadixPrefixCache
+
+if TYPE_CHECKING:
+    from silica.models.adapter import ModelAdapter
 
 
 @dataclass(frozen=True)
@@ -109,18 +120,24 @@ class MemoryBudgeter:
         weights_bytes: bytes held by static model weights + activations.
         bytes_per_token: (2 * num_layers * n_kv_heads * head_dim * dtype_bytes)
                           — per-token KV bytes (one K + one V per layer).
+        block_size: token count per radix block. Together with
+                    bytes_per_token, gives the per-block byte cost used
+                    by the evict-shortfall arithmetic.
         cap_bytes: target resident cap (default 80% of unified memory,
                    tunable via SILICA_RESIDENT_CAP_MB; resolution lives
                    in the ContinuousBatcher, not here).
+
+    For typical callsites, see ``MemoryBudgeter.for_adapter`` which
+    derives ``bytes_per_token`` from an adapter's KV layout.
     """
 
     def __init__(
         self,
         *,
-        kv: PagedKVCache,
         prefix_cache: RadixPrefixCache,
         weights_bytes: int,
         bytes_per_token: int,
+        block_size: int,
         cap_bytes: int,
     ) -> None:
         if weights_bytes < 0:
@@ -131,18 +148,59 @@ class MemoryBudgeter:
             raise ValueError(
                 f"bytes_per_token must be > 0, got {bytes_per_token}"
             )
+        if block_size <= 0:
+            raise ValueError(f"block_size must be > 0, got {block_size}")
         if cap_bytes <= 0:
             raise ValueError(f"cap_bytes must be > 0, got {cap_bytes}")
-        self._kv = kv
         self._pc = prefix_cache
         self._weights_bytes = weights_bytes
         self._bytes_per_token = bytes_per_token
+        self._block_size = block_size
         self._cap_bytes = cap_bytes
         # FIFO-order list of req_ids that have been admitted and not
         # released; appended on apply_admit, removed on release. Preempt
         # policy uses the tail (newest DECODE).
         self._admitted: list[str] = []
         self._reserved_per_req: dict[str, int] = {}
+
+    @classmethod
+    def for_adapter(
+        cls,
+        adapter: "ModelAdapter",
+        *,
+        prefix_cache: RadixPrefixCache,
+        weights_bytes: int,
+        cap_bytes: int,
+    ) -> "MemoryBudgeter":
+        """Construct a ``MemoryBudgeter`` for a concrete ``ModelAdapter``.
+
+        Derives ``bytes_per_token`` from the adapter's
+        ``kv_layout()``: one K plus one V per layer, ``n_kv_heads``
+        heads, ``head_dim`` each, at the layout's dtype.
+        ``block_size`` comes from ``prefix_cache.block_size`` — the
+        radix cache is the authority on block granularity and keeping
+        it single-sourced avoids drift.
+
+        Intended for callers that would otherwise recompute this
+        arithmetic at every test / harness site. The batcher still
+        takes an explicit ``budgeter`` kwarg — this factory does not
+        remove the ownership boundary (16d non-goal).
+        """
+        layout = adapter.kv_layout()
+        bytes_per_token = (
+            2  # one K, one V
+            * layout.num_layers
+            * layout.n_kv_heads
+            * layout.head_dim
+            * layout.dtype.size
+        )
+        return cls(
+            prefix_cache=prefix_cache,
+            weights_bytes=weights_bytes,
+            bytes_per_token=bytes_per_token,
+            block_size=prefix_cache.block_size,
+            cap_bytes=cap_bytes,
+        )
 
     # --- inspection ---
 
@@ -269,14 +327,13 @@ class MemoryBudgeter:
     # --- internals ---
 
     def _kv_bytes_per_block(self) -> int:
-        """Infer bytes-per-block from the kv manager's accounting.
+        """Bytes per radix block.
 
-        We compute via a hypothetical reserve: since PagedKVCache's
-        bytes_per_block is private, we use the ratio
-        ``block_bytes = bytes_per_token * block_size``. That matches how
-        ``PagedKVCache`` calculates it internally.
+        ``bytes_per_token * block_size`` — matches ``PagedKVCache``'s
+        internal accounting and is dimensionally what the evict-
+        shortfall math wants to divide the byte shortfall by.
         """
-        return self._bytes_per_token * self._kv.block_size
+        return self._bytes_per_token * self._block_size
 
     def _count_evictable_prefix_blocks(self) -> int:
         """Best-effort count of leaf blocks with zero live hits.

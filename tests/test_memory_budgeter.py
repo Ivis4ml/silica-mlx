@@ -59,10 +59,10 @@ def _make(
     )
     bpt = _bytes_per_token_from_kv(kv)
     b = MemoryBudgeter(
-        kv=kv,
         prefix_cache=pc,
         weights_bytes=weights_bytes,
         bytes_per_token=bpt,
+        block_size=kv.block_size,
         cap_bytes=cap_bytes,
     )
     return b, kv, pc
@@ -87,15 +87,88 @@ def test_constructor_validates_inputs(field: str, bad_value: int) -> None:
         block_size=kv.block_size, store=PagedPrefixBlockStore(kv)
     )
     kwargs: dict[str, object] = {
-        "kv": kv,
         "prefix_cache": pc,
         "weights_bytes": 0,
         "bytes_per_token": 8,
+        "block_size": kv.block_size,
         "cap_bytes": 1000,
     }
     kwargs[field] = bad_value
     with pytest.raises(ValueError, match="must be"):
         MemoryBudgeter(**kwargs)  # type: ignore[arg-type]
+
+
+def test_constructor_validates_block_size() -> None:
+    kv = _kv()
+    pc = RadixPrefixCache(
+        block_size=kv.block_size, store=PagedPrefixBlockStore(kv)
+    )
+    with pytest.raises(ValueError, match="block_size must be"):
+        MemoryBudgeter(
+            prefix_cache=pc,
+            weights_bytes=0,
+            bytes_per_token=8,
+            block_size=0,
+            cap_bytes=1000,
+        )
+
+
+# --- for_adapter factory (16d-1) ---
+
+
+def test_for_adapter_derives_bytes_per_token_from_layout() -> None:
+    """Factory computes ``bytes_per_token`` as ``2 * num_layers *
+    n_kv_heads * head_dim * dtype.size`` and pulls ``block_size``
+    from the prefix cache so callers never re-derive either."""
+    import mlx.core as mx
+
+    from silica.models.adapter import (
+        AttentionKind,
+        AttentionPattern,
+        KVLayout,
+        ModelConfig,
+    )
+
+    class _StubAdapter:
+        config = ModelConfig(
+            model_name="stub",
+            num_layers=3,
+            hidden_size=16,
+            vocab_size=8,
+        )
+        _layout = KVLayout(
+            num_layers=3,
+            n_kv_heads=2,
+            head_dim=4,
+            dtype=mx.float16,
+        )
+        _pattern = AttentionPattern(
+            per_layer=(AttentionKind.GLOBAL,) * 3
+        )
+
+        def kv_layout(self) -> KVLayout:
+            return self._layout
+
+        def attention_pattern(self) -> AttentionPattern:
+            return self._pattern
+
+    kv = _kv()
+    pc = RadixPrefixCache(
+        block_size=kv.block_size, store=PagedPrefixBlockStore(kv)
+    )
+    b = MemoryBudgeter.for_adapter(
+        _StubAdapter(),  # type: ignore[arg-type]
+        prefix_cache=pc,
+        weights_bytes=100,
+        cap_bytes=10_000,
+    )
+    # 2 * 3 layers * 2 heads * 4 head_dim * 2 (fp16) = 96
+    assert b.bytes_per_token == 96
+    # Block size came from the prefix cache, not the adapter.
+    assert b._block_size == kv.block_size  # type: ignore[attr-defined]
+    # weights + cap pass through unchanged.
+    assert b.weights_bytes == 100
+    assert b.cap_bytes == 10_000
 
 
 # --- worst_case_bytes ---
@@ -196,10 +269,10 @@ def test_admit_returns_preempt_when_only_option() -> None:
     # Cap fits two of these requests exactly; we'll fill it with two and
     # then try to admit a third.
     tight = MemoryBudgeter(
-        kv=b._kv,  # type: ignore[attr-defined]
         prefix_cache=b._pc,  # type: ignore[attr-defined]
         weights_bytes=0,
         bytes_per_token=b.bytes_per_token,
+        block_size=b._block_size,  # type: ignore[attr-defined]
         cap_bytes=per_req_bytes * 2,
     )
     tight.apply_admit("old", per_req_bytes)
@@ -272,10 +345,10 @@ def test_admit_skips_evict_when_prefix_cache_empty_falls_to_preempt() -> None:
     b, _, _ = _make(cap_bytes=10_000)
     per_req = b.worst_case_bytes(8, 8)
     tight = MemoryBudgeter(
-        kv=b._kv,  # type: ignore[attr-defined]
         prefix_cache=b._pc,  # type: ignore[attr-defined]
         weights_bytes=0,
         bytes_per_token=b.bytes_per_token,
+        block_size=b._block_size,  # type: ignore[attr-defined]
         cap_bytes=per_req,
     )
     tight.apply_admit("newest", per_req)
@@ -301,10 +374,10 @@ def test_preempt_victim_is_newest_after_release() -> None:
     b, _, _ = _make(cap_bytes=10_000)
     per_req = b.worst_case_bytes(4, 4)
     tight = MemoryBudgeter(
-        kv=b._kv,  # type: ignore[attr-defined]
         prefix_cache=b._pc,  # type: ignore[attr-defined]
         weights_bytes=0,
         bytes_per_token=b.bytes_per_token,
+        block_size=b._block_size,  # type: ignore[attr-defined]
         cap_bytes=per_req * 2,
     )
     tight.apply_admit("old", per_req)

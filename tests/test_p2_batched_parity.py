@@ -43,7 +43,6 @@ import pytest
 from mlx_lm.models.cache import BatchKVCache
 from mlx_lm.utils import load
 
-from silica.core.events import BatchEvent
 from silica.core.sampling import SamplingParams
 from silica.engine import Engine
 from silica.kvcache.prefix import RadixPrefixCache
