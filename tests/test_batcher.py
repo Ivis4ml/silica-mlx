@@ -1560,3 +1560,167 @@ def test_reject_event_does_not_block_later_queue_items() -> None:
     assert tokens[0].req_index == 1
     # Small's reservation committed; huge's did not.
     assert budgeter.reserved_bytes() == 96
+
+
+# --- 16d-3: evict path wiring ------------------------------------------------
+#
+# AdmitAfterEvictDecision's apply path. Happy path uses a real
+# RadixPrefixCache pre-populated via a bootstrap batcher; the underrun
+# tests use a spy subclass that returns ``n_blocks - 1`` from
+# evict_until so the batcher sees an underrun without needing to
+# manipulate live_hits / tree internals directly.
+
+
+class _UnderrunPrefixCache(RadixPrefixCache):
+    """Spy: ``evict_until(n)`` reports freeing ``n - 1`` blocks.
+
+    Drives ``_apply_evict``'s underrun branch without coupling the test
+    to RadixPrefixCache's internal eviction ordering. It intentionally
+    does NOT mutate the tree: the invariant under review is that an
+    underrun leaves batcher + prefix-cache state as it found them.
+    """
+
+    def evict_until(self, n_blocks: int) -> int:
+        if n_blocks <= 0:
+            return 0
+        return n_blocks - 1
+
+
+def _bootstrap_block_into(pc: RadixPrefixCache) -> None:
+    """Run a one-request batcher through termination to install one
+    aligned block into ``pc`` via the reclaim-side insert_detached
+    path. Isolates evict-path tests from hand-rolled synthetic inserts.
+    """
+    bootstrap = ContinuousBatcher(
+        _admit_adapter(script=(5,)), max_batch_size=1, prefix_cache=pc
+    )
+    bootstrap.add_request(99, [1, 2, 3, 4], _greedy(max_tokens=1))
+    while bootstrap.has_work():
+        bootstrap.step()
+    assert pc.node_count() == 1
+
+
+def test_evict_decision_calls_evict_until_and_admits() -> None:
+    """AdmitAfterEvictDecision happy path: one evictable block in the
+    tree; cap tight enough to force the evict branch; eviction succeeds
+    → row admits, evictions bumped, leaf gone, reservation applied.
+
+    bpt=16, block_size=4, block_bytes=64. cap=160, filler=96 →
+    headroom=64. r0 worst=(4+2)*16=96 > 64 → shortfall=32, n_blocks=1.
+    Evictable=1 → AdmitAfterEvict(n_blocks=1).
+    """
+    pc = _make_prefix_cache(block_size=4)
+    _bootstrap_block_into(pc)
+
+    adapter = _admit_adapter(script=(7,))
+    budgeter = MemoryBudgeter.for_adapter(
+        adapter, prefix_cache=pc, weights_bytes=0, cap_bytes=160
+    )
+    budgeter.apply_admit("filler", 96)
+    b = ContinuousBatcher(
+        adapter, max_batch_size=1, prefix_cache=pc, budgeter=budgeter
+    )
+    b.step()  # seal empty cohort
+
+    b.add_request(0, [10, 20, 30, 40], _greedy(max_tokens=2))
+    events = b.step()
+
+    assert b.evictions == 1
+    assert b.aborts == 0
+    # Leaf evicted.
+    assert pc.node_count() == 0
+    # Row admitted via miss cohort (r0's prompt doesn't share the
+    # bootstrapped prefix [1,2,3,4]).
+    assert len(b._rows) == 1  # type: ignore[attr-defined]
+    assert b._rows[0].req_index == 0  # type: ignore[attr-defined]
+    # filler (96) + r0 (96) = 192.
+    assert budgeter.reserved_bytes() == 192
+    tokens = [e for e in events if e.kind == "token"]
+    assert len(tokens) == 1
+    assert tokens[0].req_index == 0
+
+
+def test_evict_underrun_aborts_without_admit_or_reservation() -> None:
+    """B-2: when ``evict_until`` frees fewer blocks than the decision
+    asked for, the admission aborts cleanly — no row, no cache
+    mutation, reservation untouched, ``evictions`` NOT bumped (only
+    successful evicts count).
+    """
+    pc = _UnderrunPrefixCache(
+        block_size=4, store=SyntheticPrefixBlockStore(block_size=4)
+    )
+    _bootstrap_block_into(pc)
+
+    adapter = _admit_adapter(script=(7,))
+    budgeter = MemoryBudgeter.for_adapter(
+        adapter, prefix_cache=pc, weights_bytes=0, cap_bytes=160
+    )
+    budgeter.apply_admit("filler", 96)
+    b = ContinuousBatcher(
+        adapter, max_batch_size=1, prefix_cache=pc, budgeter=budgeter
+    )
+    b.step()
+
+    b.add_request(0, [10, 20, 30, 40], _greedy(max_tokens=2))
+    events = b.step()
+
+    assert b.aborts == 1
+    assert b.evictions == 0  # underrun does NOT count as an eviction
+    aborted = [e for e in events if e.kind == "aborted"]
+    assert len(aborted) == 1
+    assert aborted[0].req_index == 0
+    assert aborted[0].finish_reason == "budget-exhausted"
+    # State uncorrupted: no row, no cache extension.
+    assert b._rows == []  # type: ignore[attr-defined]
+    assert b._batch_cache is None  # type: ignore[attr-defined]
+    # Only filler's reservation remains; r0 was never apply_admit'd.
+    assert budgeter.reserved_bytes() == 96
+    # The spy reports an underrun without mutating the tree, so the
+    # failed apply left the prefix cache exactly as it found it.
+    assert pc.node_count() == 1
+
+
+def test_evict_underrun_does_not_block_later_queue_items() -> None:
+    """An evict underrun on one pending must NOT short-circuit Phase A's
+    loop. Queue [r0 (triggers underrun-aborted), r1 (fits-as-is →
+    normal admit)]. After the step: r0 aborted, r1 admitted.
+
+    cap=256, filler=96 → headroom=160. r0 worst=(4+7)*16=176 → evict
+    decision, spy makes it underrun. r1 worst=(4+2)*16=96 fits within
+    the still-160 headroom.
+    """
+    pc = _UnderrunPrefixCache(
+        block_size=4, store=SyntheticPrefixBlockStore(block_size=4)
+    )
+    _bootstrap_block_into(pc)
+
+    adapter = _admit_adapter(script=(7,))
+    budgeter = MemoryBudgeter.for_adapter(
+        adapter, prefix_cache=pc, weights_bytes=0, cap_bytes=256
+    )
+    budgeter.apply_admit("filler", 96)
+    b = ContinuousBatcher(
+        adapter, max_batch_size=2, prefix_cache=pc, budgeter=budgeter
+    )
+    b.step()
+
+    b.add_request(0, [10, 20, 30, 40], _greedy(max_tokens=7))  # evict underrun
+    b.add_request(1, [50, 60, 70, 80], _greedy(max_tokens=2))  # fits as-is
+    events = b.step()
+
+    # r0 aborted, r1 admitted.
+    assert b.aborts == 1
+    assert b.evictions == 0
+    assert len(b._rows) == 1  # type: ignore[attr-defined]
+    assert b._rows[0].req_index == 1  # type: ignore[attr-defined]
+
+    aborted = [e for e in events if e.kind == "aborted"]
+    assert len(aborted) == 1
+    assert aborted[0].req_index == 0
+
+    tokens = [e for e in events if e.kind == "token"]
+    assert len(tokens) == 1
+    assert tokens[0].req_index == 1
+
+    # filler (96) + r1 (96) = 192; r0 never reserved.
+    assert budgeter.reserved_bytes() == 192

@@ -64,6 +64,19 @@ from silica.weights.provider import WeightProvider
 from silica.weights.resident import ResidentWeightProvider
 
 
+class _BudgetEvictUnderrun(RuntimeError):
+    """Raised by ``_apply_evict`` when ``evict_until`` frees fewer blocks
+    than the budgeter's decision asked for (16d-3).
+
+    Private to this module. The ``_admit_waiting_requests`` Phase A
+    branch for ``AdmitAfterEvictDecision`` catches it, aborts the
+    triggering admission with ``finish_reason='budget-exhausted'``, and
+    moves on. The batcher's ``self._rows`` / ``self._batch_cache`` /
+    ``self._budgeter`` state stays untouched — Phase A's apply_admit
+    for this pending has not yet run when the raise fires.
+    """
+
+
 @dataclass(frozen=True)
 class _PendingAdmit:
     """One request waiting for cohort admission (16c.1).
@@ -671,10 +684,29 @@ class ContinuousBatcher:
                     )
                     self.aborts += 1
                 case AdmitAfterEvictDecision():
-                    raise NotImplementedError(
-                        "16d-3: AdmitAfterEvictDecision apply path — "
-                        "evict + admit wiring arrives in 16d-3"
+                    try:
+                        self._apply_evict(decision.n_blocks)
+                    except _BudgetEvictUnderrun:
+                        # Policy assumed more evictable blocks than the
+                        # tree could supply (live-hit churn between peek
+                        # and apply, or a disagreement between budgeter's
+                        # and batcher's prefix-cache views). Surface as
+                        # an aborted admission — the batcher's row /
+                        # cache / budgeter state is untouched because
+                        # apply_admit has NOT yet been called for this
+                        # pending (B-2).
+                        events.append(
+                            BatchEvent.aborted(
+                                pending.req_index, "budget-exhausted"
+                            )
+                        )
+                        self.aborts += 1
+                        continue
+                    self.evictions += 1
+                    self._budgeter.apply_admit(
+                        req_id, decision.reserved_delta
                     )
+                    accepted.append(pending)
                 case AdmitAfterPreemptDecision():
                     raise NotImplementedError(
                         "16d-4: AdmitAfterPreemptDecision apply path — "
@@ -903,6 +935,33 @@ class ContinuousBatcher:
         # (ignores pad) — user-visible units, matches S-5 formula.
         self.forward_prompt_tokens += sum(k_prompt_lens)
         return events
+
+    def _apply_evict(self, n_blocks: int) -> None:
+        """Evict ``n_blocks`` LRU leaves from the prefix cache (16d-3).
+
+        Called by Phase A when the budgeter returns
+        ``AdmitAfterEvictDecision``. Raises ``_BudgetEvictUnderrun`` if
+        ``evict_until`` freed fewer blocks than asked — the caller
+        converts that to an aborted admission (B-2: underrun never
+        corrupts state).
+
+        The assert on ``self._prefix_cache is not None`` is intentional:
+        the budgeter can only return this decision when it observed
+        evictable blocks, which requires a prefix cache. If the batcher
+        and budgeter somehow disagree on cache presence, a decision got
+        produced against state the batcher cannot apply — fail loudly
+        rather than silently skip the eviction.
+        """
+        assert self._prefix_cache is not None, (
+            "AdmitAfterEvictDecision reached the batcher without a "
+            "prefix_cache — budgeter and batcher disagree on cache "
+            "presence"
+        )
+        freed = self._prefix_cache.evict_until(n_blocks)
+        if freed < n_blocks:
+            raise _BudgetEvictUnderrun(
+                f"evict_until freed {freed} of {n_blocks} blocks"
+            )
 
     # --- tensor construction helpers ---
 
