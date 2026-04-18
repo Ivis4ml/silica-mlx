@@ -50,6 +50,7 @@ from silica.core.profiler import MetricsRegistry
 from silica.core.sampler import Sampler
 from silica.core.sampling import SamplingParams
 from silica.kvcache.manager import KVHandle, KVManager
+from silica.kvcache.prefix import RadixPrefixCache
 from silica.models.adapter import ModelAdapter
 from silica.scheduler.batcher import ContinuousBatcher
 
@@ -174,6 +175,7 @@ class Engine:
         params: SamplingParams | list[SamplingParams] | None = None,
         *,
         max_batch_size: int | None = None,
+        prefix_cache: RadixPrefixCache | None = None,
     ) -> Iterator[BatchEvent]:
         """Yield ``BatchEvent`` values driving ``ContinuousBatcher``.
 
@@ -198,6 +200,15 @@ class Engine:
                 the fixed-cohort 16b behaviour for small batches.
                 Callers testing queue-bounded admission explicitly
                 pass e.g. ``max_batch_size=4`` with 8 prompts.
+            prefix_cache: optional ``RadixPrefixCache`` for
+                16c.2 shared-prefix reuse. Ownership lives with the
+                caller so the cache can persist across multiple
+                ``generate_batch`` invocations. When ``None`` (default),
+                behaviour is bit-identical to 16c.1 (invariant S-6 of
+                the step-4 skeleton). As of sub-commit 1 this is a
+                pure pass-through — admission and reclaim do not yet
+                use the cache; that wiring ships in sub-commits 2
+                and 3.
 
         Empty ``prompts`` iterable yields nothing.
         """
@@ -226,6 +237,7 @@ class Engine:
             self._adapter,
             sampler=self._sampler,
             max_batch_size=effective_batch_size,
+            prefix_cache=prefix_cache,
         )
         # First ``effective_batch_size`` admits go pre-step (direct
         # append); the remainder queue for mid-run admission. The

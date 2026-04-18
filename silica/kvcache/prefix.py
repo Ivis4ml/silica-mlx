@@ -260,6 +260,27 @@ class RadixPrefixCache:
         for b in block_ids:
             self._store.release_hit(b)
 
+    def fetch_detached_blocks(
+        self, block_ids: Sequence[int]
+    ) -> list[Sequence[tuple[mx.array, mx.array]]]:
+        """Per-block detached K/V for the given hit block ids.
+
+        Shape matches what ``silica.scheduler.seed_kv.build_seeded_batch_kv``
+        expects: indexed ``[block_idx][layer_idx]`` → ``(K, V)``.
+
+        Used by 16c.2's admission path after a retained ``lookup`` —
+        the batcher passes the result straight into the seeded-cache
+        builder. Raises ``KeyError`` (via the underlying store) if any
+        id has no detached K/V registered, which would indicate either
+        a Paged-backend misuse or a retain/release ordering bug in the
+        caller.
+
+        Keeping this as a public one-liner on ``RadixPrefixCache``
+        preserves the step-3 abstraction boundary: the batcher never
+        needs to reach into ``self._prefix_cache._store``.
+        """
+        return [self._store.fetch_detached(b) for b in block_ids]
+
     def evict_until(self, n_blocks: int) -> int:
         """Evict LRU leaf nodes with zero live hits until ``n_blocks`` freed.
 

@@ -293,5 +293,76 @@ def test_queue_bounded_preserves_req_index_ordering() -> None:
     assert first_token_req_indices == [0, 1, 2]
 
 
+# --- prefix_cache kwarg (16c.2 step 4 sub-commit 1) ----------------------
+
+from silica.kvcache.prefix import RadixPrefixCache
+from silica.kvcache.store import SyntheticPrefixBlockStore
+
+
+def test_prefix_cache_kwarg_accepts_none_as_default() -> None:
+    """Default behaviour is unchanged from 16c.1 — not passing
+    prefix_cache at all must produce the same events as the existing
+    cohort admission path."""
+    engine = _make_engine(script=[5, 7])
+    events_no_kwarg = list(
+        engine.generate_batch(["hi"], _greedy(max_tokens=2))
+    )
+    engine2 = _make_engine(script=[5, 7])
+    events_explicit_none = list(
+        engine2.generate_batch(["hi"], _greedy(max_tokens=2), prefix_cache=None)
+    )
+    assert (
+        [(e.kind, e.req_index, e.token_id) for e in events_no_kwarg]
+        == [(e.kind, e.req_index, e.token_id) for e in events_explicit_none]
+    )
+
+
+def test_prefix_cache_kwarg_forwarded_to_batcher() -> None:
+    """Pass a constructed cache through; the batcher must see the same
+    instance (sub-commit 1 scope — no admission-path use yet, just the
+    reference plumbing). We verify indirectly by patching the
+    ContinuousBatcher ctor and capturing the kwarg."""
+    store = SyntheticPrefixBlockStore(block_size=16)
+    pc = RadixPrefixCache(block_size=16, store=store)
+
+    captured: dict[str, RadixPrefixCache | None] = {"got": object()}  # type: ignore[dict-item]
+    from silica import engine as eng_mod
+
+    real_cls = eng_mod.ContinuousBatcher
+
+    class _SpyBatcher(real_cls):  # type: ignore[valid-type, misc]
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            captured["got"] = kwargs.get("prefix_cache")  # type: ignore[assignment]
+            super().__init__(*args, **kwargs)
+
+    eng_mod.ContinuousBatcher = _SpyBatcher  # type: ignore[misc]
+    try:
+        engine = _make_engine(script=[5])
+        list(
+            engine.generate_batch(
+                ["hi"], _greedy(max_tokens=1), prefix_cache=pc
+            )
+        )
+    finally:
+        eng_mod.ContinuousBatcher = real_cls  # type: ignore[misc]
+
+    assert captured["got"] is pc
+
+
+def test_prefix_cache_lifetime_spans_multiple_generate_batch_calls() -> None:
+    """Caller-owned cache persists across calls. Sub-commit 1 is a
+    no-op pass-through so the cache must remain untouched (hits
+    counter stays 0 — future sub-commits will make it tick)."""
+    store = SyntheticPrefixBlockStore(block_size=16)
+    pc = RadixPrefixCache(block_size=16, store=store)
+
+    engine = _make_engine(script=[5] * 10)
+    list(engine.generate_batch(["hi"], _greedy(max_tokens=1), prefix_cache=pc))
+    list(engine.generate_batch(["hi"], _greedy(max_tokens=1), prefix_cache=pc))
+    list(engine.generate_batch(["hi"], _greedy(max_tokens=1), prefix_cache=pc))
+    assert pc.hits == 0
+    assert pc.node_count() == 0
+
+
 # --- P-1 regression coverage lives in tests/test_engine.py; this file
 #     focuses on the generate_batch (P-2 Unit 16a) surface exclusively. ---

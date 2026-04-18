@@ -49,6 +49,7 @@ from silica.core.events import BatchEvent
 from silica.core.request import Request, RequestState, RequestStatus
 from silica.core.sampler import Sampler
 from silica.core.sampling import SamplingParams
+from silica.kvcache.prefix import RadixPrefixCache
 from silica.mlx.runner import forward_batched
 from silica.models.adapter import AttentionKind, ModelAdapter
 from silica.weights.provider import WeightProvider
@@ -98,6 +99,7 @@ class ContinuousBatcher:
         sampler: Sampler | None = None,
         weight_provider: WeightProvider | None = None,
         max_batch_size: int = 1,
+        prefix_cache: RadixPrefixCache | None = None,
     ) -> None:
         if max_batch_size < 1:
             raise ValueError(
@@ -122,6 +124,19 @@ class ContinuousBatcher:
         # after every filter (§1 I-3). Kept as an observable field so
         # tests can verify post-reclaim coherence directly.
         self._slot_table: dict[int, int] = {}
+        # 16c.2 step 4: optional shared-prefix cache. When None (default)
+        # every prefix-related code path short-circuits — the batcher
+        # behaves bit-identically to 16c.1 (invariant S-6). Callers own
+        # the cache's lifetime so it can span multiple Engine.generate_batch
+        # invocations (that is the whole point of prefix reuse).
+        self._prefix_cache: RadixPrefixCache | None = prefix_cache
+        # 16c.2 observability counters. ``forward_prompt_tokens`` tracks
+        # tokens fed through prefill forwards (excludes decode steps).
+        # ``prefix_hits`` counts admissions that used the hit path. Step
+        # 5 acceptance (PLAN §7 #2) asserts a closed-form reduction on
+        # these counters.
+        self.forward_prompt_tokens: int = 0
+        self.prefix_hits: int = 0
 
     # --- public admission / stepping surface ---
 

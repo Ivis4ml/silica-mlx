@@ -781,3 +781,79 @@ def test_pending_reclaim_row_does_not_block_queue_admit() -> None:
     assert len(b._rows) == 1  # type: ignore[attr-defined]
     assert b._rows[0].req_index == 1  # type: ignore[attr-defined]
     assert len(b._waiting_queue) == 0  # type: ignore[attr-defined]
+
+
+# --- 16c.2 step 4 sub-commit 1: ctor wiring + S-6 no-op invariance ---
+
+from silica.kvcache.prefix import RadixPrefixCache
+from silica.kvcache.store import SyntheticPrefixBlockStore
+
+
+def _make_prefix_cache(block_size: int = 16) -> RadixPrefixCache:
+    return RadixPrefixCache(
+        block_size=block_size,
+        store=SyntheticPrefixBlockStore(block_size=block_size),
+    )
+
+
+def test_ctor_without_prefix_cache_initialises_counters_to_zero() -> None:
+    adapter = _ScriptedAdapter()
+    b = ContinuousBatcher(adapter)
+    assert b.forward_prompt_tokens == 0
+    assert b.prefix_hits == 0
+    assert b._prefix_cache is None  # type: ignore[attr-defined]
+
+
+def test_ctor_stores_prefix_cache_reference() -> None:
+    """Cache ownership stays with the caller — batcher holds a reference,
+    does not copy or deepcopy."""
+    adapter = _ScriptedAdapter()
+    pc = _make_prefix_cache()
+    b = ContinuousBatcher(adapter, prefix_cache=pc)
+    assert b._prefix_cache is pc  # type: ignore[attr-defined]
+
+
+def test_s6_no_cache_path_matches_16c1_behaviour() -> None:
+    """Invariant S-6: with prefix_cache=None, the batcher's observable
+    event stream and counter trajectory must be bit-identical to the
+    pre-step-4 behaviour. Sub-commit 1's counters are initialised but
+    must stay at 0 on a run that never admits through a hit path."""
+    adapter1 = _ScriptedAdapter(script=(5, 7))
+    b1 = ContinuousBatcher(adapter1, max_batch_size=1)
+    b1.add_request(0, [1, 2], _greedy(max_tokens=2))
+    events1: list[BatchEvent] = []
+    while b1.has_work():
+        events1.extend(b1.step())
+
+    adapter2 = _ScriptedAdapter(script=(5, 7))
+    b2 = ContinuousBatcher(adapter2, max_batch_size=1, prefix_cache=None)
+    b2.add_request(0, [1, 2], _greedy(max_tokens=2))
+    events2: list[BatchEvent] = []
+    while b2.has_work():
+        events2.extend(b2.step())
+
+    assert [
+        (e.kind, e.req_index, e.token_id, e.finish_reason) for e in events1
+    ] == [
+        (e.kind, e.req_index, e.token_id, e.finish_reason) for e in events2
+    ]
+    # Counters untouched on the no-cache path.
+    assert b1.forward_prompt_tokens == 0
+    assert b1.prefix_hits == 0
+    assert b2.forward_prompt_tokens == 0
+    assert b2.prefix_hits == 0
+
+
+def test_s6_unused_prefix_cache_does_not_mutate() -> None:
+    """Passing a prefix_cache but never hitting its admission path (no
+    code path uses it yet in sub-commit 1) leaves the cache untouched.
+    Sub-commits 2-3 will start mutating it; this test will be rewritten
+    then."""
+    adapter = _ScriptedAdapter(script=(5,))
+    pc = _make_prefix_cache()
+    b = ContinuousBatcher(adapter, max_batch_size=1, prefix_cache=pc)
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=1))
+    while b.has_work():
+        b.step()
+    assert pc.hits == 0
+    assert pc.node_count() == 0

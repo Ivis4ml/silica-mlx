@@ -274,3 +274,43 @@ def test_release_mismatched_raises() -> None:
     pc = _pc(store)
     with pytest.raises(KeyError, match="no outstanding hit ref"):
         pc.release([42])
+
+
+# --- fetch_detached_blocks (16c.2 step 4 sub-commit 1) ---
+
+
+def test_fetch_detached_blocks_returns_per_block_kv() -> None:
+    """Shape contract: return value is indexed [block_idx][layer_idx] →
+    (K, V) — matches build_seeded_batch_kv's input shape exactly.
+    """
+    store = _store()
+    pc = _pc(store)
+    blocks = _detached_blocks(3, seed_base=10.0)  # 3 blocks, 2 layers each
+    tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]  # 3 aligned blocks
+    ids = pc.insert_detached(tokens, blocks)
+
+    got = pc.fetch_detached_blocks(ids)
+    assert len(got) == 3
+    # Each element is the per-layer list we registered; layer count is 2.
+    for per_layer in got:
+        assert len(per_layer) == 2
+
+    # Content round-trip: block 0 layer 0 was seeded with 10.0 in _detached_blocks.
+    mx.eval(got[0][0][0])
+    assert float(got[0][0][0].flatten()[0].item()) == 10.0
+
+
+def test_fetch_detached_blocks_missing_id_raises() -> None:
+    """Calling with a block id the store does not know about bubbles
+    up the store's KeyError — 16c.2 step 4 admission relies on this
+    loud-fail to surface retain/release ordering bugs."""
+    store = _store()
+    pc = _pc(store)
+    with pytest.raises(KeyError, match="no detached K/V"):
+        pc.fetch_detached_blocks([999])
+
+
+def test_fetch_detached_blocks_empty_list_returns_empty() -> None:
+    store = _store()
+    pc = _pc(store)
+    assert pc.fetch_detached_blocks([]) == []
