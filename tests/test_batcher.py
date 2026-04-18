@@ -1788,3 +1788,195 @@ def test_find_row_by_req_id_returns_none_when_missing() -> None:
     # Populated-but-no-match case.
     b.add_request(0, [1, 2, 3], _greedy(max_tokens=2))
     assert b._find_row_by_req_id("req-99") is None  # type: ignore[attr-defined]
+
+
+# --- 16d-4b: _preempt_active_row helper (pure state, no re-enqueue) ---------
+#
+# Exercises the helper that strips one active row out of the batch,
+# extracts its prefix K/V, transitions its state PREFILL/DECODE →
+# PREEMPTED → WAITING, filters it from batched cache + self._rows, and
+# releases its budget reservation. Re-enqueue + composite prompt land
+# in 16d-4c as _apply_preempt() wrapping this helper.
+
+
+def test_preempt_active_row_returns_victim_row_on_success() -> None:
+    """Happy path: single-row batch, preempt the sole row, helper
+    returns the detached _BatchRow. The row is gone from self._rows
+    and the batched cache has been dropped (all-empty path)."""
+    adapter = _admit_adapter(script=(5,))
+    b = ContinuousBatcher(adapter, max_batch_size=1)
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=5))
+    b.step()  # prefill → row in DECODE, batch_cache allocated
+
+    assert len(b._rows) == 1  # type: ignore[attr-defined]
+    victim = b._preempt_active_row("req-0")  # type: ignore[attr-defined]
+
+    assert victim is not None
+    assert victim.req_id == "req-0"
+    assert list(victim.prompt_ids) == [1, 2, 3, 4]
+    assert len(b._rows) == 0  # type: ignore[attr-defined]
+    # All-empty path drops the batched cache.
+    assert b._batch_cache is None  # type: ignore[attr-defined]
+
+
+def test_preempt_active_row_returns_none_on_missing_victim() -> None:
+    """B-7: when the victim req_id does not map to any current row,
+    the helper returns None without mutating any batcher state. Covers
+    both "no batch cache yet" and "batch cache present but req_id
+    absent"."""
+    adapter = _admit_adapter(script=(5,))
+    b = ContinuousBatcher(adapter, max_batch_size=1)
+
+    # No batch cache yet (pre-step).
+    assert b._preempt_active_row("req-0") is None  # type: ignore[attr-defined]
+
+    # Populated but req_id mismatched.
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=5))
+    b.step()
+    assert b._preempt_active_row("req-99") is None  # type: ignore[attr-defined]
+    # State unchanged.
+    assert len(b._rows) == 1  # type: ignore[attr-defined]
+    assert b._batch_cache is not None  # type: ignore[attr-defined]
+
+
+def test_preempt_active_row_removes_row_from_rows_via_filter() -> None:
+    """Two-row batch: preempting one leaves the survivor at a fresh
+    row index 0 (mlx-lm's filter re-indexes). batched cache remains
+    present because at least one row survived."""
+    adapter = _admit_adapter(script=((5, 7),))  # per-row targets
+    b = ContinuousBatcher(adapter, max_batch_size=2)
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=5))
+    b.add_request(1, [10, 20, 30, 40], _greedy(max_tokens=5))
+    b.step()
+    assert len(b._rows) == 2  # type: ignore[attr-defined]
+
+    victim = b._preempt_active_row("req-0")  # type: ignore[attr-defined]
+
+    assert victim is not None
+    assert victim.req_index == 0
+    assert len(b._rows) == 1  # type: ignore[attr-defined]
+    assert b._rows[0].req_index == 1  # type: ignore[attr-defined]
+    assert b._batch_cache is not None  # type: ignore[attr-defined]
+
+
+def test_preempt_active_row_transitions_victim_PREEMPTED_then_WAITING() -> None:
+    """The OLD RequestState moves through PREEMPTED → WAITING for
+    state-machine correctness (prep doc §4.6). The returned row carries
+    that history so callers can inspect it."""
+    adapter = _admit_adapter(script=(5,))
+    b = ContinuousBatcher(adapter, max_batch_size=1)
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=5))
+    b.step()  # prefill → DECODE
+
+    victim = b._preempt_active_row("req-0")  # type: ignore[attr-defined]
+
+    assert victim is not None
+    assert victim.state.status == RequestStatus.WAITING
+    history = victim.state.history
+    # Last two entries are the preempt pair.
+    assert history[-2] == (RequestStatus.PREEMPTED, "budget-preempt")
+    assert history[-1] == (RequestStatus.WAITING, "re-admit")
+
+
+def test_preempt_active_row_handles_prefill_state_uniformly() -> None:
+    """PREFILL victims use the same path as DECODE victims. Prepare the
+    cohort without running the forward so the row is still PREFILL,
+    then preempt it directly."""
+    adapter = _admit_adapter(script=(5,))
+    b = ContinuousBatcher(adapter, max_batch_size=1)
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=5))
+    b._prepare_cohort()  # type: ignore[attr-defined]
+    assert b._rows[0].state.status == RequestStatus.PREFILL  # type: ignore[attr-defined]
+
+    victim = b._preempt_active_row("req-0")  # type: ignore[attr-defined]
+
+    assert victim is not None
+    assert victim.state.status == RequestStatus.WAITING
+    assert victim.state.history[-2] == (
+        RequestStatus.PREEMPTED,
+        "budget-preempt",
+    )
+    assert victim.state.history[-1] == (RequestStatus.WAITING, "re-admit")
+
+
+def test_preempt_active_row_releases_budgeter_reservation() -> None:
+    """When a budgeter is wired, preempting a row releases its
+    reservation so the triggering admission's own apply_admit sees
+    consistent accounting."""
+    pc = _make_prefix_cache(block_size=4)
+    adapter = _admit_adapter(script=(5,))
+    budgeter = MemoryBudgeter.for_adapter(
+        adapter, prefix_cache=pc, weights_bytes=0, cap_bytes=10_000
+    )
+    b = ContinuousBatcher(
+        adapter, max_batch_size=1, prefix_cache=pc, budgeter=budgeter
+    )
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=5))
+    b.step()  # prefill — pre-step admission does not consult budgeter
+    # Manually install r0's reservation so the release has something
+    # to free. In 4c+ this would come from Phase A's admit flow; here
+    # we test the helper in isolation.
+    budgeter.apply_admit("req-0", 200)
+    assert budgeter.reserved_bytes() == 200
+
+    victim = b._preempt_active_row("req-0")  # type: ignore[attr-defined]
+
+    assert victim is not None
+    assert budgeter.reserved_bytes() == 0
+    assert budgeter.active_requests() == []
+
+
+def test_preempt_active_row_extracts_prefix_before_filter() -> None:
+    """Prefix K/V extraction runs before the filter/drop mutations, so
+    a future admission sharing the same prompt can hit the detached
+    block after preempt."""
+    pc = _make_prefix_cache(block_size=4)
+    adapter = _admit_adapter(script=(5,))
+    b = ContinuousBatcher(adapter, max_batch_size=1, prefix_cache=pc)
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=5))
+    b.step()  # prefill → 4-token K/V in batch_cache
+    assert pc.node_count() == 0
+
+    victim = b._preempt_active_row("req-0")  # type: ignore[attr-defined]
+
+    assert victim is not None
+    # Prefix extracted → one radix block available to future admissions.
+    assert pc.node_count() == 1
+    assert pc.peek([1, 2, 3, 4]).num_hit_tokens == 4
+
+
+def test_preempt_active_row_no_prefix_cache_still_works() -> None:
+    """``prefix_cache=None`` degrades acceptably: the victim's prompt
+    work is lost with the filtered K/V, but preempt itself completes
+    without error. Prefix cache is an optimisation, not a precondition."""
+    adapter = _admit_adapter(script=(5,))
+    b = ContinuousBatcher(adapter, max_batch_size=1)  # no prefix_cache
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=5))
+    b.step()
+
+    victim = b._preempt_active_row("req-0")  # type: ignore[attr-defined]
+
+    assert victim is not None
+    assert victim.req_id == "req-0"
+    assert len(b._rows) == 0  # type: ignore[attr-defined]
+
+
+def test_preempt_active_row_rebuilds_slot_table() -> None:
+    """Post-filter slot_table must re-index surviving rows to their new
+    positions. Preempting the middle of three rows: before
+    {0:0, 5:1, 7:2}, after {0:0, 7:1}. This is the idx-shift case
+    deferred from 16d-4a."""
+    adapter = _admit_adapter(script=((5, 7, 9),))
+    b = ContinuousBatcher(adapter, max_batch_size=3)
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=5))
+    b.add_request(5, [10, 20, 30, 40], _greedy(max_tokens=5))
+    b.add_request(7, [100, 200, 300, 400], _greedy(max_tokens=5))
+    b.step()
+    assert b._slot_table == {0: 0, 5: 1, 7: 2}  # type: ignore[attr-defined]
+
+    victim = b._preempt_active_row("req-5")  # type: ignore[attr-defined]
+
+    assert victim is not None
+    assert victim.req_index == 5
+    assert b._slot_table == {0: 0, 7: 1}  # type: ignore[attr-defined]
+    assert len(b._rows) == 2  # type: ignore[attr-defined]

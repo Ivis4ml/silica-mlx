@@ -535,6 +535,80 @@ class ContinuousBatcher:
                 return row_idx
         return None
 
+    def _preempt_active_row(
+        self, victim_req_id: str
+    ) -> _BatchRow | None:
+        """Strip one active row out of the batch and return it (16d-4b).
+
+        Does steps 1-4 of prep doc ``P2_UNIT_16D_PREP.md`` §4.4:
+
+          1. Extract victim's aligned prefix K/V into
+             ``self._prefix_cache`` (if present). Safe no-op when the
+             cache is absent — the row's prompt work is lost, but
+             preempt still completes.
+          2. Transition state PREFILL/DECODE → PREEMPTED → WAITING on
+             the OLD ``RequestState`` for state-machine correctness.
+             The returned row carries that state so callers can
+             inspect the chain.
+          3. ``filter`` the victim out of every layer's BatchKVCache,
+             prune ``self._rows``, and rebuild ``self._slot_table``.
+             When the victim was the only row, the batch cache is
+             dropped to None (same rationale as ``_reclaim_terminated``
+             §4 Fix 2).
+          4. Release the victim's reservation on
+             ``self._budgeter`` so the triggering admission's own
+             ``apply_admit`` lands in consistent accounting.
+
+        Re-enqueue (step 5 in prep doc) is NOT this helper's job —
+        16d-4c's ``_apply_preempt`` will wrap this to build the
+        composite prompt + ``appendleft`` the replay ``_PendingAdmit``.
+
+        Returns:
+            The victim ``_BatchRow`` on success (caller reads its
+            ``prompt_ids`` / ``generated`` / ``params`` to construct the
+            re-admission). ``None`` when the request is no longer
+            active (not in ``self._rows``) — that is B-7's race path.
+        """
+        if self._batch_cache is None:
+            # No active batched cache → no row to preempt. Distinct
+            # from "victim missing" but maps to the same None result.
+            return None
+        victim_row_idx = self._find_row_by_req_id(victim_req_id)
+        if victim_row_idx is None:
+            return None
+        victim_row = self._rows[victim_row_idx]
+
+        # 1. Extract prefix K/V into the prefix cache (optional).
+        if self._prefix_cache is not None:
+            self._extract_and_insert_prefix(victim_row_idx)
+
+        # 2. State transitions on the OLD RequestState.
+        victim_row.state.transition(
+            RequestStatus.PREEMPTED, reason="budget-preempt"
+        )
+        victim_row.state.transition(
+            RequestStatus.WAITING, reason="re-admit"
+        )
+
+        # 3. Drop the victim from batched cache + self._rows.
+        kept = [
+            i for i in range(len(self._rows)) if i != victim_row_idx
+        ]
+        if not kept:
+            self._batch_cache = None
+            self._rows = []
+        else:
+            for layer_cache in self._batch_cache:
+                layer_cache.filter(kept)
+            self._rows = [self._rows[i] for i in kept]
+        self._rebuild_slot_table()
+
+        # 4. Release budget reservation for the victim.
+        if self._budgeter is not None:
+            self._budgeter.release(victim_req_id)
+
+        return victim_row
+
     def _prefill_phase(self) -> list[BatchEvent]:
         """One batched forward over the left-padded prompt tensor."""
         assert self._batch_cache is not None
@@ -739,8 +813,9 @@ class ContinuousBatcher:
                     accepted.append(pending)
                 case AdmitAfterPreemptDecision():
                     raise NotImplementedError(
-                        "16d-4: AdmitAfterPreemptDecision apply path — "
-                        "preempt + re-admit arrives in 16d-4"
+                        "16d-4c: AdmitAfterPreemptDecision apply path — "
+                        "_preempt_active_row lands in 16d-4b (pure state), "
+                        "_apply_preempt + re-enqueue in 16d-4c"
                     )
                 case _:
                     raise AssertionError(
