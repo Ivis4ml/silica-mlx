@@ -404,3 +404,106 @@ def test_full_admit_apply_release_cycle() -> None:
     # Now re-admit the same req id — should be allowed.
     decision2 = b.admit("r", n_prompt=4, max_tokens=4)
     assert isinstance(decision2, AdmitDecision)
+
+
+# --- 16d-2a: admit() purity + apply_admit() reservation-timing (B-8) ---
+#
+# B-8 (prep doc §5) says: within one batcher admit loop, every admission's
+# ``apply_admit`` must commit to ``reserved_bytes`` BEFORE the next iteration's
+# ``admit()`` runs. At the budgeter layer this decomposes into two primitive
+# properties — (a) ``admit()`` is pure (no state mutation), and (b) a prior
+# ``apply_admit()`` call IS visible to the next ``admit()``'s headroom math.
+# If either fails, a batch of small pendings would each see the same initial
+# headroom and systematically over-admit. These tests pin those primitives.
+
+
+def test_admit_does_not_mutate_budgeter_state() -> None:
+    """``admit()`` is pure: calling it any number of times leaves
+    ``reserved_bytes`` / ``active_requests`` unchanged, and the decision
+    is reproducible for identical inputs."""
+    b, _, _ = _make(cap_bytes=10_000)
+    before_reserved = b.reserved_bytes()
+    before_active = b.active_requests()
+
+    d1 = b.admit("r1", n_prompt=4, max_tokens=4)
+    d2 = b.admit("r2", n_prompt=4, max_tokens=4)
+    d3 = b.admit("r1", n_prompt=4, max_tokens=4)
+
+    assert b.reserved_bytes() == before_reserved
+    assert b.active_requests() == before_active
+    assert isinstance(d1, AdmitDecision)
+    assert isinstance(d2, AdmitDecision)
+    assert isinstance(d3, AdmitDecision)
+    # Same inputs → identical decision shape (dataclasses are value-equal).
+    assert d1 == d2 == d3
+
+
+def test_admit_same_req_id_twice_without_apply_admit_is_allowed() -> None:
+    """Duplicate-req_id detection hinges on ``_reserved_per_req``, not on
+    any in-flight admission-intent tracking. Two back-to-back ``admit()``
+    calls for the same req_id without an intervening ``apply_admit`` must
+    NOT raise — this lets a batcher re-evaluate a pending after evict /
+    preempt without fabricating a fresh req_id."""
+    b, _, _ = _make(cap_bytes=10_000)
+    b.admit("r1", n_prompt=4, max_tokens=4)
+    # No apply_admit between calls.
+    b.admit("r1", n_prompt=4, max_tokens=4)  # must not raise
+
+
+def test_apply_admit_updates_headroom_visible_to_next_admit() -> None:
+    """B-8 positive: once ``apply_admit`` commits a reservation, the next
+    ``admit()`` call sees the reduced headroom and its decision reflects
+    that. Sizing: cap fits exactly one worst-case request; after
+    apply_admit on the first, a second ``admit()`` cannot fit as-is and
+    falls through to preempt."""
+    b, _, _ = _make(cap_bytes=10_000)
+    per_req = b.worst_case_bytes(4, 4)
+    tight = MemoryBudgeter(
+        prefix_cache=b._pc,  # type: ignore[attr-defined]
+        weights_bytes=0,
+        bytes_per_token=b.bytes_per_token,
+        block_size=b._block_size,  # type: ignore[attr-defined]
+        cap_bytes=per_req,
+    )
+
+    d1 = tight.admit("r1", n_prompt=4, max_tokens=4)
+    assert isinstance(d1, AdmitDecision)
+    tight.apply_admit("r1", d1.reserved_delta)
+    assert tight.headroom_bytes() == 0
+
+    # Next admit sees zero headroom → fit-as-is fails, preempt picks r1.
+    d2 = tight.admit("r2", n_prompt=4, max_tokens=4)
+    assert isinstance(d2, AdmitAfterPreemptDecision)
+    assert d2.preempt_req_id == "r1"
+
+
+def test_admit_without_apply_admit_sees_unchanged_headroom() -> None:
+    """B-8 negative — the bug the batcher MUST prevent by interleaving
+    ``apply_admit``. If the caller runs ``admit`` multiple times without
+    committing, every decision sees the original headroom and every call
+    returns ``AdmitDecision``. Same setup as the positive test, but no
+    intervening ``apply_admit``; both admissions "fit as-is" even though
+    their sum exceeds the cap. The budgeter is correct to report this —
+    ``admit()`` is a pure decision over the current committed state —
+    and the batcher is responsible for calling ``apply_admit`` between
+    iterations."""
+    b, _, _ = _make(cap_bytes=10_000)
+    per_req = b.worst_case_bytes(4, 4)
+    tight = MemoryBudgeter(
+        prefix_cache=b._pc,  # type: ignore[attr-defined]
+        weights_bytes=0,
+        bytes_per_token=b.bytes_per_token,
+        block_size=b._block_size,  # type: ignore[attr-defined]
+        cap_bytes=per_req,
+    )
+
+    d1 = tight.admit("r1", n_prompt=4, max_tokens=4)
+    d2 = tight.admit("r2", n_prompt=4, max_tokens=4)
+    d3 = tight.admit("r3", n_prompt=4, max_tokens=4)
+
+    assert isinstance(d1, AdmitDecision)
+    assert isinstance(d2, AdmitDecision)
+    assert isinstance(d3, AdmitDecision)
+    # No reservation was committed — headroom never moved.
+    assert tight.reserved_bytes() == 0
+    assert tight.headroom_bytes() == per_req
