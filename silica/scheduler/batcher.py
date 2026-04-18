@@ -52,6 +52,7 @@ from silica.core.sampling import SamplingParams
 from silica.kvcache.prefix import RadixPrefixCache
 from silica.mlx.runner import forward_batched
 from silica.models.adapter import AttentionKind, ModelAdapter
+from silica.scheduler.seed_kv import build_seeded_batch_kv
 from silica.weights.provider import WeightProvider
 from silica.weights.resident import ResidentWeightProvider
 
@@ -465,6 +466,12 @@ class ContinuousBatcher:
         logits = forward_batched(
             self._model, tokens, list(self._batch_cache)
         )  # (B, V)
+        # 16c.2 step 4: initial-cohort forward_prompt_tokens accounting.
+        # Counts effective prompt tokens (not padded B*T_max) so the S-5
+        # acceptance assertion reads in user-visible units.
+        self.forward_prompt_tokens += sum(
+            len(r.prompt_ids) for r in self._rows
+        )
         return self._sample_and_emit_batched(logits, is_prefill=True)
 
     def _decode_phase(self) -> list[BatchEvent]:
@@ -540,25 +547,178 @@ class ContinuousBatcher:
 
     def _admit_waiting_requests(self) -> list[BatchEvent]:
         """Phase 2 — drain up to ``max_batch_size − len(self._rows)``
-        requests from ``_waiting_queue`` and run one batched prefill
-        for them.
+        requests from ``_waiting_queue``.
 
-        Extends main batched cache with the K new rows, or replaces
-        main outright when main is ``None`` (post all-terminal reclaim).
+        16c.2 step 4 sub-commit 3 splits the admits into two phases:
 
-        Returns: emitted events (K token events + any done events
-        from rows that hit stop / max_tokens on the first token). An
-        empty list means no admission fired this step — the caller
-        then proceeds to Phase 3 forward.
+          - **hit rows** (per-row): those whose ``prompt_ids`` have a
+            non-zero block-aligned prefix match in ``self._prefix_cache``.
+            Each goes through ``_admit_single_hit_row``, which seeds a
+            per-row ``BatchKVCache`` from detached K/V and runs the
+            forward only over the suffix.
+          - **miss rows** (batched): the rest go through
+            ``_admit_miss_cohort``, which is the pre-step-4 K-row
+            cohort-prefill path.
+
+        Events are emitted in phase-grouped order (hit rows first,
+        then miss cohort) — **not** admitted-queue order. See
+        docs/P2_UNIT_16C_2_STEP_4_SKELETON.md §5 S-7 for the rationale.
+
+        Returns emitted events. An empty list means no admission fired
+        this step — the caller then proceeds to Phase 3 forward.
         """
         capacity = self._max_batch_size - len(self._rows)
         if capacity <= 0 or not self._waiting_queue:
             return []
 
         # Pop up to `capacity` pending admits.
+        admitted_pending: list[_PendingAdmit] = []
+        while len(admitted_pending) < capacity and self._waiting_queue:
+            admitted_pending.append(self._waiting_queue.popleft())
+        if not admitted_pending:
+            return []
+
+        # Split into hit / miss. With no prefix_cache installed, every
+        # admission routes to the miss path and behaviour is bit-
+        # identical to sub-commit 2 (invariant S-6).
+        hit_rows: list[tuple[_PendingAdmit, int]] = []
+        miss_rows: list[_PendingAdmit] = []
+        if self._prefix_cache is None:
+            miss_rows = admitted_pending
+        else:
+            block_size = self._prefix_cache.block_size
+            for pending in admitted_pending:
+                raw = self._prefix_cache.peek(pending.prompt_ids)
+                # S-5 edge 1: reserve at least one token for suffix
+                # prefill so first-token logits are available.
+                if len(pending.prompt_ids) <= 1:
+                    max_aligned = 0
+                else:
+                    max_aligned = (
+                        (len(pending.prompt_ids) - 1) // block_size
+                    ) * block_size
+                usable = min(raw.num_hit_tokens, max_aligned)
+                if usable == 0:
+                    miss_rows.append(pending)
+                else:
+                    hit_rows.append((pending, usable))
+
+        events: list[BatchEvent] = []
+        # Phase 1 — hit rows, per-row seeded admission.
+        for pending, usable in hit_rows:
+            events.extend(self._admit_single_hit_row(pending, usable))
+        # Phase 2 — miss cohort, one batched prefill over K miss rows.
+        if miss_rows:
+            events.extend(self._admit_miss_cohort(miss_rows))
+
+        # One slot_table rebuild suffices after both phases' mutations.
+        self._rebuild_slot_table()
+        return events
+
+    def _admit_single_hit_row(
+        self, pending: _PendingAdmit, usable_hit_tokens: int
+    ) -> list[BatchEvent]:
+        """Per-row admission via prefix-cache hit (16c.2 step 4 sub-commit 3).
+
+        Sequence (docs/P2_UNIT_16C_2_STEP_4_SKELETON.md §3.2):
+
+          1. lookup retains hits in the store.
+          2. try: assert S-1, fetch detached K/V, build seeded
+             per-layer BatchKVCache list, suffix-prefill forward,
+             sample + emit, extend into main, append row, counters.
+          3. finally: release retained hits. Release lives in
+             ``finally`` so an exception anywhere in step 2 (shape
+             error, forward failure, sampler bug) still returns the
+             hit refs to the store — leaking them would make those
+             blocks permanently non-evictable (S-2).
+
+        Placing the assertion INSIDE the try block is load-bearing.
+        If it ran between lookup and try, a failing assertion would
+        skip the finally and strand the hits that lookup just retained.
+        """
+        assert self._prefix_cache is not None
+
+        # Construct the row state before the retaining lookup so the
+        # try-finally window can be as tight as possible.
+        request = Request(
+            prompt="",
+            sampling_params=pending.params,
+            request_id=f"req-{pending.req_index}",
+            token_ids=pending.prompt_ids,
+        )
+        state = RequestState(request=request)
+        state.transition(RequestStatus.PREFILL, reason="admit-mid-run-hit")
+        row = _BatchRow(
+            req_index=pending.req_index,
+            req_id=f"req-{pending.req_index}",
+            prompt_ids=list(pending.prompt_ids),
+            params=pending.params,
+            state=state,
+        )
+
+        hit = self._prefix_cache.lookup(
+            pending.prompt_ids[:usable_hit_tokens]
+        )
+        try:
+            # S-1: the walk inside lookup must agree with what peek
+            # measured above. Divergence would mean the radix tree
+            # mutated between peek and lookup, which should be
+            # impossible inside a single step().
+            assert hit.num_hit_tokens == usable_hit_tokens, (
+                f"lookup hit_tokens {hit.num_hit_tokens} != "
+                f"peek-sized {usable_hit_tokens} — radix tree drift"
+            )
+
+            detached = self._prefix_cache.fetch_detached_blocks(
+                list(hit.block_ids)
+            )
+            num_layers = self._adapter.config.num_layers
+            row_cache = build_seeded_batch_kv(
+                detached, num_layers=num_layers
+            )
+
+            suffix_tokens = list(pending.prompt_ids[usable_hit_tokens:])
+            # S-5 edge 1 guarantees suffix_tokens is non-empty — the
+            # max_aligned formula above reserves at least one token.
+            suffix_arr = mx.array([suffix_tokens], dtype=mx.int32)
+            logits = forward_batched(
+                self._model, suffix_arr, list(row_cache)
+            )  # (1, V)
+            events = self._sample_and_emit_rows(
+                [row], logits, is_prefill=True
+            )
+
+            # Stitch row_cache into main. Both branches preserve
+            # invariant I-2 (incumbent rows keep their indices).
+            if self._batch_cache is None:
+                self._batch_cache = row_cache
+            else:
+                for layer in range(num_layers):
+                    self._batch_cache[layer].extend(row_cache[layer])
+
+            self._rows.append(row)
+            self.prefix_hits += 1
+            self.forward_prompt_tokens += len(suffix_tokens)
+            return events
+        finally:
+            self._prefix_cache.release(list(hit.block_ids))
+
+    def _admit_miss_cohort(
+        self, admitted_pending: list[_PendingAdmit]
+    ) -> list[BatchEvent]:
+        """Cohort-prefill admission path for rows with no prefix hit.
+
+        Renamed from the pre-step-4 body of ``_admit_waiting_requests``.
+        Behaviour is unchanged: build fresh B=K BatchKVCache, run one
+        batched prefill over the left-padded admit subset, sample + emit,
+        extend into main. Counter bump goes at the end so it does not
+        double-count if a hit row ran earlier in the same step.
+
+        Does NOT rebuild slot_table — caller does that once per step
+        after both hit and miss phases.
+        """
         admitted: list[_BatchRow] = []
-        while admitted.__len__() < capacity and self._waiting_queue:
-            pending = self._waiting_queue.popleft()
+        for pending in admitted_pending:
             request = Request(
                 prompt="",
                 sampling_params=pending.params,
@@ -566,8 +726,6 @@ class ContinuousBatcher:
                 token_ids=pending.prompt_ids,
             )
             state = RequestState(request=request)
-            # New rows start in PREFILL; _sample_and_emit_rows transitions
-            # them to DECODE (or DONE) after sampling.
             state.transition(RequestStatus.PREFILL, reason="admit-mid-run")
             admitted.append(
                 _BatchRow(
@@ -579,21 +737,15 @@ class ContinuousBatcher:
                 )
             )
 
-        if not admitted:
-            return []
-
-        # Build fresh B=K BatchKVCache directly (prep doc §4 Fix 5 — no
-        # merge-of-empty-KVCaches). Mirrors 16b's _prepare_cohort layout
-        # but sized for the admit subset.
         num_layers = self._adapter.config.num_layers
         k_prompt_lens = [len(r.prompt_ids) for r in admitted]
         k_max_len = max(k_prompt_lens)
         k_left_padding = [k_max_len - n for n in k_prompt_lens]
         k_batch_cache = [
-            BatchKVCache(left_padding=k_left_padding) for _ in range(num_layers)
+            BatchKVCache(left_padding=k_left_padding)
+            for _ in range(num_layers)
         ]
 
-        # Left-padded (K, k_max_len) token tensor for the admit subset.
         pad = self._pad_token_id()
         rows_2d: list[list[int]] = []
         for r in admitted:
@@ -601,13 +753,11 @@ class ContinuousBatcher:
             rows_2d.append([pad] * n_pad + list(r.prompt_ids))
         tokens = mx.array(rows_2d, dtype=mx.int32)
 
-        # One batched prefill forward over just the admitted rows.
         logits = forward_batched(self._model, tokens, list(k_batch_cache))
-        events = self._sample_and_emit_rows(admitted, logits, is_prefill=True)
+        events = self._sample_and_emit_rows(
+            admitted, logits, is_prefill=True
+        )
 
-        # Stitch into main cache. Two regimes:
-        #   (a) main is None (post all-terminal reclaim): replace.
-        #   (b) main has live rows: extend per layer.
         if self._batch_cache is None:
             self._batch_cache = k_batch_cache
         else:
@@ -615,7 +765,9 @@ class ContinuousBatcher:
                 self._batch_cache[layer].extend(k_batch_cache[layer])
 
         self._rows.extend(admitted)
-        self._rebuild_slot_table()
+        # Counter bump AFTER the forward. Effective prompt tokens
+        # (ignores pad) — user-visible units, matches S-5 formula.
+        self.forward_prompt_tokens += sum(k_prompt_lens)
         return events
 
     # --- tensor construction helpers ---

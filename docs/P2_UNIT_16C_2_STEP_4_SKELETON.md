@@ -571,7 +571,36 @@ enough for acceptance-test introspection.
 - `prefix_cache.peek` during step()'s reclaim phase to skip
   insert_detached for already-cached prefixes — would be a small win
   and is easy to add later; not needed for PLAN §7 #2.
+- **Pre-step admissions do NOT go through the hit path (scope limit).**
+  `add_request()` called before the first `step()` puts the row directly
+  into `self._rows` via the initial-cohort path (`_prepare_cohort` +
+  `_prefill_phase`). Only mid-run admits — those routed through
+  `self._waiting_queue` because `_cohort_prepared == True` — enter
+  `_admit_waiting_requests` and see the peek/lookup split.
+
+  In the streaming server pattern this is the right behaviour: the
+  first request to arrive has nothing to hit (empty cache) and any
+  subsequent arrivals are mid-run by construction. The limitation
+  matters when a caller reuses a long-lived `prefix_cache` across
+  multiple `Engine.generate_batch` calls — each call builds a fresh
+  batcher, and the call's first prompt always goes through the
+  initial-cohort miss path even if the cache is populated. If
+  "cross-call first-request hit" becomes desired, fold the
+  peek/lookup split into `_prefill_phase` (or its caller
+  `_prepare_cohort`) — see follow-on work below.
+
 - Any interaction with the budget-aware preempt path — 16d's concern.
+
+### 9.1 Explicitly-deferred follow-on work
+
+- **Initial-cohort hit path.** Extend `_prepare_cohort` (or wrap
+  `_prefill_phase` in a hit/miss split mirroring §3.1) so the first
+  `step()` after construction can admit rows through the hit path
+  when their prompts are already in a pre-populated cache. Motivation:
+  caller reuses a persistent `prefix_cache` across multiple
+  `Engine.generate_batch` invocations (common for long-running
+  services — system prompts, fewshot headers, shared scaffolding).
+  Current behaviour forces every call's first prompt through miss.
 
 ---
 

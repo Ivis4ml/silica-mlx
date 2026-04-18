@@ -836,10 +836,11 @@ def test_s6_no_cache_path_matches_16c1_behaviour() -> None:
     ] == [
         (e.kind, e.req_index, e.token_id, e.finish_reason) for e in events2
     ]
-    # Counters untouched on the no-cache path.
-    assert b1.forward_prompt_tokens == 0
+    # forward_prompt_tokens fires on prefill regardless of cache (S-5 is
+    # the "how many tokens did we forward through prefill" counter,
+    # not a "prefix-only" counter). prefix_hits stays 0 when no cache.
+    assert b1.forward_prompt_tokens == b2.forward_prompt_tokens == 2
     assert b1.prefix_hits == 0
-    assert b2.forward_prompt_tokens == 0
     assert b2.prefix_hits == 0
 
 
@@ -999,3 +1000,302 @@ def test_reclaim_insert_detached_is_filter_safe() -> None:
     # Peek returns hit for both prompts.
     assert pc.peek([1, 2, 3, 4]).num_hit_tokens == 4
     assert pc.peek([10, 20, 30, 40]).num_hit_tokens == 4
+
+
+# --- 16c.2 step 4 sub-commit 3: admission-path hit split -------------------
+
+
+def _admit_adapter(script: Sequence[_ScriptStep] = ()) -> "_ScriptedAdapter":
+    """Single-layer scripted adapter for admission-path tests. Same rationale
+    as _reclaim_adapter — the scripted model only writes cache[0], so
+    n_layers=1 avoids the "layer 1 never written" artefact."""
+    return _ScriptedAdapter(n_layers=1, script=script)
+
+
+def test_admission_with_empty_cache_routes_all_to_miss_path() -> None:
+    """Empty cache → peek returns no hits → every admission goes through
+    the miss cohort path. Counter tracks all prompt tokens, prefix_hits
+    stays 0."""
+    adapter = _admit_adapter(script=(5,))
+    pc = _make_prefix_cache(block_size=4)
+    b = ContinuousBatcher(adapter, max_batch_size=1, prefix_cache=pc)
+    b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=1))
+    while b.has_work():
+        b.step()
+    assert b.prefix_hits == 0
+    assert b.forward_prompt_tokens == 4
+
+
+def test_single_hit_row_admission_skips_prefix_tokens_in_forward() -> None:
+    """Core happy path. Request 0 pre-fills the cache (initial cohort,
+    miss path). Request 1 (same prompt) admits MID-RUN via hit path
+    and only forwards the suffix region.
+
+    Pre-step add_request puts a row straight into the initial cohort,
+    which goes through _prefill_phase — NOT _admit_waiting_requests.
+    The hit path only fires for admissions routed through the
+    waiting queue. Triggering it thus requires a step() between the
+    two admits so _cohort_prepared flips to True and the second add
+    is queued as backlog.
+    """
+    adapter = _admit_adapter(script=(5, 7))
+    pc = _make_prefix_cache(block_size=4)
+    b = ContinuousBatcher(adapter, max_batch_size=1, prefix_cache=pc)
+
+    # Request 0: pre-step admit, initial-cohort prefill (miss path).
+    b.add_request(0, [1, 2, 3, 4, 5, 6, 7, 8], _greedy(max_tokens=1))
+    b.step()  # seals cohort, runs B=1 prefill on 8 tokens → 5; req 0 DONE.
+    assert b.forward_prompt_tokens == 8
+    assert b.prefix_hits == 0
+
+    # Request 1: mid-run admit. Step 2's reclaim populates the prefix
+    # cache from req 0 (2 blocks at block_size=4), then admit phase
+    # peeks req 1's prompt → 8 tokens hit, max_aligned=4, usable=4.
+    # Suffix prefill forwards 4 tokens; req 1 DONE on that first token.
+    b.add_request(1, [1, 2, 3, 4, 5, 6, 7, 8], _greedy(max_tokens=1))
+    events = []
+    while b.has_work():
+        events.extend(b.step())
+
+    assert b.prefix_hits == 1
+    assert b.forward_prompt_tokens == 8 + 4
+    done_events = [e for e in events if e.kind == "done"]
+    assert {e.req_index for e in done_events} == {1}
+
+
+def test_hit_row_extends_main_cache_preserving_live_rows_I2() -> None:
+    """Invariant I-2: extend appends to main, incumbent row's req_index
+    stays at its original slot_table position while the hit row gets
+    the next index. Drive this by admitting a long-running request 0,
+    then mid-run admitting request 1 via hit path.
+    """
+    pc = _make_prefix_cache(block_size=4)
+    # Bootstrap the cache.
+    bootstrap = ContinuousBatcher(
+        _admit_adapter(script=(5,)), max_batch_size=1, prefix_cache=pc
+    )
+    bootstrap.add_request(
+        99, [1, 2, 3, 4, 5, 6, 7, 8], _greedy(max_tokens=1)
+    )
+    while bootstrap.has_work():
+        bootstrap.step()
+
+    # Request 0 is long-running (max_tokens=3) and uses a prompt that
+    # does NOT share the cached prefix (miss path).
+    # Request 1 shares the cached prefix and is admitted mid-run (hit).
+    # Script interpretation:
+    #   step 1 prefill B=1: target 20 (req 0 first token, miss)
+    #   step 2 hit-admit for req 1 (suffix prefill B=1): target 30
+    #          (req 1 terminates on its first sampled token)
+    #   step 3 decode B=1 for req 0: target 21 (req 0 second token)
+    #   step 4 decode B=1 for req 0: target 22 (terminates req 0)
+    adapter = _admit_adapter(script=(20, 30, 21, 22))
+    b = ContinuousBatcher(adapter, max_batch_size=2, prefix_cache=pc)
+    b.add_request(0, [50, 51, 52, 53], _greedy(max_tokens=3))
+    b.step()  # initial cohort prefill → req 0 emits token 20
+    assert b._slot_table == {0: 0}  # type: ignore[attr-defined]
+
+    b.add_request(1, [1, 2, 3, 4, 5, 6, 7, 8], _greedy(max_tokens=1))
+    while b.has_work():
+        b.step()
+
+    # Hit fired for req 1. Req 0 terminated normally. Cache was
+    # extended (not replaced) during req 1's admission because main
+    # was non-None at that point.
+    assert b.prefix_hits == 1
+
+
+def test_forward_prompt_tokens_counts_prefill_not_decode() -> None:
+    """Decode steps must not bump the counter — only prefill does."""
+    adapter = _admit_adapter(script=(5, 7, 9))  # 3 steps: prefill + 2 decode
+    b = ContinuousBatcher(adapter, max_batch_size=1)
+    b.add_request(0, [1, 2, 3, 4, 5], _greedy(max_tokens=3))
+    while b.has_work():
+        b.step()
+    # Prefill bumped by 5 (prompt length); decode steps bump nothing.
+    assert b.forward_prompt_tokens == 5
+
+
+def test_forward_prompt_tokens_reduces_on_prefix_hit() -> None:
+    """Two staggered runs, same prompts; the second run (with cache)
+    has strictly lower total forward_prompt_tokens because the second
+    admit goes through the hit path."""
+    # Run A: no prefix cache. Two requests staggered, both miss.
+    adapter_a = _admit_adapter(script=(5, 7))
+    b_a = ContinuousBatcher(adapter_a, max_batch_size=1)
+    b_a.add_request(0, [1, 2, 3, 4, 5, 6, 7, 8], _greedy(max_tokens=1))
+    b_a.step()
+    b_a.add_request(1, [1, 2, 3, 4, 5, 6, 7, 8], _greedy(max_tokens=1))
+    while b_a.has_work():
+        b_a.step()
+    total_a = b_a.forward_prompt_tokens  # 8 + 8 = 16
+
+    # Run B: with prefix cache. First request fills, second hits.
+    adapter_b = _admit_adapter(script=(5, 7))
+    pc = _make_prefix_cache(block_size=4)
+    b_b = ContinuousBatcher(adapter_b, max_batch_size=1, prefix_cache=pc)
+    b_b.add_request(0, [1, 2, 3, 4, 5, 6, 7, 8], _greedy(max_tokens=1))
+    b_b.step()
+    b_b.add_request(1, [1, 2, 3, 4, 5, 6, 7, 8], _greedy(max_tokens=1))
+    while b_b.has_work():
+        b_b.step()
+    total_b = b_b.forward_prompt_tokens  # 8 + 4 = 12
+
+    assert total_b < total_a
+    assert total_a == 16
+    assert total_b == 12
+
+
+def test_prefix_hits_counter_increments_per_hit_admission() -> None:
+    """Each hit-path admission bumps prefix_hits by exactly 1. Drive
+    two hits via staggered mid-run admits against a pre-populated cache.
+    """
+    pc = _make_prefix_cache(block_size=4)
+    # Bootstrap: fill the cache via a separate batcher.
+    bootstrap = ContinuousBatcher(
+        _admit_adapter(script=(5,)), max_batch_size=1, prefix_cache=pc
+    )
+    bootstrap.add_request(99, [1, 2, 3, 4, 5, 6, 7, 8], _greedy(max_tokens=1))
+    while bootstrap.has_work():
+        bootstrap.step()
+
+    # Real batcher: seal cohort with a short dummy so subsequent adds
+    # route through the waiting queue (hit path). Dummy prompt length 1
+    # — no aligned block, so bootstrap into the prefill path cleanly.
+    adapter = _admit_adapter(script=(0, 7, 11))
+    b = ContinuousBatcher(adapter, max_batch_size=1, prefix_cache=pc)
+    b.add_request(100, [99], _greedy(max_tokens=1))  # dummy, sub-block
+    b.step()  # seals cohort; dummy done
+    b.add_request(0, [1, 2, 3, 4, 5, 6, 7, 8], _greedy(max_tokens=1))
+    b.add_request(1, [1, 2, 3, 4, 5, 6, 7, 8], _greedy(max_tokens=1))
+    while b.has_work():
+        b.step()
+    assert b.prefix_hits == 2
+
+
+def test_hit_admission_releases_hit_refs_on_forward_error() -> None:
+    """S-2: if the suffix forward raises, retained hit refs MUST be
+    released via the finally block. Otherwise subsequent evict_until
+    skips the blocks forever."""
+    pc = _make_prefix_cache(block_size=4)
+    # Bootstrap: fill cache.
+    bootstrap = ContinuousBatcher(
+        _admit_adapter(script=(5,)), max_batch_size=1, prefix_cache=pc
+    )
+    bootstrap.add_request(99, [1, 2, 3, 4, 5, 6, 7, 8], _greedy(max_tokens=1))
+    while bootstrap.has_work():
+        bootstrap.step()
+    hit_block_ids = pc.peek([1, 2, 3, 4, 5, 6, 7, 8]).block_ids
+    assert len(hit_block_ids) > 0
+
+    # Build a batcher whose model raises on forward. We trigger the
+    # hit-admission path, expect an exception, and verify hit_refs is 0.
+    class _ExplodingModel:
+        def __call__(
+            self, tokens: mx.array, cache: list[Any] | None = None
+        ) -> mx.array:
+            # Prove this is the hit path, not the miss cohort path:
+            # usable_hit_tokens=4, so the model should see only the
+            # 4-token suffix and a seeded cache whose logical offset is 4.
+            assert tuple(tokens.shape) == (1, 4)
+            assert cache is not None
+            assert cache[0] is not None
+            assert int(cache[0].offset[0].item()) == 4
+            raise RuntimeError("boom")
+
+    adapter = _admit_adapter(script=(0,))
+    b = ContinuousBatcher(adapter, max_batch_size=1, prefix_cache=pc)
+    # Seal the initial cohort with a sub-block dummy. This matters:
+    # pre-step admits do NOT enter the prefix-hit path. The cached
+    # prompt below must be added mid-run so it goes through
+    # _admit_waiting_requests → _admit_single_hit_row.
+    b.add_request(100, [50], _greedy(max_tokens=1))
+    b.step()
+
+    # Replace the BATCHER's model reference, not adapter._model. The
+    # batcher snapshotted adapter.build() at construction time, so
+    # mutating the adapter afterwards has no effect.
+    b._model = _ExplodingModel()  # type: ignore[assignment]
+    b.add_request(0, [1, 2, 3, 4, 5, 6, 7, 8], _greedy(max_tokens=1))
+    # Before admission, peek again (still side-effect-free).
+    for bid in hit_block_ids:
+        assert pc._store.hit_refs(bid) == 0  # type: ignore[attr-defined]
+    with pytest.raises(RuntimeError, match="boom"):
+        while b.has_work():
+            b.step()
+    # After the exception, every retained hit must be back to 0.
+    for bid in hit_block_ids:
+        assert pc._store.hit_refs(bid) == 0  # type: ignore[attr-defined]
+
+
+def test_full_hit_reservation_keeps_one_block_of_suffix_prefill() -> None:
+    """S-5 edge 1: when the prompt is fully covered by the cache, we
+    still reserve one block of suffix prefill so first-token logits
+    are generable."""
+    pc = _make_prefix_cache(block_size=4)
+    # Bootstrap: cache 8 tokens.
+    bootstrap = ContinuousBatcher(
+        _admit_adapter(script=(5,)), max_batch_size=1, prefix_cache=pc
+    )
+    bootstrap.add_request(99, [1, 2, 3, 4, 5, 6, 7, 8], _greedy(max_tokens=1))
+    while bootstrap.has_work():
+        bootstrap.step()
+
+    # Seal cohort with sub-block dummy, then mid-run admit the real
+    # request so it routes through the hit path.
+    adapter = _admit_adapter(script=(0, 7))
+    b = ContinuousBatcher(adapter, max_batch_size=1, prefix_cache=pc)
+    b.add_request(100, [50], _greedy(max_tokens=1))
+    b.step()  # dummy through
+    # Now full-hit admission for 8-token prompt:
+    # peek → 8 hit tokens, max_aligned = ((8-1)//4)*4 = 4, usable = 4.
+    # Suffix = 4 tokens.
+    b.add_request(0, [1, 2, 3, 4, 5, 6, 7, 8], _greedy(max_tokens=1))
+    while b.has_work():
+        b.step()
+    assert b.prefix_hits == 1
+    # Dummy's 1-token prefill + req 0's 4-token suffix prefill = 5.
+    assert b.forward_prompt_tokens == 1 + 4
+
+
+def test_mixed_hit_and_miss_rows_in_one_admit_call() -> None:
+    """S-7: mixed hit/miss admissions in one step produce phase-grouped
+    events (hits first, miss cohort after). This test asserts
+    per-row token correctness only; cross-row interleave is NOT
+    guaranteed by the contract.
+    """
+    pc = _make_prefix_cache(block_size=4)
+    # Bootstrap: cache prompt [1,2,3,4,5,6,7,8].
+    bootstrap = ContinuousBatcher(
+        _admit_adapter(script=(5,)), max_batch_size=1, prefix_cache=pc
+    )
+    bootstrap.add_request(99, [1, 2, 3, 4, 5, 6, 7, 8], _greedy(max_tokens=1))
+    while bootstrap.has_work():
+        bootstrap.step()
+
+    # Script:
+    #   step 1 prefill B=1 dummy: → 0 (terminates)
+    #   step 2 hit admit for req 1 (B=1 suffix prefill, runs first per S-7): → 7
+    #   step 2 miss admit for req 0 (B=1 full prefill): → 13
+    # (hit + miss both fire in step 2's admit phase; admit returns both
+    # sets of events and step() early-returns — no forward phase runs.)
+    adapter = _admit_adapter(script=(0, 7, 13))
+    b = ContinuousBatcher(adapter, max_batch_size=2, prefix_cache=pc)
+    b.add_request(100, [50], _greedy(max_tokens=1))  # seal dummy
+    b.step()
+
+    b.add_request(0, [90, 91, 92, 93, 94, 95, 96, 97], _greedy(max_tokens=1))
+    b.add_request(1, [1, 2, 3, 4, 5, 6, 7, 8], _greedy(max_tokens=1))
+    events: list[BatchEvent] = []
+    while b.has_work():
+        events.extend(b.step())
+
+    assert b.prefix_hits == 1
+    # Per-row correctness: each real request gets exactly one token +
+    # done event.
+    tokens_by_req = {
+        e.req_index: e.token_id for e in events if e.kind == "token"
+    }
+    done_by_req = {e.req_index for e in events if e.kind == "done"}
+    assert 0 in tokens_by_req and 0 in done_by_req
+    assert 1 in tokens_by_req and 1 in done_by_req
