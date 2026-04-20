@@ -25,6 +25,7 @@ from mlx_lm.utils import load as _mlx_lm_load
 
 from silica.kvcache.simple import SimpleKVCache
 from silica.models.adapter import ModelAdapter
+from silica.models.gemma4 import Gemma4Adapter
 from silica.models.qwen3 import Qwen3Adapter
 from silica.models.qwen3_5 import Qwen3_5Adapter
 
@@ -43,10 +44,27 @@ def _build_qwen3_5(
     return Qwen3_5Adapter(model, tokenizer, kv_manager=kv)
 
 
-# mlx-lm's model_type → Silica adapter builder.
+def _build_gemma4(
+    model: Any, tokenizer: Any, kv: SimpleKVCache
+) -> ModelAdapter:
+    return Gemma4Adapter(model, tokenizer, kv_manager=kv)
+
+
+# mlx-lm's model_type → Silica adapter builder. The Gemma4-31B load
+# probe (P-3-D0, commit 8718bcd) reports the outer model_type as
+# ``"gemma4"`` for the multimodal-shell repo; that is the only
+# alias D1 registers. The inner ``"gemma4_text"`` checkpoint stores
+# its structural args directly on ``model.args`` (a ``ModelArgs``
+# dataclass), not under ``args.text_config`` — ``Gemma4Adapter``
+# currently only supports the outer wrapper's dict layout, so
+# registering ``"gemma4_text"`` here would produce an adapter whose
+# variant guard and layer_types reader silently see an empty config.
+# Add the alias (plus a widened ``_text_config_dict``) only when a
+# bare text-model checkpoint is a real target.
 _ADAPTERS: dict[str, _AdapterBuilder] = {
     "qwen3": _build_qwen3,
     "qwen3_5": _build_qwen3_5,
+    "gemma4": _build_gemma4,
 }
 
 

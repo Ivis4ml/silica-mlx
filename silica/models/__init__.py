@@ -22,12 +22,14 @@ from silica.models.capabilities import (
     capabilities_from_attention_pattern,
 )
 from silica.models.factory import adapter_for_repo, supported_model_types
+from silica.models.gemma4 import Gemma4Adapter
 from silica.models.qwen3 import Qwen3Adapter
 from silica.models.qwen3_5 import Qwen3_5Adapter
 
 __all__ = [
     "AttentionKind",
     "AttentionPattern",
+    "Gemma4Adapter",
     "KVLayout",
     "ModelAdapter",
     "ModelCapabilities",
