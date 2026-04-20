@@ -355,7 +355,8 @@ through a single `get_layer`-equivalent. This is a redefinition of
 D-011 — "the **dispatch** uses per-expert ids, regardless of
 whether the **fetch** is fused."
 
-Recommended for E1 / E2: **(c)**. Reasoning:
+**Resolution: option (c), confirmed 2026-04-20** (see E-open-1 in §6
+for the full statement). Reasoning kept here for context:
 
 - Option (a) loses D-011 as a testable invariant, which is
   PLAN.md's explicit ask for MoE structural correctness.
@@ -370,11 +371,16 @@ Recommended for E1 / E2: **(c)**. Reasoning:
   `(layer_idx, expert_id)` observability, not one-fetch-per-expert
   granularity.
 
-Option (c) requires a **WeightProvider API clarification** —
-specifically, whether `get_expert(layer_idx, expert_id)` returns a
-view into a larger stacked tensor (allowed under option (c)) or a
-freshly allocated per-expert tensor (required under option (b)).
-Flagged as E-open-1.
+Under option (c), `WeightProvider.get_expert(layer_idx, expert_id)`
+is the observability seam: the adapter threads concrete per-expert
+indices through a thin proxy (installed explicitly via
+`Qwen3_5MoeAdapter.install_dispatch_proxy`, not by default
+`build()`) that calls the observer before delegating to the real
+`SwitchGLU`. A mock `WeightProvider` in E2 will assert that every
+activated expert id is seen; a quantized `QuantizedSwitchLinear`
+can still return a view into the stacked tensor, because the
+observability contract is at the dispatch level, not the fetch
+level.
 
 ### 4.2 Factory dispatch: Gemma4-MoE shares `model_type` with dense
 
@@ -494,25 +500,64 @@ Out of scope for E:
 Using the local `E-open-*` convention, not the global `Q-NNN`
 space.
 
-### E-open-1 — `WeightProvider.get_expert` return-value semantics
+### E-open-1 — `WeightProvider.get_expert` return-value semantics — **RESOLVED 2026-04-20**
 
-Does `get_expert(layer_idx, expert_id)` return an independent
-tensor (option 4.1(b) — required for literal D-011 compliance) or
-a view into a larger stacked tensor (option 4.1(c) — preserves
-SwitchGLU fast path)? PLAN.md's §D-011 text does not spell this
-out; E1 will make the call based on whether the quantized fast
-path matters for the P-3 exit criterion. **Recommendation in §4.1:
-option (c).** Needs sign-off before E2 writes the unit test.
+**Resolution: option (c) — "per-expert at dispatch, fused at fetch."**
 
-### E-open-2 — `mlp_only_layers` contents on 35B-A3B checkpoint
+The adapter-level contract is that every MoE layer's forward
+**dispatches** with concrete `(layer_idx, expert_id)` indices
+observable by a mock `WeightProvider`; the underlying **fetch**
+remains fused via `SwitchGLU` + `gather_mm` against a single
+stacked expert tensor per layer (including the quantized
+`QuantizedSwitchLinear` fast path for 4-bit checkpoints).
 
-The probe shows the key is present in `text_config_keys` but
-does not dump its contents. The qwen3_5 DecoderLayer ignores it;
-if non-empty, mlx-lm is silently wiring MoE onto layers that
-should be dense. Action: rerun the probe with a one-line
-addition dumping `_probe_attr(args, "mlp_only_layers")` — or
-read it once via a throwaway `python -c` so the 20 GB load pays
-for itself twice. If non-empty, file upstream + have E1 guard.
+Rationale: option (b) — literal per-expert independent-tensor
+fetch — would sacrifice the 4-bit quantized fast path that
+dominates real throughput on both 35B-A3B and 26B-A4B. Option
+(a) — fully fused with no per-expert observability — would lose
+D-011 as a testable invariant. Option (c) preserves both.
+
+D-011 test semantic under option (c): a mock `WeightProvider`
+whose `get_expert(layer_idx, expert_id)` records the `(layer_idx,
+expert_id)` tuples asserts **dispatch** coverage — every
+activated top-k expert on every MoE layer shows up. The fetched
+weights are still views into the stacked `SwitchLinear.weight`
+tensor; the test does not verify fetch granularity.
+
+E1.1 ships the mechanism: `Qwen3_5MoeAdapter.install_dispatch_proxy
+(observer)` wraps each MoE layer's `switch_mlp` with a
+`_DispatchProxy` that reports `(layer_idx, indices)` on every
+forward before delegating to the original `SwitchGLU`. The proxy
+is NOT installed by default — `build()` leaves the model
+untouched so single-request execution through the dense
+`ResidentWeightProvider` (whose `get_expert` raises by design)
+continues to work. E2 will write the mock-provider test that
+drives the observer into `provider.get_expert(layer_idx,
+expert_id)` calls and asserts the expected expert-id coverage.
+
+### E-open-2 — `mlp_only_layers` contents on 35B-A3B checkpoint — **RESOLVED 2026-04-20**
+
+**Resolution: empty list on the probed 35B-A3B-4bit checkpoint;
+E1.1 added a loud-fail guard to reject future non-empty cases.**
+
+Verified by reading
+`~/.cache/huggingface/hub/models--mlx-community--Qwen3.5-35B-A3B-4bit/snapshots/*/config.json`
+directly (no second 20 GB load needed): `mlp_only_layers = []`.
+The config key is carried forward from upstream but unused on
+this checkpoint, so mlx-lm's silent behaviour of ignoring the
+list is benign here.
+
+E1.1's `Qwen3_5MoeAdapter._validate_supported_moe_variant`
+guards future non-empty cases with a specific
+`NotImplementedError` that explains the silent-wrong-wiring
+risk — so the next time a Qwen3.5-MoE checkpoint arrives with
+a non-empty list, the adapter refuses at construction rather
+than accept a config mlx-lm itself does not handle. The guard
+stays in place until either (i) upstream mlx-lm adds
+`mlp_only_layers` handling to `qwen3_5.DecoderLayer`, at which
+point the guard can lift; or (ii) Silica ships its own
+per-layer branch that consults the field, in which case the
+guard is rephrased.
 
 ### E-open-3 — MTP weights and base-model forward
 
@@ -533,16 +578,33 @@ confirming that `Gemma4MoeAdapter` inherits the `layer_types`
 primary path, not a synthesised pattern from
 `sliding_window_pattern`.
 
-### E-open-5 — `attn_output_gate` and `qwen3_5.Attention`
+### E-open-5 — `attn_output_gate` and `qwen3_5.Attention` — **RESOLVED 2026-04-20**
 
-Qwen3-Next introduced `attn_output_gate` as an additional gate in
-the attention path. The 35B-A3B config sets it (presence in
-`text_config_keys`). The qwen3_5 `Attention` class may or may
-not honour the flag — needs a source check inside qwen3_5.py
-before E1 concludes that the dense Qwen3.5 attention forward
-applies unchanged to Qwen3.5-MoE. If the flag is honoured,
-E1-Qwen3.5-MoE inherits the correct behaviour automatically; if
-it is silently dropped, E1 must record the mismatch.
+**Resolution: mlx-lm silently drops the flag; Silica inherits this
+behaviour and records the divergence on `config.extra`.**
+
+The 35B-A3B config sets `attn_output_gate=True`. A repo-wide
+grep of `mlx_lm/models/` finds **zero** references to
+`attn_output_gate` or `output_gate` — mlx-lm does not implement
+the Qwen3-Next attention output gate. This is upstream
+behaviour, not a Silica bug; the model's attention forward
+simply omits the gate regardless of the config.
+
+Implication: Qwen3.5-MoE outputs under Silica may differ
+numerically from the HF reference (which honours the gate).
+Silica does not attempt to implement the missing gate; the
+adapter wraps whatever mlx-lm produces. E1.1 records the
+divergence explicitly in `config.extra`:
+
+- `attn_output_gate_config` — the config value (bool)
+- `attn_output_gate_mlx_lm_honors` — always `False` (as of
+  2026-04-20), indicating that the config field does not
+  reach the attention forward
+
+Future work that cares about HF-reference parity (P-4 bench,
+E3 per-family smoke vs an external reference) should consult
+these fields and flag the divergence in its report, rather
+than re-deriving the finding from mlx-lm source each time.
 
 ## 7. References
 

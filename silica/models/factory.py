@@ -28,6 +28,7 @@ from silica.models.adapter import ModelAdapter
 from silica.models.gemma4 import Gemma4Adapter
 from silica.models.qwen3 import Qwen3Adapter
 from silica.models.qwen3_5 import Qwen3_5Adapter
+from silica.models.qwen3_5_moe import Qwen3_5MoeAdapter
 
 _AdapterBuilder = Callable[[Any, Any, SimpleKVCache], ModelAdapter]
 
@@ -50,6 +51,12 @@ def _build_gemma4(
     return Gemma4Adapter(model, tokenizer, kv_manager=kv)
 
 
+def _build_qwen3_5_moe(
+    model: Any, tokenizer: Any, kv: SimpleKVCache
+) -> ModelAdapter:
+    return Qwen3_5MoeAdapter(model, tokenizer, kv_manager=kv)
+
+
 # mlx-lm's model_type → Silica adapter builder. The Gemma4-31B load
 # probe (P-3-D0, commit 8718bcd) reports the outer model_type as
 # ``"gemma4"`` for the multimodal-shell repo; that is the only
@@ -61,9 +68,16 @@ def _build_gemma4(
 # variant guard and layer_types reader silently see an empty config.
 # Add the alias (plus a widened ``_text_config_dict``) only when a
 # bare text-model checkpoint is a real target.
+#
+# P-3-E0 probe confirmed Qwen3.5-MoE reports a distinct
+# model_type ``"qwen3_5_moe"`` (unlike Gemma4-MoE which collides
+# with Gemma4-31B-dense on ``"gemma4"``), so a plain _ADAPTERS
+# entry is sufficient; Gemma4-MoE dispatch via a local
+# enable_moe_block branch inside _build_gemma4 lands in P-3-E1.2.
 _ADAPTERS: dict[str, _AdapterBuilder] = {
     "qwen3": _build_qwen3,
     "qwen3_5": _build_qwen3_5,
+    "qwen3_5_moe": _build_qwen3_5_moe,
     "gemma4": _build_gemma4,
 }
 

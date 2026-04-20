@@ -1321,7 +1321,9 @@ class ContinuousBatcher:
             reason = _unsupported_kind_reason(kind)
             extra = (
                 "; adapter also declares MoE routing (has_moe=True) — "
-                "MoE scheduling is a P-3 discussion"
+                "MoE adapters (e.g. qwen3_5_moe, gemma4_moe) are "
+                "single-request-only until P-3-E4 lands batched MoE "
+                "smoke + parity"
                 if caps.has_moe
                 else ""
             )
@@ -1344,8 +1346,9 @@ class ContinuousBatcher:
         # append MoE context only when ``has_moe`` is actually set —
         # no hard-coded assumption.
         moe_tail = (
-            " — MoE-aware scheduling arrives in P-3 alongside the "
-            "Qwen3.5-35B-A3B / gemma-4-26B-A4B adapters"
+            " — MoE adapters (Qwen3.5-35B-A3B, gemma-4-26B-A4B) are "
+            "registered as of P-3-E1 for single-request execution "
+            "only; batched MoE scheduling is P-3-E4"
             if caps.has_moe
             else (
                 "; attention_pattern() reports no unsupported layer, so "
