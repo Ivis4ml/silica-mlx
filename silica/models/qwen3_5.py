@@ -123,6 +123,89 @@ class Qwen3_5Adapter:
         logits = forward(self._model, token, cache_list)
         return logits, StateDelta()
 
+    # --- D-015 adapter-local state lifecycle (P-3-C1) ---
+    #
+    # These four helpers are NOT part of I-1's frozen Python signatures
+    # (see D-015: "lifecycle operations are adapter methods called by
+    # the engine ... non-frozen helpers"). They are deliberately minimal
+    # in the single-request / non-speculative path, which is what P-1
+    # through P-3-B exercises. Batched admission (P-3-C3) and
+    # speculative rollback (P-7) will extend the bodies; the signatures
+    # are stabilised here so engine and scheduler wiring can be written
+    # against them without further churn.
+
+    def commit_state(self, req_id: str, n_accepted: int) -> None:
+        """Mark ``n_accepted`` recurrent-state updates as committed.
+
+        In mlx-lm's ``ArraysCache`` model the state is updated in place
+        on every forward and there is no separate staging buffer —
+        ``decode_step`` has already written the committed state by the
+        time ``commit_state`` is called. So this is a no-op under the
+        current forward contract. P-7 speculative decoding changes that
+        (snapshot before draft, collapse on commit); at that point this
+        body gains real behaviour.
+
+        ``n_accepted`` is unused here but retained in the signature
+        because D-015 pairs it with ``KVManager.commit(req_id,
+        n_accepted)`` — the engine treats the KV and recurrent-state
+        commit as a pair and passes the same count to both.
+        """
+        del req_id, n_accepted
+
+    def rollback_state(self, req_id: str, n_reject: int) -> None:
+        """Roll back the last ``n_reject`` recurrent-state steps.
+
+        The current forward path updates ``cache[1]`` (recurrent state)
+        in place via ``gated_delta_update``, so rolling back requires a
+        pre-draft snapshot that P-1 through P-3 does not take. Raising
+        here (rather than silently returning) is intentional: if a
+        caller reaches this, they have wired in a draft source without
+        the matching snapshot logic, and a silent no-op would corrupt
+        decoding.
+
+        Real rollback semantics land with P-7 (speculative decoding)
+        alongside ``KVManager.rollback(req_id, n_reject)``.
+        """
+        del req_id
+        raise NotImplementedError(
+            f"Qwen3_5Adapter.rollback_state requires a pre-draft "
+            f"snapshot of the recurrent state; that snapshot pathway "
+            f"lands with P-7 speculative decoding. Got n_reject="
+            f"{n_reject}."
+        )
+
+    def state_from_prefix(
+        self, req_id: str, token_ids: list[int]
+    ) -> StateDelta | None:
+        """Return reusable recurrent state for a prefix — v0.1 returns None.
+
+        D-015's v0.1 rule: reuse recurrent state only when the **full**
+        KV prefix is reused. The caller has no way to ask for that
+        specifically, so we conservatively return ``None`` for all
+        prefix-reuse requests. DeltaNet's recurrent hidden state is a
+        running accumulation over the entire sequence (see
+        ``docs/P3_DELTANET_SURVEY.md`` §3.2) — unlike per-token K/V it
+        cannot be sliced to a partial prefix, so "always None" is the
+        only correct P-3 behaviour.
+
+        Partial-prefix reuse is a v0.2 question (D-015 item 4).
+        """
+        del req_id, token_ids
+        return None
+
+    def free_state(self, req_id: str) -> None:
+        """Release the adapter-local state for ``req_id``.
+
+        Under ``SimpleKVCache`` the per-request cache list is owned by
+        the KV manager and released by ``KVManager.free(req_id)`` — the
+        ArraysCache slots (conv_state + recurrent state) are freed
+        there. So the adapter has no separate tenant to release today,
+        and this method is a no-op. When P-3-C3 introduces a batched
+        recurrent-state store owned by the adapter, this helper is the
+        hook where per-row state is evicted.
+        """
+        del req_id
+
     # --- family-specific metadata extraction ---
 
     @staticmethod

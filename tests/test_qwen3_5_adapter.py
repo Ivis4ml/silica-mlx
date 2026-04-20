@@ -206,6 +206,65 @@ def test_capabilities_carry_hybrid_deltanet_and_set_recurrent_state() -> None:
     assert caps.has_moe is False
 
 
+# --- D-015 adapter-local state helpers (P-3-C1) ---
+
+
+def test_commit_state_is_a_noop_returning_none() -> None:
+    """Under mlx-lm's in-place forward, commit_state has nothing to do."""
+    adapter, _, _ = _make_adapter_and_kv()
+    assert adapter.commit_state("req-0", 0) is None
+    assert adapter.commit_state("req-0", 7) is None
+
+
+def test_rollback_state_raises_not_implemented_naming_p7() -> None:
+    """Rollback requires a pre-draft snapshot that P-3 does not take;
+    raising is intentional so a caller that wires in a draft source
+    without the snapshot pathway fails loudly rather than silently
+    corrupting decoding."""
+    adapter, _, _ = _make_adapter_and_kv()
+    with pytest.raises(NotImplementedError, match="P-7"):
+        adapter.rollback_state("req-0", 3)
+
+
+def test_state_from_prefix_returns_none_for_any_input() -> None:
+    """D-015 v0.1 rule: reuse recurrent state only when the full KV
+    prefix is reused; the adapter has no way to distinguish that today,
+    so it conservatively returns None for every prefix request."""
+    adapter, _, _ = _make_adapter_and_kv()
+    assert adapter.state_from_prefix("req-0", []) is None
+    assert adapter.state_from_prefix("req-0", [1, 2, 3]) is None
+    assert adapter.state_from_prefix("req-0", list(range(1024))) is None
+
+
+def test_free_state_is_a_noop_returning_none() -> None:
+    """The SimpleKVCache already discards the per-request ArraysCache
+    slots via KVManager.free; the adapter has no second tenant to
+    release in the single-request path."""
+    adapter, _, _ = _make_adapter_and_kv()
+    assert adapter.free_state("req-0") is None
+
+
+def test_helpers_signatures_match_d015_pairing() -> None:
+    """D-015 pairs commit_state / rollback_state with KVManager.commit
+    / KVManager.rollback, and free_state with KVManager.free. Verify
+    the helpers accept the same ``(req_id, n)`` / ``(req_id,)``
+    signatures so the engine can call them symmetrically without
+    type-juggling."""
+    import inspect
+
+    adapter, _, _ = _make_adapter_and_kv()
+    commit_params = list(inspect.signature(adapter.commit_state).parameters)
+    rollback_params = list(inspect.signature(adapter.rollback_state).parameters)
+    state_prefix_params = list(
+        inspect.signature(adapter.state_from_prefix).parameters
+    )
+    free_params = list(inspect.signature(adapter.free_state).parameters)
+    assert commit_params == ["req_id", "n_accepted"]
+    assert rollback_params == ["req_id", "n_reject"]
+    assert state_prefix_params == ["req_id", "token_ids"]
+    assert free_params == ["req_id"]
+
+
 # --- tokenizer / build ---
 
 
