@@ -171,6 +171,116 @@ def test_for_adapter_derives_bytes_per_token_from_layout() -> None:
     assert b.cap_bytes == 10_000
 
 
+def test_for_adapter_prefers_kv_layout_bytes_per_token_total_when_set() -> None:
+    """P-3-D4: when ``KVLayout.bytes_per_token_total`` is populated
+    (heterogeneous-shape adapter, e.g. Gemma4's sliding + full layer
+    mix), ``for_adapter`` uses the field verbatim and ignores the
+    ``num_layers × n_kv_heads × head_dim`` product. This is the whole
+    point of the field: adapter-authored per-kind sums override the
+    naive pre-D4 formula."""
+    import mlx.core as mx
+
+    from silica.models.adapter import (
+        AttentionKind,
+        AttentionPattern,
+        KVLayout,
+        ModelConfig,
+    )
+
+    class _HeterogeneousAdapter:
+        config = ModelConfig(
+            model_name="hetero",
+            num_layers=3,
+            hidden_size=16,
+            vocab_size=8,
+        )
+        _layout = KVLayout(
+            num_layers=3,
+            n_kv_heads=2,
+            head_dim=4,
+            dtype=mx.float16,
+            # Naive formula would yield 2*3*2*4*2 = 96; the field
+            # deliberately disagrees to prove it is load-bearing.
+            bytes_per_token_total=50,
+        )
+        _pattern = AttentionPattern(
+            per_layer=(AttentionKind.GLOBAL,) * 3
+        )
+
+        def kv_layout(self) -> KVLayout:
+            return self._layout
+
+        def attention_pattern(self) -> AttentionPattern:
+            return self._pattern
+
+    kv = _kv()
+    pc = RadixPrefixCache(
+        block_size=kv.block_size, store=PagedPrefixBlockStore(kv)
+    )
+    b = MemoryBudgeter.for_adapter(
+        _HeterogeneousAdapter(),  # type: ignore[arg-type]
+        prefix_cache=pc,
+        weights_bytes=0,
+        cap_bytes=10_000,
+    )
+    assert b.bytes_per_token == 50
+
+
+def test_for_adapter_falls_back_to_layout_formula_when_total_is_none() -> (
+    None
+):
+    """Regression guard: adapters that leave
+    ``bytes_per_token_total=None`` (the default — plain Qwen3 and
+    Qwen3.5 dense do this, since their per-layer KV shapes are
+    homogeneous) get the pre-D4 derivation unchanged."""
+    import mlx.core as mx
+
+    from silica.models.adapter import (
+        AttentionKind,
+        AttentionPattern,
+        KVLayout,
+        ModelConfig,
+    )
+
+    class _HomogeneousAdapter:
+        config = ModelConfig(
+            model_name="homo",
+            num_layers=3,
+            hidden_size=16,
+            vocab_size=8,
+        )
+        _layout = KVLayout(
+            num_layers=3,
+            n_kv_heads=2,
+            head_dim=4,
+            dtype=mx.float16,
+            # Explicitly default — belt and braces.
+            bytes_per_token_total=None,
+        )
+        _pattern = AttentionPattern(
+            per_layer=(AttentionKind.GLOBAL,) * 3
+        )
+
+        def kv_layout(self) -> KVLayout:
+            return self._layout
+
+        def attention_pattern(self) -> AttentionPattern:
+            return self._pattern
+
+    kv = _kv()
+    pc = RadixPrefixCache(
+        block_size=kv.block_size, store=PagedPrefixBlockStore(kv)
+    )
+    b = MemoryBudgeter.for_adapter(
+        _HomogeneousAdapter(),  # type: ignore[arg-type]
+        prefix_cache=pc,
+        weights_bytes=0,
+        cap_bytes=10_000,
+    )
+    # Naive formula: 2 * 3 layers * 2 heads * 4 head_dim * 2 bytes = 96.
+    assert b.bytes_per_token == 96
+
+
 # --- worst_case_bytes ---
 
 

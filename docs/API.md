@@ -641,7 +641,11 @@ Factory classmethod:
 - **`MemoryBudgeter.for_adapter(adapter, *, prefix_cache, weights_bytes, cap_bytes)`**
   — derives `bytes_per_token` from `adapter.kv_layout()` and
   `block_size` from `prefix_cache.block_size`. Use this at callsites that
-  would otherwise recompute the arithmetic.
+  would otherwise recompute the arithmetic. When
+  `layout.bytes_per_token_total` is set (P-3-D4, used by adapters with
+  heterogeneous per-layer KV shapes such as Gemma4), the factory uses
+  that value verbatim; otherwise it falls back to
+  `2 * num_layers * n_kv_heads * head_dim * dtype.size`.
 
 Read-only properties / methods:
 - **`cap_bytes`**, **`weights_bytes`**, **`bytes_per_token`**.
@@ -832,8 +836,19 @@ Architecture-level info. Fields: `model_name`, `num_layers`, `hidden_size`,
 
 #### `KVLayout` *(public, dataclass)*
 
-Per-layer KV shape. Fields: `num_layers`, `n_kv_heads`, `head_dim`,
-`dtype: mx.Dtype`. Consumed by `KVCodec` and the kv allocator.
+Per-layer KV shape. Required fields: `num_layers`, `n_kv_heads`,
+`head_dim`, `dtype: mx.Dtype`. Optional field (P-3-D4):
+- `bytes_per_token_total: int | None = None` — aggregate per-token KV
+  bytes across all layers. Homogeneous-shape adapters (plain Qwen3,
+  Qwen3.5 dense) leave this at `None` and `MemoryBudgeter.for_adapter`
+  derives the total from the four required fields. Adapters whose
+  per-layer KV shapes disagree (Gemma4: sliding 16×256 + full 4×512)
+  populate this with an explicit per-kind sum so the budget is not
+  computed from the single-shape summary fields.
+
+Consumed by `KVCodec` and the KV allocator (which read the four
+required fields) and by `MemoryBudgeter.for_adapter` (which prefers
+`bytes_per_token_total` when set).
 
 #### `AttentionKind` *(str enum)*
 

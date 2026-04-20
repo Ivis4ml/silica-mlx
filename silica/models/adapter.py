@@ -90,12 +90,23 @@ class ModelConfig:
 
 @dataclass
 class KVLayout:
-    """Per-layer KV shape — consumed by KVCodec and the KV allocator."""
+    """Per-layer KV shape — consumed by KVCodec and the KV allocator.
+
+    The four required fields describe the dominant / single KV shape on
+    homogeneous-shape models (plain Qwen3, Qwen3.5 dense). For adapters
+    whose per-layer KV shapes disagree (e.g. Gemma4's sliding vs full
+    attention layers), set ``bytes_per_token_total`` explicitly —
+    ``MemoryBudgeter.for_adapter`` prefers that value over the naive
+    ``2 × num_layers × n_kv_heads × head_dim × dtype.size`` formula.
+    When left at ``None`` the formula is used unchanged, so existing
+    homogeneous-shape adapters are not forced to opt in (P-3-D4).
+    """
 
     num_layers: int
     n_kv_heads: int
     head_dim: int
     dtype: mx.Dtype
+    bytes_per_token_total: int | None = None
 
 
 class AttentionKind(str, Enum):

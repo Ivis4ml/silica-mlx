@@ -18,15 +18,17 @@ misconfiguration cannot slip into production:
 Gemma4-31B has two coexisting KV shapes — sliding layers use
 ``(n_kv_heads=16, head_dim=256)``, full layers use
 ``(n_kv_heads=4, head_dim=512)`` with ``attention_k_eq_v=True`` (see
-``docs/P3_GEMMA4_SURVEY.md`` §3.4). ``KVLayout`` as currently defined
-is a single-shape summary; per D-open-1 option (a) we populate it
-from the sliding (majority) layer and record the full per-kind detail
-in ``ModelConfig.extra`` under explicit keys plus a ``kv_layout_caveat``
-string that makes the summary nature readable from any consumer.
-``MemoryBudgeter.bytes_per_token`` built from this ``KVLayout`` will
-therefore over- or under-count on Gemma4; D4 is the scheduled unit
-for a per-kind budget, landing after D3 lifts the scheduler gate
-for ``SLIDING``.
+``docs/P3_GEMMA4_SURVEY.md`` §3.4). ``KVLayout``'s four primary fields
+stay as a single-shape summary; per D-open-1 option (a) we populate
+them from the sliding (majority) layer and record the full per-kind
+detail in ``ModelConfig.extra`` under explicit keys plus a
+``kv_layout_caveat`` string that makes the summary nature readable
+from any consumer. P-3-D4 additionally populates
+``KVLayout.bytes_per_token_total`` with an explicit per-kind sum so
+``MemoryBudgeter.for_adapter`` no longer derives a wrong total from
+those summary fields. The D4 scalar still assumes unbounded growth
+on sliding layers; a full sliding-window-aware budget model is
+future work, tracked separately from D4.
 
 ``make_batch_cache`` (P-3-D2) returns a hybrid per-layer list of
 ``BatchRotatingKVCache`` (sliding) and ``BatchKVCache`` (full) from
@@ -95,9 +97,15 @@ class Gemma4Adapter:
         self._model = model
         self._tokenizer = tokenizer
         self._kv_manager = kv_manager
-        self.config = self._build_config(model, tokenizer)
-        self._kv_layout = self._build_kv_layout(model)
+        # Order matters: _build_attention_pattern runs the strict
+        # layer_types guards (missing / empty / length mismatch / unknown
+        # value), so building it first means _build_kv_layout is only
+        # ever called on a config that has already been validated — and
+        # can consume the pattern to compute a per-kind
+        # bytes_per_token_total.
         self._attention_pattern = self._build_attention_pattern(model)
+        self.config = self._build_config(model, tokenizer)
+        self._kv_layout = self._build_kv_layout(model, self._attention_pattern)
 
     @classmethod
     def from_hf_repo(cls, repo: str) -> tuple[Gemma4Adapter, SimpleKVCache]:
@@ -284,25 +292,69 @@ class Gemma4Adapter:
         )
 
     @staticmethod
-    def _build_kv_layout(model: Any) -> KVLayout:
-        """Sliding-layer summary — NOT authoritative per D-open-1 option (a).
+    def _build_kv_layout(
+        model: Any, pattern: AttentionPattern
+    ) -> KVLayout:
+        """Sliding-layer summary + explicit per-kind byte budget (D-open-1 / D4).
 
-        Populated from the sliding-layer fields because sliding is the
-        majority (50 of 60 on 31B). ``MemoryBudgeter.bytes_per_token``
-        reading this layout over-counts when applied to full-attention
-        layers' smaller KV footprint; documented in ``extra`` via the
-        ``kv_layout_caveat`` string.
+        The four primary ``KVLayout`` fields (``num_layers``,
+        ``n_kv_heads``, ``head_dim``, ``dtype``) stay populated from the
+        sliding-layer fields because sliding is the majority (50 of 60
+        on Gemma4-31B); homogeneous-shape consumers that read these
+        directly see a reasonable single-shape summary with a caveat
+        recorded in ``ModelConfig.extra``.
+
+        ``bytes_per_token_total`` is populated explicitly (P-3-D4) by
+        summing K+V contributions per attention kind using the per-kind
+        shape fields from ``text_config``:
+
+        - SLIDING: ``num_key_value_heads * head_dim``
+        - GLOBAL (full attention): ``num_global_key_value_heads *
+          global_head_dim``
+
+        ``attention_k_eq_v=True`` shares the ``v_proj`` *weight* matrix
+        on full-attention layers but keeps K and V as separate cache
+        tensors at runtime (``gemma4_text.py`` stores both via
+        ``cache.update_and_fetch(keys, values)`` after an independent
+        ``v_norm`` on V). The factor 2 therefore applies uniformly.
+
+        Caveat: this is an unbounded-window assumption — sliding
+        layers are actually capped at ``sliding_window`` tokens of KV,
+        so very long sequences over-estimate sliding contributions and
+        under-estimate the fixed per-request sliding footprint. See
+        ``docs/P3_BATCH_ROTATING_KV_SURVEY.md`` §4.4. The D4 single
+        scalar is still strictly better than the pre-D4 "sliding
+        shape × all 60 layers" over-count by ~9% on Gemma4-31B.
         """
         tc = Gemma4Adapter._text_config_dict(model)
         n_kv_heads = int(tc.get("num_key_value_heads", 0) or 0)
         head_dim = int(tc.get("head_dim", 0) or 0)
         dtype_name = str(tc.get("dtype", "bfloat16"))
         dtype = _DTYPE_BY_NAME.get(dtype_name, mx.bfloat16)
+        dtype_bytes = dtype.size
+
+        sliding_kv_heads = int(tc.get("num_key_value_heads", 0) or 0)
+        sliding_head_dim = int(tc.get("head_dim", 0) or 0)
+        global_kv_heads = int(tc.get("num_global_key_value_heads", 0) or 0)
+        global_head_dim = int(tc.get("global_head_dim", 0) or 0)
+
+        n_sliding = sum(
+            1 for k in pattern.per_layer if k is AttentionKind.SLIDING
+        )
+        n_full = sum(
+            1 for k in pattern.per_layer if k is AttentionKind.GLOBAL
+        )
+        bytes_per_token_total = (
+            n_sliding * 2 * sliding_kv_heads * sliding_head_dim * dtype_bytes
+            + n_full * 2 * global_kv_heads * global_head_dim * dtype_bytes
+        )
+
         return KVLayout(
             num_layers=len(model.layers),
             n_kv_heads=n_kv_heads,
             head_dim=head_dim,
             dtype=dtype,
+            bytes_per_token_total=bytes_per_token_total,
         )
 
     @staticmethod

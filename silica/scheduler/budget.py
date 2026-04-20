@@ -175,8 +175,20 @@ class MemoryBudgeter:
         """Construct a ``MemoryBudgeter`` for a concrete ``ModelAdapter``.
 
         Derives ``bytes_per_token`` from the adapter's
-        ``kv_layout()``: one K plus one V per layer, ``n_kv_heads``
-        heads, ``head_dim`` each, at the layout's dtype.
+        ``kv_layout()``. Two paths:
+
+        - ``layout.bytes_per_token_total`` set (P-3-D4):
+          used verbatim. Adapters with heterogeneous per-layer KV
+          shapes (e.g. Gemma4's sliding 16×256 + full 4×512 mix)
+          populate this field from a per-kind sum so the naive
+          ``num_layers × n_kv_heads × head_dim`` formula does not
+          systematically over-count.
+        - ``layout.bytes_per_token_total`` left at ``None``: one K
+          plus one V per layer, ``n_kv_heads`` heads, ``head_dim``
+          each, at the layout's dtype — the pre-D4 formula,
+          correct for homogeneous-shape models (plain Qwen3,
+          Qwen3.5 dense).
+
         ``block_size`` comes from ``prefix_cache.block_size`` — the
         radix cache is the authority on block granularity and keeping
         it single-sourced avoids drift.
@@ -187,13 +199,16 @@ class MemoryBudgeter:
         remove the ownership boundary (16d non-goal).
         """
         layout = adapter.kv_layout()
-        bytes_per_token = (
-            2  # one K, one V
-            * layout.num_layers
-            * layout.n_kv_heads
-            * layout.head_dim
-            * layout.dtype.size
-        )
+        if layout.bytes_per_token_total is not None:
+            bytes_per_token = layout.bytes_per_token_total
+        else:
+            bytes_per_token = (
+                2  # one K, one V
+                * layout.num_layers
+                * layout.n_kv_heads
+                * layout.head_dim
+                * layout.dtype.size
+            )
         return cls(
             prefix_cache=prefix_cache,
             weights_bytes=weights_bytes,

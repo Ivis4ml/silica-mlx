@@ -235,14 +235,35 @@ Silica batched output must match a direct mlx-lm batched reference
 using the same `Gemma4Adapter.make_batch_cache(left_padding)` cache
 list.
 
-### 4.4 `KVLayout` caveat remains in place
+### 4.4 `KVLayout` caveat — partially resolved in D4
 
-D-open-1 option (a) from the Gemma4 survey still applies: the
-single-shape `KVLayout` captures only the sliding-layer values.
-`MemoryBudgeter.bytes_per_token` under batched execution will mis-
-count on Gemma4 by ~20% until D4 lands a per-kind decomposition or an
-aggregate-bytes field. Not blocking for smoke-level correctness;
-matters once P-4 bench numbers cite KV residency.
+D-open-1 option (a) from the Gemma4 survey still applies to the four
+primary `KVLayout` fields: the sliding-layer shape populates them.
+However P-3-D4 added an optional `bytes_per_token_total: int | None`
+field on `KVLayout`, which `MemoryBudgeter.for_adapter` now reads in
+preference to the naive `2 × num_layers × n_kv_heads × head_dim ×
+dtype.size` formula. `Gemma4Adapter._build_kv_layout` populates this
+as an explicit per-kind sum:
+
+    n_sliding * 2 * sliding_kv_heads * sliding_head_dim * dtype_bytes
+  + n_full    * 2 * global_kv_heads  * global_head_dim  * dtype_bytes
+
+On Gemma4-31B defaults (50 sliding @ 16×256, 10 full @ 4×512,
+bfloat16) this yields `50*2*16*256*2 + 10*2*4*512*2 = 901_120`
+bytes/token, versus the pre-D4 `983_040` bytes/token — a ~9%
+correction in the right direction. `attention_k_eq_v=True` does NOT
+reduce runtime cache footprint (mlx-lm stores K and V as separate
+tensors after independent `v_norm`; only the `v_proj` weight matrix
+is dropped), so the factor 2 applies uniformly.
+
+Remaining caveat for long-context budgeting: the D4 scalar still
+assumes unbounded growth on sliding layers. Beyond `sliding_window`
+tokens (1024 on 31B) sliding-layer cache stops growing — the true
+asymptotic `bytes_per_token` drops to the full-layer contribution
+alone (`81_920` bytes/token on 31B), with a fixed per-request
+sliding cost of roughly `50 * 2 * 16 * 256 * 1024 * 2 ≈ 800 MB`.
+A full sliding-window-aware budget model is future work, tracked
+separately from D4.
 
 ## 5. Open items (P-3-D2 local)
 
@@ -281,7 +302,7 @@ Open Questions space (same convention as `C-open-*` /
 | **D2** | `Gemma4Adapter.make_batch_cache` returns hybrid `[BatchRotatingKVCache / BatchKVCache]` list. Unit tests updated. No gate change. | ~50 lines of code + tests. |
 | **D3** | Extend `_SUPPORTED_ATTENTION_KINDS` to include `SLIDING`; error-locator + `_unsupported_kind_reason` trim; real-model Gemma4-31B batched smoke via `Engine.generate_batch`; README row updated. | Structurally identical to C3c. |
 | **D3.1** | B=1 parity vs single-request, same-prompt symmetry, B>1 parity vs direct mlx-lm batched reference, unequal-length row-lifecycle smoke. Strict B>1 batched-vs-single greedy parity was attempted and degraded after observed drift. | Same spirit as P-2's honest oracle downgrade. |
-| **D4** | `KVLayout` / `MemoryBudgeter` correctness on per-kind KV shapes (option (b) aggregate-bytes or (c) per-kind decomposition). | Separate bench-driven unit. |
+| **D4** | `KVLayout` / `MemoryBudgeter` correctness on per-kind KV shapes — *landed* as the aggregate-bytes variant: new optional `KVLayout.bytes_per_token_total` populated by `Gemma4Adapter._build_kv_layout`; `MemoryBudgeter.for_adapter` prefers it over the naive formula. Sliding-window-aware budget model remains future work. | ~90 lines + 5 unit tests. |
 | **D5** | Gemma4-26B MoE variant — overlaps P-3-E. | Defer until E track starts. |
 
 D2 and D3 **may** land as a single commit given the mutual

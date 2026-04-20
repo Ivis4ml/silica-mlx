@@ -201,6 +201,62 @@ def test_kv_layout_is_sliding_summary() -> None:
     assert layout.dtype == mx.bfloat16
 
 
+def test_kv_layout_bytes_per_token_total_is_explicit_per_kind_sum() -> None:
+    """P-3-D4: ``KVLayout.bytes_per_token_total`` is populated on
+    Gemma4 with an explicit per-kind K+V contribution so
+    ``MemoryBudgeter.for_adapter`` does not derive a wrong total from
+    the sliding-shape summary fields.
+
+    Formula: ``n_sliding * 2 * sliding_kv_heads * sliding_head_dim *
+    dtype.size + n_full * 2 * global_kv_heads * global_head_dim *
+    dtype.size`` under the unbounded-window assumption (sliding-window
+    truncation is a future budget-model refinement, not D4).
+
+    For Gemma4-31B defaults (50 sliding @ 16×256, 10 full @ 4×512,
+    bfloat16=2 bytes) that is
+    ``50*2*16*256*2 + 10*2*4*512*2 = 819_200 + 81_920 = 901_120``."""
+    adapter, _, _ = _make_adapter_and_kv()
+    layout = adapter.kv_layout()
+    assert layout.bytes_per_token_total == (
+        50 * 2 * 16 * 256 * 2 + 10 * 2 * 4 * 512 * 2
+    )
+    assert layout.bytes_per_token_total == 901_120
+
+
+def test_kv_layout_bytes_per_token_total_corrects_pre_d4_overcount() -> None:
+    """Pre-D4 ``MemoryBudgeter.for_adapter`` would multiply the
+    sliding-shape summary over all 60 layers: ``2*60*16*256*2 =
+    983_040``. D4's per-kind total is strictly smaller (~9% less);
+    this test pins the improvement direction so a regression that
+    restores the naive formula fails loudly."""
+    adapter, _, _ = _make_adapter_and_kv()
+    layout = adapter.kv_layout()
+    naive = 2 * layout.num_layers * layout.n_kv_heads * layout.head_dim * layout.dtype.size
+    assert layout.bytes_per_token_total is not None
+    assert layout.bytes_per_token_total < naive
+    assert naive - layout.bytes_per_token_total == 983_040 - 901_120  # 81_920
+
+
+def test_kv_layout_bytes_per_token_total_follows_layer_type_mix() -> None:
+    """Flipping a layer from sliding to full must change
+    ``bytes_per_token_total`` by the per-layer delta. Guards against
+    a regression where the counts are derived from total layer count
+    rather than ``attention_pattern.per_layer``."""
+    tc = _default_31b_text_config()
+    # Convert one sliding layer into a full_attention layer: now 49
+    # sliding + 11 full.
+    types = list(tc["layer_types"])
+    first_sliding = types.index("sliding_attention")
+    types[first_sliding] = "full_attention"
+    tc["layer_types"] = types
+
+    adapter, _, _ = _make_adapter_and_kv(text_config=tc)
+    layout = adapter.kv_layout()
+    assert layout.bytes_per_token_total == (
+        49 * 2 * 16 * 256 * 2 + 11 * 2 * 4 * 512 * 2
+    )
+
+
 def test_config_extra_records_per_kind_detail_and_caveat() -> None:
     adapter, _, _ = _make_adapter_and_kv()
     extra = adapter.config.extra
