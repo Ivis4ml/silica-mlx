@@ -114,14 +114,43 @@ class Qwen3_5Adapter:
     ) -> tuple[mx.array, StateDelta]:
         cache_list = self._kv_manager.cache_list(kv_handle.req_id)
         logits = forward(self._model, tokens, cache_list)
-        return logits, StateDelta()
+        return logits, StateDelta(
+            _recurrent_bytes=self._recurrent_state_bytes(cache_list)
+        )
 
     def decode_step(
         self, token: mx.array, kv_handle: KVHandle
     ) -> tuple[mx.array, StateDelta]:
         cache_list = self._kv_manager.cache_list(kv_handle.req_id)
         logits = forward(self._model, token, cache_list)
-        return logits, StateDelta()
+        return logits, StateDelta(
+            _recurrent_bytes=self._recurrent_state_bytes(cache_list)
+        )
+
+    def _recurrent_state_bytes(self, cache_list: list[Any]) -> int:
+        """Sum the bytes held by recurrent-state caches only (P-3-C2).
+
+        Walks the (layer, cache) pairs and accumulates ``cache.nbytes``
+        when ``layer.is_linear`` is true — those are the DeltaNet
+        layers that back ``AttentionKind.HYBRID_DELTANET``. Global
+        attention layers are skipped; their bytes belong to KV
+        accounting via ``KVManager.budget().resident_bytes``, not to
+        ``StateDelta.recurrent_bytes()`` (D-015 items 2 and 5).
+
+        Defensive reads:
+          - ``zip(..., strict=False)`` — adapter wraps an external
+            cache structure (mlx-lm owns the list); shape mismatch in
+            a test fake or probe should not crash the inference hot
+            path.
+          - ``int(getattr(cache, "nbytes", 0) or 0)`` — tolerates
+            caches that do not expose ``nbytes`` (e.g. an in-flight
+            None slot inside ``ArraysCache`` before first write).
+        """
+        total = 0
+        for layer, cache in zip(self._model.layers, cache_list, strict=False):
+            if getattr(layer, "is_linear", False):
+                total += int(getattr(cache, "nbytes", 0) or 0)
+        return total
 
     # --- D-015 adapter-local state lifecycle (P-3-C1) ---
     #

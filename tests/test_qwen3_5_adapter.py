@@ -14,7 +14,7 @@ from typing import Any
 
 import mlx.core as mx
 import pytest
-from mlx_lm.models.cache import KVCache
+from mlx_lm.models.cache import ArraysCache, KVCache
 
 from silica.kvcache.manager import KVHandle
 from silica.kvcache.simple import SimpleKVCache
@@ -263,6 +263,124 @@ def test_helpers_signatures_match_d015_pairing() -> None:
     assert rollback_params == ["req_id", "n_reject"]
     assert state_prefix_params == ["req_id", "token_ids"]
     assert free_params == ["req_id"]
+
+
+# --- D-015 recurrent_bytes accounting (P-3-C2) ---
+
+
+def _make_adapter_with_hybrid_cache() -> (
+    tuple[Qwen3_5Adapter, SimpleKVCache, _FakeQwen35Model]
+):
+    """Adapter wired with the realistic mlx-lm heterogeneous cache shape:
+    ArraysCache(size=2) for linear layers, KVCache for full attention.
+
+    The default ``_make_adapter_and_kv`` uses all-KVCache for simplicity
+    (existing tests do not exercise the hybrid boundary); this fixture
+    produces the shape the adapter sees in production so the
+    recurrent-bytes tests can populate linear slots specifically and
+    assert the accounting splits them from global KV.
+    """
+    model = _FakeQwen35Model(n_linear=2, n_full=2)
+    kv = SimpleKVCache(
+        [ArraysCache(size=2), ArraysCache(size=2), KVCache(), KVCache()]
+    )
+    adapter = Qwen3_5Adapter(model, _FakeTokenizer(), kv_manager=kv)
+    return adapter, kv, model
+
+
+def test_recurrent_state_bytes_empty_cache_returns_zero() -> None:
+    """Before any forward, every linear ArraysCache slot is None and
+    ArraysCache.nbytes sums to 0 (cache.py:694-696). Global KV caches
+    are likewise empty. Helper must return 0 cleanly."""
+    adapter, kv, _ = _make_adapter_with_hybrid_cache()
+    kv.reserve_for_prefill("req-a", [1])
+    cache_list = kv.cache_list("req-a")
+    assert adapter._recurrent_state_bytes(cache_list) == 0
+
+
+def test_recurrent_state_bytes_counts_only_linear_layers() -> None:
+    """Populate both linear (ArraysCache) and global (KVCache) slots by
+    hand. Helper must return the linear sum only and ignore the
+    global KV bytes, demonstrating the accounting split promised by
+    D-015 item 5 (recurrent_bytes is SEPARATE from KV resident bytes)."""
+    adapter, kv, _ = _make_adapter_with_hybrid_cache()
+    kv.reserve_for_prefill("req-a", [1])
+    cache_list = kv.cache_list("req-a")
+
+    # Populate linear ArraysCache slots (conv_state + recurrent state)
+    # with known-size dummy arrays so their nbytes is predictable.
+    conv_state = mx.zeros((1, 3, 16), dtype=mx.float16)  # 96 bytes
+    recurrent = mx.zeros((1, 4, 8, 8), dtype=mx.float32)  # 1024 bytes
+    for linear_idx in (0, 1):
+        cache_list[linear_idx].cache[0] = conv_state
+        cache_list[linear_idx].cache[1] = recurrent
+    linear_sum = 2 * (conv_state.nbytes + recurrent.nbytes)
+
+    # Populate global KVCache slots with non-trivial content so nbytes > 0.
+    for full_idx in (2, 3):
+        k = mx.zeros((1, 2, 5, 8), dtype=mx.float16)  # 160 bytes
+        v = mx.zeros((1, 2, 5, 8), dtype=mx.float16)  # 160 bytes
+        cache_list[full_idx].update_and_fetch(k, v)
+
+    recurrent_bytes = adapter._recurrent_state_bytes(cache_list)
+    assert recurrent_bytes == linear_sum
+    # And critically: the global KVCache bytes are not in the total.
+    global_sum = sum(cache_list[i].nbytes for i in (2, 3))
+    assert global_sum > 0
+    assert recurrent_bytes < sum(c.nbytes for c in cache_list)
+
+
+def test_prefill_state_delta_reports_recurrent_bytes_from_linear_cache() -> None:
+    """After prefill, ``delta.recurrent_bytes()`` must equal the live
+    linear-cache sum returned by the helper. Pre-populates the linear
+    ArraysCache (the fake's forward does not write to linear slots) so
+    the assertion exercises a non-zero path end-to-end."""
+    adapter, kv, _ = _make_adapter_with_hybrid_cache()
+    kv.reserve_for_prefill("req-a", [1, 2, 3])
+    cache_list = kv.cache_list("req-a")
+    cache_list[0].cache[0] = mx.zeros((1, 3, 16), dtype=mx.float16)
+    cache_list[0].cache[1] = mx.zeros((1, 4, 8, 8), dtype=mx.float32)
+
+    tokens = mx.array([1, 2, 3], dtype=mx.int32)
+    _, delta = adapter.prefill(tokens, KVHandle(req_id="req-a"))
+    assert isinstance(delta, StateDelta)
+    expected = adapter._recurrent_state_bytes(cache_list)
+    assert delta.recurrent_bytes() == expected
+    assert delta.recurrent_bytes() > 0
+
+
+def test_decode_step_state_delta_tracks_recurrent_bytes() -> None:
+    """decode_step must also populate recurrent_bytes. Prefill first to
+    initialise the full-attention caches, then decode — recurrent_bytes
+    reflects whatever linear-cache state is live at decode exit."""
+    adapter, kv, _ = _make_adapter_with_hybrid_cache()
+    kv.reserve_for_prefill("req-a", [1])
+    cache_list = kv.cache_list("req-a")
+    cache_list[0].cache[0] = mx.zeros((1, 3, 16), dtype=mx.float16)
+    cache_list[0].cache[1] = mx.zeros((1, 4, 8, 8), dtype=mx.float32)
+
+    adapter.prefill(mx.array([1], dtype=mx.int32), KVHandle(req_id="req-a"))
+    _, delta = adapter.decode_step(
+        mx.array([2], dtype=mx.int32), KVHandle(req_id="req-a")
+    )
+    expected = adapter._recurrent_state_bytes(cache_list)
+    assert delta.recurrent_bytes() == expected
+    assert delta.recurrent_bytes() > 0
+
+
+def test_recurrent_state_bytes_defensive_against_shorter_cache_list() -> None:
+    """strict=False zip tolerates a cache list shorter than the model's
+    layer list (e.g. during partial initialisation or a malformed test
+    fake). The helper must not raise; it simply accounts for as many
+    pairs as the shorter sequence permits."""
+    adapter, kv, _ = _make_adapter_with_hybrid_cache()
+    kv.reserve_for_prefill("req-a", [1])
+    short_list = kv.cache_list("req-a")[:1]  # one ArraysCache only
+    # Populate it so there are bytes to count.
+    short_list[0].cache[0] = mx.zeros((1, 3, 16), dtype=mx.float16)
+    bytes_seen = adapter._recurrent_state_bytes(short_list)
+    assert bytes_seen == short_list[0].nbytes
+    assert bytes_seen > 0
 
 
 # --- tokenizer / build ---
