@@ -37,6 +37,7 @@ from mlx_lm.models.cache import ArraysCache, BatchKVCache
 
 from silica import Engine
 from silica.core.sampling import SamplingParams
+from silica.models.adapter import AttentionKind
 from silica.models.factory import adapter_for_repo
 from silica.scheduler.batcher import ContinuousBatcher
 
@@ -112,9 +113,11 @@ def test_batcher_batch_cache_is_genuinely_hybrid_on_qwen3_5_0_8b() -> None:
     actually reached the scheduler rather than the ``callable()``
     fallback producing an all-``BatchKVCache`` list.
 
-    The assertion covers both directions: both types must be present
-    (no homogeneous fallback), and their count must sum to
-    ``num_layers`` (no dropped entries).
+    The assertion walks ``adapter.attention_pattern().per_layer`` and
+    ``_batch_cache`` in lockstep, pinning the exact per-layer mapping:
+    ``HYBRID_DELTANET → ArraysCache``, ``GLOBAL → BatchKVCache``. Any
+    future ``AttentionKind`` reaching this path must fail loudly here
+    rather than silently degrading to the wrong cache type.
     """
     adapter, _ = adapter_for_repo(REPO)
     batcher = ContinuousBatcher(
@@ -140,13 +143,27 @@ def test_batcher_batch_cache_is_genuinely_hybrid_on_qwen3_5_0_8b() -> None:
     assert cache is not None
     assert len(cache) == adapter.config.num_layers
 
-    arrays_count = sum(1 for c in cache if isinstance(c, ArraysCache))
-    kv_count = sum(1 for c in cache if isinstance(c, BatchKVCache))
-    # The layer pattern for Qwen3.5 is ``[D, D, D, G]`` repeating
-    # (docs/P3_DELTANET_SURVEY.md §3.1). Both counts must be positive
-    # — a single-type list indicates the adapter factory did not
-    # reach this scheduler (fallback triggered) or the per-layer
-    # dispatch in ``make_batch_cache`` is broken.
-    assert arrays_count > 0
-    assert kv_count > 0
-    assert arrays_count + kv_count == adapter.config.num_layers
+    pattern = adapter.attention_pattern().per_layer
+    assert len(pattern) == len(cache)
+    for layer_idx, (kind, layer_cache) in enumerate(
+        zip(pattern, cache, strict=True)
+    ):
+        if kind == AttentionKind.HYBRID_DELTANET:
+            assert isinstance(layer_cache, ArraysCache), (
+                f"layer {layer_idx}: kind={kind.value} expected "
+                f"ArraysCache, got {type(layer_cache).__name__}"
+            )
+        elif kind == AttentionKind.GLOBAL:
+            assert isinstance(layer_cache, BatchKVCache), (
+                f"layer {layer_idx}: kind={kind.value} expected "
+                f"BatchKVCache, got {type(layer_cache).__name__}"
+            )
+        else:
+            raise AssertionError(
+                f"layer {layer_idx}: unexpected AttentionKind "
+                f"{kind.value!r} reached the hybrid cache-alignment "
+                f"smoke — either the capability gate grew a new "
+                f"supported kind without a matching case here, or "
+                f"Qwen3_5Adapter.make_batch_cache is producing caches "
+                f"for layers it should not own."
+            )

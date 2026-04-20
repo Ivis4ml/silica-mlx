@@ -4,13 +4,18 @@ MLX-native LLM inference platform for Apple Silicon. vLLM-style core (paged KV,
 continuous batching, prefix cache, memory budget) plus a mini-sglang outer layer
 planned for Phase 8. Target: run dense 27B-31B class models on a 48 GB M5 Pro.
 
-> **Status: P-2 complete, P-3 pending.** Today the package runs single-request
-> and 8-way batched generation end-to-end on Qwen3-class checkpoints, with
-> shared-prefix caching and budget-aware preemption. Big-model adapters
-> (Qwen3.5-27B / Gemma4-31B / MoE), VQ KV compression, weight streaming, and
-> speculative decoding are stubbed at the interface level but not yet
-> implemented. See [`docs/PLAN.md`](docs/PLAN.md) for the full roadmap and
-> [`docs/API.md`](docs/API.md) for the per-module function reference.
+> **Status: P-2 complete, P-3 in progress.** Today the package runs
+> single-request and batched generation end-to-end on both plain Qwen3
+> (0.6B / 4B / 7B / ...) and hybrid DeltaNet Qwen3.5-0.8B, with
+> shared-prefix caching and budget-aware preemption on the plain-Qwen3
+> path. Qwen3.5-27B loads cleanly via `mlx_lm.load` and runs
+> single-request; its batched path uses the same hybrid scheduler as
+> 0.8B and is ready for benchmarking. Gemma4-31B, MoE variants
+> (Qwen3.5-35B-A3B / gemma-4-26B-A4B), VQ KV compression, weight
+> streaming, and speculative decoding are stubbed at the interface
+> level but not yet implemented. See [`docs/PLAN.md`](docs/PLAN.md) for
+> the full roadmap and [`docs/API.md`](docs/API.md) for the per-module
+> function reference.
 
 ---
 
@@ -133,19 +138,20 @@ in the `prompts` list. For budget-aware scheduling, construct a
 | Memory-budget admission: admit → evict → preempt → reject ladder | ✅ | `silica.scheduler.MemoryBudgeter` |
 | Preempt + replay (save composite prompt, re-enter queue) | ✅ | `ContinuousBatcher._apply_preempt` |
 | Plain Qwen3 family adapter (0.6B / 4B / 7B / 14B / 32B) | ✅ | `silica.models.qwen3.Qwen3Adapter` |
-| Qwen3.5 hybrid family adapter (0.8B) — single-request only | Partial | `silica.models.qwen3_5.Qwen3_5Adapter` (batching gated by capability check) |
+| Qwen3.5 hybrid family adapter (0.8B) — single-request + batched (greedy parity pinned) | ✅ | `silica.models.qwen3_5.Qwen3_5Adapter`; parity vs single-request in `tests/test_p3_hybrid_batched_parity.py` |
 | CLI: `python -m silica run` | ✅ | `silica.server.cli` |
-| Qwen3.5-27B / Gemma4-31B dense big-model adapters | ⏳ | P-3 |
+| Qwen3.5-27B load via `mlx_lm.load` verified (single-request) | ✅ | `scripts/probe_qwen3_5_27b_load.py` (batched validation pending bench) |
+| DeltaNet recurrent state + `state_delta` plumbing (single-request + batched path) | ✅ | D-015 + P-3-C0..C3d; `Qwen3_5Adapter.make_batch_cache` interleaves `ArraysCache` / `BatchKVCache` per layer |
+| Gemma4-31B dense big-model adapter | ⏳ | P-3 |
 | MoE adapters (Qwen3.5-35B-A3B / gemma-4-26B-A4B) | ⏳ | P-3 |
-| DeltaNet recurrent state + `state_delta` plumbing | ⏳ | P-3 |
+| Preempt/replay with recurrent state snapshot | ⏳ | P-3-C5 |
 | VQ KV compression (BlockTQ / RaBitQ) | Stub | P-5 (`IdentityCodec` today) |
 | Weight streaming | Stub | P-6 (`ResidentWeightProvider` today) |
 | Speculative decoding (DraftTarget / EAGLE / Medusa) | Stub | P-7 (`NoopDraftEngine` today) |
 | OpenAI-compatible HTTP server + session layer | ⏳ | P-8 |
 | Unified benchmark harness | ⏳ | P-4 |
 
-Legend: ✅ shipped · Partial = interface complete but batching-disabled at
-the capability gate · Stub = wired to the main loop as the fp16 baseline,
+Legend: ✅ shipped · Stub = wired to the main loop as the fp16 baseline,
 real implementation in the named phase · ⏳ = not started.
 
 ---
