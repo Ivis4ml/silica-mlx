@@ -196,20 +196,24 @@ def _greedy(max_tokens: int = 4, stop: Sequence[int] = ()) -> SamplingParams:
 @pytest.mark.parametrize(
     "bad_kind",
     [
-        AttentionKind.HYBRID_DELTANET,
         AttentionKind.RECURRENT,
         AttentionKind.SLIDING,
         AttentionKind.HYBRID,
     ],
 )
-def test_capability_gate_rejects_non_global_patterns(
+def test_capability_gate_rejects_non_supported_patterns(
     bad_kind: AttentionKind,
 ) -> None:
+    """After P-3-C3c the supported set is {GLOBAL, HYBRID_DELTANET}.
+    ``RECURRENT``, ``SLIDING``, and ``HYBRID`` remain rejected."""
     pattern = AttentionPattern(
         per_layer=(AttentionKind.GLOBAL, bad_kind, AttentionKind.GLOBAL)
     )
     adapter = _ScriptedAdapter(n_layers=3, attention_pattern=pattern)
-    with pytest.raises(NotImplementedError, match="AttentionKind.GLOBAL only"):
+    with pytest.raises(
+        NotImplementedError,
+        match="AttentionKind.GLOBAL and AttentionKind.HYBRID_DELTANET only",
+    ):
         ContinuousBatcher(adapter)
 
 
@@ -218,11 +222,56 @@ def test_capability_gate_accepts_all_global() -> None:
     ContinuousBatcher(adapter)  # no raise
 
 
-def test_capability_gate_error_names_phase_for_deltanet() -> None:
+def test_capability_gate_accepts_hybrid_deltanet_after_c3c() -> None:
+    """P-3-C3c lifted the gate for hybrid DeltaNet adapters. The
+    prerequisite wiring (C3a adapter factory; C3b mid-run factory +
+    prefix-cache guard) is already in place, so ``HYBRID_DELTANET``
+    now passes without raising. Real-model Qwen3.5-0.8B coverage is
+    in ``tests/test_p3_hybrid_batched_smoke.py``; this test pins the
+    gate-level predicate against a pure-hybrid scripted adapter."""
     pattern = AttentionPattern(per_layer=(AttentionKind.HYBRID_DELTANET,))
     adapter = _ScriptedAdapter(n_layers=1, attention_pattern=pattern)
-    with pytest.raises(NotImplementedError, match="P-3"):
+    ContinuousBatcher(adapter)  # no raise
+
+
+def test_capability_gate_accepts_mixed_global_and_hybrid_deltanet() -> None:
+    """The 3:1 ``[D, D, D, G]`` Qwen3.5-27B pattern (P-3-B probe)
+    lives in the supported set as a whole — gate does not reject a
+    pattern that mixes GLOBAL and HYBRID_DELTANET layers."""
+    pattern = AttentionPattern(
+        per_layer=(
+            AttentionKind.HYBRID_DELTANET,
+            AttentionKind.HYBRID_DELTANET,
+            AttentionKind.HYBRID_DELTANET,
+            AttentionKind.GLOBAL,
+        )
+    )
+    adapter = _ScriptedAdapter(n_layers=4, attention_pattern=pattern)
+    ContinuousBatcher(adapter)  # no raise
+
+
+def test_capability_gate_error_points_at_unsupported_layer_not_hybrid_deltanet() -> (
+    None
+):
+    """For a ``{GLOBAL, HYBRID_DELTANET, SLIDING}`` mix, the error
+    message must name the ``SLIDING`` layer rather than the now-
+    supported ``HYBRID_DELTANET`` one. This pins the
+    ``kind in _SUPPORTED_ATTENTION_KINDS`` skip in the error-locator
+    loop — without that skip, the loop would stop at the first non-
+    GLOBAL layer even if that kind is actually supported."""
+    pattern = AttentionPattern(
+        per_layer=(
+            AttentionKind.GLOBAL,
+            AttentionKind.HYBRID_DELTANET,
+            AttentionKind.SLIDING,
+        )
+    )
+    adapter = _ScriptedAdapter(n_layers=3, attention_pattern=pattern)
+    with pytest.raises(NotImplementedError) as exc:
         ContinuousBatcher(adapter)
+    msg = str(exc.value)
+    assert "'sliding'" in msg or "SLIDING" in msg
+    assert "layer 2" in msg
 
 
 def test_capability_gate_error_names_phase_for_sliding() -> None:
@@ -233,19 +282,6 @@ def test_capability_gate_error_names_phase_for_sliding() -> None:
 
 
 # --- D-016: capability gate reads ModelCapabilities, not attention_pattern ---
-
-
-def test_capability_gate_error_mentions_capabilities_for_deltanet() -> None:
-    """The D-016 gate reads adapter.capabilities(); the error message
-    must mention 'capabilities' and expose has_recurrent_state=True
-    for hybrid DeltaNet adapters."""
-    pattern = AttentionPattern(per_layer=(AttentionKind.HYBRID_DELTANET,))
-    adapter = _ScriptedAdapter(n_layers=1, attention_pattern=pattern)
-    with pytest.raises(NotImplementedError) as exc:
-        ContinuousBatcher(adapter)
-    msg = str(exc.value)
-    assert "capabilities" in msg
-    assert "has_recurrent_state=True" in msg
 
 
 def test_capability_gate_reads_has_moe_bit_via_capabilities() -> None:

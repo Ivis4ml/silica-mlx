@@ -364,14 +364,16 @@ class ContinuousBatcher:
 
         As of P-3-C3a the per-layer cache list is produced by the
         adapter's ``make_batch_cache(left_padding)`` method when it
-        exists, falling back to an all-``BatchKVCache`` list (which is
-        what the scheduler hardcoded pre-C3a). Letting the adapter
-        produce this list is what enables hybrid adapters like
+        exists, falling back to an all-``BatchKVCache`` list (what the
+        scheduler hardcoded pre-C3a). Letting the adapter produce
+        this list is what enables hybrid adapters like
         ``Qwen3_5Adapter`` to interleave ``ArraysCache`` for DeltaNet
         layers without the scheduler having to grow family-specific
-        logic. The capability gate still rejects non-GLOBAL adapters
-        at construction time in C3a, so in practice only the fallback
-        path and ``Qwen3Adapter.make_batch_cache`` execute today.
+        logic. After P-3-C3c the capability gate admits both
+        ``GLOBAL`` and ``HYBRID_DELTANET`` adapters (subject to the
+        C3b prefix-cache guard), so the hybrid factory path is live
+        for real Qwen3.5 workloads — not only the plain-Qwen3
+        fallback.
 
         After this runs, subsequent ``add_request`` calls go to the
         waiting queue (mid-run admission path, see Phase 2).
@@ -1261,7 +1263,7 @@ class ContinuousBatcher:
 
     @staticmethod
     def _enforce_capability_gate(adapter: ModelAdapter) -> None:
-        """P-2 batcher only accepts adapters whose capabilities are pure GLOBAL.
+        """Reject adapters whose capabilities the batcher cannot schedule.
 
         Layer 3 of the v2.3 three-layer stack. The batcher asks the
         adapter for its ``ModelCapabilities`` (D-016) and decides from
@@ -1269,20 +1271,28 @@ class ContinuousBatcher:
         for per-layer detail — used here only to locate the offending
         layer index for the error message.
 
-        Mamba / DeltaNet / sliding-window families and MoE routing will
-        each need their own scheduler (or an extended capability
-        matrix). This gate refuses to guess.
+        As of P-3-C3c the accepted set is ``GLOBAL`` (plain attention,
+        P-2) **and** ``HYBRID_DELTANET`` (Qwen3.5 hybrid family,
+        unblocked by C3a/C3b wiring + constructor-time prefix-cache
+        guard). Mamba / pure-recurrent / sliding-window adapters and
+        MoE routing still need their own scheduler plumbing before
+        being unlocked here.
         """
         caps = adapter.capabilities()
-        if caps.attention_kinds == {AttentionKind.GLOBAL} and not caps.has_moe:
+        if (
+            caps.attention_kinds.issubset(_SUPPORTED_ATTENTION_KINDS)
+            and not caps.has_moe
+        ):
             return
         # Locate a concrete offending layer for the error message. We
-        # walk ``attention_pattern`` once, prefer the first non-GLOBAL
-        # hit because that is what a human reads; the capability
-        # predicate above has already decided the gate fails.
+        # walk ``attention_pattern`` and skip every kind in the
+        # supported set — crucial after C3c, because an adapter whose
+        # kinds include ``{GLOBAL, HYBRID_DELTANET, SLIDING}`` must
+        # report the ``SLIDING`` layer rather than the (now supported)
+        # ``HYBRID_DELTANET`` one.
         pattern = adapter.attention_pattern()
         for layer_idx, kind in enumerate(pattern.per_layer):
-            if kind == AttentionKind.GLOBAL:
+            if kind in _SUPPORTED_ATTENTION_KINDS:
                 continue
             reason = _unsupported_kind_reason(kind)
             extra = (
@@ -1292,25 +1302,29 @@ class ContinuousBatcher:
                 else ""
             )
             raise NotImplementedError(
-                f"ContinuousBatcher accepts AttentionKind.GLOBAL only in P-2; "
+                f"ContinuousBatcher accepts AttentionKind.GLOBAL and "
+                f"AttentionKind.HYBRID_DELTANET only; "
                 f"adapter capabilities include {kind.value!r} "
                 f"(layer {layer_idx}, has_recurrent_state="
                 f"{caps.has_recurrent_state}) — {reason}{extra}"
             )
         # Fallback: the capability predicate rejected the adapter but
-        # the attention_pattern walk found no non-GLOBAL layer. The
-        # normal path into here is ``has_moe=True`` with pure-GLOBAL
-        # per-layer routing; a pathological adapter whose
-        # ``attention_kinds`` disagree with its ``attention_pattern``
-        # would also fall here. Emit a generic message that names the
-        # capabilities values explicitly, and append MoE context only
-        # when ``has_moe`` is actually set — no hard-coded assumption.
+        # the attention_pattern walk found no layer outside
+        # ``_SUPPORTED_ATTENTION_KINDS``. The normal path into here
+        # is ``has_moe=True`` with an otherwise supported
+        # ``attention_kinds`` set (e.g. pure ``{GLOBAL}``, pure
+        # ``{HYBRID_DELTANET}``, or a mix of the two); a pathological
+        # adapter whose ``attention_kinds`` disagree with its
+        # ``attention_pattern`` would also fall here. Emit a generic
+        # message that names the capabilities values explicitly, and
+        # append MoE context only when ``has_moe`` is actually set —
+        # no hard-coded assumption.
         moe_tail = (
             " — MoE-aware scheduling arrives in P-3 alongside the "
             "Qwen3.5-35B-A3B / gemma-4-26B-A4B adapters"
             if caps.has_moe
             else (
-                "; attention_pattern() reports no non-GLOBAL layer, so "
+                "; attention_pattern() reports no unsupported layer, so "
                 "ModelCapabilities and AttentionPattern disagree — "
                 "re-run capabilities_from_attention_pattern on the "
                 "adapter's pattern to regenerate a consistent summary"
@@ -1318,7 +1332,8 @@ class ContinuousBatcher:
         )
         kinds_display = sorted(k.value for k in caps.attention_kinds)
         raise NotImplementedError(
-            f"ContinuousBatcher accepts AttentionKind.GLOBAL only in P-2; "
+            f"ContinuousBatcher accepts AttentionKind.GLOBAL and "
+            f"AttentionKind.HYBRID_DELTANET only; "
             f"adapter capabilities are unsupported: "
             f"attention_kinds={kinds_display!r}, "
             f"has_recurrent_state={caps.has_recurrent_state}, "
@@ -1326,17 +1341,26 @@ class ContinuousBatcher:
         )
 
 
+_SUPPORTED_ATTENTION_KINDS: frozenset[AttentionKind] = frozenset(
+    {
+        AttentionKind.GLOBAL,
+        AttentionKind.HYBRID_DELTANET,
+    }
+)
+
+
 def _unsupported_kind_reason(kind: AttentionKind) -> str:
-    """Short explanation used by the capability-gate error message."""
-    if kind == AttentionKind.HYBRID_DELTANET:
-        return (
-            "hybrid DeltaNet batching arrives in P-3 via "
-            "BatchRecurrentStateStore on the adapter side"
-        )
+    """Short explanation used by the capability-gate error message.
+
+    HYBRID_DELTANET was dropped from this map in P-3-C3c when the gate
+    started accepting it (alongside GLOBAL). The remaining kinds still
+    lack scheduler support.
+    """
     if kind == AttentionKind.RECURRENT:
         return (
-            "pure-recurrent batching arrives in P-3 via "
-            "BatchRecurrentStateStore"
+            "pure-recurrent batching needs adapter-owned recurrent "
+            "state on par with DeltaNet hybrid; add a scheduler path "
+            "analogous to the HYBRID_DELTANET one from P-3-C3a/b/c"
         )
     if kind == AttentionKind.SLIDING:
         return (

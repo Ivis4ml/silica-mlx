@@ -2,7 +2,7 @@
 
 | Field        | Value                                   |
 | ------------ | --------------------------------------- |
-| Version      | v1.6.1                                  |
+| Version      | v1.6.2                                  |
 | Last updated | 2026-04-19                              |
 | Status       | Phase 0 in-progress                     |
 | Maintainer   | Xin Zhou                                |
@@ -456,6 +456,10 @@ Each Phase uses the same structure: `ID / Goal / Scope / Strategy / Deliverables
     - Single-request `Engine.generate` runs end-to-end (greedy 4-token completion of "Hello" → `", I have a"` — plausible base-model continuation). First-forward kernel compile dominates TTFT (~2.4 s for a 1-token prompt), so prefill-tok/s on this single run is not a meaningful baseline — rerun after warmup when quantified bench data is needed.
     - Peak device memory ~30.5 GB (weights ~16 GB + MLX forward scratch ~14 GB) — leaves ~17 GB headroom on a 48 GB M5 Pro for KV growth and batch state.
     - Batched execution stays blocked by the D-016 capability gate (HYBRID_DELTANET → `has_recurrent_state=True`). The blocker is identical for Qwen3.5-0.8B (currently "Partial") and Qwen3.5-27B, so the DeltaNet-plumbing sub-unit of P-3 delivers batched throughput for both sizes in one pass.
+  - **2026-04-19 — Qwen3.5-0.8B hybrid batched smoke** (P-3-C3c, `tests/test_p3_hybrid_batched_smoke.py`, against `Qwen/Qwen3.5-0.8B`):
+    - After the capability-gate lift (`_SUPPORTED_ATTENTION_KINDS = {GLOBAL, HYBRID_DELTANET}`), `Engine.generate_batch` runs two prompts with `max_batch_size=2`, `prefix_cache=None`, and emits token + done events for every request (no aborts).
+    - Direct `ContinuousBatcher` probe confirms the live `_batch_cache` is genuinely hybrid — `ArraysCache` at DeltaNet layer indices, `BatchKVCache` at global-attention layer indices — proving `Qwen3_5Adapter.make_batch_cache` reached the scheduler rather than the `callable()` fallback producing an all-`BatchKVCache` list.
+    - No token-level parity is asserted yet. Bit-parity vs `Engine.generate` single-request (and vs a direct mlx-lm batched reference) is an M-4 / future-C3d concern. The README's "Partial — batching-disabled at the capability gate" label will flip once parity is pinned; keeping the label honest until then avoids shipping a "works" claim that has not been measured.
 
 ### P-4 Phase 4 — Bench Unification
 
@@ -993,6 +997,8 @@ Local reference implementations sit at the repo root. **Algorithm / architecture
 
 ## 13. Changelog
 
+- **v1.6.2** (2026-04-19): P-3-C3c lifts the `ContinuousBatcher` capability gate for `HYBRID_DELTANET`. Supported `attention_kinds` set is now `{GLOBAL, HYBRID_DELTANET}`; `RECURRENT` / `SLIDING` / `HYBRID` stay rejected. The error-locator loop skips every supported kind (not just `GLOBAL`) so a mixed pattern like `{GLOBAL, HYBRID_DELTANET, SLIDING}` names the `SLIDING` layer rather than the now-supported hybrid one. Real-model validation ships as `tests/test_p3_hybrid_batched_smoke.py` — two smokes against `Qwen/Qwen3.5-0.8B` (skipped when not in the local HF cache): a public API smoke through `Engine.generate_batch`, and a direct-batcher smoke asserting the live `_batch_cache` is genuinely heterogeneous (`ArraysCache` at DeltaNet layer indices, `BatchKVCache` at global attention layer indices). Together with P-3-C3a (adapter `make_batch_cache` factory) and P-3-C3b (mid-run admission factory + prefix-cache guard) this makes batched generation functional for the Qwen3.5 dense family on real models. Token-level parity vs `Engine.generate` single-request is **not** asserted here — that is an M-4 / future C3d responsibility; README's "Partial — batching-disabled at the capability gate" label will be updated once bit-parity is pinned. No new decisions or interface changes; no `Q-NNN` promotion.
+  - **References:** D-015, D-016, P-3, M-4.
 - **v1.6.1** (2026-04-19): P-3-A load probe landed — `scripts/probe_qwen3_5_27b_load.py` plus an **Empirical findings** bullet added to §7 P-3 recording the Qwen3.5-27B-4bit architecture survey (64 layers = 48 HYBRID_DELTANET + 16 GLOBAL in a 3:1 `[D, D, D, G]` repeating pattern; hidden_size=5120, 24 attention heads, 4 KV heads, head_dim=256; `mlx_lm.load` accepts the repo directly without an mlx-vlm detour; `Qwen3_5Adapter` dispatches via the existing factory; single-request `Engine.generate` runs with peak ~30.5 GB on a 48 GB M5 Pro). No new decisions or interface changes — the finding confirms D-015's hybrid-DeltaNet framing at 27B scale and makes explicit that Qwen3.5-0.8B and Qwen3.5-27B share the same batched-execution blocker (DeltaNet plumbing, P-3-C).
   - **References:** D-015, D-016, P-3.
 - **v1.6.0** (2026-04-19): P-3 opening — land D-016 (I-1 extended with `capabilities() -> ModelCapabilities`). New module `silica/models/capabilities.py` ships `ModelCapabilities` (three-field frozen dataclass: `attention_kinds`, `has_recurrent_state`, `has_moe`) and the pure helper `capabilities_from_attention_pattern(pattern, *, has_moe=False)`. `ContinuousBatcher._enforce_capability_gate` now reads `adapter.capabilities()` as its primary predicate; `attention_pattern()` is walked only for the error-message layer index. Concrete adapters (`Qwen3Adapter`, `Qwen3_5Adapter`, `StubModelAdapter`, test doubles) implement `capabilities()` by delegating to the helper. Behaviour unchanged — the batcher still accepts pure GLOBAL and still rejects HYBRID_DELTANET — this is a contract-surface refactor that clears the way for the dense-big, MoE, and DeltaNet adapters landing later in P-3. `AttentionPattern` remains the authoritative per-layer routing source (D-015).
