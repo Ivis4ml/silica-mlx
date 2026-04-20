@@ -17,9 +17,11 @@ weights on-device. Two tests:
     token parity — Gemma4 has no known parity anchor in Silica today
     (P-3-D2 / D3 expand the test surface).
 
-No batched path exercised: the C3c capability gate rejects SLIDING,
-which is exactly the current Gemma4 routing. ``Engine.generate`` is
-single-request only and does not go through ``ContinuousBatcher``.
+``Engine.generate`` is single-request only and does not go through
+``ContinuousBatcher``; the batched path for Gemma4 unlocks in
+P-3-D3 and is exercised separately in
+``tests/test_p3_gemma4_batched_smoke.py`` (dual-gated: cache +
+``SILICA_REAL_GEMMA4_31B=1``).
 
 Skipped when Gemma4-31B-4bit is not in the local HF cache — same
 skipif pattern as ``tests/test_p2_batched_parity.py`` so new machines

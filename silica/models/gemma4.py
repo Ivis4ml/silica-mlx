@@ -24,15 +24,17 @@ from the sliding (majority) layer and record the full per-kind detail
 in ``ModelConfig.extra`` under explicit keys plus a ``kv_layout_caveat``
 string that makes the summary nature readable from any consumer.
 ``MemoryBudgeter.bytes_per_token`` built from this ``KVLayout`` will
-therefore over- or under-count on Gemma4 until D3 / D4 lands a
-per-kind layout; C3c-era gate rejection of ``SLIDING`` keeps that
-mismatch from reaching the scheduler today.
+therefore over- or under-count on Gemma4; D4 is the scheduled unit
+for a per-kind budget, landing after D3 lifts the scheduler gate
+for ``SLIDING``.
 
 ``make_batch_cache`` (P-3-D2) returns a hybrid per-layer list of
 ``BatchRotatingKVCache`` (sliding) and ``BatchKVCache`` (full) from
-``mlx_lm.models.cache``. The capability gate still rejects ``SLIDING``
-at D2, so this factory is unreachable until D3 lifts the gate — it is
-wired now so D3 gate-lift + real-model smoke are a minimal follow-up.
+``mlx_lm.models.cache``. As of P-3-D3 the capability gate accepts
+``SLIDING`` under the miss-only admission path (constructor rejects
+``prefix_cache != None`` when SLIDING is present), so batched
+execution through ``Engine.generate_batch(..., prefix_cache=None)``
+is the supported batched path today.
 
 Adapter-local D-015 lifecycle helpers (``commit_state`` /
 ``rollback_state`` / ``state_from_prefix`` / ``free_state``) are NOT
@@ -117,9 +119,10 @@ class Gemma4Adapter:
 
     def capabilities(self) -> ModelCapabilities:
         # Gemma4-31B is sliding + full-attention hybrid (no DeltaNet, no
-        # MoE). has_recurrent_state is False; the capability gate
-        # currently rejects SLIDING so batched execution stays locked
-        # until PLAN §Q-013 lands BatchRotatingKVCache.
+        # MoE). has_recurrent_state is False. The capability gate
+        # accepts SLIDING after P-3-D3; the constructor rejects a
+        # non-None prefix_cache for SLIDING-bearing adapters, so
+        # batched execution is available via the miss-only path.
         return capabilities_from_attention_pattern(self._attention_pattern)
 
     def make_batch_cache(self, left_padding: list[int]) -> list[Any]:
@@ -132,9 +135,9 @@ class Gemma4Adapter:
 
         The per-layer ordering follows ``self._attention_pattern.per_layer``,
         which was built from ``config.text_config['layer_types']`` under
-        the strict guards in ``_build_attention_pattern``. The capability
-        gate in ``ContinuousBatcher._enforce_capability_gate`` still
-        rejects ``SLIDING`` as of D2; the matching gate lift lands in D3.
+        the strict guards in ``_build_attention_pattern``. As of
+        P-3-D3 the capability gate accepts ``SLIDING`` under the
+        miss-only admission path.
 
         A ``sliding_window <= 0`` when the pattern contains ``SLIDING``
         layers is a config inconsistency and raises loudly rather than

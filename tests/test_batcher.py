@@ -197,22 +197,26 @@ def _greedy(max_tokens: int = 4, stop: Sequence[int] = ()) -> SamplingParams:
     "bad_kind",
     [
         AttentionKind.RECURRENT,
-        AttentionKind.SLIDING,
         AttentionKind.HYBRID,
     ],
 )
 def test_capability_gate_rejects_non_supported_patterns(
     bad_kind: AttentionKind,
 ) -> None:
-    """After P-3-C3c the supported set is {GLOBAL, HYBRID_DELTANET}.
-    ``RECURRENT``, ``SLIDING``, and ``HYBRID`` remain rejected."""
+    """After P-3-D3 the supported set is
+    ``{GLOBAL, HYBRID_DELTANET, SLIDING}``. ``RECURRENT`` (pure-Mamba)
+    and ``HYBRID`` (single-kind sliding/global hybrid enum) remain
+    rejected."""
     pattern = AttentionPattern(
         per_layer=(AttentionKind.GLOBAL, bad_kind, AttentionKind.GLOBAL)
     )
     adapter = _ScriptedAdapter(n_layers=3, attention_pattern=pattern)
     with pytest.raises(
         NotImplementedError,
-        match="AttentionKind.GLOBAL and AttentionKind.HYBRID_DELTANET only",
+        match=(
+            "AttentionKind.GLOBAL, AttentionKind.HYBRID_DELTANET, and "
+            "AttentionKind.SLIDING only"
+        ),
     ):
         ContinuousBatcher(adapter)
 
@@ -250,15 +254,43 @@ def test_capability_gate_accepts_mixed_global_and_hybrid_deltanet() -> None:
     ContinuousBatcher(adapter)  # no raise
 
 
-def test_capability_gate_error_points_at_unsupported_layer_not_hybrid_deltanet() -> (
+def test_capability_gate_accepts_pure_sliding_after_d3() -> None:
+    """P-3-D3 lifted the gate for sliding-window adapters. The
+    prerequisite wiring (D2 ``make_batch_cache`` returning
+    ``BatchRotatingKVCache`` for SLIDING layers + the constructor
+    SLIDING + prefix_cache guard) is already in place, so a pure
+    ``SLIDING`` adapter now passes without raising. Real-model
+    Gemma4-31B coverage lives in
+    ``tests/test_p3_gemma4_batched_smoke.py``; this test pins the
+    gate-level predicate against a pure-SLIDING scripted adapter."""
+    pattern = AttentionPattern(per_layer=(AttentionKind.SLIDING,))
+    adapter = _ScriptedAdapter(n_layers=1, attention_pattern=pattern)
+    ContinuousBatcher(adapter)  # no raise
+
+
+def test_capability_gate_accepts_mixed_global_and_sliding() -> None:
+    """Gemma4-31B's 5:1 ``[S, S, S, S, S, F]`` pattern (50 sliding + 10
+    full over 60 layers, per the D0 probe) lives in the supported set
+    as a whole — gate does not reject a pattern that mixes GLOBAL and
+    SLIDING layers."""
+    pattern = AttentionPattern(
+        per_layer=(
+            AttentionKind.SLIDING,
+            AttentionKind.SLIDING,
+            AttentionKind.SLIDING,
+            AttentionKind.GLOBAL,
+        )
+    )
+    adapter = _ScriptedAdapter(n_layers=4, attention_pattern=pattern)
+    ContinuousBatcher(adapter)  # no raise
+
+
+def test_capability_gate_accepts_mixed_global_hybrid_deltanet_and_sliding() -> (
     None
 ):
-    """For a ``{GLOBAL, HYBRID_DELTANET, SLIDING}`` mix, the error
-    message must name the ``SLIDING`` layer rather than the now-
-    supported ``HYBRID_DELTANET`` one. This pins the
-    ``kind in _SUPPORTED_ATTENTION_KINDS`` skip in the error-locator
-    loop — without that skip, the loop would stop at the first non-
-    GLOBAL layer even if that kind is actually supported."""
+    """All three supported kinds coexisting is also accepted — a
+    forward-compatibility regression guard for any future adapter that
+    mixes DeltaNet and sliding layers."""
     pattern = AttentionPattern(
         per_layer=(
             AttentionKind.GLOBAL,
@@ -267,18 +299,32 @@ def test_capability_gate_error_points_at_unsupported_layer_not_hybrid_deltanet()
         )
     )
     adapter = _ScriptedAdapter(n_layers=3, attention_pattern=pattern)
+    ContinuousBatcher(adapter)  # no raise
+
+
+def test_capability_gate_error_skips_every_supported_kind() -> None:
+    """For a pattern mixing all three supported kinds
+    (``GLOBAL``, ``HYBRID_DELTANET``, ``SLIDING``) plus a genuinely
+    unsupported ``RECURRENT`` at the last layer, the error message
+    must name the ``RECURRENT`` layer rather than stopping early at
+    one of the now-supported kinds. Pins the
+    ``kind in _SUPPORTED_ATTENTION_KINDS`` skip in the error-locator
+    loop — without the skip, the loop would stop at the first
+    non-``GLOBAL`` layer (``HYBRID_DELTANET`` at index 1)."""
+    pattern = AttentionPattern(
+        per_layer=(
+            AttentionKind.GLOBAL,
+            AttentionKind.HYBRID_DELTANET,
+            AttentionKind.SLIDING,
+            AttentionKind.RECURRENT,
+        )
+    )
+    adapter = _ScriptedAdapter(n_layers=4, attention_pattern=pattern)
     with pytest.raises(NotImplementedError) as exc:
         ContinuousBatcher(adapter)
     msg = str(exc.value)
-    assert "'sliding'" in msg or "SLIDING" in msg
-    assert "layer 2" in msg
-
-
-def test_capability_gate_error_names_phase_for_sliding() -> None:
-    pattern = AttentionPattern(per_layer=(AttentionKind.SLIDING,))
-    adapter = _ScriptedAdapter(n_layers=1, attention_pattern=pattern)
-    with pytest.raises(NotImplementedError, match="Q-013"):
-        ContinuousBatcher(adapter)
+    assert "'recurrent'" in msg or "RECURRENT" in msg
+    assert "layer 3" in msg
 
 
 # --- D-016: capability gate reads ModelCapabilities, not attention_pattern ---
@@ -384,14 +430,40 @@ def test_hybrid_adapter_with_prefix_cache_raises_before_capability_gate() -> Non
 
 
 def test_non_hybrid_adapter_with_prefix_cache_still_constructs() -> None:
-    """Guard must fire only on ``has_recurrent_state=True``; pure-
-    GLOBAL adapters continue to accept a RadixPrefixCache for prefix
-    reuse. Regression guard for pre-C3b behaviour."""
+    """Guard must fire only on ``has_recurrent_state=True`` or a
+    sliding-bearing ``attention_kinds`` set; pure-GLOBAL adapters
+    continue to accept a RadixPrefixCache for prefix reuse. Regression
+    guard for pre-C3b behaviour."""
     adapter = _ScriptedAdapter(n_layers=2)  # pure GLOBAL attention_pattern
     pc = RadixPrefixCache(
         block_size=16, store=SyntheticPrefixBlockStore(block_size=16)
     )
     ContinuousBatcher(adapter, prefix_cache=pc)  # no raise
+
+
+def test_sliding_adapter_with_prefix_cache_raises_before_capability_gate() -> (
+    None
+):
+    """P-3-D3: an adapter with ``AttentionKind.SLIDING`` in its
+    ``attention_kinds`` combined with a non-None ``prefix_cache`` is
+    rejected at construction time with a specific error naming
+    ``BatchRotatingKVCache`` semantics — not an AttributeError
+    surfacing later from inside the seeded-admission path.
+
+    The guard sits next to the hybrid ``has_recurrent_state=True``
+    guard, BEFORE ``_enforce_capability_gate`` — D3 only commits to
+    the ``prefix_cache=None`` path for SLIDING-bearing adapters."""
+    pattern = AttentionPattern(per_layer=(AttentionKind.SLIDING,))
+    adapter = _ScriptedAdapter(n_layers=1, attention_pattern=pattern)
+    pc = RadixPrefixCache(
+        block_size=16, store=SyntheticPrefixBlockStore(block_size=16)
+    )
+    with pytest.raises(NotImplementedError) as exc:
+        ContinuousBatcher(adapter, prefix_cache=pc)
+    msg = str(exc.value)
+    assert "AttentionKind.SLIDING" in msg or "'sliding'" in msg
+    assert "prefix_cache=None" in msg
+    assert "BatchRotatingKVCache" in msg
 
 
 def test_admit_miss_cohort_calls_adapter_make_batch_cache() -> None:

@@ -164,17 +164,40 @@ class ContinuousBatcher:
                     "prefix_cache=None to run hybrid adapters under the "
                     "miss-only admission path."
                 )
+            # P-3-D3: sliding-window attention needs its own guard against
+            # the seeded-admission path. ``build_seeded_batch_kv`` /
+            # ``_extract_and_insert_prefix`` emit ``BatchKVCache`` per
+            # layer; adapting that to ``BatchRotatingKVCache``'s window
+            # truncation, ``offset`` arithmetic, and ``rotated`` state
+            # has not been validated. D3 only commits to the
+            # ``prefix_cache=None`` path for SLIDING-bearing adapters;
+            # future work widens the seed path rather than bypassing
+            # this guard.
+            if AttentionKind.SLIDING in caps.attention_kinds:
+                raise NotImplementedError(
+                    "ContinuousBatcher does not support a RadixPrefixCache "
+                    "on adapters whose attention_kinds include "
+                    f"AttentionKind.SLIDING "
+                    f"(attention_kinds="
+                    f"{sorted(k.value for k in caps.attention_kinds)!r}): "
+                    "the prefix-cache seed path emits BatchKVCache per "
+                    "layer, and the window-truncation / offset / rotated "
+                    "semantics of BatchRotatingKVCache under seeded "
+                    "admission are not yet validated (P-3-D3 local "
+                    "follow-up). Pass prefix_cache=None to run "
+                    "sliding-bearing adapters under the miss-only path."
+                )
         self._enforce_capability_gate(adapter)
         self._adapter = adapter
         self._sampler = sampler or Sampler()
         self._model = adapter.build(weight_provider or ResidentWeightProvider())
         self._max_batch_size = max_batch_size
         self._rows: list[_BatchRow] = []
-        # As of P-3-C3a the cache list is adapter-produced and may be
-        # heterogeneous (ArraysCache for DeltaNet layers alongside
-        # BatchKVCache for global attention); use ``list[Any]`` so the
-        # type annotation tracks the hybrid reality. The gate still
-        # ensures only all-BatchKVCache lists reach here today.
+        # As of P-3-C3a / P-3-D3 the cache list is adapter-produced and
+        # may mix ``BatchKVCache`` (global attention), ``ArraysCache``
+        # (DeltaNet layers, Qwen3.5 hybrid), and ``BatchRotatingKVCache``
+        # (sliding-window layers, Gemma4). ``list[Any]`` so the
+        # annotation tracks the heterogeneous reality.
         self._batch_cache: list[Any] | None = None
         # Cohort-prep flag. First step() seals the pre-step cohort and
         # allocates the batched cache; subsequent add_request calls go
@@ -1271,12 +1294,13 @@ class ContinuousBatcher:
         for per-layer detail — used here only to locate the offending
         layer index for the error message.
 
-        As of P-3-C3c the accepted set is ``GLOBAL`` (plain attention,
-        P-2) **and** ``HYBRID_DELTANET`` (Qwen3.5 hybrid family,
-        unblocked by C3a/C3b wiring + constructor-time prefix-cache
-        guard). Mamba / pure-recurrent / sliding-window adapters and
-        MoE routing still need their own scheduler plumbing before
-        being unlocked here.
+        As of P-3-D3 the accepted set is ``GLOBAL`` (plain attention,
+        P-2), ``HYBRID_DELTANET`` (Qwen3.5 hybrid family, P-3-C3c), and
+        ``SLIDING`` (Gemma4 sliding-window family, P-3-D3 — restricted
+        to the ``prefix_cache=None`` path by a separate constructor
+        guard). ``RECURRENT`` (pure-Mamba), ``HYBRID`` (single-kind
+        sliding/global hybrid), and MoE routing still need their own
+        scheduler plumbing before being unlocked here.
         """
         caps = adapter.capabilities()
         if (
@@ -1287,9 +1311,9 @@ class ContinuousBatcher:
         # Locate a concrete offending layer for the error message. We
         # walk ``attention_pattern`` and skip every kind in the
         # supported set — crucial after C3c, because an adapter whose
-        # kinds include ``{GLOBAL, HYBRID_DELTANET, SLIDING}`` must
-        # report the ``SLIDING`` layer rather than the (now supported)
-        # ``HYBRID_DELTANET`` one.
+        # kinds include ``{GLOBAL, HYBRID_DELTANET, SLIDING, RECURRENT}``
+        # must report the ``RECURRENT`` layer rather than any of the
+        # three (now supported) kinds.
         pattern = adapter.attention_pattern()
         for layer_idx, kind in enumerate(pattern.per_layer):
             if kind in _SUPPORTED_ATTENTION_KINDS:
@@ -1302,9 +1326,9 @@ class ContinuousBatcher:
                 else ""
             )
             raise NotImplementedError(
-                f"ContinuousBatcher accepts AttentionKind.GLOBAL and "
-                f"AttentionKind.HYBRID_DELTANET only; "
-                f"adapter capabilities include {kind.value!r} "
+                f"ContinuousBatcher accepts AttentionKind.GLOBAL, "
+                f"AttentionKind.HYBRID_DELTANET, and AttentionKind.SLIDING "
+                f"only; adapter capabilities include {kind.value!r} "
                 f"(layer {layer_idx}, has_recurrent_state="
                 f"{caps.has_recurrent_state}) — {reason}{extra}"
             )
@@ -1332,9 +1356,9 @@ class ContinuousBatcher:
         )
         kinds_display = sorted(k.value for k in caps.attention_kinds)
         raise NotImplementedError(
-            f"ContinuousBatcher accepts AttentionKind.GLOBAL and "
-            f"AttentionKind.HYBRID_DELTANET only; "
-            f"adapter capabilities are unsupported: "
+            f"ContinuousBatcher accepts AttentionKind.GLOBAL, "
+            f"AttentionKind.HYBRID_DELTANET, and AttentionKind.SLIDING "
+            f"only; adapter capabilities are unsupported: "
             f"attention_kinds={kinds_display!r}, "
             f"has_recurrent_state={caps.has_recurrent_state}, "
             f"has_moe={caps.has_moe}{moe_tail}"
@@ -1345,6 +1369,7 @@ _SUPPORTED_ATTENTION_KINDS: frozenset[AttentionKind] = frozenset(
     {
         AttentionKind.GLOBAL,
         AttentionKind.HYBRID_DELTANET,
+        AttentionKind.SLIDING,
     }
 )
 
@@ -1352,9 +1377,8 @@ _SUPPORTED_ATTENTION_KINDS: frozenset[AttentionKind] = frozenset(
 def _unsupported_kind_reason(kind: AttentionKind) -> str:
     """Short explanation used by the capability-gate error message.
 
-    HYBRID_DELTANET was dropped from this map in P-3-C3c when the gate
-    started accepting it (alongside GLOBAL). The remaining kinds still
-    lack scheduler support.
+    HYBRID_DELTANET was dropped from this map in P-3-C3c; SLIDING was
+    dropped in P-3-D3. The remaining kinds still lack scheduler support.
     """
     if kind == AttentionKind.RECURRENT:
         return (
@@ -1362,13 +1386,12 @@ def _unsupported_kind_reason(kind: AttentionKind) -> str:
             "state on par with DeltaNet hybrid; add a scheduler path "
             "analogous to the HYBRID_DELTANET one from P-3-C3a/b/c"
         )
-    if kind == AttentionKind.SLIDING:
-        return (
-            "sliding-window batching is gated on the P-2 Q-013 "
-            "BatchRotatingKVCache probe"
-        )
     if kind == AttentionKind.HYBRID:
-        return "sliding/global hybrid needs the Q-013 probe first"
+        return (
+            "the single-kind HYBRID enum (sliding/global combined in one "
+            "AttentionKind) has no adapter on the v0.1 roadmap; real "
+            "hybrids like Gemma4 emit per-layer SLIDING + GLOBAL"
+        )
     return "unknown AttentionKind; no scheduler mapping defined"
 
 
