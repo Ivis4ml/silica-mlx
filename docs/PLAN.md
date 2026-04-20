@@ -2,7 +2,7 @@
 
 | Field        | Value                                   |
 | ------------ | --------------------------------------- |
-| Version      | v1.6.0                                  |
+| Version      | v1.6.1                                  |
 | Last updated | 2026-04-19                              |
 | Status       | Phase 0 in-progress                     |
 | Maintainer   | Xin Zhou                                |
@@ -447,6 +447,15 @@ Each Phase uses the same structure: `ID / Goal / Scope / Strategy / Deliverables
 - **Dependencies:** P-2.
 - **Status:** planned.
 - **Notes:** risk — Qwen3.5-27B fp16 is ~54 GB, so quantization is required. If 4-bit still doesn't fit, Q-003 fires and P-6 is pulled forward. Acceptance is split into adapter structural correctness (fp16 parity on a dense control model) + quantized big-model correctness (teacher-forced comparison) + product memory-fit target (conditional, dense only) + MoE structural correctness (D-011, independent exit criterion). If dense memory-fit is deferred, the MoE smoke test must still pass — MoE targets have small active params and do not depend on Q-003 resolution.
+- **Empirical findings:**
+  - **2026-04-19 — Qwen3.5-27B-4bit load probe** (`scripts/probe_qwen3_5_27b_load.py`, run on M5 Pro 48 GB against `mlx-community/Qwen3.5-27B-4bit`, ~16.1 GB weights):
+    - Loads cleanly through `mlx_lm.load` — the HF model card's mlx-vlm reference applies to the multimodal input path; text-only inference via mlx-lm works without fallback.
+    - Structural metadata (from `model.args.text_config` dict): `model_type="qwen3_5"`, 64 hidden layers, hidden_size=5120, 24 attention heads, 4 KV heads (GQA 6:1), head_dim=256, vocab_size=248044.
+    - `adapter_for_repo` dispatches to the existing `Qwen3_5Adapter` via the `model_type` registry — **no 27B-specific adapter file is needed**; the dense deliverable above already anticipated this by listing `Qwen3_5Adapter` "reused at Qwen3.5-27B scale".
+    - `capabilities()` reports `attention_kinds={GLOBAL, HYBRID_DELTANET}`, `has_recurrent_state=True`, `has_moe=False`. Per-layer pattern is a strict 3:1 repeating `[D, D, D, G]` across all 64 layers — 48 HYBRID_DELTANET + 16 GLOBAL. Same hybrid architecture as Qwen3.5-0.8B, just wider and deeper.
+    - Single-request `Engine.generate` runs end-to-end (greedy 4-token completion of "Hello" → `", I have a"` — plausible base-model continuation). First-forward kernel compile dominates TTFT (~2.4 s for a 1-token prompt), so prefill-tok/s on this single run is not a meaningful baseline — rerun after warmup when quantified bench data is needed.
+    - Peak device memory ~30.5 GB (weights ~16 GB + MLX forward scratch ~14 GB) — leaves ~17 GB headroom on a 48 GB M5 Pro for KV growth and batch state.
+    - Batched execution stays blocked by the D-016 capability gate (HYBRID_DELTANET → `has_recurrent_state=True`). The blocker is identical for Qwen3.5-0.8B (currently "Partial") and Qwen3.5-27B, so the DeltaNet-plumbing sub-unit of P-3 delivers batched throughput for both sizes in one pass.
 
 ### P-4 Phase 4 — Bench Unification
 
@@ -984,6 +993,8 @@ Local reference implementations sit at the repo root. **Algorithm / architecture
 
 ## 13. Changelog
 
+- **v1.6.1** (2026-04-19): P-3-A load probe landed — `scripts/probe_qwen3_5_27b_load.py` plus an **Empirical findings** bullet added to §7 P-3 recording the Qwen3.5-27B-4bit architecture survey (64 layers = 48 HYBRID_DELTANET + 16 GLOBAL in a 3:1 `[D, D, D, G]` repeating pattern; hidden_size=5120, 24 attention heads, 4 KV heads, head_dim=256; `mlx_lm.load` accepts the repo directly without an mlx-vlm detour; `Qwen3_5Adapter` dispatches via the existing factory; single-request `Engine.generate` runs with peak ~30.5 GB on a 48 GB M5 Pro). No new decisions or interface changes — the finding confirms D-015's hybrid-DeltaNet framing at 27B scale and makes explicit that Qwen3.5-0.8B and Qwen3.5-27B share the same batched-execution blocker (DeltaNet plumbing, P-3-C).
+  - **References:** D-015, D-016, P-3.
 - **v1.6.0** (2026-04-19): P-3 opening — land D-016 (I-1 extended with `capabilities() -> ModelCapabilities`). New module `silica/models/capabilities.py` ships `ModelCapabilities` (three-field frozen dataclass: `attention_kinds`, `has_recurrent_state`, `has_moe`) and the pure helper `capabilities_from_attention_pattern(pattern, *, has_moe=False)`. `ContinuousBatcher._enforce_capability_gate` now reads `adapter.capabilities()` as its primary predicate; `attention_pattern()` is walked only for the error-message layer index. Concrete adapters (`Qwen3Adapter`, `Qwen3_5Adapter`, `StubModelAdapter`, test doubles) implement `capabilities()` by delegating to the helper. Behaviour unchanged — the batcher still accepts pure GLOBAL and still rejects HYBRID_DELTANET — this is a contract-surface refactor that clears the way for the dense-big, MoE, and DeltaNet adapters landing later in P-3. `AttentionPattern` remains the authoritative per-layer routing source (D-015).
   - **References:** D-016, I-1, P-3.
 - **v1.5.2** (2026-04-17): model-integration refactor — formalise the three-layer stack (family adapter + factory registry + capability gate) surfaced by the P-2 Qwen3-0.6B preload. No interface or principle changes; clarifies deliverable-level class naming and §5.1 layout. Triggered by: plain Qwen3 and Qwen3.5 share mlx-lm's `qwen3*.py` neighbourhood but differ in attribute names (`n_kv_heads` vs `num_key_value_heads`) AND runtime semantics (pure KV vs DeltaNet hybrid + MTP + multimodal sanitize); keeping them in a single `Qwen3Adapter` class would grow a conditional on every future family (Kimi, GLM, MiniMax, Mamba, MoE, …).
