@@ -123,3 +123,55 @@ def test_unknown_error_message_names_registration_location() -> None:
     ):
         with pytest.raises(NotImplementedError, match="silica.models.factory"):
             factory.adapter_for_repo("fake/unknown")
+
+
+# --- adapter_from_loaded_model: skip-reload helper for probe scripts --------
+
+
+def test_adapter_from_loaded_model_does_not_call_mlx_lm_load() -> None:
+    """Probe scripts that already paid the ``mlx_lm.load`` cost in a
+    Phase 1 must be able to dispatch without loading the checkpoint
+    again. Using ``adapter_for_repo`` for Phase 2 would double-load a
+    16-20 GB MoE checkpoint, which on a 48 GB M5 Pro can turn an
+    expected variant-guard failure into an out-of-memory failure that
+    masks the real probe finding.
+
+    Pins the contract: this helper never touches ``_mlx_lm_load``."""
+    model = _PlainModel()
+    tokenizer = _Tok()
+    with patch(
+        "silica.models.factory._mlx_lm_load",
+        side_effect=AssertionError(
+            "adapter_from_loaded_model must not call mlx_lm.load"
+        ),
+    ):
+        adapter, kv = factory.adapter_from_loaded_model(model, tokenizer)
+    assert isinstance(adapter, Qwen3Adapter)
+    assert isinstance(kv, SimpleKVCache)
+
+
+def test_adapter_from_loaded_model_raises_same_error_as_adapter_for_repo() -> (
+    None
+):
+    """The dispatch branch behind both helpers is shared; the error
+    surface must match so callers (e.g. probe scripts) can rely on
+    the same ``NotImplementedError`` text."""
+    with pytest.raises(NotImplementedError, match="totally_unknown_family"):
+        factory.adapter_from_loaded_model(_UnknownModel(), _Tok())
+    with pytest.raises(NotImplementedError, match="silica.models.factory"):
+        factory.adapter_from_loaded_model(_UnknownModel(), _Tok())
+
+
+def test_adapter_for_repo_still_loads_via_mlx_lm() -> None:
+    """The existing ``adapter_for_repo(repo)`` path is a thin wrapper
+    over ``adapter_from_loaded_model`` that still calls
+    ``_mlx_lm_load``. Callers with just the repo id (e.g. the CLI)
+    continue to work unchanged."""
+    load_mock = patch(
+        "silica.models.factory._mlx_lm_load",
+        return_value=(_PlainModel(), _Tok()),
+    )
+    with load_mock as mocked:
+        adapter, _ = factory.adapter_for_repo("fake/plain")
+    assert mocked.call_count == 1
+    assert isinstance(adapter, Qwen3Adapter)

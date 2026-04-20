@@ -73,14 +73,25 @@ def supported_model_types() -> tuple[str, ...]:
     return tuple(sorted(_ADAPTERS.keys()))
 
 
-def adapter_for_repo(repo: str) -> tuple[ModelAdapter, SimpleKVCache]:
-    """Load ``repo`` via mlx-lm and build the matching family adapter.
+def adapter_from_loaded_model(
+    model: Any, tokenizer: Any
+) -> tuple[ModelAdapter, SimpleKVCache]:
+    """Build the matching family adapter for an already-loaded
+    ``(model, tokenizer)`` pair.
 
-    Returns ``(adapter, kv)`` so the Engine can drive both. Raises
-    ``NotImplementedError`` with a greppable list of supported families
-    when the checkpoint's ``model_type`` is not registered.
+    Skips ``mlx_lm.load`` — callers that have already paid the load
+    cost (e.g. probe scripts capturing Phase 1 metadata before
+    dispatching) can pass the result through this helper instead of
+    re-calling ``adapter_for_repo`` which would load the checkpoint a
+    second time. On large MoE checkpoints (16-20 GB quantized)
+    double-loading may exhaust device memory and pollute probe
+    findings; see ``scripts/probe_qwen3_5_moe_load.py`` / ``scripts/
+    probe_gemma4_moe_load.py`` for the first callers.
+
+    Returns ``(adapter, kv)`` exactly like ``adapter_for_repo``.
+    Raises ``NotImplementedError`` with the same error text when the
+    ``model_type`` is not registered.
     """
-    model, tokenizer = _mlx_lm_load(repo)  # type: ignore[misc]
     kv = SimpleKVCache.from_model(model)
     model_type = getattr(model, "model_type", None)
     builder = _ADAPTERS.get(str(model_type)) if model_type is not None else None
@@ -92,3 +103,16 @@ def adapter_for_repo(repo: str) -> tuple[ModelAdapter, SimpleKVCache]:
             f"silica.models.factory._ADAPTERS."
         )
     return builder(model, tokenizer, kv), kv
+
+
+def adapter_for_repo(repo: str) -> tuple[ModelAdapter, SimpleKVCache]:
+    """Load ``repo`` via mlx-lm and build the matching family adapter.
+
+    Thin wrapper around ``adapter_from_loaded_model`` — loads the
+    checkpoint once, then delegates to the dispatch helper. Returns
+    ``(adapter, kv)`` so the Engine can drive both. Raises
+    ``NotImplementedError`` with a greppable list of supported families
+    when the checkpoint's ``model_type`` is not registered.
+    """
+    model, tokenizer = _mlx_lm_load(repo)  # type: ignore[misc]
+    return adapter_from_loaded_model(model, tokenizer)
