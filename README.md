@@ -10,12 +10,15 @@ planned for Phase 8. Target: run dense 27B-31B class models on a 48 GB M5 Pro.
 > shared-prefix caching and budget-aware preemption on the plain-Qwen3
 > path. Qwen3.5-27B loads cleanly via `mlx_lm.load` and runs
 > single-request; its batched path uses the same hybrid scheduler as
-> 0.8B and is ready for benchmarking. Gemma4-31B, MoE variants
-> (Qwen3.5-35B-A3B / gemma-4-26B-A4B), VQ KV compression, weight
-> streaming, and speculative decoding are stubbed at the interface
-> level but not yet implemented. See [`docs/PLAN.md`](docs/PLAN.md) for
-> the full roadmap and [`docs/API.md`](docs/API.md) for the per-module
-> function reference.
+> 0.8B and is ready for benchmarking. Gemma4-31B now has the dense
+> single-request path plus a batched miss-only path pinned against a
+> direct mlx-lm batched reference; strict B>1 batched-vs-single greedy
+> parity is not claimed. MoE variants (Qwen3.5-35B-A3B /
+> gemma-4-26B-A4B), VQ KV compression, weight streaming, and
+> speculative decoding are stubbed at the interface level but not yet
+> implemented. See [`docs/PLAN.md`](docs/PLAN.md) for the full roadmap
+> and [`docs/API.md`](docs/API.md) for the per-module function
+> reference.
 
 ---
 
@@ -142,7 +145,7 @@ in the `prompts` list. For budget-aware scheduling, construct a
 | CLI: `python -m silica run` | ✅ | `silica.server.cli` |
 | Qwen3.5-27B load via `mlx_lm.load` verified (single-request) | ✅ | `scripts/probe_qwen3_5_27b_load.py` (batched validation pending bench) |
 | DeltaNet recurrent state + `state_delta` plumbing (single-request + batched path) | ✅ | D-015 + P-3-C0..C3d; `Qwen3_5Adapter.make_batch_cache` interleaves `ArraysCache` / `BatchKVCache` per layer |
-| Gemma4-31B dense adapter — single-request + batched miss-only path (sliding + full attention hybrid) | ✅ | `silica.models.gemma4.Gemma4Adapter`; single-request smoke in `tests/test_p3_gemma4_single_request_smoke.py`; batched smoke in `tests/test_p3_gemma4_batched_smoke.py` (dual-gated); **batched parity** pending P-3-D3.1; **prefix-cache + SLIDING** rejected at construction (P-3-D3 local follow-up) |
+| Gemma4-31B dense adapter — single-request + batched miss-only path (sliding + full attention hybrid) | ✅ | `silica.models.gemma4.Gemma4Adapter`; single-request smoke in `tests/test_p3_gemma4_single_request_smoke.py`; batched smoke in `tests/test_p3_gemma4_batched_smoke.py` (dual-gated); B=1 parity + B>1 direct mlx-lm batched reference pinned in `tests/test_p3_gemma4_batched_parity.py`; strict B>1 batched-vs-single greedy parity drifts empirically; **prefix-cache + SLIDING** rejected at construction (P-3-D3 local follow-up) |
 | MoE adapters (Qwen3.5-35B-A3B / gemma-4-26B-A4B) | ⏳ | P-3 |
 | Preempt/replay with recurrent state snapshot | ⏳ | P-3-C5 |
 | VQ KV compression (BlockTQ / RaBitQ) | Stub | P-5 (`IdentityCodec` today) |

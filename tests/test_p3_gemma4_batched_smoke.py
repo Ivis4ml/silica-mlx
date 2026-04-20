@@ -19,9 +19,12 @@ tests:
     rather than falling back to an all-``BatchKVCache`` list via the
     ``callable()`` branch.
 
-Token-level parity (vs ``Engine.generate`` single-request) is NOT
-asserted here — that is P-3-D3.1 territory, structurally mirroring
-C3d on the Qwen3.5 hybrid side.
+Token-level parity is NOT asserted here. P-3-D3.1 covers the
+stronger invariant separately: B=1 batched equals single-request, and
+B>1 Silica batched matches a direct mlx-lm batched reference. Strict
+B>1 batched-vs-single-request greedy parity is not claimed for
+Gemma4-31B because the real 31B-4bit checkpoint drifts empirically
+under batched sliding-window attention.
 
 **Dual gate**: real weights cached AND
 ``SILICA_REAL_GEMMA4_31B=1`` must be set. Gemma4-31B batched is

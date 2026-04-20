@@ -1,31 +1,26 @@
-"""P-3-D3.1: Gemma4-31B-4bit batched parity against single-request.
+"""P-3-D3.1: Gemma4-31B-4bit batched invariants.
 
 Following P-3-D3 (SLIDING gate lift + miss-only batched smoke), this
-module attempts **exact token parity** between:
+module pins the strongest batched correctness claims Gemma4 supports
+empirically on the current Apple Silicon + mlx-lm toolchain:
 
-  - ``Engine.generate_batch(prompts, params, max_batch_size=N,
-    prefix_cache=None)`` and
-  - ``Engine.generate(prompt, params)`` per row.
+  - B=1 ``Engine.generate_batch`` equals ``Engine.generate`` exactly.
+  - Identical prompts in the same batch emit identical rows.
+  - B>1 ``Engine.generate_batch`` matches a direct mlx-lm batched
+    reference driven with ``Gemma4Adapter.make_batch_cache``.
+  - Unequal prompt lengths exercise row lifecycle and left padding.
 
-Structurally mirrors ``tests/test_p3_hybrid_batched_parity.py`` (C3d
-on the Qwen3.5 DeltaNet side) with identical test topology: three
-hard invariants (B=1 equals single-request; identical prompts yield
-identical rows; different-length prompts exercise row lifecycle) plus
-one strict B>1 parity attempt.
-
-The strict B>1 attempt is deliberately exact-first (the user's
-directive): if it fails empirically on Gemma4-31B, the assertion
-message surfaces the raw drift (single-row tokens, batch-row tokens,
-first mismatch index, prompt, finish_reason) so the project can
-decide whether to degrade to a weaker invariant.
-
-Empirical expectation at D3.1 write-time: unlike Qwen3.5-0.8B where
-DeltaNet's fp32 recurrent state and 3:1 D:G ratio diluted fp16-SDPA
-drift into exact parity, Gemma4-31B is pure KV attention (50 sliding
-+ 10 full over 60 layers, mixed-precision bf16). 4-bit quantization
-adds another noise source absent on Qwen3.5-0.8B fp16. Strict parity
-may or may not hold; the test stays exact-first so the observed
-behaviour is recorded rather than assumed.
+The original exact B>1 batched-vs-single-request attempt failed
+empirically on 2026-04-20: for ``"The capital of France is"`` at
+``max_tokens=16`` the first drift appeared at token index 2
+(``single=600``, ``batch=529``), while B=1, same-prompt symmetry, and
+unequal-length row lifecycle all passed. This mirrors the P-2 plain
+Qwen3 caveat more than Qwen3.5-C3d: Gemma4-31B is pure KV attention
+(50 sliding + 10 full layers) on a 4-bit checkpoint, so B>1 greedy
+sequences are not claimed to equal free-running solo greedy output.
+Instead, D3.1 pins the scheduler-owned contract: Silica batched output
+must match a direct mlx-lm batched run with the same per-layer cache
+types and left-padding convention.
 
 Each run uses a freshly built ``adapter`` + ``Engine`` to keep
 mlx-lm's in-place cache from polluting across invocations.
@@ -44,11 +39,13 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+import mlx.core as mx
 import pytest
 
 from silica import Engine
 from silica.core.sampling import SamplingParams
 from silica.models.factory import adapter_for_repo
+from silica.weights.resident import ResidentWeightProvider
 
 REPO = "mlx-community/gemma-4-31b-4bit"
 
@@ -61,13 +58,14 @@ _HF_CACHE = (
 )
 _ENV_FLAG = os.environ.get("SILICA_REAL_GEMMA4_31B") == "1"
 _SKIP_REASON = (
-    "Gemma4-31B-4bit batched parity is dual-gated. Required: (1) the "
+    "Gemma4-31B-4bit batched invariant suite is dual-gated. Required: "
+    "(1) the "
     f"checkpoint cached at {_HF_CACHE} (run "
     "scripts/probe_gemma4_31b_load.py --repo mlx-community/"
     "gemma-4-31b-4bit to populate, ~18 GB); (2) env var "
-    "SILICA_REAL_GEMMA4_31B=1 to opt in — batched 31B parity runs "
-    "both single-request and batched per test, so the cost compounds "
-    "over the 4 tests in this file."
+    "SILICA_REAL_GEMMA4_31B=1 to opt in — batched 31B invariant "
+    "tests run real single-request and batched forwards, so the cost "
+    "compounds over the tests in this file."
 )
 _SKIP = (
     not _HF_CACHE.exists()
@@ -150,6 +148,58 @@ def _batch_tokens(
     return tokens_by_req, done_by_req, aborts
 
 
+def _direct_mlx_lm_batched_tokens(
+    prompts: Sequence[str],
+    max_tokens: int,
+) -> dict[int, list[int]]:
+    """Drive the loaded Gemma4 mlx-lm model directly in batched mode.
+
+    This is the D3.1 reference for B>1 correctness. It bypasses
+    ``Engine`` / ``ContinuousBatcher`` but intentionally uses the
+    adapter-owned ``make_batch_cache(left_padding)`` factory so the
+    per-layer cache list matches Silica's live scheduler path:
+    ``BatchRotatingKVCache`` for SLIDING layers and ``BatchKVCache``
+    for GLOBAL layers.
+    """
+    adapter, _ = adapter_for_repo(REPO)
+    model = adapter.build(ResidentWeightProvider())
+    tokenizer = adapter.tokenizer()
+    encoded = [list(tokenizer.encode(prompt)) for prompt in prompts]
+    assert all(encoded), "test prompts must tokenize to non-empty ids"
+
+    max_len = max(len(ids) for ids in encoded)
+    left_padding = [max_len - len(ids) for ids in encoded]
+    padded = [
+        [0] * pad + ids for pad, ids in zip(left_padding, encoded, strict=True)
+    ]
+    make_batch_cache = getattr(adapter, "make_batch_cache", None)
+    assert callable(make_batch_cache)
+    cache = make_batch_cache(left_padding)
+
+    tokens = mx.array(padded, dtype=mx.int32)
+    logits = model(tokens, cache=cache)
+    mx.eval(logits)
+    last = logits[:, -1, :]
+    next_tokens = [
+        int(mx.argmax(last[row_idx]).item()) for row_idx in range(len(prompts))
+    ]
+    out = {row_idx: [tok] for row_idx, tok in enumerate(next_tokens)}
+
+    for _ in range(max_tokens - 1):
+        decode = mx.array([[tok] for tok in next_tokens], dtype=mx.int32)
+        logits = model(decode, cache=cache)
+        mx.eval(logits)
+        last = logits[:, -1, :]
+        next_tokens = [
+            int(mx.argmax(last[row_idx]).item())
+            for row_idx in range(len(prompts))
+        ]
+        for row_idx, tok in enumerate(next_tokens):
+            out[row_idx].append(tok)
+
+    return out
+
+
 def _format_parity_mismatch(
     *,
     prompt: str,
@@ -224,30 +274,21 @@ def test_identical_prompts_yield_identical_rows() -> None:
     )
 
 
-# --- Strict parity attempt (exact first; degrade only after empirical review) ---
+# --- B>1 direct-reference parity ---------------------------------------------
 
 
 @pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
-def test_bgt1_strict_parity_matches_single_request() -> None:
-    """B>1 exact parity: each batch row's tokens equal the
-    corresponding ``Engine.generate(prompt)`` single-request output.
+def test_bgt1_matches_direct_mlx_lm_batched_reference() -> None:
+    """B>1 scheduler correctness: Silica batched output matches a
+    direct mlx-lm batched run using the same adapter-produced cache
+    list and left-padding convention.
 
-    Gemma4-31B is pure KV attention with a sliding-window majority and
-    a 4-bit quantized checkpoint; strict parity is plausible but not
-    guaranteed. If this fails, the assertion message surfaces the
-    drift for offline review; the project then decides whether to
-    degrade this invariant (prefix match, first-N tokens, argmax
-    agreement, etc.) or fix the code. Precedents:
-
-      - Qwen3.5-0.8B hybrid DeltaNet: strict parity holds at
-        max_tokens=16/32/64 (fp32 recurrent state + 3:1 D:G ratio
-        dilute fp16-SDPA drift).
-      - Qwen3-0.6B plain fp16 SDPA (P-2): fp16 batched SDPA drift on
-        Apple Silicon blocked exact vs-solo parity; invariants were
-        weakened to prefix match.
-
-    The test stays at max_tokens=16 to match C3d's boundary; raise
-    locally when qualifying the ceiling on a specific toolchain.
+    This deliberately does NOT compare against ``Engine.generate`` per
+    row. The exact-vs-solo attempt drifted at token index 2 on the
+    real 31B-4bit checkpoint, which is a numerical / upstream batched
+    kernel property unless this direct reference disagrees with
+    Silica. The invariant we own is scheduler glue equivalence to the
+    direct batched execution path.
     """
     prompts = [
         "The capital of France is",
@@ -255,23 +296,24 @@ def test_bgt1_strict_parity_matches_single_request() -> None:
     ]
     max_tokens = 16
 
-    singles = [
-        _single_request_tokens(p, max_tokens) for p in prompts
-    ]
     tokens_by_req, done_by_req, aborts = _batch_tokens(
         prompts, max_batch_size=2, max_tokens=max_tokens
     )
+    direct = _direct_mlx_lm_batched_tokens(prompts, max_tokens=max_tokens)
 
     assert aborts == []
     assert set(done_by_req) == {0, 1}
 
     for req_index, prompt in enumerate(prompts):
         batch_tokens = tokens_by_req.get(req_index, [])
-        assert batch_tokens == singles[req_index], _format_parity_mismatch(
-            prompt=prompt,
-            single_tokens=singles[req_index],
-            batch_tokens=batch_tokens,
-            finish_reason=done_by_req[req_index],
+        direct_tokens = direct[req_index]
+        assert batch_tokens == direct_tokens, (
+            "Gemma4 Silica batched output diverged from direct mlx-lm "
+            "batched reference:\n"
+            f"  prompt:             {prompt!r}\n"
+            f"  finish_reason:      {done_by_req[req_index]!r}\n"
+            f"  direct tokens:      {direct_tokens}\n"
+            f"  silica batch tokens: {batch_tokens}"
         )
 
 

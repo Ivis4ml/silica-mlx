@@ -226,11 +226,14 @@ load-bearing commit is:
 - `tests/test_p3_gemma4_batched_smoke.py` (new): real-model smoke
   mirroring `test_p3_hybrid_batched_smoke.py`.
 
-Strict parity vs single-request mirroring C3d is a separate follow-up
-(call it D3.1). The C3d finding that Qwen3.5-0.8B batched parity
-holds at `max_tokens=16/32/64` is encouraging but does not transfer —
-Gemma4's fp16 sliding-window SDPA may drift the same way P-2's
-Qwen3-0.6B did. Empirical only.
+Strict parity vs single-request mirroring C3d was tested in D3.1 and
+does **not** hold on the observed Gemma4-31B-4bit toolchain: B=1
+parity holds, but B>1 drifts from solo greedy output by token index
+2 on the `"The capital of France is"` probe at `max_tokens=16`.
+The landed invariant is therefore the P-2-style degraded one:
+Silica batched output must match a direct mlx-lm batched reference
+using the same `Gemma4Adapter.make_batch_cache(left_padding)` cache
+list.
 
 ### 4.4 `KVLayout` caveat remains in place
 
@@ -277,7 +280,7 @@ Open Questions space (same convention as `C-open-*` /
 | --- | --- | --- |
 | **D2** | `Gemma4Adapter.make_batch_cache` returns hybrid `[BatchRotatingKVCache / BatchKVCache]` list. Unit tests updated. No gate change. | ~50 lines of code + tests. |
 | **D3** | Extend `_SUPPORTED_ATTENTION_KINDS` to include `SLIDING`; error-locator + `_unsupported_kind_reason` trim; real-model Gemma4-31B batched smoke via `Engine.generate_batch`; README row updated. | Structurally identical to C3c. |
-| **D3.1** *(optional)* | B=1 / symmetry / strict B>1 parity tests vs single-request, mirroring C3d. Empirical — may land with degraded invariants if Gemma4's sliding-window SDPA drifts. | Same shape as C3d. |
+| **D3.1** | B=1 parity vs single-request, same-prompt symmetry, B>1 parity vs direct mlx-lm batched reference, unequal-length row-lifecycle smoke. Strict B>1 batched-vs-single greedy parity was attempted and degraded after observed drift. | Same spirit as P-2's honest oracle downgrade. |
 | **D4** | `KVLayout` / `MemoryBudgeter` correctness on per-kind KV shapes (option (b) aggregate-bytes or (c) per-kind decomposition). | Separate bench-driven unit. |
 | **D5** | Gemma4-26B MoE variant — overlaps P-3-E. | Defer until E track starts. |
 
