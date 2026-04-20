@@ -142,7 +142,7 @@ in the `prompts` list. For budget-aware scheduling, construct a
 | CLI: `python -m silica run` | ✅ | `silica.server.cli` |
 | Qwen3.5-27B load via `mlx_lm.load` verified (single-request) | ✅ | `scripts/probe_qwen3_5_27b_load.py` (batched validation pending bench) |
 | DeltaNet recurrent state + `state_delta` plumbing (single-request + batched path) | ✅ | D-015 + P-3-C0..C3d; `Qwen3_5Adapter.make_batch_cache` interleaves `ArraysCache` / `BatchKVCache` per layer |
-| Gemma4-31B dense big-model adapter | ⏳ | P-3 |
+| Gemma4-31B dense adapter — single-request (sliding + full attention hybrid) | ✅ | `silica.models.gemma4.Gemma4Adapter`; real-model smoke in `tests/test_p3_gemma4_single_request_smoke.py`; **batched** path blocked on PLAN §Q-013 (no `BatchRotatingKVCache`) |
 | MoE adapters (Qwen3.5-35B-A3B / gemma-4-26B-A4B) | ⏳ | P-3 |
 | Preempt/replay with recurrent state snapshot | ⏳ | P-3-C5 |
 | VQ KV compression (BlockTQ / RaBitQ) | Stub | P-5 (`IdentityCodec` today) |
