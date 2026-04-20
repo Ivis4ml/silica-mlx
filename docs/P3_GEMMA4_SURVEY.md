@@ -269,6 +269,18 @@ at introduction.
 
 ### 5.3 Batched path is blocked on Q-013 / sliding-window-batched KV cache
 
+> **Correction (P-3-D2.0, 2026-04-20).** The first sentence below —
+> "mlx-lm ships `BatchKVCache` ... but **no `BatchRotatingKVCache`**"
+> — is **wrong**. `mlx_lm/models/cache.py` defines a complete
+> `BatchRotatingKVCache` (lines 1100-1444) with the full batched
+> surface (`update_and_fetch` / `prepare` / `finalize` / `filter` /
+> `extend` / `extract` / `merge` / `make_mask`). See
+> `docs/P3_BATCH_ROTATING_KV_SURVEY.md` for the authoritative audit
+> and the revised D2 / D3 scope (which shrinks from "implement the
+> container" to "wire the factory + lift the gate"). The rest of §5.3
+> is preserved below as the historical reasoning; the §5.4 roadmap is
+> superseded by `P3_BATCH_ROTATING_KV_SURVEY.md` §6.
+
 mlx-lm ships `BatchKVCache` (adopted by C3a/b/c) but **no
 `BatchRotatingKVCache`**. A Gemma4 batched admission would have to:
 
