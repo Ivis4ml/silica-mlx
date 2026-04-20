@@ -28,12 +28,11 @@ therefore over- or under-count on Gemma4 until D3 / D4 lands a
 per-kind layout; C3c-era gate rejection of ``SLIDING`` keeps that
 mismatch from reaching the scheduler today.
 
-``make_batch_cache`` raises ``NotImplementedError`` pointing at PLAN
-§Q-013. The capability gate already rejects ``SLIDING`` adapters, so
-this method is unreachable today; raising (rather than falling back to
-an all-``BatchKVCache`` list) guarantees loud failure if a future gate
-lift forgets to land the matching ``BatchRotatingKVCache`` Q-013
-infrastructure.
+``make_batch_cache`` (P-3-D2) returns a hybrid per-layer list of
+``BatchRotatingKVCache`` (sliding) and ``BatchKVCache`` (full) from
+``mlx_lm.models.cache``. The capability gate still rejects ``SLIDING``
+at D2, so this factory is unreachable until D3 lifts the gate — it is
+wired now so D3 gate-lift + real-model smoke are a minimal follow-up.
 
 Adapter-local D-015 lifecycle helpers (``commit_state`` /
 ``rollback_state`` / ``state_from_prefix`` / ``free_state``) are NOT
@@ -124,25 +123,52 @@ class Gemma4Adapter:
         return capabilities_from_attention_pattern(self._attention_pattern)
 
     def make_batch_cache(self, left_padding: list[int]) -> list[Any]:
-        """Loud-fail until Q-013 adds batched sliding-window cache support.
+        """Build a hybrid per-layer batched cache list (P-3-D2).
 
-        mlx-lm ships ``BatchKVCache`` (full-attention) but no
-        ``BatchRotatingKVCache``; the sliding layers of Gemma4 require
-        a rotating variant that respects per-row left-padding. Writing
-        this method to raise (rather than falling through to an
-        all-``BatchKVCache`` list via the scheduler's getattr fallback)
-        guarantees that any future capability-gate lift for ``SLIDING``
-        fails immediately here if the matching Q-013 work has not
-        landed, rather than silently corrupting sliding cache state.
+        Sliding layers get ``BatchRotatingKVCache(max_size=sliding_window,
+        left_padding=...)``; full-attention layers get ``BatchKVCache(
+        left_padding=...)``. Both primitives already ship in mlx-lm
+        (``mlx_lm.models.cache``); see ``docs/P3_BATCH_ROTATING_KV_SURVEY.md``.
+
+        The per-layer ordering follows ``self._attention_pattern.per_layer``,
+        which was built from ``config.text_config['layer_types']`` under
+        the strict guards in ``_build_attention_pattern``. The capability
+        gate in ``ContinuousBatcher._enforce_capability_gate`` still
+        rejects ``SLIDING`` as of D2; the matching gate lift lands in D3.
+
+        A ``sliding_window <= 0`` when the pattern contains ``SLIDING``
+        layers is a config inconsistency and raises loudly rather than
+        passing a sentinel to ``BatchRotatingKVCache``.
         """
-        del left_padding
-        raise NotImplementedError(
-            "Gemma4Adapter.make_batch_cache: batched sliding-window KV "
-            "cache is not implemented. mlx-lm has no BatchRotatingKVCache; "
-            "tracked as PLAN §Q-013 / P-3-D2. The capability gate "
-            "currently rejects SLIDING, so single-request Engine.generate "
-            "is the supported path today."
-        )
+        from mlx_lm.models.cache import BatchKVCache, BatchRotatingKVCache
+
+        per_layer = self._attention_pattern.per_layer
+        sliding_window = int(self.config.extra.get("sliding_window", 0) or 0)
+        if AttentionKind.SLIDING in per_layer and sliding_window <= 0:
+            raise NotImplementedError(
+                "Gemma4Adapter.make_batch_cache: attention pattern "
+                "contains SLIDING layers but text_config['sliding_window']"
+                f"={sliding_window}. BatchRotatingKVCache requires a "
+                "positive max_size; check the loaded repo's config."
+            )
+
+        caches: list[Any] = []
+        for kind in per_layer:
+            if kind is AttentionKind.SLIDING:
+                caches.append(
+                    BatchRotatingKVCache(
+                        max_size=sliding_window, left_padding=left_padding
+                    )
+                )
+            elif kind is AttentionKind.GLOBAL:
+                caches.append(BatchKVCache(left_padding=left_padding))
+            else:
+                raise NotImplementedError(
+                    "Gemma4Adapter.make_batch_cache: unexpected "
+                    f"AttentionKind.{kind.name} in per-layer pattern. "
+                    "Supported kinds today: SLIDING, GLOBAL."
+                )
+        return caches
 
     def tokenizer(self) -> Tokenizer:
         return self._tokenizer  # type: ignore[no-any-return]

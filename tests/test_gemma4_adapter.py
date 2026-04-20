@@ -2,8 +2,9 @@
 
 Uses a fake mlx-lm-gemma4-shaped model so the adapter's Silica-side
 translation (ModelConfig / KVLayout / AttentionPattern / prefill /
-decode / _validate_supported_variant / make_batch_cache guard) is
-exercised without requiring the 18.4 GB Gemma4-31B-4bit checkpoint.
+decode / _validate_supported_variant / make_batch_cache hybrid
+sliding+global wiring) is exercised without requiring the 18.4 GB
+Gemma4-31B-4bit checkpoint.
 End-to-end real-model smoke is P-3-D1.1 (``tests/test_p3_gemma4_*``)
 and is separate from this unit file.
 """
@@ -15,7 +16,12 @@ from typing import Any
 
 import mlx.core as mx
 import pytest
-from mlx_lm.models.cache import KVCache, RotatingKVCache
+from mlx_lm.models.cache import (
+    BatchKVCache,
+    BatchRotatingKVCache,
+    KVCache,
+    RotatingKVCache,
+)
 
 from silica.kvcache.manager import KVHandle
 from silica.kvcache.simple import SimpleKVCache
@@ -328,22 +334,70 @@ def test_validate_rejects_shared_kv_variant() -> None:
         _make_adapter_and_kv(text_config=tc)
 
 
-# --- make_batch_cache: Q-013 guard ---
+# --- make_batch_cache: hybrid BatchRotatingKVCache + BatchKVCache list (D2) ---
 
 
-def test_make_batch_cache_raises_pointing_at_q_013() -> None:
-    """Sliding-window batched KV is not implemented. The adapter MUST
-    raise rather than fall back to an all-BatchKVCache list — the
-    capability gate currently rejects SLIDING, so a silent fallback
-    would only matter if a future gate lift forgets Q-013, at which
-    point loud failure is strictly preferable to corrupt sliding
-    cache state."""
+def test_make_batch_cache_returns_per_layer_hybrid_list() -> None:
+    """Per-layer cache list must mirror ``attention_pattern.per_layer``:
+    ``BatchRotatingKVCache`` for SLIDING, ``BatchKVCache`` for GLOBAL.
+    Walking ``attention_pattern`` (instead of a parallel re-derivation
+    from ``layer_types``) ensures the batched factory and the
+    capability gate stay in lockstep."""
     adapter, _, _ = _make_adapter_and_kv()
-    with pytest.raises(NotImplementedError) as exc:
+    caches = adapter.make_batch_cache(left_padding=[0, 1])
+    assert len(caches) == 60
+    pattern = adapter.attention_pattern().per_layer
+    for i, (kind, cache) in enumerate(zip(pattern, caches, strict=True)):
+        if kind == AttentionKind.SLIDING:
+            assert isinstance(cache, BatchRotatingKVCache), (
+                f"layer {i}: expected BatchRotatingKVCache, got {type(cache)}"
+            )
+        else:
+            assert isinstance(cache, BatchKVCache), (
+                f"layer {i}: expected BatchKVCache, got {type(cache)}"
+            )
+
+
+def test_make_batch_cache_sliding_max_size_matches_text_config() -> None:
+    """``BatchRotatingKVCache.max_size`` must equal
+    ``text_config['sliding_window']`` — mismatched window sizes
+    silently corrupt attention masks rather than raising."""
+    adapter, _, _ = _make_adapter_and_kv()
+    caches = adapter.make_batch_cache(left_padding=[0, 1])
+    pattern = adapter.attention_pattern().per_layer
+    expected = adapter.config.extra["sliding_window"]
+    for kind, cache in zip(pattern, caches, strict=True):
+        if kind == AttentionKind.SLIDING:
+            assert cache.max_size == expected
+
+
+def test_make_batch_cache_threads_left_padding_through() -> None:
+    """Both cache types must receive the caller's ``left_padding`` so
+    masks account for per-row prefix padding. mlx-lm stores it as an
+    ``mx.array``; we compare the ``.tolist()`` view for stable equality."""
+    left_padding = [2, 0, 5]
+    adapter, _, _ = _make_adapter_and_kv()
+    caches = adapter.make_batch_cache(left_padding=left_padding)
+    # Sample one of each kind.
+    sliding_caches = [
+        c for c in caches if isinstance(c, BatchRotatingKVCache)
+    ]
+    global_caches = [c for c in caches if isinstance(c, BatchKVCache)]
+    assert sliding_caches and global_caches
+    assert sliding_caches[0].left_padding.tolist() == left_padding
+    assert global_caches[0].left_padding.tolist() == left_padding
+
+
+def test_make_batch_cache_raises_when_sliding_window_is_zero() -> None:
+    """A SLIDING-bearing pattern with ``sliding_window == 0`` is a
+    config inconsistency. Passing ``max_size=0`` to
+    ``BatchRotatingKVCache`` would crash opaquely deep in
+    ``update_and_fetch``; surface the problem at factory time."""
+    tc = _default_31b_text_config()
+    tc["sliding_window"] = 0
+    adapter, _, _ = _make_adapter_and_kv(text_config=tc)
+    with pytest.raises(NotImplementedError, match="sliding_window"):
         adapter.make_batch_cache(left_padding=[0, 1])
-    msg = str(exc.value)
-    assert "Q-013" in msg
-    assert "BatchRotatingKVCache" in msg
 
 
 # --- tokenizer / build / prefill / decode_step ---
