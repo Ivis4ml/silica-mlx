@@ -6,6 +6,14 @@ with hybrid recurrent layers (DeltaNet) — the Python signatures are unchanged,
 but `AttentionPattern` gains `recurrent` / `hybrid_deltanet` enum values and
 `StateDelta` becomes a read-only snapshot with a single public method.
 
+D-016 (P-3 opening) adds ``capabilities() -> ModelCapabilities`` to I-1 as a
+backwards-compatible extension: a typed summary view over the existing
+``attention_pattern()`` plus an ``has_moe`` bit that ``AttentionPattern``
+cannot express. ``AttentionPattern`` remains the authoritative per-layer
+routing source; ``ModelCapabilities`` is a strictly coarser summary used by
+scheduler-level gates (continuous batching today, MoE-aware budgeting and
+the P-4 bench harness later).
+
 Key constraints (from §6):
   1. `attention_pattern()` expresses per-layer routing (D-015). KV-attention
      layers dispatch to `KVManager`; recurrent layers dispatch to an
@@ -17,6 +25,10 @@ Key constraints (from §6):
      position counter, sliding-window cursor, DeltaNet recurrent state
      ownership info). Counter-examples forbidden inside `state_delta`:
      KV blocks, cache residency mutations, prefix cache pinning.
+  4. ``capabilities()`` returns a frozen ``ModelCapabilities`` summary
+     derived from ``attention_pattern()`` (plus an ``has_moe`` bit the
+     MoE adapters set). Scheduler-level gates must prefer it over
+     re-walking ``AttentionPattern``.
 
 P-0 stub (`StubModelAdapter`): minimal conforming implementation — config
 carries the shape fields needed by the test harness, `build` is a no-op,
@@ -28,12 +40,20 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import mlx.core as mx
 
 from silica.kvcache.manager import KVHandle
 from silica.weights.provider import WeightProvider
+
+if TYPE_CHECKING:
+    # Avoid a runtime cycle: capabilities.py imports AttentionKind /
+    # AttentionPattern from this module. The Protocol signature uses
+    # ``ModelCapabilities`` as a forward-referenced string annotation
+    # via ``from __future__ import annotations``; StubModelAdapter's
+    # ``capabilities()`` does a local import at call time.
+    from silica.models.capabilities import ModelCapabilities
 
 # `Module` and `Tokenizer` are deliberately permissive in v0.1.
 # P-1 / P-3 adapters will carry concrete types (mlx-lm's `nn.Module`,
@@ -146,6 +166,8 @@ class ModelAdapter(Protocol):
         self, token: mx.array, kv_handle: KVHandle
     ) -> tuple[mx.array, StateDelta]: ...
 
+    def capabilities(self) -> ModelCapabilities: ...
+
 
 class _StubTokenizer:
     """Minimal tokenizer for the P-0 stub — roundtrips empty text only."""
@@ -220,3 +242,10 @@ class StubModelAdapter:
     ) -> tuple[mx.array, StateDelta]:
         logits = mx.zeros((self.config.vocab_size,), dtype=mx.float16)
         return logits, StateDelta()
+
+    def capabilities(self) -> ModelCapabilities:
+        # Local import: capabilities.py imports AttentionKind / AttentionPattern
+        # from this module, so pulling it at module load would cycle.
+        from silica.models.capabilities import capabilities_from_attention_pattern
+
+        return capabilities_from_attention_pattern(self._pattern)

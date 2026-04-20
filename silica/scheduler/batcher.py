@@ -1214,24 +1214,69 @@ class ContinuousBatcher:
 
     @staticmethod
     def _enforce_capability_gate(adapter: ModelAdapter) -> None:
-        """P-2 batcher only accepts adapters whose every layer is GLOBAL.
+        """P-2 batcher only accepts adapters whose capabilities are pure GLOBAL.
 
-        Layer 3 of the v2.3 three-layer stack. The batcher does not
-        test ``isinstance(adapter, ...)``; it asks the adapter what
-        ``AttentionPattern`` it claims and decides from that alone.
-        Mamba / DeltaNet / sliding-window families will each need their
-        own scheduler (or an extended capability matrix) — this gate
-        simply refuses to guess.
+        Layer 3 of the v2.3 three-layer stack. The batcher asks the
+        adapter for its ``ModelCapabilities`` (D-016) and decides from
+        that typed summary. ``AttentionPattern`` remains authoritative
+        for per-layer detail — used here only to locate the offending
+        layer index for the error message.
+
+        Mamba / DeltaNet / sliding-window families and MoE routing will
+        each need their own scheduler (or an extended capability
+        matrix). This gate refuses to guess.
         """
+        caps = adapter.capabilities()
+        if caps.attention_kinds == {AttentionKind.GLOBAL} and not caps.has_moe:
+            return
+        # Locate a concrete offending layer for the error message. We
+        # walk ``attention_pattern`` once, prefer the first non-GLOBAL
+        # hit because that is what a human reads; the capability
+        # predicate above has already decided the gate fails.
         pattern = adapter.attention_pattern()
         for layer_idx, kind in enumerate(pattern.per_layer):
             if kind == AttentionKind.GLOBAL:
                 continue
             reason = _unsupported_kind_reason(kind)
+            extra = (
+                "; adapter also declares MoE routing (has_moe=True) — "
+                "MoE scheduling is a P-3 discussion"
+                if caps.has_moe
+                else ""
+            )
             raise NotImplementedError(
                 f"ContinuousBatcher accepts AttentionKind.GLOBAL only in P-2; "
-                f"adapter layer {layer_idx} is {kind.value!r} — {reason}"
+                f"adapter capabilities include {kind.value!r} "
+                f"(layer {layer_idx}, has_recurrent_state="
+                f"{caps.has_recurrent_state}) — {reason}{extra}"
             )
+        # Fallback: the capability predicate rejected the adapter but
+        # the attention_pattern walk found no non-GLOBAL layer. The
+        # normal path into here is ``has_moe=True`` with pure-GLOBAL
+        # per-layer routing; a pathological adapter whose
+        # ``attention_kinds`` disagree with its ``attention_pattern``
+        # would also fall here. Emit a generic message that names the
+        # capabilities values explicitly, and append MoE context only
+        # when ``has_moe`` is actually set — no hard-coded assumption.
+        moe_tail = (
+            " — MoE-aware scheduling arrives in P-3 alongside the "
+            "Qwen3.5-35B-A3B / gemma-4-26B-A4B adapters"
+            if caps.has_moe
+            else (
+                "; attention_pattern() reports no non-GLOBAL layer, so "
+                "ModelCapabilities and AttentionPattern disagree — "
+                "re-run capabilities_from_attention_pattern on the "
+                "adapter's pattern to regenerate a consistent summary"
+            )
+        )
+        kinds_display = sorted(k.value for k in caps.attention_kinds)
+        raise NotImplementedError(
+            f"ContinuousBatcher accepts AttentionKind.GLOBAL only in P-2; "
+            f"adapter capabilities are unsupported: "
+            f"attention_kinds={kinds_display!r}, "
+            f"has_recurrent_state={caps.has_recurrent_state}, "
+            f"has_moe={caps.has_moe}{moe_tail}"
+        )
 
 
 def _unsupported_kind_reason(kind: AttentionKind) -> str:

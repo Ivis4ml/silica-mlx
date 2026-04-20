@@ -2,8 +2,8 @@
 
 | Field        | Value                                   |
 | ------------ | --------------------------------------- |
-| Version      | v1.5.2                                  |
-| Last updated | 2026-04-17                              |
+| Version      | v1.6.0                                  |
+| Last updated | 2026-04-19                              |
 | Status       | Phase 0 in-progress                     |
 | Maintainer   | Xin Zhou                                |
 | Source       | `docs/PLAN.md` (single source of truth) |
@@ -428,7 +428,7 @@ Each Phase uses the same structure: `ID / Goal / Scope / Strategy / Deliverables
   - [ ] DeltaNet recurrent-layer forward + adapter-local per-request state store (keyed by `req_id` via `kv_handle`); `adapter.commit_state` / `adapter.rollback_state` / `adapter.state_from_prefix` / `adapter.free_state` helpers implemented per D-015 (P-7 will exercise commit/rollback; P-3 only needs the primitives in place).
   - [ ] MoE top-k gating + per-expert FFN aggregation (inference path, aux-loss ignored).
   - [ ] `silica.weights.resident.ResidentWeightProvider` (full residency; the MoE variant exposes `get_expert` per-expert access even if the underlying storage is fully resident).
-  - [ ] Model factory registry: `silica.models.factory` (already in place since v1.5.2 with `model_type` dispatch; P-3 extends it to prefer HF `config.architectures[0]` keying — e.g. `Qwen3ForCausalLM`, `Qwen3_5ForConditionalGeneration`, `Qwen3_5MoeForConditionalGeneration` — with `model_type` as a fallback. Each registry entry carries a `ModelCapabilities` summary (`is_moe`, `is_hybrid`, `is_attention_free`, `supports_prefix_cache`, `supports_batch_kv`, …) so schedulers gate on capabilities rather than adapter class. MoE entries require a MoE-capable `WeightProvider`.)
+  - [ ] Model factory registry: `silica.models.factory` (already in place since v1.5.2 with `model_type` dispatch; P-3 keeps the `model_type` key — no `config.architectures[0]` rekeying unless a real collision appears — and enriches the **value** side by having each adapter return a typed `ModelCapabilities` summary via its new `capabilities()` method (D-016). First-version fields are `attention_kinds`, `has_recurrent_state`, `has_moe`; additional capability bits land only when concrete P-5 / P-6 / P-7 consumers require them. MoE entries declare `has_moe=True` at the `capabilities_from_attention_pattern` call site; MoE entries require a MoE-capable `WeightProvider`.)
 - **Acceptance:**
   - **Adapter structural correctness (fp16 parity on control model)** — P-3 exit criterion:
     - [ ] On a fp16 control model (Qwen3.5-0.8B or Qwen3.5-4B), Silica adapter logits match the HuggingFace reference: `max |logit diff| < 1e-3` over the first 50 greedy-decoded tokens under the same tokenizer state and seed. This verifies adapter structural components (attention, RMSNorm, MoE routing, positional encoding) without quantization noise.
@@ -788,6 +788,20 @@ Append-only. New decisions go at the end; old ones are not edited. Revocations /
   - P-7 speculative decoding must exercise `adapter.commit_state` / `adapter.rollback_state` on DeltaNet layers in addition to `KVManager.commit` / `.rollback` on KV layers.
 - **References:** D-011, D-014, I-1, I-2, P-3, P-7, Q-008, M-4.
 
+### D-016 — I-1 extension: `capabilities() -> ModelCapabilities`
+
+- **Date:** 2026-04-19.
+- **Status:** accepted.
+- **Decision:** I-1 `ModelAdapter` gains one method in P-3 opening: `capabilities() -> ModelCapabilities`. `ModelCapabilities` is a frozen dataclass with three fields — `attention_kinds: frozenset[AttentionKind]`, `has_recurrent_state: bool`, `has_moe: bool` — and ships in `silica/models/capabilities.py` together with a pure helper `capabilities_from_attention_pattern(pattern, *, has_moe=False)`. `AttentionPattern` remains the authoritative per-layer routing source (D-015). `ModelCapabilities` is a strictly coarser typed summary consumed by scheduler-level gates. `ContinuousBatcher._enforce_capability_gate` reads `adapter.capabilities()` as its primary predicate; `attention_pattern()` is walked only to locate a non-GLOBAL layer index for the error message. Every concrete adapter (Qwen3, Qwen3.5, `StubModelAdapter`, test doubles) implements `capabilities()` by calling the helper — Protocol default bodies are not used because I-1 is structurally typed.
+- **Rationale:** P-3 introduces three new adapter families (dense big-model, MoE, DeltaNet-hybrid). Without a typed capability surface, each of {batcher gate, P-4 bench harness, MoE-aware budgeter} would re-walk `AttentionPattern` and bolt on its own `isinstance` / attribute probe for MoE routing. Keeping the AttentionPattern → capability derivation in one helper eliminates that drift and gives MoE routing a named bit instead of an ad-hoc flag. No big-model download or new scheduling behaviour arrives with D-016 — the batcher's acceptance set is unchanged (pure GLOBAL, no MoE). This is a **contract-surface refactor**, not a feature.
+- **Consequences:**
+  - I-1 Python Protocol gains one method (backwards-incompatible for structurally-typed external adapters that do not implement it; Silica's own adapters are updated in the same commit). `ModelAdapter` is still `runtime_checkable` and the new method is visible to `isinstance`.
+  - `AttentionPattern` is not demoted — it is still the authority for per-layer routing. `ModelCapabilities` does not re-express per-layer detail.
+  - `ModelCapabilities` first version intentionally ships only three fields. Additional capability bits (e.g. `supports_prefix_cache`, `kv_codec_compatible`, `activated_params_per_token`) land when concrete P-5 / P-6 / P-7 consumers need them, not speculatively.
+  - Capability-gate error messages now reference `has_recurrent_state` and, for MoE-declaring adapters, `has_moe=True`. The `P-3` and `Q-013` phase references from pre-D-016 reasons remain.
+  - MoE adapters landing later in P-3 set `has_moe=True` at the `capabilities_from_attention_pattern` call site; no second override path.
+- **References:** D-011, D-015, I-1, P-3, P-4, M-4.
+
 ---
 
 ## 10. Open Questions
@@ -970,6 +984,8 @@ Local reference implementations sit at the repo root. **Algorithm / architecture
 
 ## 13. Changelog
 
+- **v1.6.0** (2026-04-19): P-3 opening — land D-016 (I-1 extended with `capabilities() -> ModelCapabilities`). New module `silica/models/capabilities.py` ships `ModelCapabilities` (three-field frozen dataclass: `attention_kinds`, `has_recurrent_state`, `has_moe`) and the pure helper `capabilities_from_attention_pattern(pattern, *, has_moe=False)`. `ContinuousBatcher._enforce_capability_gate` now reads `adapter.capabilities()` as its primary predicate; `attention_pattern()` is walked only for the error-message layer index. Concrete adapters (`Qwen3Adapter`, `Qwen3_5Adapter`, `StubModelAdapter`, test doubles) implement `capabilities()` by delegating to the helper. Behaviour unchanged — the batcher still accepts pure GLOBAL and still rejects HYBRID_DELTANET — this is a contract-surface refactor that clears the way for the dense-big, MoE, and DeltaNet adapters landing later in P-3. `AttentionPattern` remains the authoritative per-layer routing source (D-015).
+  - **References:** D-016, I-1, P-3.
 - **v1.5.2** (2026-04-17): model-integration refactor — formalise the three-layer stack (family adapter + factory registry + capability gate) surfaced by the P-2 Qwen3-0.6B preload. No interface or principle changes; clarifies deliverable-level class naming and §5.1 layout. Triggered by: plain Qwen3 and Qwen3.5 share mlx-lm's `qwen3*.py` neighbourhood but differ in attribute names (`n_kv_heads` vs `num_key_value_heads`) AND runtime semantics (pure KV vs DeltaNet hybrid + MTP + multimodal sanitize); keeping them in a single `Qwen3Adapter` class would grow a conditional on every future family (Kimi, GLM, MiniMax, Mamba, MoE, …).
   - **§5.1 models/:** description updated from "ModelAdapter Protocol + Qwen3.5 / Gemma4 adapters" to "ModelAdapter Protocol + per-family adapters + factory" — matches the new three-layer stack.
   - **§7 P-1 Deliverables:** the adapter entry now explicitly names `silica.models.qwen3_5.Qwen3_5Adapter` as the P-1 class (Qwen3.5-0.8B hybrid), with `silica.models.qwen3.Qwen3Adapter` named separately as the plain-KV P-2 dev-loop adapter and `silica.models.factory.adapter_for_repo(repo)` as the dispatch entry. References `docs/P2_OPENING.md` §"Model integration in three layers".

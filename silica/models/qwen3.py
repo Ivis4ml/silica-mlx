@@ -50,6 +50,10 @@ from silica.models.adapter import (
     StateDelta,
     Tokenizer,
 )
+from silica.models.capabilities import (
+    ModelCapabilities,
+    capabilities_from_attention_pattern,
+)
 from silica.weights.provider import WeightProvider
 
 
@@ -88,6 +92,11 @@ class Qwen3Adapter:
 
     def attention_pattern(self) -> AttentionPattern:
         return self._attention_pattern
+
+    def capabilities(self) -> ModelCapabilities:
+        # Plain Qwen3 is pure GQA attention, no recurrent state, no MoE.
+        # The helper reduces self._attention_pattern to the typed summary.
+        return capabilities_from_attention_pattern(self._attention_pattern)
 
     def tokenizer(self) -> Tokenizer:
         return self._tokenizer  # type: ignore[no-any-return]

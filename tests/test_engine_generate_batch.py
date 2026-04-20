@@ -26,6 +26,10 @@ from silica.models.adapter import (
     ModelConfig,
     StateDelta,
 )
+from silica.models.capabilities import (
+    ModelCapabilities,
+    capabilities_from_attention_pattern,
+)
 
 # --- scripted fixtures (local copy — simpler than cross-file import) ---
 
@@ -93,6 +97,9 @@ class _Adapter:
 
     def attention_pattern(self) -> AttentionPattern:
         return self._pattern
+
+    def capabilities(self) -> ModelCapabilities:
+        return capabilities_from_attention_pattern(self._pattern)
 
     def tokenizer(self) -> _Tokenizer:
         return self._tok

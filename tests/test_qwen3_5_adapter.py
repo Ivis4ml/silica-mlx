@@ -26,6 +26,7 @@ from silica.models.adapter import (
     ModelConfig,
     StateDelta,
 )
+from silica.models.capabilities import ModelCapabilities
 from silica.models.qwen3_5 import Qwen3_5Adapter
 from silica.weights.resident import ResidentWeightProvider
 
@@ -186,6 +187,23 @@ def test_attention_pattern_length_matches_num_layers() -> None:
     adapter, _, _ = _make_adapter_and_kv()
     pattern = adapter.attention_pattern()
     assert len(pattern.per_layer) == adapter.config.num_layers
+
+
+# --- capabilities (D-016) ---
+
+
+def test_capabilities_carry_hybrid_deltanet_and_set_recurrent_state() -> None:
+    """Hybrid Qwen3.5 fake has 2 linear + 2 full layers; capabilities
+    must reflect HYBRID_DELTANET presence and has_recurrent_state=True."""
+    adapter, _, _ = _make_adapter_and_kv()
+    caps = adapter.capabilities()
+    assert isinstance(caps, ModelCapabilities)
+    assert AttentionKind.HYBRID_DELTANET in caps.attention_kinds
+    assert AttentionKind.GLOBAL in caps.attention_kinds
+    assert caps.has_recurrent_state is True
+    # MoE A3B variant will live in a separate adapter; the dense
+    # Qwen3.5 adapter declares has_moe=False.
+    assert caps.has_moe is False
 
 
 # --- tokenizer / build ---

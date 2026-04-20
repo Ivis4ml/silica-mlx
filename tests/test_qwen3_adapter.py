@@ -24,6 +24,7 @@ from silica.models.adapter import (
     ModelConfig,
     StateDelta,
 )
+from silica.models.capabilities import ModelCapabilities
 from silica.models.qwen3 import Qwen3Adapter
 from silica.weights.resident import ResidentWeightProvider
 
@@ -181,6 +182,18 @@ def test_attention_pattern_contains_no_hybrid_deltanet() -> None:
     kinds = set(adapter.attention_pattern().per_layer)
     assert AttentionKind.HYBRID_DELTANET not in kinds
     assert AttentionKind.RECURRENT not in kinds
+
+
+# --- capabilities (D-016) ---
+
+
+def test_capabilities_is_pure_global_no_recurrent_no_moe() -> None:
+    adapter, _, _ = _make_adapter_and_kv(n_layers=6)
+    caps = adapter.capabilities()
+    assert isinstance(caps, ModelCapabilities)
+    assert caps.attention_kinds == frozenset({AttentionKind.GLOBAL})
+    assert caps.has_recurrent_state is False
+    assert caps.has_moe is False
 
 
 # --- tokenizer / build ---

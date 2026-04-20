@@ -25,6 +25,10 @@ from silica.models.adapter import (
     ModelConfig,
     StateDelta,
 )
+from silica.models.capabilities import (
+    ModelCapabilities,
+    capabilities_from_attention_pattern,
+)
 
 # --- scripted fakes ---
 
@@ -79,6 +83,9 @@ class _ScriptedAdapter:
 
     def attention_pattern(self) -> AttentionPattern:
         return AttentionPattern(per_layer=(AttentionKind.GLOBAL,))
+
+    def capabilities(self) -> ModelCapabilities:
+        return capabilities_from_attention_pattern(self.attention_pattern())
 
     def tokenizer(self) -> _ScriptedTokenizer:
         return self._tokenizer

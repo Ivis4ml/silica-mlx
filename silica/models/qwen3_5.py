@@ -54,6 +54,10 @@ from silica.models.adapter import (
     StateDelta,
     Tokenizer,
 )
+from silica.models.capabilities import (
+    ModelCapabilities,
+    capabilities_from_attention_pattern,
+)
 from silica.weights.provider import WeightProvider
 
 
@@ -94,6 +98,13 @@ class Qwen3_5Adapter:
 
     def attention_pattern(self) -> AttentionPattern:
         return self._attention_pattern
+
+    def capabilities(self) -> ModelCapabilities:
+        # Qwen3.5 is hybrid DeltaNet + GQA; has_recurrent_state is True
+        # via ``HYBRID_DELTANET`` layers in the pattern. No MoE in the
+        # dense variants; the MoE-A3B variant lives in a separate adapter
+        # that will override ``has_moe=True`` when it lands in P-3.
+        return capabilities_from_attention_pattern(self._attention_pattern)
 
     def tokenizer(self) -> Tokenizer:
         return self._tokenizer  # type: ignore[no-any-return]

@@ -84,6 +84,17 @@ Qwen3 / Qwen3.5 split clean. A follow-up iteration — opened before P-3
 adapters land (Kimi / GLM / MiniMax / Mamba / MoE variants) — should
 adopt two more elements of vLLM's proven pattern:
 
+> **Superseded / refined by D-016 (2026-04-19).** Item 1 below
+> (``config.architectures[0]`` dispatch) is **rejected for P-3**: the
+> registry keeps ``model_type`` as its key; a rekeying happens only
+> if a real collision appears. Item 2 (``ModelCapabilities``) is
+> **accepted in a minimal form** — three fields only
+> (``attention_kinds`` / ``has_recurrent_state`` / ``has_moe``),
+> with additional capability bits gated on concrete P-5 / P-6 / P-7
+> consumers needing them. Canonical construction is the helper
+> ``capabilities_from_attention_pattern``. See PLAN.md §9 D-016 for
+> the authoritative description.
+
 1. **Dispatch key upgrade.** Prefer HF ``config.architectures[0]``
    (e.g. ``Qwen3ForCausalLM``, ``KimiLinearForCausalLM``,
    ``MambaForCausalLM``, ``Qwen3_5ForConditionalGeneration``) over the

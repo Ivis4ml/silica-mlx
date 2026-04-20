@@ -32,6 +32,10 @@ from silica.models.adapter import (
     ModelConfig,
     StateDelta,
 )
+from silica.models.capabilities import (
+    ModelCapabilities,
+    capabilities_from_attention_pattern,
+)
 from silica.scheduler.batcher import ContinuousBatcher, _PendingAdmit
 from silica.scheduler.budget import MemoryBudgeter
 
@@ -149,6 +153,9 @@ class _ScriptedAdapter:
     def attention_pattern(self) -> AttentionPattern:
         return self._pattern
 
+    def capabilities(self) -> ModelCapabilities:
+        return capabilities_from_attention_pattern(self._pattern)
+
     def tokenizer(self) -> _ScriptedTokenizer:
         return self._tokenizer
 
@@ -208,6 +215,42 @@ def test_capability_gate_error_names_phase_for_sliding() -> None:
     pattern = AttentionPattern(per_layer=(AttentionKind.SLIDING,))
     adapter = _ScriptedAdapter(n_layers=1, attention_pattern=pattern)
     with pytest.raises(NotImplementedError, match="Q-013"):
+        ContinuousBatcher(adapter)
+
+
+# --- D-016: capability gate reads ModelCapabilities, not attention_pattern ---
+
+
+def test_capability_gate_error_mentions_capabilities_for_deltanet() -> None:
+    """The D-016 gate reads adapter.capabilities(); the error message
+    must mention 'capabilities' and expose has_recurrent_state=True
+    for hybrid DeltaNet adapters."""
+    pattern = AttentionPattern(per_layer=(AttentionKind.HYBRID_DELTANET,))
+    adapter = _ScriptedAdapter(n_layers=1, attention_pattern=pattern)
+    with pytest.raises(NotImplementedError) as exc:
+        ContinuousBatcher(adapter)
+    msg = str(exc.value)
+    assert "capabilities" in msg
+    assert "has_recurrent_state=True" in msg
+
+
+def test_capability_gate_reads_has_moe_bit_via_capabilities() -> None:
+    """An adapter whose attention_kinds are pure GLOBAL but that
+    declares has_moe=True still fails the gate. This locks in the
+    capability-based branch rather than a pure pattern walk."""
+
+    class _MoEScriptedAdapter(_ScriptedAdapter):
+        def capabilities(self) -> ModelCapabilities:
+            base = capabilities_from_attention_pattern(self._pattern)
+            # Override has_moe to exercise the MoE branch of the gate.
+            return ModelCapabilities(
+                attention_kinds=base.attention_kinds,
+                has_recurrent_state=base.has_recurrent_state,
+                has_moe=True,
+            )
+
+    adapter = _MoEScriptedAdapter(n_layers=2)  # all-GLOBAL attention_pattern
+    with pytest.raises(NotImplementedError, match="has_moe=True"):
         ContinuousBatcher(adapter)
 
 
