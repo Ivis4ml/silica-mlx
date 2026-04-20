@@ -319,6 +319,76 @@ def test_prepare_cohort_falls_back_when_adapter_lacks_make_batch_cache() -> None
     assert all(isinstance(c, BatchKVCache) for c in cache)
 
 
+# --- P-3-C3b: hybrid prefix-cache guard + mid-run admission factory -----
+
+
+def test_hybrid_adapter_with_prefix_cache_raises_before_capability_gate() -> None:
+    """P-3-C3b: ``has_recurrent_state=True`` adapter + a non-None
+    prefix_cache is rejected at construction time with a specific
+    'DeltaNet is a running accumulation' error — not an AttributeError
+    surfacing later from inside ``_extract_and_insert_prefix`` on
+    ``ArraysCache.offset`` / ``.keys`` / ``.values``.
+
+    The guard sits BEFORE ``_enforce_capability_gate`` so the more
+    specific error surfaces first; the placement also stays stable
+    once C3c lifts the capability gate for hybrid adapters running
+    without a prefix cache.
+    """
+    pattern = AttentionPattern(per_layer=(AttentionKind.HYBRID_DELTANET,))
+    adapter = _ScriptedAdapter(n_layers=1, attention_pattern=pattern)
+    pc = RadixPrefixCache(
+        block_size=16, store=SyntheticPrefixBlockStore(block_size=16)
+    )
+    with pytest.raises(NotImplementedError) as exc:
+        ContinuousBatcher(adapter, prefix_cache=pc)
+    msg = str(exc.value)
+    assert "has_recurrent_state=True" in msg
+    assert "prefix_cache=None" in msg
+    assert "DeltaNet" in msg or "recurrent" in msg.lower()
+
+
+def test_non_hybrid_adapter_with_prefix_cache_still_constructs() -> None:
+    """Guard must fire only on ``has_recurrent_state=True``; pure-
+    GLOBAL adapters continue to accept a RadixPrefixCache for prefix
+    reuse. Regression guard for pre-C3b behaviour."""
+    adapter = _ScriptedAdapter(n_layers=2)  # pure GLOBAL attention_pattern
+    pc = RadixPrefixCache(
+        block_size=16, store=SyntheticPrefixBlockStore(block_size=16)
+    )
+    ContinuousBatcher(adapter, prefix_cache=pc)  # no raise
+
+
+def test_admit_miss_cohort_calls_adapter_make_batch_cache() -> None:
+    """P-3-C3b: mid-run admission's fresh prefill now routes through
+    ``adapter.make_batch_cache`` alongside the initial-cohort path
+    (C3a wired that into ``_prepare_cohort``). Before C3b this site
+    hardcoded ``[BatchKVCache(...) for _ in num_layers]``, which
+    would have produced the wrong shape for hybrid adapters once C3c
+    lifts the gate.
+
+    Scenario: initial cohort of 2 rows completes (max_tokens=1 on
+    both), then 2 more rows admit from the waiting queue, triggering
+    ``_admit_miss_cohort``. Expected: two ``make_batch_cache`` calls
+    with distinct ``left_padding`` vectors — one for the initial
+    cohort (prompt lengths 2, 3 → padding [1, 0]) and one for the
+    mid-run cohort (prompt lengths 5, 4 → padding [0, 1]).
+    """
+    adapter = _ScriptedAdapter(script=[1, 2])
+    b = ContinuousBatcher(adapter, max_batch_size=2)
+
+    b.add_request(0, [10, 11], _greedy(max_tokens=1))
+    b.add_request(1, [20, 21, 22], _greedy(max_tokens=1))
+    list(b.step())  # initial cohort prepared + both terminate
+
+    b.add_request(2, [30, 31, 32, 33, 34], _greedy(max_tokens=1))
+    b.add_request(3, [40, 41, 42, 43], _greedy(max_tokens=1))
+    list(b.step())  # reclaim + _admit_miss_cohort for rows 2, 3
+
+    assert len(adapter.make_batch_cache_calls) == 2
+    assert adapter.make_batch_cache_calls[0] == [1, 0]
+    assert adapter.make_batch_cache_calls[1] == [0, 1]
+
+
 # --- admission / cohort rules -----------------------------------------------
 
 

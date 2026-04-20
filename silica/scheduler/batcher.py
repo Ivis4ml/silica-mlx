@@ -136,6 +136,34 @@ class ContinuousBatcher:
             raise ValueError(
                 f"max_batch_size must be >= 1, got {max_batch_size}"
             )
+        # P-3-C3b: the prefix-cache extract path (``_extract_and_insert_prefix``
+        # + the seeded-admission path through the radix trie) assumes
+        # per-token K/V slicing on every layer's cache. DeltaNet
+        # recurrent state is a running accumulation over the full
+        # sequence; it cannot be sliced to an arbitrary block-aligned
+        # prefix (see ``docs/P3_DELTANET_SURVEY.md`` C-open-3). Reject
+        # the combination at construction time with a specific error
+        # rather than crashing deep inside ``_extract_and_insert_prefix``
+        # at an ``AttributeError`` on ``ArraysCache.offset`` / ``.keys``.
+        # The guard sits BEFORE ``_enforce_capability_gate`` so the more
+        # specific error surfaces first and the placement stays stable
+        # once C3c lifts the capability gate for hybrid adapters running
+        # without a prefix cache.
+        if prefix_cache is not None:
+            caps = adapter.capabilities()
+            if caps.has_recurrent_state:
+                raise NotImplementedError(
+                    "ContinuousBatcher does not support a RadixPrefixCache "
+                    "on adapters with has_recurrent_state=True "
+                    f"(attention_kinds="
+                    f"{sorted(k.value for k in caps.attention_kinds)!r}): "
+                    "DeltaNet / recurrent state is a running accumulation "
+                    "over the full sequence and cannot be sliced into "
+                    "block-aligned prefix K/V entries (see "
+                    "docs/P3_DELTANET_SURVEY.md C-open-3). Pass "
+                    "prefix_cache=None to run hybrid adapters under the "
+                    "miss-only admission path."
+                )
         self._enforce_capability_gate(adapter)
         self._adapter = adapter
         self._sampler = sampler or Sampler()
@@ -1128,10 +1156,15 @@ class ContinuousBatcher:
         k_prompt_lens = [len(r.prompt_ids) for r in admitted]
         k_max_len = max(k_prompt_lens)
         k_left_padding = [k_max_len - n for n in k_prompt_lens]
-        k_batch_cache = [
-            BatchKVCache(left_padding=k_left_padding)
-            for _ in range(num_layers)
-        ]
+        # P-3-C3b: mid-run admission now routes through the adapter's
+        # cache factory alongside the initial-cohort path (C3a wired
+        # that into ``_prepare_cohort``). For plain Qwen3 the fallback
+        # returns the same all-``BatchKVCache`` shape as the pre-C3b
+        # hardcoded list, so behaviour is bit-identical for currently
+        # batchable adapters; for hybrid adapters (once C3c lifts the
+        # gate) the factory produces the matching ``ArraysCache`` /
+        # ``BatchKVCache`` interleaving.
+        k_batch_cache = _make_batch_cache(self._adapter, k_left_padding)
 
         pad = self._pad_token_id()
         rows_2d: list[list[int]] = []
