@@ -41,6 +41,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Any
 
 import mlx.core as mx
 from mlx_lm.models.cache import BatchKVCache
@@ -141,7 +142,12 @@ class ContinuousBatcher:
         self._model = adapter.build(weight_provider or ResidentWeightProvider())
         self._max_batch_size = max_batch_size
         self._rows: list[_BatchRow] = []
-        self._batch_cache: list[BatchKVCache] | None = None
+        # As of P-3-C3a the cache list is adapter-produced and may be
+        # heterogeneous (ArraysCache for DeltaNet layers alongside
+        # BatchKVCache for global attention); use ``list[Any]`` so the
+        # type annotation tracks the hybrid reality. The gate still
+        # ensures only all-BatchKVCache lists reach here today.
+        self._batch_cache: list[Any] | None = None
         # Cohort-prep flag. First step() seals the pre-step cohort and
         # allocates the batched cache; subsequent add_request calls go
         # to the waiting queue instead of directly into self._rows
@@ -321,12 +327,23 @@ class ContinuousBatcher:
     # --- phase methods ---
 
     def _prepare_cohort(self) -> None:
-        """Seal the initial cohort; allocate BatchKVCache with per-row
+        """Seal the initial cohort; allocate per-layer cache with per-row
         left_padding.
 
         Rows with shorter prompts get more left padding so that, after
         the prefill forward, the ``offset[i] == T_max - left_padding[i]``
         equals each row's true prompt length.
+
+        As of P-3-C3a the per-layer cache list is produced by the
+        adapter's ``make_batch_cache(left_padding)`` method when it
+        exists, falling back to an all-``BatchKVCache`` list (which is
+        what the scheduler hardcoded pre-C3a). Letting the adapter
+        produce this list is what enables hybrid adapters like
+        ``Qwen3_5Adapter`` to interleave ``ArraysCache`` for DeltaNet
+        layers without the scheduler having to grow family-specific
+        logic. The capability gate still rejects non-GLOBAL adapters
+        at construction time in C3a, so in practice only the fallback
+        path and ``Qwen3Adapter.make_batch_cache`` execute today.
 
         After this runs, subsequent ``add_request`` calls go to the
         waiting queue (mid-run admission path, see Phase 2).
@@ -338,10 +355,7 @@ class ContinuousBatcher:
         left_padding = [
             max_prompt_len - len(r.prompt_ids) for r in self._rows
         ]
-        num_layers = self._adapter.config.num_layers
-        self._batch_cache = [
-            BatchKVCache(left_padding=left_padding) for _ in range(num_layers)
-        ]
+        self._batch_cache = _make_batch_cache(self._adapter, left_padding)
         for row in self._rows:
             row.state.transition(RequestStatus.PREFILL, reason="admit-cohort")
 
@@ -1299,3 +1313,31 @@ def _unsupported_kind_reason(kind: AttentionKind) -> str:
     if kind == AttentionKind.HYBRID:
         return "sliding/global hybrid needs the Q-013 probe first"
     return "unknown AttentionKind; no scheduler mapping defined"
+
+
+def _make_batch_cache(
+    adapter: ModelAdapter, left_padding: list[int]
+) -> list[Any]:
+    """Produce the per-layer batched cache list for ``_prepare_cohort``.
+
+    Prefers ``adapter.make_batch_cache(left_padding)`` (P-3-C3a) so
+    family adapters can inject their own per-layer cache type — hybrid
+    Qwen3.5 interleaves ``ArraysCache`` for DeltaNet layers with
+    ``BatchKVCache`` for global attention, whereas plain Qwen3 keeps a
+    homogeneous ``BatchKVCache`` list. The method is deliberately NOT
+    on the I-1 Protocol (see D-016 discussion for the "keep Protocol
+    lean" rule), so callers use ``getattr`` and fall back to the
+    pre-C3a hardcoded all-``BatchKVCache`` shape when the adapter does
+    not implement it. The fallback preserves bit-identical behaviour
+    for any adapter that passed the capability gate before C3a.
+    """
+    maker = getattr(adapter, "make_batch_cache", None)
+    if callable(maker):
+        caches: list[Any] = maker(left_padding)
+        return caches
+    # ``maker`` may be absent (no attribute) or explicitly set to
+    # ``None`` / a non-callable sentinel; all three route to fallback.
+    return [
+        BatchKVCache(left_padding=left_padding)
+        for _ in range(adapter.config.num_layers)
+    ]

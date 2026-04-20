@@ -142,6 +142,11 @@ class _ScriptedAdapter:
             head_dim=_ScriptedModel.HEAD_DIM,
             dtype=mx.float16,
         )
+        # P-3-C3a: record make_batch_cache invocations so a test can
+        # assert the batcher's _prepare_cohort actually calls back into
+        # the adapter factory rather than reverting to a hardcoded
+        # BatchKVCache list.
+        self.make_batch_cache_calls: list[list[int]] = []
 
     # ModelAdapter Protocol surface
     def build(self, weight_provider: Any) -> Any:
@@ -155,6 +160,15 @@ class _ScriptedAdapter:
 
     def capabilities(self) -> ModelCapabilities:
         return capabilities_from_attention_pattern(self._pattern)
+
+    def make_batch_cache(self, left_padding: list[int]) -> list[Any]:
+        from mlx_lm.models.cache import BatchKVCache
+
+        self.make_batch_cache_calls.append(list(left_padding))
+        return [
+            BatchKVCache(left_padding=left_padding)
+            for _ in range(self._n_layers)
+        ]
 
     def tokenizer(self) -> _ScriptedTokenizer:
         return self._tokenizer
@@ -252,6 +266,57 @@ def test_capability_gate_reads_has_moe_bit_via_capabilities() -> None:
     adapter = _MoEScriptedAdapter(n_layers=2)  # all-GLOBAL attention_pattern
     with pytest.raises(NotImplementedError, match="has_moe=True"):
         ContinuousBatcher(adapter)
+
+
+# --- P-3-C3a: _prepare_cohort uses adapter.make_batch_cache --------------
+
+
+def test_prepare_cohort_calls_adapter_make_batch_cache_with_left_padding() -> None:
+    """P-3-C3a moved the per-layer cache construction out of the
+    batcher and into ``adapter.make_batch_cache(left_padding)``. Before
+    the first ``step()`` the adapter factory has not been called; after
+    one step the factory has been called exactly once with the per-row
+    left-padding vector derived from the cohort's prompt lengths.
+
+    Scalar-target script ``[1]`` broadcasts to both rows so this test
+    can use ``max_batch_size=2`` without needing per-row script tuples
+    — the per-row targets path is exercised elsewhere.
+    """
+    adapter = _ScriptedAdapter(script=[1])
+    b = ContinuousBatcher(adapter, max_batch_size=2)
+    # Two rows with different prompt lengths (3 and 2). The longest is
+    # 3, so left_padding == [3-3, 3-2] == [0, 1].
+    b.add_request(0, [10, 11, 12], _greedy(max_tokens=1))
+    b.add_request(1, [20, 21], _greedy(max_tokens=1))
+    assert adapter.make_batch_cache_calls == []
+
+    list(b.step())
+    assert adapter.make_batch_cache_calls == [[0, 1]]
+
+
+def test_prepare_cohort_falls_back_when_adapter_lacks_make_batch_cache() -> None:
+    """If an adapter does not implement ``make_batch_cache``, the
+    batcher's ``_make_batch_cache`` helper falls back to an
+    all-``BatchKVCache`` list — the pre-C3a behaviour. Preserving the
+    fallback is invariant: any adapter that used to pass the capability
+    gate still works bit-identically without implementing the new
+    method."""
+    from mlx_lm.models.cache import BatchKVCache
+
+    class _AdapterWithoutMaker(_ScriptedAdapter):
+        # ``getattr(adapter, "make_batch_cache", None)`` returns None
+        # here, which routes through the helper's fallback branch.
+        make_batch_cache = None  # type: ignore[assignment]
+
+    adapter = _AdapterWithoutMaker(script=[(1,)])
+    b = ContinuousBatcher(adapter, max_batch_size=1)
+    b.add_request(0, [10, 11], _greedy(max_tokens=1))
+    list(b.step())
+    # Cohort was sealed — batch cache was produced via fallback.
+    cache = b._batch_cache  # type: ignore[attr-defined]
+    assert cache is not None
+    assert len(cache) == adapter.config.num_layers
+    assert all(isinstance(c, BatchKVCache) for c in cache)
 
 
 # --- admission / cohort rules -----------------------------------------------

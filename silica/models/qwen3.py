@@ -98,6 +98,24 @@ class Qwen3Adapter:
         # The helper reduces self._attention_pattern to the typed summary.
         return capabilities_from_attention_pattern(self._attention_pattern)
 
+    def make_batch_cache(self, left_padding: list[int]) -> list[Any]:
+        """Build a per-layer batched cache list for the ContinuousBatcher.
+
+        Plain Qwen3 is pure GQA attention, so every layer uses mlx-lm's
+        ``BatchKVCache`` with the shared ``left_padding`` — this matches
+        the pre-C3a hardcoded behaviour of ``_prepare_cohort``. Returning
+        the list from the adapter (instead of the scheduler hardcoding
+        it) is what lets hybrid adapters (P-3-C3a) interleave
+        ``ArraysCache`` for DeltaNet layers without the scheduler having
+        to grow family-specific logic.
+        """
+        from mlx_lm.models.cache import BatchKVCache
+
+        return [
+            BatchKVCache(left_padding=left_padding)
+            for _ in range(self.config.num_layers)
+        ]
+
     def tokenizer(self) -> Tokenizer:
         return self._tokenizer  # type: ignore[no-any-return]
 

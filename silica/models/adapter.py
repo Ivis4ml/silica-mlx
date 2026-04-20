@@ -249,3 +249,20 @@ class StubModelAdapter:
         from silica.models.capabilities import capabilities_from_attention_pattern
 
         return capabilities_from_attention_pattern(self._pattern)
+
+    def make_batch_cache(self, left_padding: list[int]) -> list[Any]:
+        """Build a per-layer batched cache list (P-3-C3a).
+
+        The stub has no real forward so the list is never consumed in
+        anger, but it must match the scheduler's expectation: one
+        ``BatchKVCache`` per layer with the shared ``left_padding``.
+        Real adapters override to express family-specific shapes (e.g.
+        ``Qwen3_5Adapter`` returns a hybrid ArraysCache / BatchKVCache
+        list).
+        """
+        from mlx_lm.models.cache import BatchKVCache
+
+        return [
+            BatchKVCache(left_padding=left_padding)
+            for _ in range(self.config.num_layers)
+        ]

@@ -196,6 +196,20 @@ def test_capabilities_is_pure_global_no_recurrent_no_moe() -> None:
     assert caps.has_moe is False
 
 
+# --- make_batch_cache (P-3-C3a) ---
+
+
+def test_make_batch_cache_returns_all_batch_kv_cache() -> None:
+    """Plain Qwen3 is pure GQA — every layer is a BatchKVCache with the
+    shared left_padding. Length matches ``config.num_layers``."""
+    from mlx_lm.models.cache import BatchKVCache
+
+    adapter, _, _ = _make_adapter_and_kv(n_layers=6)
+    caches = adapter.make_batch_cache(left_padding=[0, 1, 2])
+    assert len(caches) == adapter.config.num_layers == 6
+    assert all(isinstance(c, BatchKVCache) for c in caches)
+
+
 # --- tokenizer / build ---
 
 

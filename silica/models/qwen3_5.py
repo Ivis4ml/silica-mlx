@@ -106,6 +106,36 @@ class Qwen3_5Adapter:
         # that will override ``has_moe=True`` when it lands in P-3.
         return capabilities_from_attention_pattern(self._attention_pattern)
 
+    def make_batch_cache(self, left_padding: list[int]) -> list[Any]:
+        """Build a hybrid per-layer batched cache list (P-3-C3a).
+
+        DeltaNet layers (``layer.is_linear == True``) get
+        ``ArraysCache(size=2)`` — the same shape mlx-lm's
+        ``Model.make_cache`` returns for single-request, but with
+        ``left_padding`` so ``make_mask`` can align the SSM mask across
+        variable-length rows. Global attention layers get the usual
+        ``BatchKVCache``.
+
+        The gate in ``ContinuousBatcher._enforce_capability_gate`` still
+        rejects ``HYBRID_DELTANET`` adapters as of C3a, so this method
+        is reachable only once P-3-C3c lifts the gate. Writing it now
+        gives C3b (wiring ``ArraysCache.filter`` / ``.extend`` into the
+        batcher's reclaim and admit paths) a stable factory to call
+        against.
+        """
+        from mlx_lm.models.cache import ArraysCache, BatchKVCache
+
+        layers = self._model.layers
+        caches: list[Any] = []
+        for layer in layers:
+            if getattr(layer, "is_linear", False):
+                caches.append(
+                    ArraysCache(size=2, left_padding=left_padding)
+                )
+            else:
+                caches.append(BatchKVCache(left_padding=left_padding))
+        return caches
+
     def tokenizer(self) -> Tokenizer:
         return self._tokenizer  # type: ignore[no-any-return]
 

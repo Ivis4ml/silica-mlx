@@ -123,3 +123,19 @@ def test_build_accepts_a_weight_provider(adapter: StubModelAdapter) -> None:
     # Stub tolerates any WeightProvider, returns a sentinel module.
     module = adapter.build(ResidentWeightProvider())
     assert module is not None
+
+
+# --- make_batch_cache (P-3-C3a) ---
+
+
+def test_stub_make_batch_cache_returns_all_batch_kv_cache(
+    adapter: StubModelAdapter,
+) -> None:
+    """Stub has no real forward; ``make_batch_cache`` still matches the
+    scheduler's shape expectation — one ``BatchKVCache`` per layer with
+    the shared ``left_padding``."""
+    from mlx_lm.models.cache import BatchKVCache
+
+    caches = adapter.make_batch_cache(left_padding=[0, 1, 2])
+    assert len(caches) == adapter.config.num_layers
+    assert all(isinstance(c, BatchKVCache) for c in caches)

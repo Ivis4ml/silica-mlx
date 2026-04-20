@@ -383,6 +383,38 @@ def test_recurrent_state_bytes_defensive_against_shorter_cache_list() -> None:
     assert bytes_seen > 0
 
 
+# --- make_batch_cache (P-3-C3a) ---
+
+
+def test_make_batch_cache_returns_hybrid_list() -> None:
+    """Hybrid Qwen3.5 interleaves ArraysCache for linear layers with
+    BatchKVCache for global-attention layers. The returned list length
+    matches num_layers and the type at each index matches is_linear."""
+    from mlx_lm.models.cache import ArraysCache, BatchKVCache
+
+    adapter, _, model = _make_adapter_and_kv()
+    caches = adapter.make_batch_cache(left_padding=[0, 1])
+    assert len(caches) == adapter.config.num_layers
+    for layer, cache in zip(model.layers, caches, strict=True):
+        if layer.is_linear:
+            assert isinstance(cache, ArraysCache)
+        else:
+            assert isinstance(cache, BatchKVCache)
+
+
+def test_make_batch_cache_first_two_are_arrays_last_two_are_kv() -> None:
+    """Concrete layout check against the fake's
+    ``n_linear=2, n_full=2`` construction order."""
+    from mlx_lm.models.cache import ArraysCache, BatchKVCache
+
+    adapter, _, _ = _make_adapter_and_kv()
+    caches = adapter.make_batch_cache(left_padding=[0])
+    assert isinstance(caches[0], ArraysCache)
+    assert isinstance(caches[1], ArraysCache)
+    assert isinstance(caches[2], BatchKVCache)
+    assert isinstance(caches[3], BatchKVCache)
+
+
 # --- tokenizer / build ---
 
 
