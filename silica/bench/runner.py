@@ -586,13 +586,30 @@ def _collect_bgt1_batched_tokens(
     to a structured ``bgt1_batched_*`` failure before the oracle
     runs — keeping the "the scheduler misbehaved" signal distinct
     from "per-row tokens diverged".
+
+    P-4.5-B.1 opt-out: the BGT1 oracle compares Silica's B>1 batched
+    tokens against a direct mlx-lm ``B=N`` reference
+    (``_direct_mlx_lm_batched_reference``) run over the unsplit
+    cohort. The default ``length_spread_threshold=2.0`` would split
+    heterogeneous-length BGT1 scenarios (e.g. the catalog's
+    ``qwen3-0.6b-bgt1-parity`` on prompts ``("Hello", "The capital
+    of Japan is")`` with tokenized lengths ``[1, 5]``, ratio ``5.0 >
+    2.0``) into ``B=1 + B=1``, which is not what the reference
+    exercises. Pin ``float('inf')`` so the oracle continues to
+    compare like-for-like. The SMOKE B>1 path
+    (``_collect_smoke_batched_tokens``) intentionally does NOT opt
+    out — its Q-010 scenario is what the admission reorder is there
+    to fix.
     """
     expected_rows = set(range(len(prompts)))
     tokens: dict[int, list[int]] = {row: [] for row in expected_rows}
     done_rows: set[int] = set()
 
     for event in engine.generate_batch(
-        prompts, params, max_batch_size=max_batch_size
+        prompts,
+        params,
+        max_batch_size=max_batch_size,
+        length_spread_threshold=float("inf"),
     ):
         if event.req_index not in expected_rows:
             raise RuntimeError(

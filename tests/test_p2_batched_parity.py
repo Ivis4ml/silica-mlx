@@ -213,8 +213,23 @@ def test_left_padding_does_not_corrupt_any_row() -> None:
     pad_id = 0
     padded = [[pad_id] * (max_len - len(x)) + list(x) for x in ids]
 
-    # Silica path
-    events = list(Engine(adapter, kv).generate_batch(prompts, params))
+    # Silica path. This test asserts that Silica's left-padded B=2
+    # prefill matches a direct mlx-lm B=2 reference with the same
+    # left_padding. P-4.5-B.1's default admission-reorder would split
+    # the heterogeneous batch (Hi vs "The capital..." tokenize to
+    # [1, 5]) into B=1 pre-step + B=1 mid-run admit, bypassing the
+    # unsplit B=2 codepath this test exists to exercise. Opt out of
+    # the split explicitly so the test's stated claim ("left-padding
+    # construction matches mlx-lm") keeps testing that claim. A
+    # future fp16 batch-composition drift between split and unsplit
+    # paths must be caught by the dedicated P-4.5-B.1 admission-
+    # reorder tests, not silently flip this assertion from true to
+    # false (or vice versa).
+    events = list(
+        Engine(adapter, kv).generate_batch(
+            prompts, params, length_spread_threshold=float("inf")
+        )
+    )
     silica: dict[int, list[int]] = {0: [], 1: []}
     for e in events:
         if e.kind == "token" and e.token_id is not None:

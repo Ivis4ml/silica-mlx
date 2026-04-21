@@ -40,6 +40,7 @@ Metrics populated per ``generate`` call:
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Iterator, Sequence
 
@@ -188,6 +189,7 @@ class Engine:
         *,
         max_batch_size: int | None = None,
         prefix_cache: RadixPrefixCache | None = None,
+        length_spread_threshold: float = 2.0,
     ) -> Iterator[BatchEvent]:
         """Yield ``BatchEvent`` values driving ``ContinuousBatcher``.
 
@@ -197,6 +199,12 @@ class Engine:
         cohort, the rest sit in the waiting queue, and the admit
         phase drains the backlog as slots free via reclaim. Mid-run
         admission uses ``BatchKVCache.extend``.
+
+        As of P-4.5-B.1 (Q-010 fix), ``generate_batch`` also reorders
+        admissions by prompt length when the batch is heterogeneous
+        enough to stall short-row TTFT behind long-row prefill. See
+        ``length_spread_threshold`` below and
+        ``docs/P4_5_CHUNKED_PREFILL_OPENING.md``.
 
         Args:
             prompts: one or more prompts. Empty strings are skipped
@@ -217,10 +225,22 @@ class Engine:
                 caller so the cache can persist across multiple
                 ``generate_batch`` invocations. When ``None`` (default),
                 behaviour is bit-identical to 16c.1 (invariant S-6 of
-                the step-4 skeleton). As of sub-commit 1 this is a
-                pure pass-through — admission and reclaim do not yet
-                use the cache; that wiring ships in sub-commits 2
-                and 3.
+                the step-4 skeleton).
+            length_spread_threshold: P-4.5-B.1 Q-010 fairness fix.
+                When ``max(prompt_lens) / min(prompt_lens) >``
+                threshold, admissions sort by length ASC and only
+                the leading short-prompt cluster admits pre-step;
+                the remainder queues and drains through the existing
+                mid-run admission path. Default ``2.0`` fixes the
+                measured TTFT defect for heterogeneous batches.
+                Pass ``float('inf')`` to disable the split (needed by
+                strict-parity tests that compare Silica against a
+                direct mlx-lm ``B=N`` reference run over the same
+                unsplit cohort — the P-2 ``test_left_padding_does_not_corrupt_any_row``
+                case and the bench harness BGT1 parity path).
+                ``req_index`` remains the original user-supplied
+                index on every event, independent of the admission
+                reorder.
 
         Empty ``prompts`` iterable yields nothing.
         """
@@ -245,23 +265,57 @@ class Engine:
                 f"max_batch_size must be >= 1, got {max_batch_size}"
             )
 
+        # P-4.5-B.1 Q-010: reorder admissions so heterogeneous batches
+        # do not stall short-row TTFT. ``_sort_admissions_by_length`` is
+        # a stable sort; ``_initial_cohort_cap`` is a pure function
+        # whose spec (and reverse-example pins) lives in the opening
+        # doc §6.1. The ``length_spread_threshold > 1.0`` precondition
+        # raises inside ``_initial_cohort_cap``; we catch the violation
+        # before any batcher construction.
+        #
+        # Reorder policy: the sort itself changes the ``BatchEvent``
+        # emission order (event ``req_index`` stays stable on the
+        # tuple, but the row index in ``_rows`` differs, which in
+        # turn changes the order of per-step emit). A caller who
+        # passes ``length_spread_threshold=float('inf')`` — the
+        # documented opt-out for strict-parity tests — expects
+        # pre-P-4.5 behaviour, not just "no split but different event
+        # order". Same for homogeneous batches where
+        # ``max_len / min_len <= threshold`` does not warrant a
+        # split. We therefore only switch to the sorted ordering
+        # when the split path actually fires. The cap helper is
+        # still called in both branches so the threshold / NaN
+        # preconditions surface at the same entry point.
+        admissions_sorted = _sort_admissions_by_length(admissions)
+        cap = _initial_cohort_cap(
+            admissions_sorted, effective_batch_size, length_spread_threshold
+        )
+        lens = [len(ids) for _, ids in admissions]
+        needs_reorder = (
+            len(admissions) > 1
+            and min(lens) > 0
+            and max(lens) / min(lens) > length_spread_threshold
+        )
+        admissions_ordered = admissions_sorted if needs_reorder else list(admissions)
+        pre_step = admissions_ordered[:cap]
+        remainder = admissions_ordered[cap:]
+
         batcher = ContinuousBatcher(
             self._adapter,
             sampler=self._sampler,
             max_batch_size=effective_batch_size,
             prefix_cache=prefix_cache,
         )
-        # First ``effective_batch_size`` admits go pre-step (direct
-        # append); the remainder queue for mid-run admission. The
-        # split matches what ``ContinuousBatcher.add_request`` does
-        # based on the ``_cohort_prepared`` flag, but we drive it
-        # explicitly here so the initial cohort is deterministic.
-        for i, (req_index, prompt_ids) in enumerate(admissions):
-            if i < effective_batch_size:
-                batcher.add_request(req_index, prompt_ids, effective)
+        # Pre-step admits seal the initial cohort. ``req_index`` on each
+        # tuple is the ORIGINAL user-supplied index (unchanged by the
+        # sort — the sort reorders the admission-order only). The
+        # batcher stores ``req_index`` on each ``_BatchRow`` and emits
+        # it unchanged in every ``BatchEvent``, so downstream callers
+        # still see events tagged with the original index.
+        for req_index, prompt_ids in pre_step:
+            batcher.add_request(req_index, prompt_ids, effective)
         # Remaining prompts: prepare cohort via a bootstrap step so
         # subsequent add_request calls route to the waiting queue.
-        remainder = admissions[effective_batch_size:]
         if remainder:
             # The first step() call seals the pre-step cohort; we peel
             # one step's events out for the caller and then queue the
@@ -280,6 +334,91 @@ class Engine:
         while batcher.has_work():
             for event in batcher.step():
                 yield event
+
+
+def _sort_admissions_by_length(
+    admissions: Sequence[tuple[int, list[int]]],
+) -> list[tuple[int, list[int]]]:
+    """Sort admissions by prompt-token length ASC, stably.
+
+    Python's ``list.sort`` is stable, so ties preserve the user's
+    original order. ``req_index`` stays on its tuple — the original
+    user-facing index the event stream must emit — and only the
+    *admission order* (which prompts go pre-step vs queue) changes.
+    P-4.5-B.1 / `docs/P4_5_CHUNKED_PREFILL_OPENING.md` §6.1.
+    """
+    return sorted(admissions, key=lambda a: len(a[1]))
+
+
+def _initial_cohort_cap(
+    admissions_sorted: Sequence[tuple[int, list[int]]],
+    effective_batch_size: int,
+    spread_ratio_threshold: float,
+) -> int:
+    """How many leading (shortest) admissions go into the initial cohort.
+
+    P-4.5-B.1 / `docs/P4_5_CHUNKED_PREFILL_OPENING.md` §6.1 spec.
+
+    Preconditions enforced at call time:
+      - ``admissions_sorted`` is length-ASC (caller's responsibility;
+        we don't re-sort defensively since this is hot-path
+        adjacent and the upstream is a known ``_sort_admissions_by_length``).
+      - ``effective_batch_size >= 1``.
+      - ``spread_ratio_threshold > 1.0`` — a threshold of exactly 1.0
+        would require strict equality of lengths to avoid splitting,
+        i.e. an always-split policy on any variation; rejected
+        explicitly so callers cannot stumble into it. ``float('inf')``
+        is a legal opt-out sentinel (never splits).
+
+    Homogeneous fast path: if there is at most one admission or the
+    length-spread ratio ``max_len / min_len`` is ``<=`` threshold,
+    return ``min(effective_batch_size, len(admissions_sorted))`` —
+    current pre-P-4.5 behaviour.
+
+    Split path: find the smallest index ``k`` such that
+    ``admissions_sorted[k].len > threshold * admissions_sorted[0].len``
+    and return ``cap = max(1, min(effective_batch_size, k))``. The
+    ``min(effective_batch_size, ...)`` ceiling is the hard invariant
+    that the runtime respects ``max_batch_size``; the ``max(1, ...)``
+    floor handles the pathological zero-index case defensively.
+    """
+    if effective_batch_size < 1:
+        raise ValueError(
+            f"effective_batch_size must be >= 1, got {effective_batch_size}"
+        )
+    # NaN comparisons always return False, so ``NaN <= 1.0`` slips
+    # past the threshold precondition below and later ``len(ids) >
+    # NaN * min_len`` is also False, which silently disables the
+    # split — the exact shape of ``float('inf')`` but without the
+    # caller's consent. Reject NaN explicitly so a caller who
+    # accidentally passes one gets a clear error rather than a
+    # silently-degraded fairness guarantee.
+    if math.isnan(spread_ratio_threshold):
+        raise ValueError(
+            "length_spread_threshold must not be NaN (use float('inf') "
+            "to disable the split)"
+        )
+    if spread_ratio_threshold <= 1.0:
+        raise ValueError(
+            f"length_spread_threshold must be > 1.0 (use float('inf') "
+            f"to disable the split), got {spread_ratio_threshold}"
+        )
+    n = len(admissions_sorted)
+    if n <= 1:
+        return min(effective_batch_size, n)
+    min_len = len(admissions_sorted[0][1])
+    max_len = len(admissions_sorted[-1][1])
+    # min_len is >= 1 because upstream filters empty prompts, but
+    # guard against future callers that skip that filter.
+    if min_len <= 0 or max_len / min_len <= spread_ratio_threshold:
+        return min(effective_batch_size, n)
+    # Split: find the first index whose prompt exceeds the threshold.
+    threshold_abs = spread_ratio_threshold * min_len
+    first_exceeding = next(
+        (k for k, (_, ids) in enumerate(admissions_sorted) if len(ids) > threshold_abs),
+        n,
+    )
+    return max(1, min(effective_batch_size, first_exceeding))
 
 
 def _resolve_batch_params(

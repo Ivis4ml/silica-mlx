@@ -129,7 +129,16 @@ class _FakeEngine:
         *,
         max_batch_size: int | None = None,
         prefix_cache: Any = None,
+        length_spread_threshold: float = 2.0,
     ) -> Iterator[BatchEvent]:
+        # ``length_spread_threshold`` is accepted but ignored by the
+        # fake engine: the bench harness passes ``float('inf')`` on
+        # the BGT1 parity path (P-4.5-B.1 opt-out, see
+        # ``silica/bench/runner.py::_collect_bgt1_batched_tokens``),
+        # and this test's fakes script events directly without going
+        # through the admission-reorder code path. Accept the kwarg
+        # so the runner's call signature matches what the real
+        # Engine exposes; ignore it in the body.
         if self._batched_events is not None:
             yield from self._batched_events
             return
