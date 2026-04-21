@@ -52,6 +52,7 @@ from silica.bench import (
     Workload,
     hf_cache_path_for_repo,
 )
+from silica.core.events import BatchEvent
 from silica.core.profiler import MetricsRegistry
 
 # ---------- fakes ------------------------------------------------------
@@ -84,7 +85,14 @@ class _FakeAdapter:
 
 
 class _FakeEngine:
-    """Stand-in for :class:`silica.engine.Engine` — just yields pre-programmed tokens."""
+    """Stand-in for :class:`silica.engine.Engine` — yields pre-programmed tokens.
+
+    ``generate`` drives single-request scenarios. ``generate_batch``
+    drives the B=1 parity path: by default it echoes the same token
+    stream as ``generate`` followed by a ``done`` event (happy-path
+    parity), but ``batched_events`` can override the stream so tests
+    can exercise abort / unexpected-req_index failure modes.
+    """
 
     def __init__(
         self,
@@ -92,9 +100,13 @@ class _FakeEngine:
         *,
         metrics: dict[str, float | int] | None = None,
         raise_on_generate: Exception | None = None,
+        batched_events: list[BatchEvent] | None = None,
     ) -> None:
         self._tokens = list(tokens)
         self._raise = raise_on_generate
+        self._batched_events = (
+            list(batched_events) if batched_events is not None else None
+        )
         self.metrics = MetricsRegistry()
         for name, value in (metrics or {}).items():
             self.metrics.set_metric(name, value)
@@ -103,6 +115,21 @@ class _FakeEngine:
         if self._raise is not None:
             raise self._raise
         yield from self._tokens
+
+    def generate_batch(
+        self,
+        prompts: Any,
+        params: Any,
+        *,
+        max_batch_size: int | None = None,
+        prefix_cache: Any = None,
+    ) -> Iterator[BatchEvent]:
+        if self._batched_events is not None:
+            yield from self._batched_events
+            return
+        for tok in self._tokens:
+            yield BatchEvent.token(req_index=0, token_id=tok)
+        yield BatchEvent.done(req_index=0, reason="max_tokens")
 
 
 def _factory_returning(
@@ -395,7 +422,9 @@ def test_unknown_oracle_kind_raises_via_runner(fake_home_cache: Path) -> None:
     """A scenario naming a not-yet-implemented oracle surfaces the
     NotImplementedError via ScenarioResult.reason rather than crashing
     the runner (which would take down subsequent scenarios in the
-    same run)."""
+    same run). Uses BGT1_DIRECT_BATCHED_REFERENCE because its
+    implementation lands in P-4.2c; earlier oracle kinds that used
+    to be stubs are now implemented."""
     repo = "test-owner/unknown-oracle"
     _create_cache_dir(repo)
 
@@ -404,6 +433,112 @@ def test_unknown_oracle_kind_raises_via_runner(fake_home_cache: Path) -> None:
 
     scenario = _scenario(
         scenario_id="unknown-oracle",
+        repo=repo,
+        oracle=OracleKind.BGT1_DIRECT_BATCHED_REFERENCE,
+    )
+    runner = BenchRunner(
+        engine_factory=_factory_returning(adapter, engine),
+        reset_peak=lambda: None,
+        read_peak_mb=lambda: None,
+    )
+    [result] = runner.run([scenario])
+
+    assert result.status == "failed"
+    assert result.reason is not None
+    assert "NotImplementedError" in result.reason
+    assert "P-4.2c" in result.reason
+
+
+# ---------- B1 parity oracle / runner branch --------------------------
+
+
+def test_b1_parity_happy_path(fake_home_cache: Path) -> None:
+    """Single reference and B=1 batched emit identical token streams;
+    runner collects batched tokens, oracle sees matching reference
+    via context['reference_tokens'], returns ok."""
+    repo = "test-owner/b1-happy"
+    _create_cache_dir(repo)
+
+    adapter = _FakeAdapter(vocab_size=100)
+    # Default generate_batch echoes the single-request tokens, so
+    # batch and reference match by construction.
+    engine = _FakeEngine([10, 20, 30])
+    scenario = _scenario(
+        scenario_id="b1-happy",
+        repo=repo,
+        oracle=OracleKind.B1_PARITY_VS_SINGLE,
+    )
+    runner = BenchRunner(
+        engine_factory=_factory_returning(adapter, engine),
+        reset_peak=lambda: None,
+        read_peak_mb=lambda: None,
+    )
+    [result] = runner.run([scenario])
+
+    assert result.status == "ok"
+    assert result.reason is None
+    assert result.total_tokens == 3
+    assert result.metadata["reference_len"] == 3
+    assert result.metadata["batch_len"] == 3
+    assert result.metadata["first_mismatch_index"] == -1
+
+
+def test_b1_parity_mismatch_reports_index(fake_home_cache: Path) -> None:
+    """Single [1,2,3], batched [1,9,3]: oracle returns failed with
+    first_mismatch_index=1 and both stream tokens in metadata."""
+    repo = "test-owner/b1-mismatch"
+    _create_cache_dir(repo)
+
+    adapter = _FakeAdapter(vocab_size=100)
+    engine = _FakeEngine(
+        [1, 2, 3],
+        batched_events=[
+            BatchEvent.token(req_index=0, token_id=1),
+            BatchEvent.token(req_index=0, token_id=9),
+            BatchEvent.token(req_index=0, token_id=3),
+            BatchEvent.done(req_index=0, reason="max_tokens"),
+        ],
+    )
+    scenario = _scenario(
+        scenario_id="b1-mismatch",
+        repo=repo,
+        oracle=OracleKind.B1_PARITY_VS_SINGLE,
+    )
+    runner = BenchRunner(
+        engine_factory=_factory_returning(adapter, engine),
+        reset_peak=lambda: None,
+        read_peak_mb=lambda: None,
+    )
+    [result] = runner.run([scenario])
+
+    assert result.status == "failed"
+    assert result.reason == "b1_parity_first_mismatch_index:1"
+    assert result.metadata["first_mismatch_index"] == 1
+    assert result.metadata["reference_len"] == 3
+    assert result.metadata["batch_len"] == 3
+    assert result.metadata["reference_token_at_mismatch"] == 2
+    assert result.metadata["batch_token_at_mismatch"] == 9
+
+
+def test_b1_parity_length_mismatch(fake_home_cache: Path) -> None:
+    """Single stream is a strict prefix of batched: oracle reports
+    length mismatch with first_mismatch_index set to the common
+    prefix length (no tokens differ within the overlap)."""
+    repo = "test-owner/b1-length"
+    _create_cache_dir(repo)
+
+    adapter = _FakeAdapter(vocab_size=100)
+    engine = _FakeEngine(
+        [1, 2],
+        batched_events=[
+            BatchEvent.token(req_index=0, token_id=1),
+            BatchEvent.token(req_index=0, token_id=2),
+            BatchEvent.token(req_index=0, token_id=3),
+            BatchEvent.done(req_index=0, reason="max_tokens"),
+        ],
+    )
+    scenario = _scenario(
+        scenario_id="b1-length",
         repo=repo,
         oracle=OracleKind.B1_PARITY_VS_SINGLE,
     )
@@ -416,8 +551,81 @@ def test_unknown_oracle_kind_raises_via_runner(fake_home_cache: Path) -> None:
 
     assert result.status == "failed"
     assert result.reason is not None
-    assert "NotImplementedError" in result.reason
-    assert "P-4.2" in result.reason
+    assert result.reason.startswith("b1_parity_length_mismatch:")
+    assert result.metadata["reference_len"] == 2
+    assert result.metadata["batch_len"] == 3
+    assert result.metadata["first_mismatch_index"] == 2
+
+
+def test_b1_parity_batched_aborted_fails_before_oracle(
+    fake_home_cache: Path,
+) -> None:
+    """An ``aborted`` event in the batched stream must surface as a
+    runner failure with a ``b1_batched_aborted:`` reason, NOT as an
+    oracle mismatch. The user needs to know the scheduler misbehaved,
+    not that the tokens disagreed."""
+    repo = "test-owner/b1-aborted"
+    _create_cache_dir(repo)
+
+    adapter = _FakeAdapter(vocab_size=100)
+    engine = _FakeEngine(
+        [1, 2],
+        batched_events=[
+            BatchEvent.token(req_index=0, token_id=1),
+            BatchEvent.aborted(req_index=0, reason="budget-exhausted"),
+        ],
+    )
+    scenario = _scenario(
+        scenario_id="b1-aborted",
+        repo=repo,
+        oracle=OracleKind.B1_PARITY_VS_SINGLE,
+    )
+    runner = BenchRunner(
+        engine_factory=_factory_returning(adapter, engine),
+        reset_peak=lambda: None,
+        read_peak_mb=lambda: None,
+    )
+    [result] = runner.run([scenario])
+
+    assert result.status == "failed"
+    assert result.reason is not None
+    assert "b1_batched_aborted:budget-exhausted" in result.reason
+    # Oracle never ran, so parity-specific metadata absent.
+    assert "first_mismatch_index" not in result.metadata
+
+
+def test_b1_parity_batched_unexpected_req_index_fails_before_oracle(
+    fake_home_cache: Path,
+) -> None:
+    """An event with req_index != 0 in a B=1 stream is a scheduler
+    fault (the only admitted request is row 0). Runner surfaces this
+    as a structured failure before calling the oracle."""
+    repo = "test-owner/b1-bad-req-index"
+    _create_cache_dir(repo)
+
+    adapter = _FakeAdapter(vocab_size=100)
+    engine = _FakeEngine(
+        [1, 2],
+        batched_events=[
+            BatchEvent.token(req_index=0, token_id=1),
+            BatchEvent.token(req_index=1, token_id=2),
+        ],
+    )
+    scenario = _scenario(
+        scenario_id="b1-bad-req-index",
+        repo=repo,
+        oracle=OracleKind.B1_PARITY_VS_SINGLE,
+    )
+    runner = BenchRunner(
+        engine_factory=_factory_returning(adapter, engine),
+        reset_peak=lambda: None,
+        read_peak_mb=lambda: None,
+    )
+    [result] = runner.run([scenario])
+
+    assert result.status == "failed"
+    assert result.reason is not None
+    assert "b1_batched_unexpected_req_index:1" in result.reason
 
 
 def test_result_schema_is_flat(fake_home_cache: Path) -> None:

@@ -105,6 +105,26 @@ def test_qwen3_0_6b_smoke_is_cache_only() -> None:
     assert scenario.workload.max_batch_size == 1
 
 
+def test_qwen3_0_6b_b1_parity_is_cache_only() -> None:
+    """The P-4.2b parity row reuses the cached 0.6B weights — no
+    env-var gate — so B=1 scheduler correctness is exercised on any
+    dev run that exercises the smoke row."""
+    scenario = get_scenario("qwen3-0.6b-b1-parity")
+    assert scenario.repo == "Qwen/Qwen3-0.6B"
+    assert scenario.gate_env_var is None
+    assert scenario.oracle == OracleKind.B1_PARITY_VS_SINGLE
+    assert scenario.workload.max_tokens == 4
+    assert scenario.workload.max_batch_size == 1
+    assert scenario.workload.prompts == ("Hello",)
+    # Same SamplingParams shape as the smoke row is intentional;
+    # pin it so a drift on the smoke row does not silently widen
+    # the parity claim (parity compares the specific params, not
+    # an abstract "same model behaves the same").
+    smoke = get_scenario("qwen3-0.6b-smoke")
+    assert scenario.workload.temperature == smoke.workload.temperature
+    assert scenario.workload.top_p == smoke.workload.top_p
+
+
 def test_qwen3_5_moe_smoke_is_dual_gated() -> None:
     """Env var name must match the pytest-side
     tests/test_p3_qwen3_5_moe_smoke.py gate so the two views of the

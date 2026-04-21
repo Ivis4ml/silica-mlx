@@ -7,7 +7,7 @@ a module-level ``dict`` rather than a registry class: scenario
 definitions are static constants, and a dict lets readers see the
 full roster at a glance.
 
-Current catalog (P-4.1 + P-4.2a):
+Current catalog (P-4.1 + P-4.2a + P-4.2b):
 
   * ``qwen3-0.6b-smoke`` (P-4.1) — short-in / short-out on
     Qwen3-0.6B, ``max_tokens=4``, ``OracleKind.SMOKE``, cache-only
@@ -27,6 +27,12 @@ Current catalog (P-4.1 + P-4.2a):
     dual-gated (cache + ``SILICA_REAL_GEMMA4_MOE=1``). ~16 GB on
     disk; always-on dense MLP + SwitchGLU experts forward is more
     expensive per token than dense Gemma4-31B.
+  * ``qwen3-0.6b-b1-parity`` (P-4.2b) — reuses the cached 0.6B
+    weights from ``qwen3-0.6b-smoke``. Runs the single-request
+    reference and a B=1 ``generate_batch`` on the same prompt
+    with byte-identical ``SamplingParams``; ``B1_PARITY_VS_SINGLE``
+    oracle asserts token-for-token equality. Cache-only gate so
+    the scheduler's B=1 correctness rides every dev run.
 
 The pytest-side real-model smokes remain in place: they pin the
 adapter shape (``config.extra`` values, capability flags), which
@@ -131,8 +137,35 @@ _GEMMA4_MOE_SMOKE = Scenario(
 )
 
 
+_QWEN3_0_6B_B1_PARITY = Scenario(
+    id="qwen3-0.6b-b1-parity",
+    repo="Qwen/Qwen3-0.6B",
+    workload=Workload(
+        name="short-in-short-out",
+        prompts=("Hello",),
+        max_tokens=4,
+        max_batch_size=1,
+        prefix_cache=False,
+        temperature=0.0,
+        top_p=1.0,
+    ),
+    oracle=OracleKind.B1_PARITY_VS_SINGLE,
+    gate_env_var=None,
+    description=(
+        "B=1 parity regression: for the same prompt, the B=1 batched "
+        "path through Engine.generate_batch(..., max_batch_size=1) "
+        "must emit the same token stream as the single-request "
+        "Engine.generate path. Runner drives both executions with the "
+        "shared _build_sampling_params helper so divergence cannot be "
+        "blamed on drifted params. Reuses the cached Qwen/Qwen3-0.6B "
+        "weights so the scheduler B=1 claim rides every dev run."
+    ),
+)
+
+
 BUILTIN_SCENARIOS: dict[str, Scenario] = {
     _QWEN3_0_6B_SMOKE.id: _QWEN3_0_6B_SMOKE,
+    _QWEN3_0_6B_B1_PARITY.id: _QWEN3_0_6B_B1_PARITY,
     _QWEN3_5_MOE_SMOKE.id: _QWEN3_5_MOE_SMOKE,
     _GEMMA4_MOE_SMOKE.id: _GEMMA4_MOE_SMOKE,
 }

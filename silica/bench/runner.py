@@ -1,4 +1,4 @@
-"""silica.bench.runner — P-4.1 BenchRunner.
+"""silica.bench.runner — BenchRunner.
 
 ``BenchRunner`` drives one or more :class:`Scenario` objects from
 skip-check through workload execution through oracle through JSONL
@@ -10,8 +10,8 @@ Design choices this module encodes:
 
   * **Per-scenario isolation**. Each scenario gets a fresh
     ``adapter_for_repo`` load. Weight streaming / model caching
-    across scenarios is a P-4.2+ feature; P-4.1 favours correctness
-    over throughput (the first migrated scenario is cheap).
+    across scenarios is a later phase feature; P-4.1/4.2 favour
+    correctness over throughput (migrated scenarios are cheap).
   * **Injected engine factory**. The default factory delegates to
     :func:`silica.models.factory.adapter_for_repo`, but tests pass
     a fake that returns a mock-driven ``Engine``. This is the only
@@ -22,25 +22,43 @@ Design choices this module encodes:
     skipped row is still load-bearing: it records *why* a gate
     blocked the run so the bench report does not pretend the
     scenario does not exist.
-  * **Batched workloads rejected in P-4.1**. Any scenario with
-    ``workload.max_batch_size > 1`` returns
-    ``status="skipped", reason="batched_workload_deferred_p42"``
-    rather than silently running single-request on the first
-    prompt. P-4.2 lands the batched dispatch branch alongside the
-    D3.1 migration.
+  * **B>1 workloads rejected through P-4.2b**. Any scenario with
+    ``workload.max_batch_size > 1`` returns ``status="skipped",
+    reason="batched_workload_deferred_p42"``. P-4.2c lands the
+    B>1 dispatch branch alongside the direct mlx-lm batched
+    reference oracle.
 
-Exception handling is deliberately coarse: any exception during the
-load / generate / oracle call chain collapses to
-``status="failed"`` with the exception type + message as the
-reason. Structured per-phase failure reporting (distinguishing a
-load crash from an oracle rejection) is a P-4.2 polish item once
-the second and third scenarios reveal whether the collapse is
-actually confusing in practice.
+Oracle-driven dispatch:
+
+The runner picks its workload-execution path by
+``scenario.oracle``:
+
+  * ``SMOKE`` — single-request via ``Engine.generate``; oracle
+    receives the token stream plus ``context={'vocab_size': N}``.
+  * ``B1_PARITY_VS_SINGLE`` — runs the single-request reference
+    first (populates ``engine.metrics``), then collects B=1
+    batched tokens via ``Engine.generate_batch`` with
+    ``max_batch_size=1`` and the *same* :class:`SamplingParams`
+    instance. Batch-event validation is strict: an ``aborted``
+    event or a ``req_index != 0`` event raises a RuntimeError that
+    collapses to ``status="failed"`` with a ``b1_batched_*``
+    reason, never reaching the oracle (the user is told the scheduler
+    misbehaved, not that the tokens mismatched). On success the
+    oracle receives batched tokens plus ``context`` carrying
+    ``reference_tokens``.
+
+Exception handling is deliberately coarse: any exception during
+load / generate / oracle collapses to ``status="failed"`` with the
+exception type + message. Metrics snapshot reflects the
+single-request reference for B1 parity because
+``Engine.generate_batch`` does not populate the shared
+``MetricsRegistry`` at present; ``wall_s`` covers reference +
+batched end-to-end.
 
 The peak-memory hook is injectable so tests on fake adapters can
 skip the mlx call entirely. The defaults are backed by
-``mlx.core.get_peak_memory`` / ``reset_peak_memory``, which are the
-same APIs ``scripts/bench_p2_baseline.py`` has been using.
+``mlx.core.get_peak_memory`` / ``reset_peak_memory``, the same APIs
+``scripts/bench_p2_baseline.py`` uses.
 """
 
 from __future__ import annotations
@@ -51,11 +69,14 @@ import time
 from collections.abc import Callable, Iterable
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 from silica.bench.oracles import ORACLES
 from silica.bench.scenario import (
+    OracleKind,
     Scenario,
     ScenarioResult,
+    Workload,
     hf_cache_path_for_repo,
 )
 from silica.core.sampling import SamplingParams
@@ -193,14 +214,21 @@ class BenchRunner:
             self._reset_peak()
             t_start = self._clock()
             adapter, engine = self._engine_factory(scenario)
-            tokens = _run_single_request(scenario, engine, adapter)
+            params = _build_sampling_params(wl, adapter)
+
+            if scenario.oracle == OracleKind.B1_PARITY_VS_SINGLE:
+                tokens, oracle_context = _run_b1_parity(
+                    scenario, engine, adapter, params
+                )
+            else:
+                tokens = _run_single_request(scenario, engine, params)
+                oracle_context = {"vocab_size": adapter.config.vocab_size}
+
             wall_s = self._clock() - t_start
             peak_mb = self._read_peak_mb()
             oracle_fn = ORACLES[scenario.oracle]
             ok, oracle_reason, metadata = oracle_fn(
-                scenario,
-                tokens,
-                {"vocab_size": adapter.config.vocab_size},
+                scenario, tokens, oracle_context
             )
         except Exception as exc:  # noqa: BLE001 — top-level scenario boundary
             return ScenarioResult(
@@ -231,19 +259,87 @@ class BenchRunner:
             f.write(json.dumps(asdict(result)) + "\n")
 
 
-def _run_single_request(
-    scenario: Scenario, engine: Engine, adapter: ModelAdapter
-) -> list[int]:
-    wl = scenario.workload
+def _build_sampling_params(
+    workload: Workload, adapter: ModelAdapter
+) -> SamplingParams:
+    """Shared SamplingParams helper.
+
+    Both the single-request and the B=1 batched paths on a
+    B1_PARITY scenario pull from this one helper so the parity
+    claim stays honest: divergent tokens cannot be blamed on
+    accidentally drifted sampling params.
+    """
     tokenizer = adapter.tokenizer()
     eos_ids = tuple(sorted(getattr(tokenizer, "eos_token_ids", set()) or ()))
-    params = SamplingParams(
-        temperature=wl.temperature,
-        top_p=wl.top_p,
-        max_tokens=wl.max_tokens,
+    return SamplingParams(
+        temperature=workload.temperature,
+        top_p=workload.top_p,
+        max_tokens=workload.max_tokens,
         stop_token_ids=eos_ids,
     )
-    return list(engine.generate(wl.prompts[0], params))
+
+
+def _run_single_request(
+    scenario: Scenario, engine: Engine, params: SamplingParams
+) -> list[int]:
+    return list(engine.generate(scenario.workload.prompts[0], params))
+
+
+def _run_b1_parity(
+    scenario: Scenario,
+    engine: Engine,
+    adapter: ModelAdapter,
+    params: SamplingParams,
+) -> tuple[list[int], dict[str, Any]]:
+    """Drive single-request reference + B=1 batched on the same prompt.
+
+    Returns the batched token stream (the oracle's primary input)
+    and the oracle context carrying ``reference_tokens`` and
+    ``vocab_size``. Running reference first means the engine's
+    MetricsRegistry captures single-request timings — batch-side
+    metrics are not re-populated by ``generate_batch`` at present,
+    so the JSONL row reflects the reference execution.
+    """
+    prompt = scenario.workload.prompts[0]
+    reference_tokens = list(engine.generate(prompt, params))
+    batched_tokens = _collect_b1_batched_tokens(engine, prompt, params)
+    return batched_tokens, {
+        "vocab_size": adapter.config.vocab_size,
+        "reference_tokens": reference_tokens,
+    }
+
+
+def _collect_b1_batched_tokens(
+    engine: Engine, prompt: str, params: SamplingParams
+) -> list[int]:
+    """Collect row-0 token events from a B=1 ``generate_batch`` stream.
+
+    Strict validation: any event with ``req_index != 0`` is
+    treated as a scheduler fault (generated batches in a B=1 run
+    must only emit against the single admitted request), and an
+    ``aborted`` event short-circuits the run as a failure rather
+    than letting the oracle see a truncated stream. Both conditions
+    raise ``RuntimeError`` so the outer ``_run_one`` collapses them
+    to ``status="failed"`` with a structured ``b1_batched_*``
+    reason — never into the oracle's "tokens mismatched" branch.
+    """
+    tokens: list[int] = []
+    for event in engine.generate_batch([prompt], params, max_batch_size=1):
+        if event.req_index != 0:
+            raise RuntimeError(
+                f"b1_batched_unexpected_req_index:{event.req_index}"
+            )
+        if event.kind == "aborted":
+            raise RuntimeError(
+                f"b1_batched_aborted:{event.finish_reason}"
+            )
+        if event.kind == "token":
+            if event.token_id is None:
+                raise RuntimeError("b1_batched_token_event_missing_id")
+            tokens.append(event.token_id)
+        # "done" is terminal but carries no token data; accept
+        # silently so the loop exits on stream close.
+    return tokens
 
 
 __all__ = ["BenchRunner", "EngineFactory"]
