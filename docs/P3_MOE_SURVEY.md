@@ -567,16 +567,20 @@ produce the same tokens as a reference that includes MTP? For
 P-3 this is a question about speculative decoding (P-7), not the
 MoE forward. Flag and defer.
 
-### E-open-4 — Gemma4-MoE `sliding_window_pattern` absence
+### E-open-4 — Gemma4-MoE `sliding_window_pattern` absence — **RESOLVED 2026-04-20**
 
-The 26B-A4B config omits `sliding_window_pattern`, which the D1
-adapter's `_build_attention_pattern` reads via
-`text_config.get("sliding_window_pattern", 0) or 0`. The
-authoritative source remains `layer_types`, which is present and
-consistent (25 sliding + 5 full). No action needed for E1 beyond
-confirming that `Gemma4MoeAdapter` inherits the `layer_types`
-primary path, not a synthesised pattern from
-`sliding_window_pattern`.
+**Resolution: `layer_types` is authoritative; `sliding_window_pattern`
+absence is benign.**
+
+`Gemma4MoeAdapter` inherits `Gemma4Adapter._build_attention_pattern`
+unchanged (P-3-D1). That helper walks `text_config["layer_types"]`
+as the primary source and raises loudly on missing / empty /
+length-mismatched values. `sliding_window_pattern` is only used
+informationally (stored on `config.extra.sliding_window_pattern`);
+its absence on the 26B-A4B checkpoint does not change routing. The
+adapter unit test
+`tests/test_gemma4_moe_adapter.py::test_attention_pattern_inherits_25_sliding_plus_5_full`
+confirms the 25+5 split comes out of `layer_types` alone.
 
 ### E-open-5 — `attn_output_gate` and `qwen3_5.Attention` — **RESOLVED 2026-04-20**
 

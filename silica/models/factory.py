@@ -26,6 +26,7 @@ from mlx_lm.utils import load as _mlx_lm_load
 from silica.kvcache.simple import SimpleKVCache
 from silica.models.adapter import ModelAdapter
 from silica.models.gemma4 import Gemma4Adapter
+from silica.models.gemma4_moe import Gemma4MoeAdapter
 from silica.models.qwen3 import Qwen3Adapter
 from silica.models.qwen3_5 import Qwen3_5Adapter
 from silica.models.qwen3_5_moe import Qwen3_5MoeAdapter
@@ -48,6 +49,23 @@ def _build_qwen3_5(
 def _build_gemma4(
     model: Any, tokenizer: Any, kv: SimpleKVCache
 ) -> ModelAdapter:
+    """Dispatch Gemma4 checkpoints between dense and MoE adapters.
+
+    mlx-lm reports ``model_type="gemma4"`` for BOTH the dense
+    Gemma4-31B path (``Gemma4Adapter``, P-3-D1) and the MoE
+    Gemma4-26B-A4B path (``Gemma4MoeAdapter``, P-3-E1.2); keying the
+    ``_ADAPTERS`` map on ``model_type`` alone is therefore ambiguous
+    for the Gemma4 family. Instead of widening the map to a
+    two-key tuple (no other family needs it today), we branch
+    locally on ``args.text_config.enable_moe_block`` — the same
+    field that controls mlx-lm's own
+    ``gemma4_text.DecoderLayer`` dense-vs-MoE construction.
+    """
+    tc = Gemma4Adapter._text_config_dict(model)
+    enable_moe = bool(tc.get("enable_moe_block", False))
+    num_experts = int(tc.get("num_experts", 0) or 0)
+    if enable_moe or num_experts > 0:
+        return Gemma4MoeAdapter(model, tokenizer, kv_manager=kv)
     return Gemma4Adapter(model, tokenizer, kv_manager=kv)
 
 
