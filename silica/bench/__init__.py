@@ -27,6 +27,12 @@ from silica.bench.scenarios import (
     get_scenario,
     list_scenario_ids,
 )
+from silica.bench.vqbench_baseline import (
+    VqbenchBaselineResult,
+    default_reproduce_script_path,
+    parse_headline_row,
+    run_vqbench_baseline,
+)
 
 __all__ = [
     "BUILTIN_SCENARIOS",
@@ -39,9 +45,13 @@ __all__ = [
     "ScenarioResult",
     "TeacherForcedReferenceFn",
     "TeacherForcedSilicaFn",
+    "VqbenchBaselineResult",
     "Workload",
+    "default_reproduce_script_path",
     "get_scenario",
     "hf_cache_path_for_repo",
     "list_scenario_ids",
+    "parse_headline_row",
     "render_markdown_report",
+    "run_vqbench_baseline",
 ]
