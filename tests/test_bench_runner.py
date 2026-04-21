@@ -360,14 +360,14 @@ def test_engine_exception_collapses_to_failed(fake_home_cache: Path) -> None:
     assert result.total_tokens is None
 
 
-def test_batched_workload_with_smoke_oracle_is_authoring_error(
+def test_smoke_b1_with_multiple_prompts_is_authoring_error(
     fake_home_cache: Path,
 ) -> None:
-    """SMOKE is a single-request oracle; a scenario that pairs it
-    with ``max_batch_size>1`` is broken as authored, not blocked
-    by the environment. Surfaces as status=failed with a structured
-    reason (not skipped). The engine factory must never run."""
-    repo = "test-owner/batched"
+    """SMOKE at max_batch_size=1 must have exactly one prompt — a
+    single-request scenario with multiple prompts is authoring-
+    broken (which prompt does the run use?). Surfaces as
+    status=failed before the engine factory runs."""
+    repo = "test-owner/smoke-b1-multi-prompt"
     _create_cache_dir(repo)
 
     called = {"n": 0}
@@ -377,10 +377,10 @@ def test_batched_workload_with_smoke_oracle_is_authoring_error(
         raise AssertionError("factory must not be called for authoring errors")
 
     scenario = _scenario(
-        scenario_id="batched",
+        scenario_id="smoke-b1-multi-prompt",
         repo=repo,
-        max_batch_size=4,
-        prompts=("a", "b", "c", "d"),
+        max_batch_size=1,
+        prompts=("a", "b"),
     )
     runner = BenchRunner(
         engine_factory=factory, reset_peak=lambda: None, read_peak_mb=lambda: None
@@ -389,8 +389,39 @@ def test_batched_workload_with_smoke_oracle_is_authoring_error(
 
     assert result.status == "failed"
     assert result.reason is not None
-    assert "'smoke'" in result.reason
-    assert "max_batch_size=1" in result.reason
+    assert "max_batch_size=1 requires exactly 1 prompt" in result.reason
+    assert called["n"] == 0
+
+
+def test_smoke_b_gt_1_with_single_prompt_is_authoring_error(
+    fake_home_cache: Path,
+) -> None:
+    """SMOKE at max_batch_size>1 must have at least 2 prompts — B>1
+    with one prompt would degenerate to single-request hiding in a
+    batched API."""
+    repo = "test-owner/smoke-bgt1-single-prompt"
+    _create_cache_dir(repo)
+
+    called = {"n": 0}
+
+    def factory(scenario: Scenario) -> Any:
+        called["n"] += 1
+        raise AssertionError("factory must not be called for authoring errors")
+
+    scenario = _scenario(
+        scenario_id="smoke-bgt1-single-prompt",
+        repo=repo,
+        max_batch_size=4,
+        prompts=("only-one",),
+    )
+    runner = BenchRunner(
+        engine_factory=factory, reset_peak=lambda: None, read_peak_mb=lambda: None
+    )
+    [result] = runner.run([scenario])
+
+    assert result.status == "failed"
+    assert result.reason is not None
+    assert "requires at least 2 prompts" in result.reason
     assert called["n"] == 0
 
 
@@ -933,6 +964,210 @@ def test_bgt1_parity_rejects_batch_size_one_at_authoring_time(
     assert result.reason is not None
     assert "max_batch_size>=2" in result.reason
     assert called["n"] == 0
+
+
+# ---------- SMOKE B>1 batched dispatch --------------------------------
+
+
+def _smoke_batched_scenario(
+    *,
+    scenario_id: str,
+    repo: str,
+    prompts: tuple[str, ...] = ("prompt-a", "prompt-b"),
+    max_tokens: int = 3,
+    max_batch_size: int = 2,
+    prefix_cache: bool = False,
+) -> Scenario:
+    return Scenario(
+        id=scenario_id,
+        repo=repo,
+        workload=Workload(
+            name="fake-smoke-batched",
+            prompts=prompts,
+            max_tokens=max_tokens,
+            max_batch_size=max_batch_size,
+            prefix_cache=prefix_cache,
+        ),
+        oracle=OracleKind.SMOKE,
+    )
+
+
+def test_smoke_batched_happy_path(fake_home_cache: Path) -> None:
+    """Multi-prompt SMOKE at B>1 returns per-row metadata, total
+    tokens summed across rows, status ok."""
+    repo = "test-owner/smoke-batched-happy"
+    _create_cache_dir(repo)
+
+    adapter = _FakeAdapter(vocab_size=100)
+    per_row = {0: [11, 12, 13], 1: [21, 22, 23]}
+    engine = _FakeEngine(
+        tokens=[], batched_events=_bgt1_events_for(per_row)
+    )
+    scenario = _smoke_batched_scenario(
+        scenario_id="smoke-batched-happy", repo=repo
+    )
+    runner = BenchRunner(
+        engine_factory=_factory_returning(adapter, engine),
+        reset_peak=lambda: None,
+        read_peak_mb=lambda: None,
+    )
+    [result] = runner.run([scenario])
+
+    assert result.status == "ok"
+    assert result.reason is None
+    assert result.total_tokens == 6
+    rows = result.metadata["rows"]
+    assert len(rows) == 2
+    assert rows[0]["row"] == 0 and rows[0]["token_count"] == 3
+    assert rows[1]["row"] == 1 and rows[1]["token_count"] == 3
+    # max_token_id surfaced for at-a-glance JSONL validation.
+    assert result.metadata["max_token_id"] == 23
+
+
+def test_smoke_batched_fails_on_empty_row(fake_home_cache: Path) -> None:
+    """A row that emits no tokens before done is a scheduler fault
+    the SMOKE oracle catches — ``smoke_row_X_no_tokens_emitted``
+    with the specific row index."""
+    repo = "test-owner/smoke-batched-empty-row"
+    _create_cache_dir(repo)
+
+    adapter = _FakeAdapter(vocab_size=100)
+    engine = _FakeEngine(
+        tokens=[],
+        batched_events=[
+            BatchEvent.token(req_index=0, token_id=11),
+            BatchEvent.done(req_index=0, reason="max_tokens"),
+            # Row 1 "done" without any token events.
+            BatchEvent.done(req_index=1, reason="max_tokens"),
+        ],
+    )
+    scenario = _smoke_batched_scenario(
+        scenario_id="smoke-batched-empty-row", repo=repo
+    )
+    runner = BenchRunner(
+        engine_factory=_factory_returning(adapter, engine),
+        reset_peak=lambda: None,
+        read_peak_mb=lambda: None,
+    )
+    [result] = runner.run([scenario])
+
+    assert result.status == "failed"
+    assert result.reason == "smoke_row_1_no_tokens_emitted"
+
+
+def test_smoke_batched_aborted_row_fails_before_oracle(
+    fake_home_cache: Path,
+) -> None:
+    """An aborted row in the SMOKE batched stream must surface as a
+    runner failure with a ``smoke_batched_aborted:*`` reason, not
+    as an oracle empty-row mismatch."""
+    repo = "test-owner/smoke-batched-aborted"
+    _create_cache_dir(repo)
+
+    adapter = _FakeAdapter(vocab_size=100)
+    engine = _FakeEngine(
+        tokens=[],
+        batched_events=[
+            BatchEvent.token(req_index=0, token_id=11),
+            BatchEvent.aborted(req_index=1, reason="budget-exhausted"),
+            BatchEvent.done(req_index=0, reason="max_tokens"),
+        ],
+    )
+    scenario = _smoke_batched_scenario(
+        scenario_id="smoke-batched-aborted", repo=repo
+    )
+    runner = BenchRunner(
+        engine_factory=_factory_returning(adapter, engine),
+        reset_peak=lambda: None,
+        read_peak_mb=lambda: None,
+    )
+    [result] = runner.run([scenario])
+
+    assert result.status == "failed"
+    assert result.reason is not None
+    assert "smoke_batched_aborted:row=1" in result.reason
+    assert "reason=budget-exhausted" in result.reason
+
+
+def test_smoke_batched_prefix_cache_reaches_engine(
+    fake_home_cache: Path,
+) -> None:
+    """When workload.prefix_cache=True, runner must wire a
+    RadixPrefixCache into generate_batch. Verified by recording
+    the kwarg the engine received."""
+    repo = "test-owner/smoke-batched-pc"
+    _create_cache_dir(repo)
+
+    adapter = _FakeAdapter(vocab_size=100)
+    per_row = {0: [11, 12], 1: [21, 22]}
+    observed_kwargs: dict[str, Any] = {}
+
+    class _PCSpy(_FakeEngine):
+        def generate_batch(
+            self, prompts: Any, params: Any, **kwargs: Any
+        ) -> Any:
+            observed_kwargs.update(kwargs)
+            return _FakeEngine.generate_batch(
+                self, prompts, params, **kwargs
+            )
+
+    engine = _PCSpy(
+        tokens=[], batched_events=_bgt1_events_for(per_row)
+    )
+    scenario = _smoke_batched_scenario(
+        scenario_id="smoke-batched-pc", repo=repo, prefix_cache=True
+    )
+    runner = BenchRunner(
+        engine_factory=_factory_returning(adapter, engine),
+        reset_peak=lambda: None,
+        read_peak_mb=lambda: None,
+    )
+    [result] = runner.run([scenario])
+
+    assert result.status == "ok"
+    from silica.kvcache.prefix import RadixPrefixCache
+
+    pc = observed_kwargs.get("prefix_cache")
+    assert pc is not None, "expected runner to pass a RadixPrefixCache"
+    assert isinstance(pc, RadixPrefixCache)
+
+
+def test_smoke_batched_prefix_cache_is_none_when_workload_flag_off(
+    fake_home_cache: Path,
+) -> None:
+    """Workload.prefix_cache=False keeps prefix_cache=None on the
+    generate_batch call — no accidental cache wiring."""
+    repo = "test-owner/smoke-batched-no-pc"
+    _create_cache_dir(repo)
+
+    adapter = _FakeAdapter(vocab_size=100)
+    per_row = {0: [11, 12], 1: [21, 22]}
+    observed_kwargs: dict[str, Any] = {}
+
+    class _PCSpy(_FakeEngine):
+        def generate_batch(
+            self, prompts: Any, params: Any, **kwargs: Any
+        ) -> Any:
+            observed_kwargs.update(kwargs)
+            return _FakeEngine.generate_batch(
+                self, prompts, params, **kwargs
+            )
+
+    engine = _PCSpy(
+        tokens=[], batched_events=_bgt1_events_for(per_row)
+    )
+    scenario = _smoke_batched_scenario(
+        scenario_id="smoke-batched-no-pc", repo=repo, prefix_cache=False
+    )
+    runner = BenchRunner(
+        engine_factory=_factory_returning(adapter, engine),
+        reset_peak=lambda: None,
+        read_peak_mb=lambda: None,
+    )
+    [result] = runner.run([scenario])
+
+    assert result.status == "ok"
+    assert observed_kwargs.get("prefix_cache") is None
 
 
 def test_result_schema_is_flat(fake_home_cache: Path) -> None:

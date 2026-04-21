@@ -24,19 +24,30 @@ Design choices this module encodes:
     scenario does not exist.
   * **Workload shape validated per oracle**. Oracle kinds dictate
     admissible ``max_batch_size`` and ``len(prompts)`` combinations
-    (SMOKE / B1_PARITY require B=1 + one prompt; BGT1_PARITY
-    requires B>=2 + at least two prompts). Misconfigurations
-    surface as ``status="failed"`` with a structured reason, not
-    ``skipped`` — the scenario is authoring-broken, not
-    environmentally blocked.
+    (SMOKE allows B=1 with one prompt *or* B>1 with >=2 prompts;
+    B1_PARITY requires B=1 + one prompt; BGT1_PARITY requires
+    B>=2 + at least two prompts). Misconfigurations surface as
+    ``status="failed"`` with a structured reason, not ``skipped``
+    — the scenario is authoring-broken, not environmentally
+    blocked.
 
 Oracle-driven dispatch:
 
 The runner picks its workload-execution path by
 ``scenario.oracle``:
 
-  * ``SMOKE`` — single-request via ``Engine.generate``; oracle
-    receives the token stream plus ``context={'vocab_size': N}``.
+  * ``SMOKE`` — single-request via ``Engine.generate`` when
+    ``max_batch_size == 1``; multi-row via
+    ``Engine.generate_batch`` when ``max_batch_size > 1``. In the
+    batched case the per-row token streams collapse to a
+    ``dict[int, list[int]]`` passed to the oracle; single-request
+    still passes a flat ``list[int]`` for compatibility. Both
+    paths receive ``context={'vocab_size': N}``. If
+    ``workload.prefix_cache`` is true the batched path builds a
+    fresh :class:`RadixPrefixCache` (block_size=16) backed by
+    :class:`SyntheticPrefixBlockStore` and passes it to
+    ``generate_batch`` — enabling shared-prefix scenarios to
+    reuse prefix blocks across rows in the same batch.
   * ``B1_PARITY_VS_SINGLE`` — runs the single-request reference
     first (populates ``engine.metrics``), then collects B=1
     batched tokens via ``Engine.generate_batch`` with
@@ -97,9 +108,6 @@ from silica.core.sampling import SamplingParams
 from silica.engine import Engine
 from silica.models.adapter import ModelAdapter
 
-_SINGLE_REQUEST_ORACLES: frozenset[OracleKind] = frozenset(
-    {OracleKind.SMOKE, OracleKind.B1_PARITY_VS_SINGLE}
-)
 _BGT1_ORACLES: frozenset[OracleKind] = frozenset(
     {OracleKind.BGT1_DIRECT_BATCHED_REFERENCE}
 )
@@ -267,11 +275,27 @@ class BenchRunner:
                     len(row) for row in bgt1_tokens.values()
                 )
             else:
+                # SMOKE (and any future single/batched-flexible
+                # oracle). B=1 takes the single-request path,
+                # B>1 goes through generate_batch with an optional
+                # prefix cache.
                 params = _build_sampling_params(scenario.workload, adapter)
-                single_tokens = _run_single_request(scenario, engine, params)
-                oracle_input = single_tokens
+                wl = scenario.workload
+                if wl.max_batch_size == 1:
+                    single_tokens = _run_single_request(
+                        scenario, engine, params
+                    )
+                    oracle_input = single_tokens
+                    total_tokens = len(single_tokens)
+                else:
+                    batched_tokens = _run_smoke_batched(
+                        scenario, engine, params
+                    )
+                    oracle_input = batched_tokens
+                    total_tokens = sum(
+                        len(row) for row in batched_tokens.values()
+                    )
                 oracle_context = {"vocab_size": adapter.config.vocab_size}
-                total_tokens = len(single_tokens)
 
             wall_s = self._clock() - t_start
             peak_mb = self._read_peak_mb()
@@ -341,13 +365,38 @@ def _validate_workload_for_oracle(
 ) -> str | None:
     """Return an authoring-error reason string, or ``None`` if OK.
 
-    SMOKE / B1_PARITY scenarios must be single-request (B=1, one
-    prompt); BGT1_PARITY scenarios must carry at least two prompts
-    and a batch size >= 2. Misconfigurations land as
-    ``status="failed"`` rather than ``skipped`` because the
-    scenario is broken as authored, not blocked by the environment.
+    Per-oracle rules:
+
+      * ``SMOKE`` — the flexible "does it crash" floor. Accepts
+        ``max_batch_size=1`` with exactly one prompt, or
+        ``max_batch_size>1`` with at least two prompts (the B>1
+        shape drives :meth:`Engine.generate_batch`).
+      * ``B1_PARITY_VS_SINGLE`` — single-request reference plus a
+        strict B=1 batched run; B>1 would require a different
+        oracle.
+      * ``BGT1_DIRECT_BATCHED_REFERENCE`` — needs real batching;
+        B=1 would make the claim degenerate.
+
+    Misconfigurations land as ``status="failed"`` rather than
+    ``skipped`` because the scenario is broken as authored, not
+    blocked by the environment.
     """
-    if oracle in _SINGLE_REQUEST_ORACLES:
+    if oracle == OracleKind.SMOKE:
+        if wl.max_batch_size < 1:
+            return (
+                f"max_batch_size must be >= 1, got {wl.max_batch_size}"
+            )
+        if wl.max_batch_size == 1 and len(wl.prompts) != 1:
+            return (
+                f"oracle 'smoke' at max_batch_size=1 requires exactly "
+                f"1 prompt, got {len(wl.prompts)}"
+            )
+        if wl.max_batch_size > 1 and len(wl.prompts) < 2:
+            return (
+                f"oracle 'smoke' at max_batch_size={wl.max_batch_size} "
+                f"requires at least 2 prompts, got {len(wl.prompts)}"
+            )
+    elif oracle == OracleKind.B1_PARITY_VS_SINGLE:
         if wl.max_batch_size > 1:
             return (
                 f"oracle {oracle.value!r} requires max_batch_size=1, "
@@ -554,6 +603,109 @@ def _direct_mlx_lm_batched_reference(
             out[row_idx].append(tok)
 
     return out
+
+
+def _run_smoke_batched(
+    scenario: Scenario,
+    engine: Engine,
+    params: SamplingParams,
+) -> dict[int, list[int]]:
+    """Drive SMOKE through ``generate_batch`` for multi-prompt B>1.
+
+    Wires a fresh :class:`RadixPrefixCache` when
+    ``scenario.workload.prefix_cache`` is ``True`` — each scenario
+    gets its own cache instance so shared-prefix metrics reflect
+    that run alone. Per-row tokens come back as a dict keyed by
+    ``req_index``, ready for the SMOKE oracle's batched branch.
+    """
+    prompts = list(scenario.workload.prompts)
+    prefix_cache = _maybe_build_prefix_cache(scenario.workload)
+    return _collect_smoke_batched_tokens(
+        engine,
+        prompts,
+        params,
+        max_batch_size=scenario.workload.max_batch_size,
+        prefix_cache=prefix_cache,
+    )
+
+
+def _collect_smoke_batched_tokens(
+    engine: Engine,
+    prompts: list[str],
+    params: SamplingParams,
+    *,
+    max_batch_size: int,
+    prefix_cache: Any | None,
+) -> dict[int, list[int]]:
+    """Collect per-row token events from a SMOKE ``generate_batch`` stream.
+
+    Event-stream validation mirrors :func:`_collect_bgt1_batched_tokens`:
+    aborted events and out-of-range ``req_index`` values raise
+    ``RuntimeError`` so the outer ``_run_one`` collapses them to
+    ``smoke_batched_*`` reasons before the oracle runs. Rows that
+    never emit ``done`` are also a scheduler fault rather than an
+    oracle concern.
+    """
+    expected_rows = set(range(len(prompts)))
+    tokens: dict[int, list[int]] = {row: [] for row in expected_rows}
+    done_rows: set[int] = set()
+
+    for event in engine.generate_batch(
+        prompts,
+        params,
+        max_batch_size=max_batch_size,
+        prefix_cache=prefix_cache,
+    ):
+        if event.req_index not in expected_rows:
+            raise RuntimeError(
+                f"smoke_batched_unexpected_req_index:{event.req_index}"
+            )
+        if event.kind == "aborted":
+            raise RuntimeError(
+                f"smoke_batched_aborted:row={event.req_index}_"
+                f"reason={event.finish_reason}"
+            )
+        if event.kind == "token":
+            if event.token_id is None:
+                raise RuntimeError(
+                    f"smoke_batched_token_event_missing_id:"
+                    f"row={event.req_index}"
+                )
+            tokens[event.req_index].append(event.token_id)
+        elif event.kind == "done":
+            done_rows.add(event.req_index)
+
+    missing = expected_rows - done_rows
+    if missing:
+        raise RuntimeError(
+            f"smoke_batched_rows_never_completed:{sorted(missing)}"
+        )
+    return tokens
+
+
+def _maybe_build_prefix_cache(workload: Workload) -> Any | None:
+    """Build a fresh :class:`RadixPrefixCache` if the workload asks
+    for it, else ``None``.
+
+    Block size is hard-coded to 16 — the same constant the README's
+    Quickstart example uses, and the default value every pytest-
+    side prefix-cache test has relied on since P-2. Exposing
+    block_size as a Workload field is avoided until a scenario
+    actually needs a different value.
+
+    Imports lazily so ``silica.bench.runner`` stays cheap when the
+    caller only runs B=1 SMOKE / B1 parity scenarios.
+    """
+    if not workload.prefix_cache:
+        return None
+    from silica.kvcache.prefix import RadixPrefixCache
+    from silica.kvcache.store import SyntheticPrefixBlockStore
+
+    block_size = 16
+    return RadixPrefixCache(
+        block_size=block_size,
+        store=SyntheticPrefixBlockStore(block_size=block_size),
+    )
 
 
 def _collect_b1_batched_tokens(

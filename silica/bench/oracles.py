@@ -54,9 +54,19 @@ from silica.bench.scenario import OracleFn, OracleKind, Scenario
 
 
 def smoke_oracle(
-    scenario: Scenario, token_ids: list[int], context: Any
+    scenario: Scenario, token_ids: Any, context: Any
 ) -> tuple[bool, str | None, dict[str, Any]]:
     """SMOKE oracle: did the workload emit at least one valid token?
+
+    ``token_ids`` may be either:
+
+      * ``list[int]`` — single-request output (B=1 SMOKE path).
+      * ``dict[int, list[int]]`` — per-row output (B>1 SMOKE via
+        ``Engine.generate_batch``). Every row is validated
+        independently; an empty row fails the oracle with a
+        ``smoke_row_X_no_tokens_emitted`` reason so concurrent /
+        shared-prefix scenarios cannot silently mask a scheduler
+        bug that drops a request.
 
     ``context`` must be a mapping containing ``"vocab_size"``. The
     runner assembles it from ``adapter.config.vocab_size`` before
@@ -65,7 +75,9 @@ def smoke_oracle(
     Metadata on success carries ``total_tokens`` and the max id
     observed so the JSONL row is self-describing — a reviewer can
     tell at a glance whether the "4 tokens, all < 150000" claim was
-    actually met without re-running the scenario.
+    actually met without re-running the scenario. The batched path
+    additionally populates a ``rows`` list with the per-row token
+    count keyed by ``row``.
     """
     if not isinstance(context, dict) or "vocab_size" not in context:
         return (
@@ -74,9 +86,16 @@ def smoke_oracle(
             {},
         )
     vocab_size = int(context["vocab_size"])
+    if isinstance(token_ids, dict):
+        return _smoke_batched(token_ids, vocab_size)
+    return _smoke_single(token_ids, vocab_size)
+
+
+def _smoke_single(
+    token_ids: list[int], vocab_size: int
+) -> tuple[bool, str | None, dict[str, Any]]:
     if not token_ids:
         return (False, "smoke_no_tokens_emitted", {"vocab_size": vocab_size})
-
     max_id = 0
     for i, tok in enumerate(token_ids):
         if not isinstance(tok, int):
@@ -100,6 +119,50 @@ def smoke_oracle(
             "total_tokens": len(token_ids),
             "max_token_id": max_id,
             "vocab_size": vocab_size,
+        },
+    )
+
+
+def _smoke_batched(
+    rows: dict[int, list[int]], vocab_size: int
+) -> tuple[bool, str | None, dict[str, Any]]:
+    total = 0
+    max_id = 0
+    rows_metadata: list[dict[str, Any]] = []
+    for row_idx in sorted(rows):
+        row_tokens = rows[row_idx]
+        if not row_tokens:
+            return (
+                False,
+                f"smoke_row_{row_idx}_no_tokens_emitted",
+                {"vocab_size": vocab_size, "row": row_idx},
+            )
+        for i, tok in enumerate(row_tokens):
+            if not isinstance(tok, int):
+                return (
+                    False,
+                    f"smoke_row_{row_idx}_token_{i}_not_int:"
+                    f"{type(tok).__name__}",
+                    {"vocab_size": vocab_size, "row": row_idx, "index": i},
+                )
+            if tok < 0 or tok >= vocab_size:
+                return (
+                    False,
+                    f"smoke_row_{row_idx}_token_{i}_out_of_vocab:{tok}",
+                    {"vocab_size": vocab_size, "row": row_idx, "index": i},
+                )
+            if tok > max_id:
+                max_id = tok
+        total += len(row_tokens)
+        rows_metadata.append({"row": row_idx, "token_count": len(row_tokens)})
+    return (
+        True,
+        None,
+        {
+            "total_tokens": total,
+            "max_token_id": max_id,
+            "vocab_size": vocab_size,
+            "rows": rows_metadata,
         },
     )
 

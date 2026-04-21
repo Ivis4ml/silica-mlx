@@ -375,6 +375,52 @@ def test_qwen3_0_6b_long_in_short_out_is_prefill_dominated() -> None:
     assert len(scenario.workload.prompts[0]) >= 500
 
 
+def test_qwen3_0_6b_concurrent_shared_prefix_uses_prefix_cache() -> None:
+    """Concurrent shared-prefix row must opt the radix prefix cache
+    in via workload.prefix_cache=True — that's the specific thing
+    the row is testing."""
+    scenario = get_scenario("qwen3-0.6b-concurrent-shared-prefix")
+    assert scenario.repo == "Qwen/Qwen3-0.6B"
+    assert scenario.gate_env_var is None
+    assert scenario.oracle == OracleKind.SMOKE
+    assert scenario.workload.max_batch_size == 4
+    assert len(scenario.workload.prompts) == 4
+    assert scenario.workload.prefix_cache is True
+    # Every prompt must start with the same string prefix so the
+    # tokenizer sees shared leading blocks. Pinning the character
+    # prefix here is a cheap proxy; the radix cache's actual reuse
+    # depends on tokenized-length blocks but "The capital of " is
+    # deliberately > 3 Qwen3 tokens long.
+    prefix = "The capital of "
+    for prompt in scenario.workload.prompts:
+        assert prompt.startswith(prefix), (
+            f"prompt {prompt!r} does not start with shared prefix {prefix!r}"
+        )
+
+
+def test_qwen3_0_6b_ttft_under_concurrency_mixes_long_and_short() -> None:
+    """TTFT-under-concurrency row must mix one long prompt with
+    several short prompts. Pin the shape so a future edit cannot
+    silently turn it into a uniform-length row (which would erase
+    the Q-010 signal)."""
+    scenario = get_scenario("qwen3-0.6b-ttft-under-concurrency")
+    assert scenario.repo == "Qwen/Qwen3-0.6B"
+    assert scenario.gate_env_var is None
+    assert scenario.oracle == OracleKind.SMOKE
+    assert scenario.workload.max_batch_size == 4
+    assert len(scenario.workload.prompts) == 4
+    assert scenario.workload.prefix_cache is False
+    lengths = [len(p) for p in scenario.workload.prompts]
+    # One prompt must be >=500 chars (the long one); the rest must
+    # be single-character shorts (pin the exact shape).
+    long_count = sum(1 for n in lengths if n >= 500)
+    short_count = sum(1 for n in lengths if n == 1)
+    assert long_count == 1, f"expected 1 long prompt, got lengths {lengths}"
+    assert short_count == 3, (
+        f"expected 3 single-char short prompts, got lengths {lengths}"
+    )
+
+
 @pytest.mark.skipif(
     not hf_cache_path_for_repo("Qwen/Qwen3-0.6B").exists(),
     reason=(

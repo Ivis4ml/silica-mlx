@@ -7,7 +7,7 @@ a module-level ``dict`` rather than a registry class: scenario
 definitions are static constants, and a dict lets readers see the
 full roster at a glance.
 
-Current catalog (P-4.1 + P-4.2a + P-4.2b + P-4.2c + P-4.2d-ii + P-4.2d-iii-a):
+Current catalog (P-4.1 + P-4.2a + P-4.2b + P-4.2c + P-4.2d-ii + P-4.2d-iii-a + P-4.2d-iii-b):
 
   * ``qwen3-0.6b-smoke`` (P-4.1) — short-in / short-out on
     Qwen3-0.6B, ``max_tokens=4``, ``OracleKind.SMOKE``, cache-only
@@ -85,12 +85,22 @@ Workload-shaped rows (PLAN §P-4 names them by shape, not model):
     brown fox …" repeated 30×, ~301 tokens on Qwen3) and
     ``max_tokens=4``, so prefill dominates the wall time. SMOKE
     oracle; the metrics signal how prefill tok/s scales.
-
-P-4.2d-iii-b / -iii-c will land the concurrent-shared-prefix and
-TTFT-under-concurrency rows, which require a runner extension to
-drive SMOKE through ``Engine.generate_batch`` (multi-prompt B>1)
-and to wire ``RadixPrefixCache``. Until then SMOKE only runs
-single-request.
+  * ``qwen3-0.6b-concurrent-shared-prefix`` (P-4.2d-iii-b) —
+    four prompts "The capital of {France, Germany, Italy, Spain}
+    is" share a three-token prefix ``"The capital of "``. Runs at
+    ``max_batch_size=4`` with ``prefix_cache=True``, so the
+    scheduler's radix prefix cache reuses the shared block across
+    rows. SMOKE oracle validates every row emits valid tokens.
+  * ``qwen3-0.6b-ttft-under-concurrency`` (P-4.2d-iii-b) — one
+    long (~301-token) prompt admitted alongside three short
+    prompts ("A", "B", "C") at ``max_batch_size=4``,
+    ``prefix_cache=False``, ``max_tokens=4``. Exercises the
+    scheduler under the Q-010 shape PLAN §P-4 specifies. With
+    Silica's current non-chunked prefill the short prompts' TTFT
+    will be dominated by the long prompt's prefill; the metrics
+    this row collects are the input to the Q-010 chunked-prefill
+    promotion decision, not a correctness oracle (SMOKE remains
+    the floor: all rows must emit valid tokens).
 
 The pytest-side real-model smokes remain in place: they pin the
 adapter shape (``config.extra`` values, capability flags), which
@@ -485,12 +495,80 @@ _QWEN3_0_6B_LONG_IN_SHORT_OUT = Scenario(
 )
 
 
+_QWEN3_0_6B_CONCURRENT_SHARED_PREFIX = Scenario(
+    id="qwen3-0.6b-concurrent-shared-prefix",
+    repo="Qwen/Qwen3-0.6B",
+    workload=Workload(
+        name="concurrent-shared-prefix",
+        prompts=(
+            "The capital of France is",
+            "The capital of Germany is",
+            "The capital of Italy is",
+            "The capital of Spain is",
+        ),
+        max_tokens=8,
+        max_batch_size=4,
+        prefix_cache=True,
+        temperature=0.0,
+        top_p=1.0,
+    ),
+    oracle=OracleKind.SMOKE,
+    gate_env_var=None,
+    description=(
+        "Four prompts share a three-token prefix 'The capital of' "
+        "(tokenized as three ids on Qwen3). Runs at "
+        "max_batch_size=4 with prefix_cache=True so the radix "
+        "prefix cache reuses the shared block across rows. SMOKE "
+        "oracle validates every row emits valid tokens; the "
+        "JSONL row's per-row metadata makes the reader aware how "
+        "many tokens each of the four rows produced. Cache-only "
+        "gate."
+    ),
+)
+
+
+_QWEN3_0_6B_TTFT_UNDER_CONCURRENCY = Scenario(
+    id="qwen3-0.6b-ttft-under-concurrency",
+    repo="Qwen/Qwen3-0.6B",
+    workload=Workload(
+        name="ttft-under-concurrency",
+        prompts=(
+            _LONG_IN_PROMPT,
+            "A",
+            "B",
+            "C",
+        ),
+        max_tokens=4,
+        max_batch_size=4,
+        prefix_cache=False,
+        temperature=0.0,
+        top_p=1.0,
+    ),
+    oracle=OracleKind.SMOKE,
+    gate_env_var=None,
+    description=(
+        "One long (~301 tokens on Qwen3) prompt admitted alongside "
+        "three one-character prompts at max_batch_size=4, "
+        "prefix_cache=False, max_tokens=4. PLAN §P-4 specifies "
+        "this shape to resolve Q-010 (chunked-prefill promotion): "
+        "with Silica's current non-chunked prefill, the long "
+        "prompt's prefill blocks the short prompts, inflating "
+        "their TTFT. The metrics this row collects are the input "
+        "to the Q-010 decision — the oracle itself is SMOKE "
+        "because 'did not crash + all rows emitted valid tokens' "
+        "is the correctness floor. Cache-only gate."
+    ),
+)
+
+
 BUILTIN_SCENARIOS: dict[str, Scenario] = {
     _QWEN3_0_6B_SMOKE.id: _QWEN3_0_6B_SMOKE,
     _QWEN3_0_6B_B1_PARITY.id: _QWEN3_0_6B_B1_PARITY,
     _QWEN3_0_6B_BGT1_PARITY.id: _QWEN3_0_6B_BGT1_PARITY,
     _QWEN3_0_6B_SHORT_IN_LONG_OUT.id: _QWEN3_0_6B_SHORT_IN_LONG_OUT,
     _QWEN3_0_6B_LONG_IN_SHORT_OUT.id: _QWEN3_0_6B_LONG_IN_SHORT_OUT,
+    _QWEN3_0_6B_CONCURRENT_SHARED_PREFIX.id: _QWEN3_0_6B_CONCURRENT_SHARED_PREFIX,
+    _QWEN3_0_6B_TTFT_UNDER_CONCURRENCY.id: _QWEN3_0_6B_TTFT_UNDER_CONCURRENCY,
     _QWEN3_5_0_8B_B1_PARITY.id: _QWEN3_5_0_8B_B1_PARITY,
     _QWEN3_5_27B_SMOKE.id: _QWEN3_5_27B_SMOKE,
     _QWEN3_5_MOE_SMOKE.id: _QWEN3_5_MOE_SMOKE,
