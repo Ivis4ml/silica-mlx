@@ -6,7 +6,11 @@ runner and are not re-exported at the package level; authors of new
 oracles import from ``silica.bench.oracles`` directly.
 """
 
-from silica.bench.runner import BenchRunner, EngineFactory
+from silica.bench.runner import (
+    BenchRunner,
+    DirectBatchedReferenceFn,
+    EngineFactory,
+)
 from silica.bench.scenario import (
     OracleFn,
     OracleKind,
@@ -24,6 +28,7 @@ from silica.bench.scenarios import (
 __all__ = [
     "BUILTIN_SCENARIOS",
     "BenchRunner",
+    "DirectBatchedReferenceFn",
     "EngineFactory",
     "OracleFn",
     "OracleKind",

@@ -37,8 +37,13 @@ from silica.bench import (
     Scenario,
     Workload,
     get_scenario,
+    hf_cache_path_for_repo,
     list_scenario_ids,
 )
+
+# Shared cache-presence sentinel for tests that need the real
+# Qwen3-0.6B tokenizer. Same repo the smoke / parity rows use.
+_QWEN3_0_6B_CACHE = hf_cache_path_for_repo("Qwen/Qwen3-0.6B")
 
 # ---------- parametrized shape invariants ------------------------------
 
@@ -123,6 +128,69 @@ def test_qwen3_0_6b_b1_parity_is_cache_only() -> None:
     smoke = get_scenario("qwen3-0.6b-smoke")
     assert scenario.workload.temperature == smoke.workload.temperature
     assert scenario.workload.top_p == smoke.workload.top_p
+
+
+def test_qwen3_0_6b_bgt1_parity_is_cache_only() -> None:
+    """The P-4.2c B>1 parity row exercises scheduler glue for
+    max_batch_size=2 on two prompts whose TOKENIZED lengths differ.
+
+    The earlier iteration used ("The capital of France is",
+    "The capital of Japan is") — both happen to tokenize to 5
+    tokens on Qwen3, so left_padding=[0, 0] and the non-trivial
+    padding branch was silently dead. The fix pins the exact pair
+    ("Hello", "The capital of Japan is"), which tokenizes to
+    [1, 5] and forces left_padding=[4, 0]. Keep these exact
+    strings so an accidental edit surfaces here rather than
+    passing tests + a dead branch on-device.
+    """
+    scenario = get_scenario("qwen3-0.6b-bgt1-parity")
+    assert scenario.repo == "Qwen/Qwen3-0.6B"
+    assert scenario.gate_env_var is None
+    assert scenario.oracle == OracleKind.BGT1_DIRECT_BATCHED_REFERENCE
+    assert scenario.workload.max_batch_size == 2
+    assert scenario.workload.prompts == (
+        "Hello",
+        "The capital of Japan is",
+    )
+
+
+@pytest.mark.skipif(
+    not _QWEN3_0_6B_CACHE.exists(),
+    reason=(
+        "Qwen3-0.6B weights not cached locally — the tokenized-length "
+        "invariant check for qwen3-0.6b-bgt1-parity needs the real "
+        "tokenizer to catch the 'France/Japan both tokenize to 5 "
+        "tokens' class of mistake. Run the P-2 parity suite once to "
+        "populate the cache."
+    ),
+)
+def test_qwen3_0_6b_bgt1_parity_prompts_actually_tokenize_to_different_lengths() -> (
+    None
+):
+    """Deep invariant: the pinned BGT1 prompts must tokenize to
+    different lengths on the real Qwen3 tokenizer, so make_batch_cache
+    is called with a non-zero entry in left_padding. A unit-test pin
+    on the prompt strings (above) catches accidental edits; this
+    additional on-device check catches a subtler regression where
+    someone picks two 'looks-different' strings that happen to
+    tokenize identically."""
+    from silica.models.factory import adapter_for_repo
+
+    scenario = get_scenario("qwen3-0.6b-bgt1-parity")
+    adapter, _ = adapter_for_repo(scenario.repo)
+    tokenizer = adapter.tokenizer()
+    lengths = [len(list(tokenizer.encode(p))) for p in scenario.workload.prompts]
+    assert len(set(lengths)) > 1, (
+        f"BGT1 prompts tokenized to identical lengths {lengths} — "
+        "left_padding would be [0, ...], bypassing the padding branch "
+        "make_batch_cache is supposed to exercise"
+    )
+    max_len = max(lengths)
+    left_padding = [max_len - length for length in lengths]
+    assert any(p > 0 for p in left_padding), (
+        f"left_padding={left_padding} has no positive entry; the "
+        "direct-reference path will not exercise non-zero left padding"
+    )
 
 
 def test_qwen3_5_moe_smoke_is_dual_gated() -> None:

@@ -151,8 +151,16 @@ def hf_cache_path_for_repo(repo: str) -> Path:
 # helpers and return (ok, reason, metadata). Runner invokes these
 # after running the workload; specifics per-kind are in
 # silica.bench.oracles.
+#
+# The second argument is ``Any`` because the workload output shape
+# depends on the oracle kind — ``list[int]`` for single-request
+# SMOKE / B1_PARITY, ``dict[int, list[int]]`` for
+# BGT1_DIRECT_BATCHED_REFERENCE (per-row streams), potentially a
+# richer structure for later kinds (logits tensors for
+# TEACHER_FORCED_ARGMAX). Oracles narrow the type locally via
+# isinstance / explicit shape assertions.
 OracleFn = Callable[
-    [Scenario, list[int], Any], tuple[bool, str | None, dict[str, Any]]
+    [Scenario, Any, Any], tuple[bool, str | None, dict[str, Any]]
 ]
 
 __all__ = [

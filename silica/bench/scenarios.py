@@ -7,7 +7,7 @@ a module-level ``dict`` rather than a registry class: scenario
 definitions are static constants, and a dict lets readers see the
 full roster at a glance.
 
-Current catalog (P-4.1 + P-4.2a + P-4.2b):
+Current catalog (P-4.1 + P-4.2a + P-4.2b + P-4.2c):
 
   * ``qwen3-0.6b-smoke`` (P-4.1) — short-in / short-out on
     Qwen3-0.6B, ``max_tokens=4``, ``OracleKind.SMOKE``, cache-only
@@ -33,6 +33,15 @@ Current catalog (P-4.1 + P-4.2a + P-4.2b):
     with byte-identical ``SamplingParams``; ``B1_PARITY_VS_SINGLE``
     oracle asserts token-for-token equality. Cache-only gate so
     the scheduler's B=1 correctness rides every dev run.
+  * ``qwen3-0.6b-bgt1-parity`` (P-4.2c) — same cached 0.6B
+    weights; drives a B=2 ``generate_batch`` on two
+    different-length prompts and compares per-row tokens against a
+    direct mlx-lm batched forward driven with
+    ``adapter.make_batch_cache(left_padding)``. Both sides use
+    ``stop_token_ids=()`` so the reference (which runs
+    unconditionally for ``max_tokens``) and Silica's stream stay
+    length-aligned. Exercises the scheduler's B>1 glue, left
+    padding, and row lifecycle on any dev box with the cached 0.6B.
 
 The pytest-side real-model smokes remain in place: they pin the
 adapter shape (``config.extra`` values, capability flags), which
@@ -163,9 +172,52 @@ _QWEN3_0_6B_B1_PARITY = Scenario(
 )
 
 
+_QWEN3_0_6B_BGT1_PARITY = Scenario(
+    id="qwen3-0.6b-bgt1-parity",
+    repo="Qwen/Qwen3-0.6B",
+    workload=Workload(
+        name="bgt1-different-length-prompts",
+        # Prompt lengths chosen so the tokenized lengths diverge on
+        # the Qwen3 tokenizer — "Hello" is 1 token, "The capital of
+        # Japan is" is 5 tokens, so make_batch_cache runs with
+        # left_padding=[4, 0]. An earlier version used two "The
+        # capital of X is" prompts where X was a single-token
+        # country name; both tokenized to 5 tokens and left padding
+        # was [0, 0], silently bypassing the branch this scenario
+        # claims to exercise.
+        prompts=(
+            "Hello",
+            "The capital of Japan is",
+        ),
+        max_tokens=8,
+        max_batch_size=2,
+        prefix_cache=False,
+        temperature=0.0,
+        top_p=1.0,
+    ),
+    oracle=OracleKind.BGT1_DIRECT_BATCHED_REFERENCE,
+    gate_env_var=None,
+    description=(
+        "B>1 scheduler glue regression: Silica's generate_batch at "
+        "max_batch_size=2 on two prompts whose tokenized lengths "
+        "differ must emit the same per-row tokens as a direct mlx-lm "
+        "batched forward driven with "
+        "adapter.make_batch_cache(left_padding). Runner overrides "
+        "stop_token_ids=() on both sides so the reference (which "
+        "runs unconditionally for max_tokens) and Silica's stream "
+        "stay length-aligned regardless of EOS. Prompts 'Hello' (1 "
+        "token) and 'The capital of Japan is' (5 tokens) force "
+        "left_padding=[4, 0] on the Qwen3 tokenizer, exercising the "
+        "non-trivial left-pad branch of make_batch_cache. Cache-only "
+        "gate."
+    ),
+)
+
+
 BUILTIN_SCENARIOS: dict[str, Scenario] = {
     _QWEN3_0_6B_SMOKE.id: _QWEN3_0_6B_SMOKE,
     _QWEN3_0_6B_B1_PARITY.id: _QWEN3_0_6B_B1_PARITY,
+    _QWEN3_0_6B_BGT1_PARITY.id: _QWEN3_0_6B_BGT1_PARITY,
     _QWEN3_5_MOE_SMOKE.id: _QWEN3_5_MOE_SMOKE,
     _GEMMA4_MOE_SMOKE.id: _GEMMA4_MOE_SMOKE,
 }

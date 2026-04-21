@@ -360,7 +360,13 @@ def test_engine_exception_collapses_to_failed(fake_home_cache: Path) -> None:
     assert result.total_tokens is None
 
 
-def test_batched_workload_deferred_to_p42(fake_home_cache: Path) -> None:
+def test_batched_workload_with_smoke_oracle_is_authoring_error(
+    fake_home_cache: Path,
+) -> None:
+    """SMOKE is a single-request oracle; a scenario that pairs it
+    with ``max_batch_size>1`` is broken as authored, not blocked
+    by the environment. Surfaces as status=failed with a structured
+    reason (not skipped). The engine factory must never run."""
     repo = "test-owner/batched"
     _create_cache_dir(repo)
 
@@ -368,7 +374,7 @@ def test_batched_workload_deferred_to_p42(fake_home_cache: Path) -> None:
 
     def factory(scenario: Scenario) -> Any:
         called["n"] += 1
-        raise AssertionError("factory must not be called for batched scenarios")
+        raise AssertionError("factory must not be called for authoring errors")
 
     scenario = _scenario(
         scenario_id="batched",
@@ -376,11 +382,15 @@ def test_batched_workload_deferred_to_p42(fake_home_cache: Path) -> None:
         max_batch_size=4,
         prompts=("a", "b", "c", "d"),
     )
-    runner = BenchRunner(engine_factory=factory, reset_peak=lambda: None, read_peak_mb=lambda: None)
+    runner = BenchRunner(
+        engine_factory=factory, reset_peak=lambda: None, read_peak_mb=lambda: None
+    )
     [result] = runner.run([scenario])
 
-    assert result.status == "skipped"
-    assert result.reason == "batched_workload_deferred_p42"
+    assert result.status == "failed"
+    assert result.reason is not None
+    assert "'smoke'" in result.reason
+    assert "max_batch_size=1" in result.reason
     assert called["n"] == 0
 
 
@@ -422,9 +432,8 @@ def test_unknown_oracle_kind_raises_via_runner(fake_home_cache: Path) -> None:
     """A scenario naming a not-yet-implemented oracle surfaces the
     NotImplementedError via ScenarioResult.reason rather than crashing
     the runner (which would take down subsequent scenarios in the
-    same run). Uses BGT1_DIRECT_BATCHED_REFERENCE because its
-    implementation lands in P-4.2c; earlier oracle kinds that used
-    to be stubs are now implemented."""
+    same run). Uses TEACHER_FORCED_ARGMAX because its implementation
+    lands in P-4.3; the other oracle kinds are already implemented."""
     repo = "test-owner/unknown-oracle"
     _create_cache_dir(repo)
 
@@ -434,7 +443,7 @@ def test_unknown_oracle_kind_raises_via_runner(fake_home_cache: Path) -> None:
     scenario = _scenario(
         scenario_id="unknown-oracle",
         repo=repo,
-        oracle=OracleKind.BGT1_DIRECT_BATCHED_REFERENCE,
+        oracle=OracleKind.TEACHER_FORCED_ARGMAX,
     )
     runner = BenchRunner(
         engine_factory=_factory_returning(adapter, engine),
@@ -446,7 +455,7 @@ def test_unknown_oracle_kind_raises_via_runner(fake_home_cache: Path) -> None:
     assert result.status == "failed"
     assert result.reason is not None
     assert "NotImplementedError" in result.reason
-    assert "P-4.2c" in result.reason
+    assert "P-4.3" in result.reason
 
 
 # ---------- B1 parity oracle / runner branch --------------------------
@@ -626,6 +635,304 @@ def test_b1_parity_batched_unexpected_req_index_fails_before_oracle(
     assert result.status == "failed"
     assert result.reason is not None
     assert "b1_batched_unexpected_req_index:1" in result.reason
+
+
+# ---------- BGT1 parity oracle / runner branch ------------------------
+
+
+def _bgt1_scenario(
+    *,
+    scenario_id: str,
+    repo: str,
+    prompts: tuple[str, ...] = ("prompt-a", "prompt-b"),
+    max_tokens: int = 3,
+    max_batch_size: int = 2,
+) -> Scenario:
+    return Scenario(
+        id=scenario_id,
+        repo=repo,
+        workload=Workload(
+            name="fake-bgt1",
+            prompts=prompts,
+            max_tokens=max_tokens,
+            max_batch_size=max_batch_size,
+        ),
+        oracle=OracleKind.BGT1_DIRECT_BATCHED_REFERENCE,
+    )
+
+
+def _bgt1_events_for(per_row_tokens: dict[int, list[int]]) -> list[BatchEvent]:
+    """Helper: turn a per-row token dict into the event stream
+    generate_batch would emit (tokens in row-interleaved order,
+    followed by done events)."""
+    events: list[BatchEvent] = []
+    rows = sorted(per_row_tokens)
+    max_steps = max(len(per_row_tokens[r]) for r in rows)
+    for step in range(max_steps):
+        for row in rows:
+            if step < len(per_row_tokens[row]):
+                events.append(
+                    BatchEvent.token(
+                        req_index=row, token_id=per_row_tokens[row][step]
+                    )
+                )
+    for row in rows:
+        events.append(BatchEvent.done(req_index=row, reason="max_tokens"))
+    return events
+
+
+def test_bgt1_parity_happy_path(fake_home_cache: Path) -> None:
+    """Silica batched and direct reference produce identical per-row
+    streams. Oracle returns ok with per-row metadata."""
+    repo = "test-owner/bgt1-happy"
+    _create_cache_dir(repo)
+
+    adapter = _FakeAdapter(vocab_size=100)
+    silica_tokens = {0: [11, 12, 13], 1: [21, 22, 23]}
+    reference_tokens = {0: [11, 12, 13], 1: [21, 22, 23]}
+    engine = _FakeEngine(
+        tokens=[], batched_events=_bgt1_events_for(silica_tokens)
+    )
+
+    def fake_reference(
+        adapter_arg: Any, prompts: list[str], params: Any
+    ) -> dict[int, list[int]]:
+        assert adapter_arg is adapter
+        assert prompts == ["prompt-a", "prompt-b"]
+        # params.stop_token_ids must be empty — runner override.
+        assert params.stop_token_ids == ()
+        return reference_tokens
+
+    runner = BenchRunner(
+        engine_factory=_factory_returning(adapter, engine),
+        direct_batched_reference=fake_reference,
+        reset_peak=lambda: None,
+        read_peak_mb=lambda: None,
+    )
+    scenario = _bgt1_scenario(scenario_id="bgt1-happy", repo=repo)
+    [result] = runner.run([scenario])
+
+    assert result.status == "ok"
+    assert result.reason is None
+    # total_tokens sums per-row: 3 + 3 = 6
+    assert result.total_tokens == 6
+    assert result.metadata["first_failure"] is None
+    rows = result.metadata["rows"]
+    assert len(rows) == 2
+    for row_entry in rows:
+        assert row_entry["first_mismatch_index"] == -1
+        assert row_entry["batch_len"] == 3
+        assert row_entry["reference_len"] == 3
+
+
+def test_bgt1_parity_per_row_mismatch(fake_home_cache: Path) -> None:
+    """Row 1 diverges at index 2; oracle reports the specific row +
+    position in metadata.first_failure."""
+    repo = "test-owner/bgt1-mismatch"
+    _create_cache_dir(repo)
+
+    adapter = _FakeAdapter(vocab_size=100)
+    silica_tokens = {0: [11, 12, 13], 1: [21, 22, 99]}
+    reference_tokens = {0: [11, 12, 13], 1: [21, 22, 23]}
+    engine = _FakeEngine(
+        tokens=[], batched_events=_bgt1_events_for(silica_tokens)
+    )
+
+    def fake_reference(adapter_arg: Any, prompts: Any, params: Any) -> Any:
+        return reference_tokens
+
+    runner = BenchRunner(
+        engine_factory=_factory_returning(adapter, engine),
+        direct_batched_reference=fake_reference,
+        reset_peak=lambda: None,
+        read_peak_mb=lambda: None,
+    )
+    scenario = _bgt1_scenario(scenario_id="bgt1-mismatch", repo=repo)
+    [result] = runner.run([scenario])
+
+    assert result.status == "failed"
+    assert result.reason == "bgt1_parity_row_1_mismatch_index:2"
+    failure = result.metadata["first_failure"]
+    assert failure["row"] == 1
+    assert failure["first_mismatch_index"] == 2
+    assert failure["batch_token_at_mismatch"] == 99
+    assert failure["reference_token_at_mismatch"] == 23
+
+
+def test_bgt1_parity_batched_aborted_fails_before_oracle(
+    fake_home_cache: Path,
+) -> None:
+    """An aborted row in the Silica batched stream must surface as a
+    runner failure with a bgt1_batched_aborted:* reason, never as an
+    oracle mismatch."""
+    repo = "test-owner/bgt1-aborted"
+    _create_cache_dir(repo)
+
+    adapter = _FakeAdapter(vocab_size=100)
+    engine = _FakeEngine(
+        tokens=[],
+        batched_events=[
+            BatchEvent.token(req_index=0, token_id=11),
+            BatchEvent.aborted(req_index=1, reason="budget-exhausted"),
+            BatchEvent.done(req_index=0, reason="max_tokens"),
+        ],
+    )
+
+    def fake_reference(adapter_arg: Any, prompts: Any, params: Any) -> Any:
+        return {0: [11], 1: [21]}
+
+    runner = BenchRunner(
+        engine_factory=_factory_returning(adapter, engine),
+        direct_batched_reference=fake_reference,
+        reset_peak=lambda: None,
+        read_peak_mb=lambda: None,
+    )
+    scenario = _bgt1_scenario(scenario_id="bgt1-aborted", repo=repo)
+    [result] = runner.run([scenario])
+
+    assert result.status == "failed"
+    assert result.reason is not None
+    assert "bgt1_batched_aborted:row=1" in result.reason
+    assert "reason=budget-exhausted" in result.reason
+
+
+def test_bgt1_parity_unexpected_req_index_fails_before_oracle(
+    fake_home_cache: Path,
+) -> None:
+    """A req_index outside range(len(prompts)) is a scheduler fault;
+    runner surfaces it as a structured failure with the offending
+    row number embedded."""
+    repo = "test-owner/bgt1-bad-req"
+    _create_cache_dir(repo)
+
+    adapter = _FakeAdapter(vocab_size=100)
+    engine = _FakeEngine(
+        tokens=[],
+        batched_events=[
+            BatchEvent.token(req_index=0, token_id=11),
+            BatchEvent.token(req_index=5, token_id=99),  # out of range
+        ],
+    )
+
+    def fake_reference(adapter_arg: Any, prompts: Any, params: Any) -> Any:
+        return {0: [11], 1: [21]}
+
+    runner = BenchRunner(
+        engine_factory=_factory_returning(adapter, engine),
+        direct_batched_reference=fake_reference,
+        reset_peak=lambda: None,
+        read_peak_mb=lambda: None,
+    )
+    scenario = _bgt1_scenario(scenario_id="bgt1-bad-req", repo=repo)
+    [result] = runner.run([scenario])
+
+    assert result.status == "failed"
+    assert result.reason is not None
+    assert "bgt1_batched_unexpected_req_index:5" in result.reason
+
+
+def test_bgt1_parity_missing_done_fails_before_oracle(
+    fake_home_cache: Path,
+) -> None:
+    """If the batched stream closes without a ``done`` event for a
+    row, runner treats that row as incomplete and fails with a
+    structured reason. Protects against scheduler bugs where rows
+    silently drop out."""
+    repo = "test-owner/bgt1-missing-done"
+    _create_cache_dir(repo)
+
+    adapter = _FakeAdapter(vocab_size=100)
+    engine = _FakeEngine(
+        tokens=[],
+        batched_events=[
+            BatchEvent.token(req_index=0, token_id=11),
+            BatchEvent.done(req_index=0, reason="max_tokens"),
+            # Row 1 never emits anything.
+        ],
+    )
+
+    def fake_reference(adapter_arg: Any, prompts: Any, params: Any) -> Any:
+        return {0: [11], 1: [21]}
+
+    runner = BenchRunner(
+        engine_factory=_factory_returning(adapter, engine),
+        direct_batched_reference=fake_reference,
+        reset_peak=lambda: None,
+        read_peak_mb=lambda: None,
+    )
+    scenario = _bgt1_scenario(scenario_id="bgt1-missing-done", repo=repo)
+    [result] = runner.run([scenario])
+
+    assert result.status == "failed"
+    assert result.reason is not None
+    assert "bgt1_batched_rows_never_completed:[1]" in result.reason
+
+
+def test_bgt1_parity_rejects_single_prompt_at_authoring_time(
+    fake_home_cache: Path,
+) -> None:
+    """A BGT1 scenario with only one prompt is authoring-broken.
+    Runner short-circuits to failed before building the engine."""
+    repo = "test-owner/bgt1-one-prompt"
+    _create_cache_dir(repo)
+
+    called = {"n": 0}
+
+    def factory(scenario: Any) -> Any:
+        called["n"] += 1
+        raise AssertionError("factory must not run for authoring errors")
+
+    scenario = _bgt1_scenario(
+        scenario_id="bgt1-one-prompt",
+        repo=repo,
+        prompts=("only-one",),
+        max_batch_size=2,
+    )
+    runner = BenchRunner(
+        engine_factory=factory,
+        reset_peak=lambda: None,
+        read_peak_mb=lambda: None,
+    )
+    [result] = runner.run([scenario])
+
+    assert result.status == "failed"
+    assert result.reason is not None
+    assert "at least 2 prompts" in result.reason
+    assert called["n"] == 0
+
+
+def test_bgt1_parity_rejects_batch_size_one_at_authoring_time(
+    fake_home_cache: Path,
+) -> None:
+    """A BGT1 scenario with max_batch_size=1 is authoring-broken
+    (use B1_PARITY_VS_SINGLE for that shape). Runner short-circuits
+    to failed before building the engine."""
+    repo = "test-owner/bgt1-batch-one"
+    _create_cache_dir(repo)
+
+    called = {"n": 0}
+
+    def factory(scenario: Any) -> Any:
+        called["n"] += 1
+        raise AssertionError("factory must not run for authoring errors")
+
+    scenario = _bgt1_scenario(
+        scenario_id="bgt1-batch-one",
+        repo=repo,
+        prompts=("a", "b"),
+        max_batch_size=1,
+    )
+    runner = BenchRunner(
+        engine_factory=factory,
+        reset_peak=lambda: None,
+        read_peak_mb=lambda: None,
+    )
+    [result] = runner.run([scenario])
+
+    assert result.status == "failed"
+    assert result.reason is not None
+    assert "max_batch_size>=2" in result.reason
+    assert called["n"] == 0
 
 
 def test_result_schema_is_flat(fake_home_cache: Path) -> None:

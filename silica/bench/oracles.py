@@ -18,11 +18,16 @@ Implemented kinds:
     ``SamplingParams`` and passes reference tokens via
     ``context['reference_tokens']``; oracle is a pure equality
     check with structured mismatch reporting.
+  * :class:`OracleKind.BGT1_DIRECT_BATCHED_REFERENCE` (P-4.2c) —
+    B>1 Silica batched per-row output must equal a direct mlx-lm
+    batched reference driven with the same
+    ``adapter.make_batch_cache(left_padding)`` list. Runner drives
+    both paths with ``stop_token_ids=()`` so the direct reference
+    (which runs unconditionally for ``max_tokens``) and Silica's
+    stream stay length-aligned regardless of EOS.
 
 Not yet implemented (registered as stubs that raise):
 
-  * ``BGT1_DIRECT_BATCHED_REFERENCE`` — lands in P-4.2c (B>1 vs
-    direct mlx-lm batched reference).
   * ``TEACHER_FORCED_ARGMAX`` — lands in P-4.3.
 
 The smoke oracle checks the minimal invariants any "did the run
@@ -176,11 +181,130 @@ def b1_parity_oracle(
     )
 
 
+def bgt1_direct_batched_reference_oracle(
+    scenario: Scenario,
+    batch_tokens: dict[int, list[int]],
+    context: Any,
+) -> tuple[bool, str | None, dict[str, Any]]:
+    """B>1 parity: Silica batched per-row output equals a direct
+    mlx-lm batched reference run with the same cache list.
+
+    ``batch_tokens`` is the Silica-side output keyed by row index.
+    ``context`` must be a mapping containing ``"reference_tokens"``
+    (same shape, ``dict[int, list[int]]``) and ``"vocab_size"``.
+
+    The claim the runner stands behind is *scheduler glue
+    equivalence to a direct batched execution path* — not
+    batched-vs-solo parity. See ``tests/test_p3_gemma4_batched_parity.py``
+    §test_bgt1_matches_direct_mlx_lm_batched_reference for the
+    rationale: 4-bit greedy can drift between batched and solo
+    runs, but the direct reference isolates scheduler correctness
+    from upstream kernel noise.
+
+    Mismatch reporting is per-row: metadata carries ``rows`` (a
+    list of per-row summaries) and, on failure, the first row index
+    that diverged plus the first mismatch position within that row.
+    Successful runs populate ``first_mismatch`` as ``None``.
+    """
+    if not isinstance(context, dict):
+        return (False, "bgt1_parity_missing_context", {})
+    if "reference_tokens" not in context:
+        return (
+            False,
+            "bgt1_parity_missing_context_reference_tokens",
+            {},
+        )
+    if not isinstance(batch_tokens, dict):
+        return (
+            False,
+            f"bgt1_parity_batch_tokens_not_dict:"
+            f"{type(batch_tokens).__name__}",
+            {},
+        )
+
+    reference = context["reference_tokens"]
+    if not isinstance(reference, dict):
+        return (
+            False,
+            f"bgt1_parity_reference_not_dict:{type(reference).__name__}",
+            {},
+        )
+
+    batch_rows = set(batch_tokens)
+    ref_rows = set(reference)
+    if batch_rows != ref_rows:
+        return (
+            False,
+            "bgt1_parity_row_set_mismatch:"
+            f"batch={sorted(batch_rows)}_ref={sorted(ref_rows)}",
+            {
+                "batch_row_set": sorted(batch_rows),
+                "reference_row_set": sorted(ref_rows),
+            },
+        )
+
+    rows_metadata: list[dict[str, Any]] = []
+    first_failure: dict[str, Any] | None = None
+
+    for row in sorted(batch_rows):
+        b = batch_tokens[row]
+        r = reference[row]
+        common = min(len(b), len(r))
+        mismatch_index: int | None = None
+        for i in range(common):
+            if b[i] != r[i]:
+                mismatch_index = i
+                break
+        if mismatch_index is None and len(b) != len(r):
+            # One is a strict prefix of the other; mark the common
+            # length as the "mismatch" position, same convention as
+            # b1_parity_oracle.
+            mismatch_index = common
+
+        row_entry: dict[str, Any] = {
+            "row": row,
+            "batch_len": len(b),
+            "reference_len": len(r),
+            "first_mismatch_index": (
+                -1 if mismatch_index is None else mismatch_index
+            ),
+        }
+        if mismatch_index is not None and first_failure is None:
+            row_entry["batch_token_at_mismatch"] = (
+                b[mismatch_index] if mismatch_index < len(b) else None
+            )
+            row_entry["reference_token_at_mismatch"] = (
+                r[mismatch_index] if mismatch_index < len(r) else None
+            )
+            first_failure = row_entry
+        rows_metadata.append(row_entry)
+
+    if first_failure is not None:
+        return (
+            False,
+            f"bgt1_parity_row_{first_failure['row']}_mismatch_index:"
+            f"{first_failure['first_mismatch_index']}",
+            {
+                "rows": rows_metadata,
+                "first_failure": first_failure,
+            },
+        )
+
+    return (
+        True,
+        None,
+        {
+            "rows": rows_metadata,
+            "first_failure": None,
+        },
+    )
+
+
 def _not_implemented(phase: str) -> OracleFn:
     """Build a stub oracle that names the phase where it lands."""
 
     def _stub(
-        scenario: Scenario, token_ids: list[int], context: Any
+        scenario: Scenario, token_ids: Any, context: Any
     ) -> tuple[bool, str | None, dict[str, Any]]:
         raise NotImplementedError(
             f"Oracle {scenario.oracle.value!r} for scenario "
@@ -193,9 +317,14 @@ def _not_implemented(phase: str) -> OracleFn:
 ORACLES: dict[OracleKind, OracleFn] = {
     OracleKind.SMOKE: smoke_oracle,
     OracleKind.B1_PARITY_VS_SINGLE: b1_parity_oracle,
-    OracleKind.BGT1_DIRECT_BATCHED_REFERENCE: _not_implemented("P-4.2c"),
+    OracleKind.BGT1_DIRECT_BATCHED_REFERENCE: bgt1_direct_batched_reference_oracle,
     OracleKind.TEACHER_FORCED_ARGMAX: _not_implemented("P-4.3"),
 }
 
 
-__all__ = ["smoke_oracle", "b1_parity_oracle", "ORACLES"]
+__all__ = [
+    "smoke_oracle",
+    "b1_parity_oracle",
+    "bgt1_direct_batched_reference_oracle",
+    "ORACLES",
+]
