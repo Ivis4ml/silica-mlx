@@ -160,7 +160,7 @@ in the `prompts` list. For budget-aware scheduling, construct a
 | Weight streaming | Stub | P-6 (`ResidentWeightProvider` today) |
 | Speculative decoding (DraftTarget / EAGLE / Medusa) | Stub | P-7 (`NoopDraftEngine` today) |
 | OpenAI-compatible HTTP server + session layer | ⏳ | P-8 |
-| Unified bench runner (SMOKE / B=1 parity / B>1 direct-reference / teacher-forced-argmax oracles, JSONL + Markdown report) | ✅ | `silica.bench.runner.BenchRunner` + `scripts/bench.py`; 13 registered scenarios covering model-shaped + workload-shaped rows (short-in/long-out, long-in/short-out, concurrent-shared-prefix, TTFT-under-concurrency) — P-4.1 through P-4.3 |
+| Unified bench runner (SMOKE / B=1 parity / B>1 direct-reference / teacher-forced-argmax oracles, JSONL + Markdown report) | ✅ | `silica.bench.runner.BenchRunner` + `scripts/bench.py`; 15 registered scenarios covering model-shaped + workload-shaped rows (short-in/long-out, long-in/short-out, concurrent-shared-prefix, TTFT-under-concurrency) — P-4.1 through P-4.3 |
 | Bench: `vqbench_baseline` subprocess PPL reference column | ✅ | `silica.bench.vqbench_baseline.run_vqbench_baseline` + `scripts/vqbench_baseline.py` (P-4.4) |
 
 Legend: ✅ shipped · Stub = wired to the main loop as the fp16 baseline,

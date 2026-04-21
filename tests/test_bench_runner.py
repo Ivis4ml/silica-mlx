@@ -644,6 +644,46 @@ def test_b1_parity_batched_unexpected_req_index_fails_before_oracle(
     assert "b1_batched_unexpected_req_index:1" in result.reason
 
 
+def test_b1_parity_missing_done_fails_before_oracle(
+    fake_home_cache: Path,
+) -> None:
+    """Stream that closes without a ``done`` event — even when the
+    emitted tokens happen to equal the single-request reference —
+    must surface as a runner failure, not a silent parity pass.
+    Parallels the BGT1 / SMOKE-batched ``rows_never_completed``
+    checks."""
+    repo = "test-owner/b1-missing-done"
+    _create_cache_dir(repo)
+
+    adapter = _FakeAdapter(vocab_size=100)
+    engine = _FakeEngine(
+        [1, 2, 3],
+        # Same tokens as the default single-request reference, but
+        # the stream omits ``done`` entirely. Without the new
+        # check, the oracle would see matching tokens and pass.
+        batched_events=[
+            BatchEvent.token(req_index=0, token_id=1),
+            BatchEvent.token(req_index=0, token_id=2),
+            BatchEvent.token(req_index=0, token_id=3),
+        ],
+    )
+    scenario = _scenario(
+        scenario_id="b1-missing-done",
+        repo=repo,
+        oracle=OracleKind.B1_PARITY_VS_SINGLE,
+    )
+    runner = BenchRunner(
+        engine_factory=_factory_returning(adapter, engine),
+        reset_peak=lambda: None,
+        read_peak_mb=lambda: None,
+    )
+    [result] = runner.run([scenario])
+
+    assert result.status == "failed"
+    assert result.reason is not None
+    assert "b1_batched_never_completed" in result.reason
+
+
 # ---------- BGT1 parity oracle / runner branch ------------------------
 
 
@@ -970,7 +1010,9 @@ def _smoke_batched_scenario(
 
 def test_smoke_batched_happy_path(fake_home_cache: Path) -> None:
     """Multi-prompt SMOKE at B>1 returns per-row metadata, total
-    tokens summed across rows, status ok."""
+    tokens summed across rows, status ok, plus a per-row
+    first_token_ms_offset (runner-instrumented TTFT — Engine's
+    batched path does not populate MetricsRegistry)."""
     repo = "test-owner/smoke-batched-happy"
     _create_cache_dir(repo)
 
@@ -998,6 +1040,12 @@ def test_smoke_batched_happy_path(fake_home_cache: Path) -> None:
     assert rows[1]["row"] == 1 and rows[1]["token_count"] == 3
     # max_token_id surfaced for at-a-glance JSONL validation.
     assert result.metadata["max_token_id"] == 23
+    # Per-row first-token wall offsets must be present and
+    # monotonic non-negative — the exact values depend on wall
+    # time (test uses real perf_counter) so we only pin shape.
+    for row_entry in rows:
+        assert "first_token_ms_offset" in row_entry
+        assert row_entry["first_token_ms_offset"] >= 0
 
 
 def test_smoke_batched_fails_on_empty_row(fake_home_cache: Path) -> None:

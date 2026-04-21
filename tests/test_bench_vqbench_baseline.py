@@ -251,6 +251,37 @@ def test_stdout_tail_truncates_long_output(tmp_path: Path) -> None:
     assert len(result.stdout_tail.splitlines()) == 10
 
 
+def test_relative_script_resolves_against_provided_cwd(tmp_path: Path) -> None:
+    """Docstring promises ``script`` is relative to ``cwd`` when
+    provided. A caller passing cwd=/a + script="b.py" must resolve
+    to /a/b.py (not to <process-cwd>/b.py as the earlier code did)."""
+    (tmp_path / "nested").mkdir()
+    script = tmp_path / "nested" / "fake_repro.py"
+    script.write_text("# placeholder\n")
+
+    seen_cmd: dict[str, list[str]] = {}
+
+    def fake_run(
+        cmd: list[str], **kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        seen_cmd["cmd"] = list(cmd)
+        return _fake_completed_process(
+            stdout=_REALISTIC_HEADLINE, returncode=0
+        )
+
+    # Pass script as relative to cwd=tmp_path/"nested".
+    result = run_vqbench_baseline(
+        "fake_repro.py",
+        cwd=tmp_path / "nested",
+        subprocess_runner=fake_run,
+    )
+    assert result.status == "ok"
+    # The second argv entry is the resolved script path; it must
+    # live under nested/ (i.e. we did NOT fall back to the process
+    # cwd where "fake_repro.py" almost certainly does not exist).
+    assert seen_cmd["cmd"][1] == str(script.resolve())
+
+
 def test_default_reproduce_script_path_points_to_checked_in_script() -> None:
     """The checked-in vqbench reproduce script must be where we
     claim it is — otherwise the CLI default silently falls back

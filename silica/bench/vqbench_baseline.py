@@ -166,9 +166,18 @@ def run_vqbench_baseline(
         one of ``ok`` / ``skipped`` / ``failed`` plus the parsed
         PPL fields when available.
     """
+    # Relative ``script`` semantics: if the caller supplies
+    # ``cwd``, resolve the relative path against it (matches the
+    # docstring's "relative to cwd" claim); otherwise fall back
+    # to the process cwd. Programmatic callers that pass
+    # ``cwd=/path/to/vqbench, script="scripts/reproduce_..."``
+    # used to land at the wrong absolute path.
     script_path = Path(script)
     if not script_path.is_absolute():
-        script_path = script_path.resolve()
+        if cwd is not None:
+            script_path = (Path(cwd) / script_path).resolve()
+        else:
+            script_path = script_path.resolve()
     args_tuple = tuple(script_args or ())
     py = python_executable or sys.executable
 

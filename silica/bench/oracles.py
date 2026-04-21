@@ -94,7 +94,20 @@ def smoke_oracle(
         )
     vocab_size = int(context["vocab_size"])
     if isinstance(token_ids, dict):
-        return _smoke_batched(token_ids, vocab_size)
+        # Runner instruments per-row first-token wall-clock
+        # offsets; surface them through per-row metadata when
+        # available so the JSONL row's ``rows[].first_token_ms_offset``
+        # carries TTFT-under-concurrency signal. ``Engine.generate_batch``
+        # does not populate ``MetricsRegistry`` so this is the only
+        # place batched TTFT actually shows up in the JSONL.
+        first_token_ms = (
+            context.get("first_token_ms_per_row")
+            if isinstance(context, dict)
+            else None
+        )
+        return _smoke_batched(
+            token_ids, vocab_size, first_token_ms_per_row=first_token_ms
+        )
     return _smoke_single(token_ids, vocab_size)
 
 
@@ -131,7 +144,10 @@ def _smoke_single(
 
 
 def _smoke_batched(
-    rows: dict[int, list[int]], vocab_size: int
+    rows: dict[int, list[int]],
+    vocab_size: int,
+    *,
+    first_token_ms_per_row: dict[int, float] | None = None,
 ) -> tuple[bool, str | None, dict[str, Any]]:
     total = 0
     max_id = 0
@@ -161,7 +177,15 @@ def _smoke_batched(
             if tok > max_id:
                 max_id = tok
         total += len(row_tokens)
-        rows_metadata.append({"row": row_idx, "token_count": len(row_tokens)})
+        row_entry: dict[str, Any] = {
+            "row": row_idx,
+            "token_count": len(row_tokens),
+        }
+        if first_token_ms_per_row is not None and row_idx in first_token_ms_per_row:
+            row_entry["first_token_ms_offset"] = round(
+                first_token_ms_per_row[row_idx], 3
+            )
+        rows_metadata.append(row_entry)
     return (
         True,
         None,

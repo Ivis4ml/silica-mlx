@@ -310,6 +310,7 @@ class BenchRunner:
                 # prefix cache.
                 params = _build_sampling_params(scenario.workload, adapter)
                 wl = scenario.workload
+                oracle_context = {"vocab_size": adapter.config.vocab_size}
                 if wl.max_batch_size == 1:
                     single_tokens = _run_single_request(
                         scenario, engine, params
@@ -317,14 +318,14 @@ class BenchRunner:
                     oracle_input = single_tokens
                     total_tokens = len(single_tokens)
                 else:
-                    batched_tokens = _run_smoke_batched(
+                    batched_tokens, first_token_ms = _run_smoke_batched(
                         scenario, engine, params
                     )
                     oracle_input = batched_tokens
                     total_tokens = sum(
                         len(row) for row in batched_tokens.values()
                     )
-                oracle_context = {"vocab_size": adapter.config.vocab_size}
+                    oracle_context["first_token_ms_per_row"] = first_token_ms
 
             wall_s = self._clock() - t_start
             peak_mb = self._read_peak_mb()
@@ -696,14 +697,17 @@ def _run_smoke_batched(
     scenario: Scenario,
     engine: Engine,
     params: SamplingParams,
-) -> dict[int, list[int]]:
+) -> tuple[dict[int, list[int]], dict[int, float]]:
     """Drive SMOKE through ``generate_batch`` for multi-prompt B>1.
 
     Wires a fresh :class:`RadixPrefixCache` when
     ``scenario.workload.prefix_cache`` is ``True`` — each scenario
     gets its own cache instance so shared-prefix metrics reflect
-    that run alone. Per-row tokens come back as a dict keyed by
-    ``req_index``, ready for the SMOKE oracle's batched branch.
+    that run alone. Returns ``(tokens, first_token_ms)`` — per-row
+    token streams plus per-row first-token wall offsets in ms
+    (measured from the moment the batched generation started, so
+    the TTFT-under-concurrency scenario can show how a long-prompt
+    prefill inflates short-prompt rows' first-token latency).
     """
     prompts = list(scenario.workload.prompts)
     prefix_cache = _maybe_build_prefix_cache(scenario.workload)
@@ -723,8 +727,8 @@ def _collect_smoke_batched_tokens(
     *,
     max_batch_size: int,
     prefix_cache: Any | None,
-) -> dict[int, list[int]]:
-    """Collect per-row token events from a SMOKE ``generate_batch`` stream.
+) -> tuple[dict[int, list[int]], dict[int, float]]:
+    """Collect per-row token events + per-row first-token offsets.
 
     Event-stream validation mirrors :func:`_collect_bgt1_batched_tokens`:
     aborted events and out-of-range ``req_index`` values raise
@@ -732,10 +736,21 @@ def _collect_smoke_batched_tokens(
     ``smoke_batched_*`` reasons before the oracle runs. Rows that
     never emit ``done`` are also a scheduler fault rather than an
     oracle concern.
+
+    ``first_token_ms`` is populated on each row's first token
+    event and carries the wall-clock offset (ms) from the start
+    of ``generate_batch``. This is what the TTFT-under-concurrency
+    scenario needs to surface per-row first-token latency —
+    ``Engine.generate_batch`` itself does not populate
+    ``MetricsRegistry``, so this is the only way a SMOKE B>1 run
+    records TTFT today. Oracle merges the dict into per-row
+    metadata so the JSONL row is self-describing.
     """
     expected_rows = set(range(len(prompts)))
     tokens: dict[int, list[int]] = {row: [] for row in expected_rows}
+    first_token_ms: dict[int, float] = {}
     done_rows: set[int] = set()
+    t_start = time.perf_counter()
 
     for event in engine.generate_batch(
         prompts,
@@ -758,6 +773,10 @@ def _collect_smoke_batched_tokens(
                     f"smoke_batched_token_event_missing_id:"
                     f"row={event.req_index}"
                 )
+            if event.req_index not in first_token_ms:
+                first_token_ms[event.req_index] = (
+                    (time.perf_counter() - t_start) * 1000.0
+                )
             tokens[event.req_index].append(event.token_id)
         elif event.kind == "done":
             done_rows.add(event.req_index)
@@ -767,7 +786,7 @@ def _collect_smoke_batched_tokens(
         raise RuntimeError(
             f"smoke_batched_rows_never_completed:{sorted(missing)}"
         )
-    return tokens
+    return tokens, first_token_ms
 
 
 def _default_teacher_forced_silica(
@@ -884,14 +903,20 @@ def _collect_b1_batched_tokens(
 
     Strict validation: any event with ``req_index != 0`` is
     treated as a scheduler fault (generated batches in a B=1 run
-    must only emit against the single admitted request), and an
-    ``aborted`` event short-circuits the run as a failure rather
-    than letting the oracle see a truncated stream. Both conditions
-    raise ``RuntimeError`` so the outer ``_run_one`` collapses them
-    to ``status="failed"`` with a structured ``b1_batched_*``
-    reason — never into the oracle's "tokens mismatched" branch.
+    must only emit against the single admitted request), an
+    ``aborted`` event short-circuits the run, and the stream
+    MUST emit a ``done`` event for row 0 before ending — any of
+    these raises ``RuntimeError`` so the outer ``_run_one``
+    collapses them to ``status="failed"`` with a structured
+    ``b1_batched_*`` reason, never into the oracle's "tokens
+    mismatched" branch. Matching the BGT1 / SMOKE-batched
+    event-validation pattern is deliberate: if a B=1 stream
+    closes without ``done`` but the emitted tokens happen to
+    equal the single-request reference, we would otherwise
+    falsely pass parity on a silently broken scheduler.
     """
     tokens: list[int] = []
+    done_seen = False
     for event in engine.generate_batch([prompt], params, max_batch_size=1):
         if event.req_index != 0:
             raise RuntimeError(
@@ -905,8 +930,10 @@ def _collect_b1_batched_tokens(
             if event.token_id is None:
                 raise RuntimeError("b1_batched_token_event_missing_id")
             tokens.append(event.token_id)
-        # "done" is terminal but carries no token data; accept
-        # silently so the loop exits on stream close.
+        elif event.kind == "done":
+            done_seen = True
+    if not done_seen:
+        raise RuntimeError("b1_batched_never_completed")
     return tokens
 
 
