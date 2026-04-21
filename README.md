@@ -146,7 +146,7 @@ in the `prompts` list. For budget-aware scheduling, construct a
 | Qwen3.5-27B load via `mlx_lm.load` verified (single-request) | ✅ | `scripts/probe_qwen3_5_27b_load.py` (batched validation pending bench) |
 | DeltaNet recurrent state + `state_delta` plumbing (single-request + batched path) | ✅ | D-015 + P-3-C0..C3d; `Qwen3_5Adapter.make_batch_cache` interleaves `ArraysCache` / `BatchKVCache` per layer |
 | Gemma4-31B dense adapter — single-request + batched miss-only path (sliding + full attention hybrid) | ✅ | `silica.models.gemma4.Gemma4Adapter`; single-request smoke in `tests/test_p3_gemma4_single_request_smoke.py`; batched smoke in `tests/test_p3_gemma4_batched_smoke.py` (dual-gated); B=1 parity + B>1 direct mlx-lm batched reference pinned in `tests/test_p3_gemma4_batched_parity.py`; strict B>1 batched-vs-single greedy parity drifts empirically; per-kind KV budget via `KVLayout.bytes_per_token_total` (P-3-D4); **prefix-cache + SLIDING** rejected at construction (P-3-D3 local follow-up) |
-| MoE adapters (Qwen3.5-35B-A3B / gemma-4-26B-A4B) | ⏳ | P-3 |
+| MoE adapters (Qwen3.5-35B-A3B / gemma-4-26B-A4B) — single-request only | ✅ | `silica.models.qwen3_5_moe.Qwen3_5MoeAdapter` (P-3-E1.1); `silica.models.gemma4_moe.Gemma4MoeAdapter` (P-3-E1.2); option (c) dispatch-observation seam pinned in `tests/test_p3_moe_dispatch.py` (P-3-E2); real-model smokes in `tests/test_p3_qwen3_5_moe_smoke.py` and `tests/test_p3_gemma4_moe_smoke.py` (dual-gated); batched MoE pending P-3-E4 |
 | Preempt/replay with recurrent state snapshot | ⏳ | P-3-C5 |
 | VQ KV compression (BlockTQ / RaBitQ) | Stub | P-5 (`IdentityCodec` today) |
 | Weight streaming | Stub | P-6 (`ResidentWeightProvider` today) |
