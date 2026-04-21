@@ -69,7 +69,13 @@ class _FakeTokenizer:
         self.eos_token_ids: set[int] = set()
 
     def encode(self, text: str) -> list[int]:
-        return [1, 2, 3] if text else []
+        # One id per character, modulo vocab so all ids stay in
+        # range. Gives teacher-forced tests direct control over the
+        # tokenized length — e.g. encode("x" * 100) returns a
+        # 100-id list.
+        if not text:
+            return []
+        return [(ord(c) % max(1, self.vocab_size)) for c in text]
 
     def decode(self, token_ids: list[int]) -> str:
         return ""
@@ -457,36 +463,6 @@ def test_jsonl_output_one_row_per_result(
     assert rows[0]["metadata"]["total_tokens"] == 1
     assert rows[1]["scenario_id"] == "skip"
     assert rows[1]["status"] == "skipped"
-
-
-def test_unknown_oracle_kind_raises_via_runner(fake_home_cache: Path) -> None:
-    """A scenario naming a not-yet-implemented oracle surfaces the
-    NotImplementedError via ScenarioResult.reason rather than crashing
-    the runner (which would take down subsequent scenarios in the
-    same run). Uses TEACHER_FORCED_ARGMAX because its implementation
-    lands in P-4.3; the other oracle kinds are already implemented."""
-    repo = "test-owner/unknown-oracle"
-    _create_cache_dir(repo)
-
-    adapter = _FakeAdapter(vocab_size=100)
-    engine = _FakeEngine([1, 2])
-
-    scenario = _scenario(
-        scenario_id="unknown-oracle",
-        repo=repo,
-        oracle=OracleKind.TEACHER_FORCED_ARGMAX,
-    )
-    runner = BenchRunner(
-        engine_factory=_factory_returning(adapter, engine),
-        reset_peak=lambda: None,
-        read_peak_mb=lambda: None,
-    )
-    [result] = runner.run([scenario])
-
-    assert result.status == "failed"
-    assert result.reason is not None
-    assert "NotImplementedError" in result.reason
-    assert "P-4.3" in result.reason
 
 
 # ---------- B1 parity oracle / runner branch --------------------------
@@ -1130,6 +1106,233 @@ def test_smoke_batched_prefix_cache_reaches_engine(
     pc = observed_kwargs.get("prefix_cache")
     assert pc is not None, "expected runner to pass a RadixPrefixCache"
     assert isinstance(pc, RadixPrefixCache)
+
+
+# ---------- TEACHER_FORCED_ARGMAX -------------------------------------
+
+
+def _tf_scenario(
+    *,
+    scenario_id: str,
+    repo: str,
+    target_continuation: str | None = " Paris.",
+    min_agreement_rate: float = 0.98,
+    prompt: str = "The capital of France is",
+) -> Scenario:
+    oracle_config: dict[str, Any] = {}
+    if target_continuation is not None:
+        oracle_config["target_continuation"] = target_continuation
+    oracle_config["min_agreement_rate"] = min_agreement_rate
+    return Scenario(
+        id=scenario_id,
+        repo=repo,
+        workload=Workload(
+            name="fake-tf",
+            prompts=(prompt,),
+            max_tokens=1,
+            max_batch_size=1,
+        ),
+        oracle=OracleKind.TEACHER_FORCED_ARGMAX,
+        oracle_config=oracle_config,
+    )
+
+
+def test_teacher_forced_argmax_happy_path(fake_home_cache: Path) -> None:
+    """Silica and reference both return identical argmax lists of
+    equal length; oracle returns ok with agreement_rate=1.0."""
+    repo = "test-owner/tf-happy"
+    _create_cache_dir(repo)
+
+    adapter = _FakeAdapter(vocab_size=100)
+    engine = _FakeEngine([])
+    # target_continuation=" Paris." tokenises to 7 ids via the
+    # per-character fake tokenizer, so prediction lists must
+    # be length 7 to match.
+    predictions = [10, 20, 30, 40, 50, 60, 70]
+
+    def fake_silica(
+        a: Any, e: Any, prompt_ids: list[int], target_ids: list[int]
+    ) -> list[int]:
+        assert len(target_ids) == len(predictions)
+        return list(predictions)
+
+    def fake_reference(
+        a: Any, prompt_ids: list[int], target_ids: list[int]
+    ) -> list[int]:
+        return list(predictions)
+
+    scenario = _tf_scenario(scenario_id="tf-happy", repo=repo)
+    runner = BenchRunner(
+        engine_factory=_factory_returning(adapter, engine),
+        teacher_forced_silica=fake_silica,
+        teacher_forced_reference=fake_reference,
+        reset_peak=lambda: None,
+        read_peak_mb=lambda: None,
+    )
+    [result] = runner.run([scenario])
+
+    assert result.status == "ok"
+    assert result.reason is None
+    assert result.total_tokens == len(predictions)
+    assert result.metadata["agreement_rate"] == 1.0
+    assert result.metadata["first_mismatch_index"] == -1
+    assert result.metadata["length"] == len(predictions)
+    assert result.metadata["matches"] == len(predictions)
+
+
+def test_teacher_forced_argmax_fail_below_threshold(
+    fake_home_cache: Path,
+) -> None:
+    """With 1 match out of 4 positions, agreement_rate=0.25 which
+    is below the 0.98 threshold → oracle fails with a structured
+    reason."""
+    repo = "test-owner/tf-fail"
+    _create_cache_dir(repo)
+
+    adapter = _FakeAdapter(vocab_size=100)
+    engine = _FakeEngine([])
+    # Target "abcd" tokenises to length 4 via per-character fake.
+    silica = [10, 99, 98, 97]
+    reference = [10, 20, 30, 40]  # matches silica only at index 0
+
+    def fake_silica(*args: Any) -> list[int]:
+        return list(silica)
+
+    def fake_reference(*args: Any) -> list[int]:
+        return list(reference)
+
+    scenario = _tf_scenario(
+        scenario_id="tf-fail", repo=repo, target_continuation="abcd"
+    )
+    runner = BenchRunner(
+        engine_factory=_factory_returning(adapter, engine),
+        teacher_forced_silica=fake_silica,
+        teacher_forced_reference=fake_reference,
+        reset_peak=lambda: None,
+        read_peak_mb=lambda: None,
+    )
+    [result] = runner.run([scenario])
+
+    assert result.status == "failed"
+    assert result.reason is not None
+    assert result.reason.startswith(
+        "teacher_forced_argmax_agreement_below_threshold:"
+    )
+    assert result.metadata["agreement_rate"] == 0.25
+    assert result.metadata["first_mismatch_index"] == 1
+    assert result.metadata["matches"] == 1
+
+
+def test_teacher_forced_argmax_exact_threshold_is_pass(
+    fake_home_cache: Path,
+) -> None:
+    """Agreement rate exactly equal to threshold must pass (>=)."""
+    repo = "test-owner/tf-threshold"
+    _create_cache_dir(repo)
+
+    adapter = _FakeAdapter(vocab_size=100)
+    engine = _FakeEngine([])
+    # 98 matches / 100 positions -> 0.98 exactly
+    reference = list(range(100))
+    silica = list(reference)
+    silica[50] = 9999
+    silica[75] = 9999
+
+    def fake_silica(*args: Any) -> list[int]:
+        return list(silica)
+
+    def fake_reference(*args: Any) -> list[int]:
+        return list(reference)
+
+    scenario = _tf_scenario(
+        scenario_id="tf-threshold",
+        repo=repo,
+        # 100 chars -> 100 tokenised ids via per-char fake tokenizer,
+        # so predictions line up with the 100 silica/reference slots.
+        target_continuation="x" * 100,
+        min_agreement_rate=0.98,
+    )
+    runner = BenchRunner(
+        engine_factory=_factory_returning(adapter, engine),
+        teacher_forced_silica=fake_silica,
+        teacher_forced_reference=fake_reference,
+        reset_peak=lambda: None,
+        read_peak_mb=lambda: None,
+    )
+    [result] = runner.run([scenario])
+
+    assert result.status == "ok"
+    assert result.metadata["agreement_rate"] == pytest.approx(0.98)
+    assert result.metadata["matches"] == 98
+
+
+def test_teacher_forced_argmax_missing_oracle_config_target_fails(
+    fake_home_cache: Path,
+) -> None:
+    """A scenario that forgot oracle_config['target_continuation']
+    is authoring-broken; runner surfaces the specific missing key
+    rather than crashing inside the silica hook."""
+    repo = "test-owner/tf-no-target"
+    _create_cache_dir(repo)
+
+    adapter = _FakeAdapter(vocab_size=100)
+    engine = _FakeEngine([])
+    scenario = _tf_scenario(
+        scenario_id="tf-no-target", repo=repo, target_continuation=None
+    )
+
+    runner = BenchRunner(
+        engine_factory=_factory_returning(adapter, engine),
+        reset_peak=lambda: None,
+        read_peak_mb=lambda: None,
+    )
+    [result] = runner.run([scenario])
+
+    assert result.status == "failed"
+    assert result.reason is not None
+    assert (
+        "teacher_forced_argmax_missing_oracle_config_target_continuation"
+        in result.reason
+    )
+
+
+def test_teacher_forced_argmax_rejects_batched_workload(
+    fake_home_cache: Path,
+) -> None:
+    """Teacher-forced is strictly single-request — B>1 is an
+    authoring error, not a runner branch."""
+    repo = "test-owner/tf-batched"
+    _create_cache_dir(repo)
+
+    called = {"n": 0}
+
+    def factory(scenario: Any) -> Any:
+        called["n"] += 1
+        raise AssertionError("factory must not run for authoring errors")
+
+    scenario = Scenario(
+        id="tf-batched",
+        repo=repo,
+        workload=Workload(
+            name="bad",
+            prompts=("a", "b"),
+            max_tokens=1,
+            max_batch_size=2,
+        ),
+        oracle=OracleKind.TEACHER_FORCED_ARGMAX,
+        oracle_config={"target_continuation": "x", "min_agreement_rate": 0.98},
+    )
+    runner = BenchRunner(
+        engine_factory=factory,
+        reset_peak=lambda: None,
+        read_peak_mb=lambda: None,
+    )
+    [result] = runner.run([scenario])
+
+    assert result.status == "failed"
+    assert result.reason is not None
+    assert "max_batch_size=1" in result.reason
+    assert called["n"] == 0
 
 
 def test_smoke_batched_prefix_cache_is_none_when_workload_flag_off(

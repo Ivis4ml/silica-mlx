@@ -11,6 +11,8 @@ from silica.bench.runner import (
     BenchRunner,
     DirectBatchedReferenceFn,
     EngineFactory,
+    TeacherForcedReferenceFn,
+    TeacherForcedSilicaFn,
 )
 from silica.bench.scenario import (
     OracleFn,
@@ -35,6 +37,8 @@ __all__ = [
     "OracleKind",
     "Scenario",
     "ScenarioResult",
+    "TeacherForcedReferenceFn",
+    "TeacherForcedSilicaFn",
     "Workload",
     "get_scenario",
     "hf_cache_path_for_repo",

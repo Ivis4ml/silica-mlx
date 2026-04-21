@@ -7,7 +7,7 @@ a module-level ``dict`` rather than a registry class: scenario
 definitions are static constants, and a dict lets readers see the
 full roster at a glance.
 
-Current catalog (P-4.1 + P-4.2a + P-4.2b + P-4.2c + P-4.2d-ii + P-4.2d-iii-a + P-4.2d-iii-b):
+Current catalog (P-4.1 + P-4.2a + P-4.2b + P-4.2c + P-4.2d-ii + P-4.2d-iii-a + P-4.2d-iii-b + P-4.3):
 
   * ``qwen3-0.6b-smoke`` (P-4.1) — short-in / short-out on
     Qwen3-0.6B, ``max_tokens=4``, ``OracleKind.SMOKE``, cache-only
@@ -101,6 +101,16 @@ Workload-shaped rows (PLAN §P-4 names them by shape, not model):
     this row collects are the input to the Q-010 chunked-prefill
     promotion decision, not a correctness oracle (SMOKE remains
     the floor: all rows must emit valid tokens).
+  * ``qwen3-0.6b-teacher-forced-argmax`` (P-4.3) — PLAN §P-3
+    exit-criterion row. For a fixed prompt + target continuation,
+    runs the silica adapter's ``prefill`` + ``decode_step`` loop
+    with teacher-forced targets and compares the positional
+    argmax sequence against a direct mlx-lm single-forward
+    reference. Oracle config supplies ``target_continuation``
+    (text tokenised by the adapter's tokenizer) and
+    ``min_agreement_rate=0.98`` per PLAN; in practice both paths
+    agree 100% on cached 0.6B because they drive the same
+    mlx-lm model from identical state.
 
 The pytest-side real-model smokes remain in place: they pin the
 adapter shape (``config.extra`` values, capability flags), which
@@ -527,6 +537,50 @@ _QWEN3_0_6B_CONCURRENT_SHARED_PREFIX = Scenario(
 )
 
 
+_QWEN3_0_6B_TEACHER_FORCED_ARGMAX = Scenario(
+    id="qwen3-0.6b-teacher-forced-argmax",
+    repo="Qwen/Qwen3-0.6B",
+    workload=Workload(
+        name="teacher-forced-argmax",
+        prompts=("The capital of France is",),
+        # max_tokens is unused on the teacher-forced path — the
+        # number of predictions is dictated by
+        # oracle_config['target_continuation']. Pinned to 1 so the
+        # Workload shape remains trivially single-request.
+        max_tokens=1,
+        max_batch_size=1,
+        prefix_cache=False,
+        temperature=0.0,
+        top_p=1.0,
+    ),
+    oracle=OracleKind.TEACHER_FORCED_ARGMAX,
+    oracle_config={
+        # Target continuation chosen to tokenize to ~40+ ids on
+        # Qwen3 — far above PLAN §P-3's "first 100 teacher-forced
+        # positions" is not required; the oracle is about
+        # silica-vs-reference agreement rate, not total length.
+        "target_continuation": (
+            " Paris. The capital of Germany is Berlin. The capital "
+            "of Italy is Rome. The capital of Spain is Madrid. The "
+            "capital of Japan is Tokyo."
+        ),
+        "min_agreement_rate": 0.98,
+    },
+    gate_env_var=None,
+    description=(
+        "Teacher-forced next-token argmax parity (PLAN §P-3 exit "
+        "criterion). Silica drives adapter.prefill + "
+        "decode_step with teacher-forced target tokens; the "
+        "reference is a single mlx-lm forward over prompt + "
+        "target[:-1] with positional logits sliced to match. "
+        "Oracle passes when silica's per-position argmax matches "
+        "the reference at >= min_agreement_rate (0.98 per PLAN; "
+        "100% expected on cached 0.6B because both paths drive "
+        "the same mlx-lm model). Cache-only gate."
+    ),
+)
+
+
 _QWEN3_0_6B_TTFT_UNDER_CONCURRENCY = Scenario(
     id="qwen3-0.6b-ttft-under-concurrency",
     repo="Qwen/Qwen3-0.6B",
@@ -568,6 +622,7 @@ BUILTIN_SCENARIOS: dict[str, Scenario] = {
     _QWEN3_0_6B_SHORT_IN_LONG_OUT.id: _QWEN3_0_6B_SHORT_IN_LONG_OUT,
     _QWEN3_0_6B_LONG_IN_SHORT_OUT.id: _QWEN3_0_6B_LONG_IN_SHORT_OUT,
     _QWEN3_0_6B_CONCURRENT_SHARED_PREFIX.id: _QWEN3_0_6B_CONCURRENT_SHARED_PREFIX,
+    _QWEN3_0_6B_TEACHER_FORCED_ARGMAX.id: _QWEN3_0_6B_TEACHER_FORCED_ARGMAX,
     _QWEN3_0_6B_TTFT_UNDER_CONCURRENCY.id: _QWEN3_0_6B_TTFT_UNDER_CONCURRENCY,
     _QWEN3_5_0_8B_B1_PARITY.id: _QWEN3_5_0_8B_B1_PARITY,
     _QWEN3_5_27B_SMOKE.id: _QWEN3_5_27B_SMOKE,

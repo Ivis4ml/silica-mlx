@@ -26,9 +26,16 @@ Implemented kinds:
     (which runs unconditionally for ``max_tokens``) and Silica's
     stream stay length-aligned regardless of EOS.
 
-Not yet implemented (registered as stubs that raise):
+  * :class:`OracleKind.TEACHER_FORCED_ARGMAX` (P-4.3) — for a
+    fixed prompt + target continuation, the Silica adapter's
+    position-by-position next-token argmax (driven by
+    ``adapter.prefill`` + ``decode_step`` with teacher-forced
+    targets) must agree with a direct mlx-lm single-forward
+    reference at >= ``min_agreement_rate`` of positions. PLAN §P-3
+    exit criterion; the oracle is pure (runner supplies both
+    streams) with structured agreement metadata.
 
-  * ``TEACHER_FORCED_ARGMAX`` — lands in P-4.3.
+All registered oracle kinds are now implemented.
 
 The smoke oracle checks the minimal invariants any "did the run
 crash?" test would check:
@@ -363,25 +370,126 @@ def bgt1_direct_batched_reference_oracle(
     )
 
 
-def _not_implemented(phase: str) -> OracleFn:
-    """Build a stub oracle that names the phase where it lands."""
+def teacher_forced_argmax_oracle(
+    scenario: Scenario,
+    silica_predictions: Any,
+    context: Any,
+) -> tuple[bool, str | None, dict[str, Any]]:
+    """Teacher-forced argmax parity: silica adapter path's positional
+    next-token argmax must agree with a direct mlx-lm reference.
 
-    def _stub(
-        scenario: Scenario, token_ids: Any, context: Any
-    ) -> tuple[bool, str | None, dict[str, Any]]:
-        raise NotImplementedError(
-            f"Oracle {scenario.oracle.value!r} for scenario "
-            f"{scenario.id!r} lands in {phase}."
+    ``silica_predictions`` is a ``list[int]`` of length N with the
+    argmax at each teacher-forced position produced by
+    ``adapter.prefill`` + ``decode_step`` with the target tokens
+    fed deterministically.
+
+    ``context`` must contain:
+
+      * ``reference_predictions`` — ``list[int]`` of the same
+        length, coming from a single direct mlx-lm forward
+        (``model(prompt + target[:-1], cache=fresh)``) with its
+        positional logits sliced to N predictions.
+      * ``target_tokens`` — the teacher-forcing target ids (used
+        only for metadata reporting, not for the pass/fail
+        decision — the oracle measures silica-vs-reference, not
+        silica-vs-expected-continuation).
+      * ``min_agreement_rate`` — float in [0, 1]; oracle passes
+        when the fraction of positions where silica == reference
+        is >= this threshold. PLAN §P-3 set this at 0.98 to
+        absorb fp16 + quantization numerical jitter.
+      * ``vocab_size`` — for defence-in-depth vocabulary bounds
+        reporting.
+
+    Metadata always includes the agreement rate, per-stream
+    lengths, the first mismatch position (``-1`` when all match),
+    the configured threshold, and a ``target_match_rate`` that
+    separately reports how often the silica path also agreed with
+    the teacher-forced target (informative, non-normative).
+    """
+    if not isinstance(context, dict):
+        return (False, "teacher_forced_argmax_missing_context", {})
+    for key in ("reference_predictions", "min_agreement_rate", "target_tokens"):
+        if key not in context:
+            return (
+                False,
+                f"teacher_forced_argmax_missing_context_{key}",
+                {},
+            )
+    if not isinstance(silica_predictions, list):
+        return (
+            False,
+            "teacher_forced_argmax_silica_predictions_not_list:"
+            f"{type(silica_predictions).__name__}",
+            {},
         )
 
-    return _stub
+    reference = list(context["reference_predictions"])
+    target = list(context["target_tokens"])
+    threshold = float(context["min_agreement_rate"])
+
+    silica_len = len(silica_predictions)
+    ref_len = len(reference)
+    if silica_len != ref_len:
+        return (
+            False,
+            f"teacher_forced_argmax_length_mismatch:"
+            f"silica={silica_len}_reference={ref_len}",
+            {
+                "silica_len": silica_len,
+                "reference_len": ref_len,
+                "min_agreement_rate": threshold,
+            },
+        )
+    if silica_len == 0:
+        return (
+            False,
+            "teacher_forced_argmax_empty_predictions",
+            {"min_agreement_rate": threshold},
+        )
+
+    matches = 0
+    first_mismatch = -1
+    for i, (s, r) in enumerate(zip(silica_predictions, reference, strict=True)):
+        if s == r:
+            matches += 1
+        elif first_mismatch == -1:
+            first_mismatch = i
+    agreement_rate = matches / silica_len
+
+    target_matches = 0
+    if len(target) == silica_len:
+        for s, t in zip(silica_predictions, target, strict=True):
+            if s == t:
+                target_matches += 1
+        target_match_rate = target_matches / silica_len
+    else:
+        # Mismatched target length is not a failure — the target is
+        # informational. Report absent so the reader sees why.
+        target_match_rate = None
+
+    metadata: dict[str, Any] = {
+        "length": silica_len,
+        "matches": matches,
+        "agreement_rate": agreement_rate,
+        "first_mismatch_index": first_mismatch,
+        "min_agreement_rate": threshold,
+        "target_match_rate": target_match_rate,
+    }
+    if agreement_rate < threshold:
+        return (
+            False,
+            f"teacher_forced_argmax_agreement_below_threshold:"
+            f"{agreement_rate:.3f}<{threshold:.3f}",
+            metadata,
+        )
+    return (True, None, metadata)
 
 
 ORACLES: dict[OracleKind, OracleFn] = {
     OracleKind.SMOKE: smoke_oracle,
     OracleKind.B1_PARITY_VS_SINGLE: b1_parity_oracle,
     OracleKind.BGT1_DIRECT_BATCHED_REFERENCE: bgt1_direct_batched_reference_oracle,
-    OracleKind.TEACHER_FORCED_ARGMAX: _not_implemented("P-4.3"),
+    OracleKind.TEACHER_FORCED_ARGMAX: teacher_forced_argmax_oracle,
 }
 
 
@@ -389,5 +497,6 @@ __all__ = [
     "smoke_oracle",
     "b1_parity_oracle",
     "bgt1_direct_batched_reference_oracle",
+    "teacher_forced_argmax_oracle",
     "ORACLES",
 ]

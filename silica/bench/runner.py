@@ -116,6 +116,17 @@ EngineFactory = Callable[[Scenario], tuple[ModelAdapter, Engine]]
 DirectBatchedReferenceFn = Callable[
     [ModelAdapter, list[str], SamplingParams], dict[int, list[int]]
 ]
+# Teacher-forced argmax has two injectable hooks because the
+# Silica path and the reference path drive different code
+# (adapter.prefill/decode_step vs direct mlx-lm forward). Tests
+# inject pre-computed prediction lists; on-device uses the
+# module-level default implementations.
+TeacherForcedSilicaFn = Callable[
+    [ModelAdapter, Engine, list[int], list[int]], list[int]
+]
+TeacherForcedReferenceFn = Callable[
+    [ModelAdapter, list[int], list[int]], list[int]
+]
 
 
 def _default_engine_factory(
@@ -186,6 +197,8 @@ class BenchRunner:
         *,
         engine_factory: EngineFactory | None = None,
         direct_batched_reference: DirectBatchedReferenceFn | None = None,
+        teacher_forced_silica: TeacherForcedSilicaFn | None = None,
+        teacher_forced_reference: TeacherForcedReferenceFn | None = None,
         out_path: Path | None = None,
         clock: Callable[[], float] = time.perf_counter,
         reset_peak: Callable[[], None] | None = None,
@@ -198,6 +211,16 @@ class BenchRunner:
             direct_batched_reference
             if direct_batched_reference is not None
             else _direct_mlx_lm_batched_reference
+        )
+        self._teacher_forced_silica: TeacherForcedSilicaFn = (
+            teacher_forced_silica
+            if teacher_forced_silica is not None
+            else _default_teacher_forced_silica
+        )
+        self._teacher_forced_reference: TeacherForcedReferenceFn = (
+            teacher_forced_reference
+            if teacher_forced_reference is not None
+            else _default_teacher_forced_reference
         )
         self._out_path = out_path
         self._clock = clock
@@ -274,6 +297,12 @@ class BenchRunner:
                 total_tokens = sum(
                     len(row) for row in bgt1_tokens.values()
                 )
+            elif scenario.oracle == OracleKind.TEACHER_FORCED_ARGMAX:
+                tf_predictions, oracle_context = self._run_teacher_forced_argmax(
+                    scenario, engine, adapter
+                )
+                oracle_input = tf_predictions
+                total_tokens = len(tf_predictions)
             else:
                 # SMOKE (and any future single/batched-flexible
                 # oracle). B=1 takes the single-request path,
@@ -330,6 +359,56 @@ class BenchRunner:
         self._out_path.parent.mkdir(parents=True, exist_ok=True)
         with self._out_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(asdict(result)) + "\n")
+
+    def _run_teacher_forced_argmax(
+        self,
+        scenario: Scenario,
+        engine: Engine,
+        adapter: ModelAdapter,
+    ) -> tuple[list[int], dict[str, Any]]:
+        """Drive both the silica and reference teacher-forced paths.
+
+        Pulls the target continuation text from
+        ``scenario.oracle_config``, tokenises with the adapter's
+        tokenizer, then invokes the injectable silica / reference
+        hooks (defaults: drive ``adapter.prefill`` + ``decode_step``
+        for silica; direct mlx-lm single forward for reference).
+        Oracle context carries the reference predictions, the
+        target token ids, and the pass-rate threshold.
+
+        Any missing oracle_config key (``target_continuation``,
+        ``min_agreement_rate``) raises a ``RuntimeError`` that the
+        outer ``_run_one`` collapses to ``status="failed"`` — the
+        scenario is authoring-broken, not environmentally blocked.
+        """
+        target_text = scenario.oracle_config.get("target_continuation")
+        if not isinstance(target_text, str) or not target_text:
+            raise RuntimeError(
+                "teacher_forced_argmax_missing_oracle_config_target_continuation"
+            )
+        threshold = scenario.oracle_config.get("min_agreement_rate", 0.98)
+
+        tokenizer = adapter.tokenizer()
+        prompt = scenario.workload.prompts[0]
+        prompt_ids = list(tokenizer.encode(prompt))
+        target_ids = list(tokenizer.encode(target_text))
+        if not prompt_ids:
+            raise RuntimeError("teacher_forced_argmax_empty_prompt")
+        if not target_ids:
+            raise RuntimeError("teacher_forced_argmax_empty_target")
+
+        silica_predictions = self._teacher_forced_silica(
+            adapter, engine, prompt_ids, target_ids
+        )
+        reference_predictions = self._teacher_forced_reference(
+            adapter, prompt_ids, target_ids
+        )
+        return silica_predictions, {
+            "reference_predictions": reference_predictions,
+            "target_tokens": target_ids,
+            "min_agreement_rate": float(threshold),
+            "vocab_size": adapter.config.vocab_size,
+        }
 
     def _run_bgt1_parity(
         self,
@@ -418,9 +497,17 @@ def _validate_workload_for_oracle(
                 f"oracle {oracle.value!r} requires at least 2 prompts, "
                 f"got {len(wl.prompts)}"
             )
-    # Unknown oracle kinds (e.g. TEACHER_FORCED_ARGMAX stub) pass
-    # this validation unchanged — their stub oracle raises
-    # NotImplementedError once dispatched.
+    elif oracle == OracleKind.TEACHER_FORCED_ARGMAX:
+        if wl.max_batch_size != 1:
+            return (
+                f"oracle {oracle.value!r} requires max_batch_size=1, "
+                f"got {wl.max_batch_size}"
+            )
+        if len(wl.prompts) != 1:
+            return (
+                f"oracle {oracle.value!r} requires exactly 1 prompt, "
+                f"got {len(wl.prompts)}"
+            )
     return None
 
 
@@ -683,6 +770,88 @@ def _collect_smoke_batched_tokens(
     return tokens
 
 
+def _default_teacher_forced_silica(
+    adapter: ModelAdapter,
+    engine: Engine,
+    prompt_ids: list[int],
+    target_ids: list[int],
+) -> list[int]:
+    """Drive Silica's ``adapter.prefill`` + ``decode_step`` with
+    teacher-forced target tokens; argmax at each position.
+
+    Returns ``len(target_ids)`` predictions: the first from the
+    prefill logits (predicting ``target[0]``) and the rest from
+    decoding each ``target[i]`` into step logits (predicting
+    ``target[i+1]``). The last target token is NOT decoded because
+    its next-position logit would predict *past* the target window.
+
+    Uses ``engine.kv_manager`` directly so we do not need to spin
+    up a second ``SimpleKVCache`` for this run; the handle is
+    local (``req_id="bench-teacher-forced"``) and freed in
+    ``finally``.
+    """
+    import mlx.core as mx  # noqa: PLC0415 — optional import, runner path only
+
+    from silica.kvcache.manager import KVHandle  # noqa: PLC0415
+
+    req_id = "bench-teacher-forced"
+    handle = KVHandle(req_id=req_id)
+    kv_manager = engine.kv_manager
+    kv_manager.reserve_for_prefill(req_id, prompt_ids)
+    try:
+        prompt_arr = mx.array(prompt_ids, dtype=mx.int32)
+        predictions: list[int] = []
+        logits, _ = adapter.prefill(prompt_arr, handle)
+        predictions.append(int(mx.argmax(logits).item()))
+        for i in range(len(target_ids) - 1):
+            step_in = mx.array([target_ids[i]], dtype=mx.int32)
+            logits, _ = adapter.decode_step(step_in, handle)
+            predictions.append(int(mx.argmax(logits).item()))
+        return predictions
+    finally:
+        kv_manager.free(req_id)
+
+
+def _default_teacher_forced_reference(
+    adapter: ModelAdapter,
+    prompt_ids: list[int],
+    target_ids: list[int],
+) -> list[int]:
+    """Direct mlx-lm reference: one forward over ``prompt + target[:-1]``,
+    slice positional logits at the N teacher-forced positions,
+    argmax each.
+
+    Uses ``adapter.make_batch_cache([0])`` for a fresh B=1 cache
+    list so the reference run has no state shared with whatever
+    the engine is carrying. Returns ``len(target_ids)`` predictions
+    aligned one-for-one with the silica path.
+    """
+    import mlx.core as mx  # noqa: PLC0415 — optional import, runner path only
+
+    from silica.weights.resident import ResidentWeightProvider  # noqa: PLC0415
+
+    model = adapter.build(ResidentWeightProvider())
+    make_batch_cache = getattr(adapter, "make_batch_cache", None)
+    if not callable(make_batch_cache):
+        raise RuntimeError(
+            f"adapter {type(adapter).__name__} does not expose "
+            "make_batch_cache — required for teacher-forced reference"
+        )
+    cache = make_batch_cache([0])
+
+    prompt_len = len(prompt_ids)
+    target_len = len(target_ids)
+    # Feed prompt + target[:-1]. The logit at position i predicts
+    # position i+1, so positions [prompt_len-1 : prompt_len-1+target_len]
+    # predict target[0 : target_len].
+    input_ids = prompt_ids + target_ids[:-1]
+    tokens_arr = mx.array([input_ids], dtype=mx.int32)  # (1, prompt_len + target_len - 1)
+    logits = model(tokens_arr, cache=cache)  # (1, T, V)
+    mx.eval(logits)
+    positional = logits[0, prompt_len - 1 : prompt_len - 1 + target_len, :]
+    return [int(mx.argmax(positional[i]).item()) for i in range(target_len)]
+
+
 def _maybe_build_prefix_cache(workload: Workload) -> Any | None:
     """Build a fresh :class:`RadixPrefixCache` if the workload asks
     for it, else ``None``.
@@ -741,4 +910,10 @@ def _collect_b1_batched_tokens(
     return tokens
 
 
-__all__ = ["BenchRunner", "DirectBatchedReferenceFn", "EngineFactory"]
+__all__ = [
+    "BenchRunner",
+    "DirectBatchedReferenceFn",
+    "EngineFactory",
+    "TeacherForcedReferenceFn",
+    "TeacherForcedSilicaFn",
+]

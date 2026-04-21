@@ -75,6 +75,18 @@ class Engine:
         self.metrics = metrics or MetricsRegistry()
         self._req_counter = 0
 
+    @property
+    def kv_manager(self) -> KVManager:
+        """Public accessor for the KV manager.
+
+        Exposed so the bench harness's teacher-forced-argmax path
+        (P-4.3) can drive ``adapter.prefill`` / ``decode_step``
+        directly without owning the KV lifecycle — otherwise it
+        would need a parallel ``SimpleKVCache.from_model`` load.
+        Internal callers still use ``self._kv_manager``.
+        """
+        return self._kv_manager
+
     def generate(
         self,
         prompt: str,

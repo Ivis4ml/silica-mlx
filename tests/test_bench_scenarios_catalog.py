@@ -398,6 +398,28 @@ def test_qwen3_0_6b_concurrent_shared_prefix_uses_prefix_cache() -> None:
         )
 
 
+def test_qwen3_0_6b_teacher_forced_argmax_is_cache_only() -> None:
+    """The P-4.3 row is cache-only; pin the oracle_config keys so
+    a forgotten target or threshold drift surfaces here rather
+    than as a cryptic runner error."""
+    scenario = get_scenario("qwen3-0.6b-teacher-forced-argmax")
+    assert scenario.repo == "Qwen/Qwen3-0.6B"
+    assert scenario.gate_env_var is None
+    assert scenario.oracle == OracleKind.TEACHER_FORCED_ARGMAX
+    assert scenario.workload.max_batch_size == 1
+    assert scenario.workload.prompts == ("The capital of France is",)
+    cfg = scenario.oracle_config
+    assert isinstance(cfg.get("target_continuation"), str)
+    assert len(cfg["target_continuation"]) >= 20, (
+        "target_continuation should be long enough for a meaningful "
+        "agreement-rate denominator"
+    )
+    assert cfg.get("min_agreement_rate") == 0.98, (
+        "PLAN §P-3 specifies 0.98 as the fp16 / quantization "
+        "numerical-jitter threshold — do not silently relax"
+    )
+
+
 def test_qwen3_0_6b_ttft_under_concurrency_mixes_long_and_short() -> None:
     """TTFT-under-concurrency row must mix one long prompt with
     several short prompts. Pin the shape so a future edit cannot
