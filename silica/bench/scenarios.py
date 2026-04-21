@@ -7,7 +7,7 @@ a module-level ``dict`` rather than a registry class: scenario
 definitions are static constants, and a dict lets readers see the
 full roster at a glance.
 
-Current catalog (P-4.1 + P-4.2a + P-4.2b + P-4.2c):
+Current catalog (P-4.1 + P-4.2a + P-4.2b + P-4.2c + P-4.2d-ii):
 
   * ``qwen3-0.6b-smoke`` (P-4.1) — short-in / short-out on
     Qwen3-0.6B, ``max_tokens=4``, ``OracleKind.SMOKE``, cache-only
@@ -42,6 +42,35 @@ Current catalog (P-4.1 + P-4.2a + P-4.2b + P-4.2c):
     unconditionally for ``max_tokens``) and Silica's stream stay
     length-aligned. Exercises the scheduler's B>1 glue, left
     padding, and row lifecycle on any dev box with the cached 0.6B.
+  * ``qwen3.5-0.8b-b1-parity`` (P-4.2d-ii) — cache-only; repo
+    ``Qwen/Qwen3.5-0.8B``. Extends the cache-only B=1 parity claim
+    to the hybrid DeltaNet / GLOBAL family so the bench keeps up
+    with the P-3-C3c/d scheduler. Runner code is unchanged — the
+    B1 oracle handles the hybrid path the same way.
+  * ``qwen3.5-27b-smoke`` (P-4.2d-ii) — dual-gated on
+    ``SILICA_REAL_QWEN3_5_27B`` (new env var; mirrors the
+    ``SILICA_REAL_<FAMILY>`` convention used for the other big
+    rows). No pytest-side equivalent existed — 27B had only the
+    ``scripts/probe_qwen3_5_27b_load.py`` metadata probe before —
+    so this row is the bench catalog's first end-to-end health
+    check on the 27B checkpoint.
+  * ``gemma4-31b-smoke`` (P-4.2d-ii) — dual-gated on
+    ``SILICA_REAL_GEMMA4_31B``. Mirrors the existing
+    ``tests/test_p3_gemma4_single_request_smoke.py`` end-to-end
+    claim; pytest side stays in place because it also asserts
+    adapter contract details beyond the bench SMOKE oracle.
+  * ``gemma4-31b-b1-parity`` (P-4.2d-ii) — same dual gate;
+    mirrors the B=1 half of
+    ``tests/test_p3_gemma4_batched_parity.py``. Pins the sliding +
+    global hybrid scheduler's B=1 claim on dev boxes with the
+    18 GB checkpoint opted in.
+  * ``gemma4-31b-bgt1-parity`` (P-4.2d-ii) — same dual gate;
+    mirrors the B>1 direct-reference half of
+    ``tests/test_p3_gemma4_batched_parity.py``. Uses the same
+    different-tokenized-length prompt strategy as the 0.6B row,
+    with a parametrized catalog test that re-asserts the
+    ``left_padding`` invariant on every BGT1 scenario whose
+    weights are on-device.
 
 The pytest-side real-model smokes remain in place: they pin the
 adapter shape (``config.extra`` values, capability flags), which
@@ -214,11 +243,169 @@ _QWEN3_0_6B_BGT1_PARITY = Scenario(
 )
 
 
+_QWEN3_5_0_8B_B1_PARITY = Scenario(
+    id="qwen3.5-0.8b-b1-parity",
+    repo="Qwen/Qwen3.5-0.8B",
+    workload=Workload(
+        name="short-in-short-out",
+        prompts=("Hello",),
+        max_tokens=4,
+        max_batch_size=1,
+        prefix_cache=False,
+        temperature=0.0,
+        top_p=1.0,
+    ),
+    oracle=OracleKind.B1_PARITY_VS_SINGLE,
+    gate_env_var=None,
+    description=(
+        "Cache-only B=1 parity row for the Qwen3.5 hybrid "
+        "DeltaNet / GLOBAL family (0.8B checkpoint). Mirrors the "
+        "cache-only spirit of qwen3-0.6b-b1-parity but on the "
+        "hybrid scheduler path wired in P-3-C3c/d. Pytest side "
+        "still holds the stronger B>1 batched-vs-single-request "
+        "parity claim (tests/test_p3_hybrid_batched_parity.py); "
+        "this bench row covers the B=1 slice so regressions on "
+        "the hybrid scheduler surface in the unified harness."
+    ),
+)
+
+
+_QWEN3_5_27B_SMOKE = Scenario(
+    id="qwen3.5-27b-smoke",
+    repo="mlx-community/Qwen3.5-27B-4bit",
+    workload=Workload(
+        name="short-in-short-out",
+        prompts=("Hello",),
+        max_tokens=4,
+        max_batch_size=1,
+        prefix_cache=False,
+        temperature=0.0,
+        top_p=1.0,
+    ),
+    oracle=OracleKind.SMOKE,
+    gate_env_var="SILICA_REAL_QWEN3_5_27B",
+    description=(
+        "First end-to-end bench smoke for Qwen3.5-27B-4bit. Before "
+        "P-4.2d-ii the 27B checkpoint only had the metadata probe "
+        "scripts/probe_qwen3_5_27b_load.py — no pytest-side "
+        "functional test exercised the forward path. This bench "
+        "row fills the gap with a four-token greedy generation on "
+        "prompt 'Hello'. Dual-gated: the 4-bit checkpoint is "
+        "~16 GB on disk and peak device memory during the forward "
+        "is ~30 GB on M5 Pro 48 GB, so opt-in via "
+        "SILICA_REAL_QWEN3_5_27B=1 is mandatory."
+    ),
+)
+
+
+_GEMMA4_31B_SMOKE = Scenario(
+    id="gemma4-31b-smoke",
+    repo="mlx-community/gemma-4-31b-4bit",
+    workload=Workload(
+        name="short-in-short-out",
+        prompts=("Hello",),
+        max_tokens=4,
+        max_batch_size=1,
+        prefix_cache=False,
+        temperature=0.0,
+        top_p=1.0,
+    ),
+    oracle=OracleKind.SMOKE,
+    gate_env_var="SILICA_REAL_GEMMA4_31B",
+    description=(
+        "Dense Gemma4-31B-4bit single-request smoke. Mirrors the "
+        "end-to-end claim of tests/test_p3_gemma4_single_request_smoke.py "
+        "('model loads + forward runs on the real weights'). "
+        "Pytest side additionally pins adapter capability flags + "
+        "KV layout details that the bench SMOKE oracle does not "
+        "check. Dual-gated: the 4-bit checkpoint is ~18 GB on disk "
+        "and the 50 sliding + 10 full layer forward is heavier than "
+        "Qwen3.5-27B per token; opt-in via SILICA_REAL_GEMMA4_31B=1."
+    ),
+)
+
+
+_GEMMA4_31B_B1_PARITY = Scenario(
+    id="gemma4-31b-b1-parity",
+    repo="mlx-community/gemma-4-31b-4bit",
+    workload=Workload(
+        name="short-in-short-out",
+        prompts=("Hello",),
+        max_tokens=4,
+        max_batch_size=1,
+        prefix_cache=False,
+        temperature=0.0,
+        top_p=1.0,
+    ),
+    oracle=OracleKind.B1_PARITY_VS_SINGLE,
+    gate_env_var="SILICA_REAL_GEMMA4_31B",
+    description=(
+        "Gemma4-31B-4bit B=1 parity. Mirrors the B=1 half of "
+        "tests/test_p3_gemma4_batched_parity.py: the B=1 batched "
+        "path must emit the same token stream as the single-"
+        "request Engine.generate path. The sliding-window "
+        "BatchRotatingKVCache + full-attention BatchKVCache "
+        "hybrid cache list produced by "
+        "Gemma4Adapter.make_batch_cache is the specific thing "
+        "being exercised at B=1. Dual-gated on "
+        "SILICA_REAL_GEMMA4_31B because every parity run pays the "
+        "cost of both a single-request and a batched forward."
+    ),
+)
+
+
+_GEMMA4_31B_BGT1_PARITY = Scenario(
+    id="gemma4-31b-bgt1-parity",
+    repo="mlx-community/gemma-4-31b-4bit",
+    workload=Workload(
+        name="bgt1-different-length-prompts",
+        # Same strategy as qwen3-0.6b-bgt1-parity: pick prompts
+        # whose tokenized lengths differ on the target tokenizer
+        # so left_padding exercises the non-trivial branch of
+        # Gemma4Adapter.make_batch_cache. "Hello" vs "The capital
+        # of Japan is" tokenize to different lengths on the
+        # Gemma4 tokenizer as well — the catalog's parametrized
+        # on-device invariant test verifies this at runtime gated
+        # on cache presence.
+        prompts=(
+            "Hello",
+            "The capital of Japan is",
+        ),
+        max_tokens=8,
+        max_batch_size=2,
+        prefix_cache=False,
+        temperature=0.0,
+        top_p=1.0,
+    ),
+    oracle=OracleKind.BGT1_DIRECT_BATCHED_REFERENCE,
+    gate_env_var="SILICA_REAL_GEMMA4_31B",
+    description=(
+        "Gemma4-31B-4bit B>1 parity against a direct mlx-lm "
+        "batched reference. Mirrors the B>1 half of "
+        "tests/test_p3_gemma4_batched_parity.py — the exact-vs-"
+        "single-request drift observed there (first mismatch at "
+        "token 2 on fp16 SDPA 4-bit) is precisely why the oracle "
+        "compares against the direct reference instead of against "
+        "Engine.generate. Runner overrides stop_token_ids=() on "
+        "both sides so the reference (max_tokens unconditional) "
+        "and Silica's batched stream stay length-aligned. "
+        "Different-tokenized-length prompts exercise the non-"
+        "trivial left_padding branch of make_batch_cache. Dual-"
+        "gated on SILICA_REAL_GEMMA4_31B."
+    ),
+)
+
+
 BUILTIN_SCENARIOS: dict[str, Scenario] = {
     _QWEN3_0_6B_SMOKE.id: _QWEN3_0_6B_SMOKE,
     _QWEN3_0_6B_B1_PARITY.id: _QWEN3_0_6B_B1_PARITY,
     _QWEN3_0_6B_BGT1_PARITY.id: _QWEN3_0_6B_BGT1_PARITY,
+    _QWEN3_5_0_8B_B1_PARITY.id: _QWEN3_5_0_8B_B1_PARITY,
+    _QWEN3_5_27B_SMOKE.id: _QWEN3_5_27B_SMOKE,
     _QWEN3_5_MOE_SMOKE.id: _QWEN3_5_MOE_SMOKE,
+    _GEMMA4_31B_SMOKE.id: _GEMMA4_31B_SMOKE,
+    _GEMMA4_31B_B1_PARITY.id: _GEMMA4_31B_B1_PARITY,
+    _GEMMA4_31B_BGT1_PARITY.id: _GEMMA4_31B_BGT1_PARITY,
     _GEMMA4_MOE_SMOKE.id: _GEMMA4_MOE_SMOKE,
 }
 

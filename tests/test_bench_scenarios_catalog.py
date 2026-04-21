@@ -29,6 +29,8 @@ Not tested here:
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from silica.bench import (
@@ -41,9 +43,11 @@ from silica.bench import (
     list_scenario_ids,
 )
 
-# Shared cache-presence sentinel for tests that need the real
-# Qwen3-0.6B tokenizer. Same repo the smoke / parity rows use.
-_QWEN3_0_6B_CACHE = hf_cache_path_for_repo("Qwen/Qwen3-0.6B")
+_BGT1_SCENARIO_IDS: list[str] = sorted(
+    sid
+    for sid, sc in BUILTIN_SCENARIOS.items()
+    if sc.oracle == OracleKind.BGT1_DIRECT_BATCHED_REFERENCE
+)
 
 # ---------- parametrized shape invariants ------------------------------
 
@@ -154,42 +158,59 @@ def test_qwen3_0_6b_bgt1_parity_is_cache_only() -> None:
     )
 
 
-@pytest.mark.skipif(
-    not _QWEN3_0_6B_CACHE.exists(),
-    reason=(
-        "Qwen3-0.6B weights not cached locally — the tokenized-length "
-        "invariant check for qwen3-0.6b-bgt1-parity needs the real "
-        "tokenizer to catch the 'France/Japan both tokenize to 5 "
-        "tokens' class of mistake. Run the P-2 parity suite once to "
-        "populate the cache."
-    ),
-)
-def test_qwen3_0_6b_bgt1_parity_prompts_actually_tokenize_to_different_lengths() -> (
-    None
-):
-    """Deep invariant: the pinned BGT1 prompts must tokenize to
-    different lengths on the real Qwen3 tokenizer, so make_batch_cache
-    is called with a non-zero entry in left_padding. A unit-test pin
-    on the prompt strings (above) catches accidental edits; this
-    additional on-device check catches a subtler regression where
-    someone picks two 'looks-different' strings that happen to
-    tokenize identically."""
+@pytest.mark.parametrize("scenario_id", _BGT1_SCENARIO_IDS)
+def test_bgt1_prompts_actually_tokenize_to_different_lengths(
+    scenario_id: str,
+) -> None:
+    """Deep invariant: every BGT1 scenario's prompts must tokenize to
+    different lengths on its own tokenizer, so ``make_batch_cache``
+    is called with at least one non-zero entry in ``left_padding``.
+
+    Unit-level pins on the prompt strings (below, per-scenario)
+    catch accidental edits; this parametrized on-device check
+    catches the subtler regression where someone picks two
+    "looks-different" strings that happen to tokenize identically
+    (e.g. "The capital of France is" and "The capital of Japan is"
+    both tokenize to 5 tokens on Qwen3, which was the P-4.2c
+    initial-iteration miss).
+
+    Each scenario's cache-presence and env-var gates are both
+    respected: when either is missing, the test skips with a
+    reason naming the specific gate so the skipped-list makes the
+    reader aware of what would have been exercised."""
     from silica.models.factory import adapter_for_repo
 
-    scenario = get_scenario("qwen3-0.6b-bgt1-parity")
+    scenario = get_scenario(scenario_id)
+    cache = hf_cache_path_for_repo(scenario.repo)
+    if not cache.exists():
+        pytest.skip(
+            f"{scenario_id}: weights not cached at {cache} — BGT1 "
+            "tokenized-length invariant needs the real tokenizer"
+        )
+    if scenario.gate_env_var is not None:
+        if os.environ.get(scenario.gate_env_var) != "1":
+            pytest.skip(
+                f"{scenario_id}: {scenario.gate_env_var}=1 not set; "
+                "opting into a dual-gated tokenizer load would "
+                "otherwise trigger the big-model adapter factory"
+            )
+
     adapter, _ = adapter_for_repo(scenario.repo)
     tokenizer = adapter.tokenizer()
-    lengths = [len(list(tokenizer.encode(p))) for p in scenario.workload.prompts]
+    lengths = [
+        len(list(tokenizer.encode(p))) for p in scenario.workload.prompts
+    ]
     assert len(set(lengths)) > 1, (
-        f"BGT1 prompts tokenized to identical lengths {lengths} — "
-        "left_padding would be [0, ...], bypassing the padding branch "
-        "make_batch_cache is supposed to exercise"
+        f"{scenario_id}: BGT1 prompts tokenized to identical lengths "
+        f"{lengths} — left_padding would be [0, ...], bypassing the "
+        "padding branch make_batch_cache is supposed to exercise"
     )
     max_len = max(lengths)
     left_padding = [max_len - length for length in lengths]
     assert any(p > 0 for p in left_padding), (
-        f"left_padding={left_padding} has no positive entry; the "
-        "direct-reference path will not exercise non-zero left padding"
+        f"{scenario_id}: left_padding={left_padding} has no positive "
+        "entry; the direct-reference path will not exercise non-zero "
+        "left padding"
     )
 
 
@@ -230,3 +251,86 @@ def test_moe_scenarios_share_workload_shape_but_not_object() -> None:
     # equal, but they remain distinct objects).
     assert q == g
     assert q is not g
+
+
+# ---------- P-4.2d-ii model-shaped row lock-ins -----------------------
+
+
+def test_qwen3_5_0_8b_b1_parity_is_cache_only() -> None:
+    """Hybrid DeltaNet / GLOBAL B=1 parity — no env-var gate, rides
+    every dev run that has the Qwen3.5-0.8B cache (pulled by
+    tests/test_p3_hybrid_batched_smoke.py / parity)."""
+    scenario = get_scenario("qwen3.5-0.8b-b1-parity")
+    assert scenario.repo == "Qwen/Qwen3.5-0.8B"
+    assert scenario.gate_env_var is None
+    assert scenario.oracle == OracleKind.B1_PARITY_VS_SINGLE
+    assert scenario.workload.max_batch_size == 1
+    assert scenario.workload.prompts == ("Hello",)
+
+
+def test_qwen3_5_27b_smoke_is_dual_gated() -> None:
+    """Qwen3.5-27B smoke is the first bench row for that checkpoint;
+    pin the env var name so future scripts/probe_qwen3_5_27b_load.py
+    promotions to pytest agree on the gate."""
+    scenario = get_scenario("qwen3.5-27b-smoke")
+    assert scenario.repo == "mlx-community/Qwen3.5-27B-4bit"
+    assert scenario.gate_env_var == "SILICA_REAL_QWEN3_5_27B"
+    assert scenario.oracle == OracleKind.SMOKE
+    assert scenario.workload.max_batch_size == 1
+    assert scenario.workload.prompts == ("Hello",)
+
+
+def test_gemma4_31b_smoke_is_dual_gated() -> None:
+    """Env var must match tests/test_p3_gemma4_single_request_smoke.py
+    so the two views of the same checkpoint opt in together."""
+    scenario = get_scenario("gemma4-31b-smoke")
+    assert scenario.repo == "mlx-community/gemma-4-31b-4bit"
+    assert scenario.gate_env_var == "SILICA_REAL_GEMMA4_31B"
+    assert scenario.oracle == OracleKind.SMOKE
+    assert scenario.workload.max_batch_size == 1
+    assert scenario.workload.prompts == ("Hello",)
+
+
+def test_gemma4_31b_b1_parity_is_dual_gated() -> None:
+    scenario = get_scenario("gemma4-31b-b1-parity")
+    assert scenario.repo == "mlx-community/gemma-4-31b-4bit"
+    assert scenario.gate_env_var == "SILICA_REAL_GEMMA4_31B"
+    assert scenario.oracle == OracleKind.B1_PARITY_VS_SINGLE
+    assert scenario.workload.max_batch_size == 1
+    assert scenario.workload.prompts == ("Hello",)
+    # Shares SamplingParams shape with gemma4-31b-smoke so a future
+    # edit to one row surfaces here if the other is forgotten.
+    smoke = get_scenario("gemma4-31b-smoke")
+    assert scenario.workload.temperature == smoke.workload.temperature
+    assert scenario.workload.top_p == smoke.workload.top_p
+
+
+def test_gemma4_31b_bgt1_parity_is_dual_gated() -> None:
+    """Same prompt pair as qwen3-0.6b-bgt1-parity — the
+    different-tokenized-length invariant gets asserted on-device
+    via the parametrized ``test_bgt1_prompts_actually_tokenize_to_
+    different_lengths`` whenever the 31B cache + env var are both
+    on."""
+    scenario = get_scenario("gemma4-31b-bgt1-parity")
+    assert scenario.repo == "mlx-community/gemma-4-31b-4bit"
+    assert scenario.gate_env_var == "SILICA_REAL_GEMMA4_31B"
+    assert scenario.oracle == OracleKind.BGT1_DIRECT_BATCHED_REFERENCE
+    assert scenario.workload.max_batch_size == 2
+    assert scenario.workload.prompts == (
+        "Hello",
+        "The capital of Japan is",
+    )
+
+
+def test_gemma4_31b_rows_share_gate_env_var() -> None:
+    """All three Gemma4-31B rows share SILICA_REAL_GEMMA4_31B so
+    opt-in is a single toggle per checkpoint, not per-oracle."""
+    gates = {
+        get_scenario(sid).gate_env_var
+        for sid in (
+            "gemma4-31b-smoke",
+            "gemma4-31b-b1-parity",
+            "gemma4-31b-bgt1-parity",
+        )
+    }
+    assert gates == {"SILICA_REAL_GEMMA4_31B"}
