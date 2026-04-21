@@ -13,11 +13,12 @@ plus a planned mini-sglang outer layer for Phase 8. Target: run dense
 | P-1 | Single-request `Engine.generate` | ✅ complete |
 | P-2 | Continuous batching, radix prefix cache, memory-budget admission, preempt+replay | ✅ complete |
 | P-3 | Family adapters — Qwen3 dense, Qwen3.5 hybrid DeltaNet, Gemma4-31B dense, Qwen3.5-MoE, Gemma4-MoE | ✅ mostly (`C5` preempt/replay with recurrent-state snapshot pending; `E4` batched MoE pending) |
-| P-4 | Unified bench harness — runner, oracles, 15 registered scenarios, JSONL + Markdown reports, vqbench subprocess PPL | ✅ complete |
-| P-5 | VQ KV compression (BlockTQ / RaBitQ) | Stub (`IdentityCodec` today) |
+| P-4 | Unified bench harness — runner, oracles, 15 registered scenarios, JSONL + Markdown reports, vqbench subprocess PPL | ✅ complete; P-4 exit surfaced Q-010 chunked-prefill trigger → P-4.5 bridge planned |
+| P-4.5 | P-4 exit bridge — chunked-prefill minimal + KVCodec runtime integration spike | ⏳ A complete; B / C planned |
+| P-5 | VQ KV compression (BlockTQ / RaBitQ) | Stub (`IdentityCodec` today; not on hot path — P-4.5-C resolves integration point) |
 | P-6 | Weight streaming | Stub (`ResidentWeightProvider` today) |
 | P-7 | Speculative decoding (DraftTarget / EAGLE / Medusa) | Stub (`NoopDraftEngine` today) |
-| P-8 | OpenAI-compatible HTTP server + session layer | ⏳ planned |
+| P-8 | OpenAI-compatible HTTP server + session layer | ⏳ planned (leaning T1 tail, after P-5) |
 
 Legend: ✅ shipped · Stub = wired as the fp16 baseline behind the
 frozen interface · ⏳ = not started.
@@ -429,23 +430,48 @@ Gate docs (for historical context):
 
 ## Roadmap
 
-Immediate next units (see `docs/PLAN.md` for the full plan):
+Immediate next units (see `docs/PLAN.md` for the full plan). The P-4
+exit surfaced two signals that reshuffle the near-term order:
+(1) Q-010 chunked-prefill promotion triggered — cohort-level prefill
+drags short-row TTFT behind the long-row `T_max`; (2) the
+`IdentityCodec` stub lives outside the real forward hot path, so P-5
+needs a runtime-integration spike before any BlockTQ coding starts.
+P-4.5 bridges both.
 
+- **P-4.5** — P-4 exit bridge (three sub-units, see `docs/PLAN.md`
+  §7 P-4.5):
+  - **P-4.5-A** — PLAN / README decision sync (this revision).
+  - **P-4.5-B** — chunked prefill minimal: three-option opening
+    doc (in-cohort chunking / cohort splitting / admission
+    ordering) → scheduler change under `silica/scheduler/batcher.py`
+    → TTFT-under-concurrency ratio `< 3×` and greedy-output
+    bit-identity regression lock.
+  - **P-4.5-C** — KVCodec runtime integration spike:
+    `docs/P5_OPENING.md` enumerating the three integration points
+    (active `BatchKVCache` / detached prefix store / cache wrapper),
+    then wire `IdentityCodec.encode_block` / `decode_block` into
+    the live forward path so BlockTQ has a real seam.
+- **P-5** — BlockTQ `KVCodec` implementation (MLX-native rewrite
+  of the vqbench numeric reference; cross-check via
+  `scripts/vqbench_baseline.py`). RaBitQ deferred until BlockTQ
+  acceptance clears; see `docs/PLAN.md` §7 P-5.
+- **P-8** — OpenAI-compatible HTTP server + session layer (wraps
+  `ChatSession` with routing, auth, streaming SSE / WebSocket).
+  Leaning T1 tail per Q-002 progress; sequenced after P-5 so the
+  HTTP product face ships with VQ compression live.
 - **P-3-C5** — preempt/replay with recurrent-state snapshot on
-  hybrid DeltaNet. Closes the last P-3 bullet.
+  hybrid DeltaNet. Deferred through P-4.5 and P-5; revisited at P-7
+  speculative-rollback entry since the commit / rollback semantics
+  co-design there.
 - **P-3-E4** — batched MoE: lift the `has_moe=True` capability
   gate on `ContinuousBatcher` once the SwitchGLU + per-row active
-  expert routing round-trips cleanly.
-- **P-5** — BlockTQ / RaBitQ `KVCodec` implementations (MLX-native
-  rewrite of the vqbench numeric reference; cross-check via
-  `scripts/vqbench_baseline.py`).
+  expert routing round-trips cleanly. Re-scoped as pre-P-6 work
+  given per-expert routing shares primitives with streaming.
 - **P-6** — weight streaming (per-expert residency for MoE + layer
   streaming for dense, driven by the `WeightProvider` interface
   that already exists).
 - **P-7** — speculative decoding behind the `DraftEngine`
   interface (DraftTarget, EAGLE, Medusa).
-- **P-8** — OpenAI-compatible HTTP server + session layer (wraps
-  `ChatSession` with routing, auth, streaming SSE / WebSocket).
 
 ---
 
