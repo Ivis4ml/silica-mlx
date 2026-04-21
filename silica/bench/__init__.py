@@ -6,6 +6,7 @@ runner and are not re-exported at the package level; authors of new
 oracles import from ``silica.bench.oracles`` directly.
 """
 
+from silica.bench.report import render_markdown_report
 from silica.bench.runner import (
     BenchRunner,
     DirectBatchedReferenceFn,
@@ -38,4 +39,5 @@ __all__ = [
     "get_scenario",
     "hf_cache_path_for_repo",
     "list_scenario_ids",
+    "render_markdown_report",
 ]

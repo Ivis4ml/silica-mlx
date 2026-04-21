@@ -11,6 +11,11 @@ Invocation:
     # Run every built-in scenario, append JSONL to the given path
     python scripts/bench.py --all --out bench-results.jsonl
 
+    # Also produce a human-readable Markdown report (paste-able into a PR)
+    python scripts/bench.py --all \
+        --out bench-results.jsonl \
+        --report-md bench-results.md
+
 The CLI is intentionally thin: it resolves scenario ids against
 ``silica.bench.BUILTIN_SCENARIOS`` and hands the Scenario objects to
 ``BenchRunner``. Anyone adding a new scenario in P-4.2 only touches
@@ -37,9 +42,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from silica.bench import (  # noqa: E402  (path hack above requires late import)
     BUILTIN_SCENARIOS,
     BenchRunner,
+    Scenario,
     ScenarioResult,
     get_scenario,
     list_scenario_ids,
+    render_markdown_report,
 )
 
 
@@ -74,6 +81,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATH",
         help="append one JSONL row per result to PATH",
+    )
+    p.add_argument(
+        "--report-md",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "write a human-readable Markdown report (GFM table + per-"
+            "scenario detail block) to PATH; combine with --out for "
+            "both machine-readable JSONL and paste-ready Markdown"
+        ),
     )
     return p
 
@@ -152,7 +170,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     results = runner.run(scenarios)
     _print_table(results)
 
+    if args.report_md is not None:
+        _write_markdown_report(scenarios, results, args.report_md)
+
     return 1 if any(r.status == "failed" for r in results) else 0
+
+
+def _write_markdown_report(
+    scenarios: Sequence[Scenario],
+    results: Sequence[ScenarioResult],
+    path: Path,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        render_markdown_report(scenarios, results), encoding="utf-8"
+    )
 
 
 if __name__ == "__main__":
