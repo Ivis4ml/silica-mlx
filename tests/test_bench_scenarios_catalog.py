@@ -334,3 +334,76 @@ def test_gemma4_31b_rows_share_gate_env_var() -> None:
         )
     }
     assert gates == {"SILICA_REAL_GEMMA4_31B"}
+
+
+# ---------- P-4.2d-iii-a workload-shaped row lock-ins -----------------
+
+
+def test_qwen3_0_6b_short_in_long_out_is_decode_dominated() -> None:
+    """Decode-dominated shape: very short prompt + long max_tokens.
+    Pin max_tokens high enough that prefill/decode ratio is clearly
+    decode-heavy regardless of model-specific prefill speed."""
+    scenario = get_scenario("qwen3-0.6b-short-in-long-out")
+    assert scenario.repo == "Qwen/Qwen3-0.6B"
+    assert scenario.gate_env_var is None
+    assert scenario.oracle == OracleKind.SMOKE
+    assert scenario.workload.max_batch_size == 1
+    assert scenario.workload.prompts == ("Hello",)
+    assert scenario.workload.max_tokens >= 32, (
+        "short-in-long-out must have max_tokens large enough for "
+        "decode to meaningfully dominate prefill (a 1-token prompt "
+        "prefill is trivial; max_tokens>=32 keeps the ratio > 30:1)"
+    )
+
+
+def test_qwen3_0_6b_long_in_short_out_is_prefill_dominated() -> None:
+    """Prefill-dominated shape: the long prompt is the work, the
+    short decode just exists to complete the run. Pin both ends
+    of the ratio so a future edit cannot silently flip the shape."""
+    scenario = get_scenario("qwen3-0.6b-long-in-short-out")
+    assert scenario.repo == "Qwen/Qwen3-0.6B"
+    assert scenario.gate_env_var is None
+    assert scenario.oracle == OracleKind.SMOKE
+    assert scenario.workload.max_batch_size == 1
+    assert scenario.workload.max_tokens <= 8, (
+        "long-in-short-out must have max_tokens small so decode "
+        "cannot dilute the prefill signal"
+    )
+    assert len(scenario.workload.prompts) == 1
+    # String-length lower bound — a cheap proxy. The tokenized-
+    # length invariant below adds the deeper on-device check.
+    assert len(scenario.workload.prompts[0]) >= 500
+
+
+@pytest.mark.skipif(
+    not hf_cache_path_for_repo("Qwen/Qwen3-0.6B").exists(),
+    reason=(
+        "Qwen3-0.6B weights not cached — long-in-short-out's "
+        "prefill-dominance claim is a tokenized-length claim, "
+        "needs the real tokenizer to verify"
+    ),
+)
+def test_qwen3_0_6b_long_in_short_out_prompt_tokenizes_long() -> None:
+    """On-device invariant: the long prompt tokenizes to enough
+    tokens that prefill meaningfully dominates. Pins the lower
+    bound so a future edit that shortens the prompt surfaces
+    here rather than as a silently diluted metric."""
+    from silica.models.factory import adapter_for_repo
+
+    scenario = get_scenario("qwen3-0.6b-long-in-short-out")
+    adapter, _ = adapter_for_repo(scenario.repo)
+    tokenizer = adapter.tokenizer()
+    prompt_tokens = len(list(tokenizer.encode(scenario.workload.prompts[0])))
+    # 100 tokens is a loose lower bound — current prompt is ~301
+    # tokens; leave headroom so a tokenizer update that shifts by
+    # a few tokens does not break the test.
+    assert prompt_tokens >= 100, (
+        f"long-in prompt tokenizes to {prompt_tokens} — not long "
+        "enough to call this row prefill-dominated"
+    )
+    # Also pin the ratio itself (prefill-to-decode > 10:1).
+    ratio = prompt_tokens / scenario.workload.max_tokens
+    assert ratio >= 10.0, (
+        f"prefill/decode token ratio is {ratio:.1f} — too small to "
+        "call this row prefill-dominated"
+    )

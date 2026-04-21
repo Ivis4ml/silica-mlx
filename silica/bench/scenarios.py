@@ -7,7 +7,7 @@ a module-level ``dict`` rather than a registry class: scenario
 definitions are static constants, and a dict lets readers see the
 full roster at a glance.
 
-Current catalog (P-4.1 + P-4.2a + P-4.2b + P-4.2c + P-4.2d-ii):
+Current catalog (P-4.1 + P-4.2a + P-4.2b + P-4.2c + P-4.2d-ii + P-4.2d-iii-a):
 
   * ``qwen3-0.6b-smoke`` (P-4.1) — short-in / short-out on
     Qwen3-0.6B, ``max_tokens=4``, ``OracleKind.SMOKE``, cache-only
@@ -71,6 +71,26 @@ Current catalog (P-4.1 + P-4.2a + P-4.2b + P-4.2c + P-4.2d-ii):
     with a parametrized catalog test that re-asserts the
     ``left_padding`` invariant on every BGT1 scenario whose
     weights are on-device.
+
+Workload-shaped rows (PLAN §P-4 names them by shape, not model):
+
+  * ``qwen3-0.6b-short-in-long-out`` (P-4.2d-iii-a) — decode-
+    dominated throughput shape. Single prompt "Hello" (1 token
+    on Qwen3) and ``max_tokens=64``, so ~64 decode steps vs a
+    one-token prefill. SMOKE oracle — the scenario's value is in
+    the metrics it collects (decode tok/s on the reference
+    cached 0.6B checkpoint), not in strict output validation.
+  * ``qwen3-0.6b-long-in-short-out`` (P-4.2d-iii-a) — prefill-
+    dominated throughput shape. Long synthetic prompt ("The quick
+    brown fox …" repeated 30×, ~301 tokens on Qwen3) and
+    ``max_tokens=4``, so prefill dominates the wall time. SMOKE
+    oracle; the metrics signal how prefill tok/s scales.
+
+P-4.2d-iii-b / -iii-c will land the concurrent-shared-prefix and
+TTFT-under-concurrency rows, which require a runner extension to
+drive SMOKE through ``Engine.generate_batch`` (multi-prompt B>1)
+and to wire ``RadixPrefixCache``. Until then SMOKE only runs
+single-request.
 
 The pytest-side real-model smokes remain in place: they pin the
 adapter shape (``config.extra`` values, capability flags), which
@@ -396,10 +416,81 @@ _GEMMA4_31B_BGT1_PARITY = Scenario(
 )
 
 
+# ---- Workload-shaped rows (P-4.2d-iii-a) ----------------------------
+#
+# PLAN §P-4 names four workload shapes: short-in/long-out,
+# long-in/short-out, concurrent shared-prefix, TTFT-under-concurrency.
+# The first two are single-request (B=1) and need no runner changes —
+# they just exercise different prompt-length / max_tokens ratios
+# against the existing SMOKE oracle. The other two require B>1
+# SMOKE dispatch and land under P-4.2d-iii-b / -iii-c.
+#
+# Both rows below use the cached Qwen/Qwen3-0.6B weights so they ride
+# every dev run without the cost of a dual-gated download.
+
+# Thirty-sentence repeat deliberately constructed so the long prompt
+# has enough structure that the tokenizer does not collapse it into
+# a degenerate repeated-id run. Empirically 30 copies of this
+# sentence tokenize to 301 tokens on the Qwen3 tokenizer — long
+# enough for prefill to clearly dominate a max_tokens=4 decode.
+_LONG_IN_PROMPT = "The quick brown fox jumps over the lazy dog. " * 30
+
+
+_QWEN3_0_6B_SHORT_IN_LONG_OUT = Scenario(
+    id="qwen3-0.6b-short-in-long-out",
+    repo="Qwen/Qwen3-0.6B",
+    workload=Workload(
+        name="short-in-long-out",
+        prompts=("Hello",),
+        max_tokens=64,
+        max_batch_size=1,
+        prefix_cache=False,
+        temperature=0.0,
+        top_p=1.0,
+    ),
+    oracle=OracleKind.SMOKE,
+    gate_env_var=None,
+    description=(
+        "Decode-dominated throughput shape. One-token prompt "
+        "'Hello' + max_tokens=64 means decode (64 steps) vastly "
+        "exceeds prefill (1 token). SMOKE oracle — the point of "
+        "the row is the decode_tok_s metric, not output "
+        "correctness. Cache-only gate (reuses the qwen3-0.6b-smoke "
+        "weights) so it rides every dev run."
+    ),
+)
+
+
+_QWEN3_0_6B_LONG_IN_SHORT_OUT = Scenario(
+    id="qwen3-0.6b-long-in-short-out",
+    repo="Qwen/Qwen3-0.6B",
+    workload=Workload(
+        name="long-in-short-out",
+        prompts=(_LONG_IN_PROMPT,),
+        max_tokens=4,
+        max_batch_size=1,
+        prefix_cache=False,
+        temperature=0.0,
+        top_p=1.0,
+    ),
+    oracle=OracleKind.SMOKE,
+    gate_env_var=None,
+    description=(
+        "Prefill-dominated throughput shape. Long synthetic prompt "
+        "('The quick brown fox jumps over the lazy dog. ' x 30 = "
+        "~301 tokens on Qwen3) + max_tokens=4 means prefill "
+        "dominates wall time. SMOKE oracle — the value is in the "
+        "prefill_tok_s metric. Cache-only gate."
+    ),
+)
+
+
 BUILTIN_SCENARIOS: dict[str, Scenario] = {
     _QWEN3_0_6B_SMOKE.id: _QWEN3_0_6B_SMOKE,
     _QWEN3_0_6B_B1_PARITY.id: _QWEN3_0_6B_B1_PARITY,
     _QWEN3_0_6B_BGT1_PARITY.id: _QWEN3_0_6B_BGT1_PARITY,
+    _QWEN3_0_6B_SHORT_IN_LONG_OUT.id: _QWEN3_0_6B_SHORT_IN_LONG_OUT,
+    _QWEN3_0_6B_LONG_IN_SHORT_OUT.id: _QWEN3_0_6B_LONG_IN_SHORT_OUT,
     _QWEN3_5_0_8B_B1_PARITY.id: _QWEN3_5_0_8B_B1_PARITY,
     _QWEN3_5_27B_SMOKE.id: _QWEN3_5_27B_SMOKE,
     _QWEN3_5_MOE_SMOKE.id: _QWEN3_5_MOE_SMOKE,
