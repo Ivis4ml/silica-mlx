@@ -4,7 +4,8 @@ MLX-native LLM inference platform for Apple Silicon. vLLM-style core (paged KV,
 continuous batching, prefix cache, memory budget) plus a mini-sglang outer layer
 planned for Phase 8. Target: run dense 27B-31B class models on a 48 GB M5 Pro.
 
-> **Status: P-2 complete, P-3 in progress.** Today the package runs
+> **Status: P-2 complete, P-3 mostly shipped (recurrent-state preempt/replay
+> pending), P-4 bench harness core landed.** Today the package runs
 > single-request and batched generation end-to-end on both plain Qwen3
 > (0.6B / 4B / 7B / ...) and hybrid DeltaNet Qwen3.5-0.8B, with
 > shared-prefix caching and budget-aware preemption on the plain-Qwen3
@@ -13,12 +14,16 @@ planned for Phase 8. Target: run dense 27B-31B class models on a 48 GB M5 Pro.
 > 0.8B and is ready for benchmarking. Gemma4-31B now has the dense
 > single-request path plus a batched miss-only path pinned against a
 > direct mlx-lm batched reference; strict B>1 batched-vs-single greedy
-> parity is not claimed. MoE variants (Qwen3.5-35B-A3B /
-> gemma-4-26B-A4B), VQ KV compression, weight streaming, and
-> speculative decoding are stubbed at the interface level but not yet
-> implemented. See [`docs/PLAN.md`](docs/PLAN.md) for the full roadmap
-> and [`docs/API.md`](docs/API.md) for the per-module function
-> reference.
+> parity is not claimed. Qwen3.5-35B-A3B and gemma-4-26B-A4B MoE
+> adapters pass single-request real-model smokes under a dual-gated
+> env-var opt-in. The unified bench harness (`python -m scripts.bench`)
+> is wired through the Engine with SMOKE / B=1 / B>1 oracle kinds and
+> five registered scenarios; workload-shaped rows, markdown report
+> output, and a vqbench PPL reference column are still pending under
+> P-4. VQ KV compression, weight streaming, and speculative decoding
+> are stubbed at the interface level but not yet implemented. See
+> [`docs/PLAN.md`](docs/PLAN.md) for the full roadmap and
+> [`docs/API.md`](docs/API.md) for the per-module function reference.
 
 ---
 
@@ -152,7 +157,10 @@ in the `prompts` list. For budget-aware scheduling, construct a
 | Weight streaming | Stub | P-6 (`ResidentWeightProvider` today) |
 | Speculative decoding (DraftTarget / EAGLE / Medusa) | Stub | P-7 (`NoopDraftEngine` today) |
 | OpenAI-compatible HTTP server + session layer | ⏳ | P-8 |
-| Unified benchmark harness | ⏳ | P-4 |
+| Unified bench runner (SMOKE / B=1 parity / B>1 direct-reference oracles, JSONL output) | ✅ | `silica.bench.runner.BenchRunner` + `scripts/bench.py`; five registered scenarios (P-4.1 / P-4.2a-c) |
+| Bench: workload-shaped scenarios (short-in/long-out, concurrent shared-prefix, TTFT-under-concurrency) + markdown report file | ⏳ | P-4.2d |
+| Bench: `TEACHER_FORCED_ARGMAX` oracle | ⏳ | P-4.3 |
+| Bench: `vqbench_baseline` subprocess PPL reference column | ⏳ | P-4.4 |
 
 Legend: ✅ shipped · Stub = wired to the main loop as the fp16 baseline,
 real implementation in the named phase · ⏳ = not started.
@@ -192,7 +200,8 @@ silica/
     speculative/          # I-5 DraftEngine + NoopDraftEngine
     engine/               # top-level Engine (generate + generate_batch)
     server/               # CLI (HTTP server is P-8)
-    bench/  llm/  vq/     # empty — reserved for P-4/P-8/P-5
+    bench/                # P-4 harness (scenario schema, runner, oracles, built-in catalog)
+    llm/  vq/             # empty — reserved for P-8/P-5
 ```
 
 The five frozen interfaces — `ModelAdapter` (I-1), `KVManager` (I-2),
