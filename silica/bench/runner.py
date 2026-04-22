@@ -319,7 +319,7 @@ class BenchRunner:
                     total_tokens = len(single_tokens)
                 else:
                     batched_tokens, first_token_ms = _run_smoke_batched(
-                        scenario, engine, params
+                        scenario, engine, params, adapter
                     )
                     oracle_input = batched_tokens
                     total_tokens = sum(
@@ -714,20 +714,24 @@ def _run_smoke_batched(
     scenario: Scenario,
     engine: Engine,
     params: SamplingParams,
+    adapter: ModelAdapter,
 ) -> tuple[dict[int, list[int]], dict[int, float]]:
     """Drive SMOKE through ``generate_batch`` for multi-prompt B>1.
 
     Wires a fresh :class:`RadixPrefixCache` when
     ``scenario.workload.prefix_cache`` is ``True`` — each scenario
     gets its own cache instance so shared-prefix metrics reflect
-    that run alone. Returns ``(tokens, first_token_ms)`` — per-row
-    token streams plus per-row first-token wall offsets in ms
-    (measured from the moment the batched generation started, so
-    the TTFT-under-concurrency scenario can show how a long-prompt
-    prefill inflates short-prompt rows' first-token latency).
+    that run alone. When ``workload.kv_codec`` is set, the cache's
+    store is constructed with the named codec so subsequent encode /
+    decode path actually exercises it (P-5-A.3a). Returns
+    ``(tokens, first_token_ms)`` — per-row token streams plus
+    per-row first-token wall offsets in ms (measured from the
+    moment the batched generation started, so the TTFT-under-
+    concurrency scenario can show how a long-prompt prefill inflates
+    short-prompt rows' first-token latency).
     """
     prompts = list(scenario.workload.prompts)
-    prefix_cache = _maybe_build_prefix_cache(scenario.workload)
+    prefix_cache = _maybe_build_prefix_cache(scenario.workload, adapter)
     return _collect_smoke_batched_tokens(
         engine,
         prompts,
@@ -888,9 +892,20 @@ def _default_teacher_forced_reference(
     return [int(mx.argmax(positional[i]).item()) for i in range(target_len)]
 
 
-def _maybe_build_prefix_cache(workload: Workload) -> Any | None:
+def _maybe_build_prefix_cache(
+    workload: Workload, adapter: ModelAdapter | None = None
+) -> Any | None:
     """Build a fresh :class:`RadixPrefixCache` if the workload asks
     for it, else ``None``.
+
+    When ``workload.kv_codec`` is set (P-5-A.3a), constructs the
+    named codec via ``silica.bench.codec_registry`` and installs it
+    on the synthetic store as the shorthand (both K and V sides use
+    the same codec). Codec factories take ``(block_size, n_kv_heads,
+    head_dim, dtype)`` — the last three come from
+    ``adapter.kv_layout()``, which is why this helper now takes an
+    ``adapter`` kwarg. Callers that pass a workload with
+    ``kv_codec=None`` (all pre-P-5-A.3 callers) can omit the adapter.
 
     Block size is hard-coded to 16 — the same constant the README's
     Quickstart example uses, and the default value every pytest-
@@ -907,10 +922,31 @@ def _maybe_build_prefix_cache(workload: Workload) -> Any | None:
     from silica.kvcache.store import SyntheticPrefixBlockStore
 
     block_size = 16
-    return RadixPrefixCache(
-        block_size=block_size,
-        store=SyntheticPrefixBlockStore(block_size=block_size),
+    codec: Any = None
+    if workload.kv_codec is not None:
+        if adapter is None:
+            raise ValueError(
+                f"workload {workload.name!r} has kv_codec="
+                f"{workload.kv_codec!r} but no adapter was supplied "
+                f"to _maybe_build_prefix_cache; codec factories need "
+                f"adapter.kv_layout() for n_kv_heads / head_dim / "
+                f"dtype"
+            )
+        from silica.bench.codec_registry import get_codec_spec
+
+        spec = get_codec_spec(workload.kv_codec)
+        layout = adapter.kv_layout()
+        codec = spec.factory(
+            block_size=block_size,
+            n_kv_heads=layout.n_kv_heads,
+            head_dim=layout.head_dim,
+            dtype=layout.dtype,
+        )
+
+    store = SyntheticPrefixBlockStore(
+        block_size=block_size, codec=codec
     )
+    return RadixPrefixCache(block_size=block_size, store=store)
 
 
 def _collect_b1_batched_tokens(

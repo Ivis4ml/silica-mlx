@@ -65,7 +65,26 @@ class OracleKind(str, Enum):
 class Workload:
     """Prompt set + decoding parameters. Separated from model because
     the same workload ("short-in/long-out 4 tokens") applies across
-    every model family."""
+    every model family.
+
+    ``kv_codec`` (P-5-A.3a) names the codec to install on the prefix
+    cache's store by ``silica.bench.codec_registry`` id. ``None`` (the
+    default) keeps the pre-P-5 pass-through behaviour (raw fp16
+    tensors stored in ``_detached``). ``"fp16"`` installs an explicit
+    ``IdentityCodec`` — the honest decode-speed baseline against
+    which compressed codecs are compared (§7(d) pins the 0.85×
+    IdentityCodec ratio, not 0.85× pass-through). Compressed codec
+    ids (``"block_tq_b64_b4"``, etc.) install the corresponding
+    ``VectorCodec`` on both K and V sides via the shorthand.
+
+    ``kv_codec`` is only meaningful when ``prefix_cache=True``; the
+    runner validates this at workload construction time and rejects
+    unknown ids against the ``codec_registry`` catalogue.
+
+    The ``--kv-codec`` CLI flag + multi-codec sweep that flips
+    scenarios' codec at runtime is P-5-C scope; A.3 ships scenarios
+    that pin a specific codec id at authoring time.
+    """
 
     name: str
     prompts: tuple[str, ...]
@@ -74,6 +93,32 @@ class Workload:
     prefix_cache: bool = False
     temperature: float = 0.0
     top_p: float = 1.0
+    kv_codec: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.kv_codec is not None:
+            if not self.prefix_cache:
+                raise ValueError(
+                    f"Workload {self.name!r}: kv_codec="
+                    f"{self.kv_codec!r} requires prefix_cache=True; "
+                    f"codecs install on the prefix cache's store, "
+                    f"so they are meaningless when no prefix cache "
+                    f"exists"
+                )
+            # Lazy import to keep silica.bench.scenario free of
+            # silica.bench.codec_registry at module-import time —
+            # codec_registry depends on silica.vq, which depends on
+            # silica.kvcache.codec + mlx.core. scenario.py is
+            # imported from many lightweight callers (scripts,
+            # tests) that don't want to pay that cost.
+            from silica.bench.codec_registry import CODEC_REGISTRY
+
+            if self.kv_codec not in CODEC_REGISTRY:
+                known = ", ".join(sorted(CODEC_REGISTRY))
+                raise ValueError(
+                    f"Workload {self.name!r}: unknown kv_codec id "
+                    f"{self.kv_codec!r}; registered: {known}"
+                )
 
 
 @dataclass(frozen=True)
