@@ -229,6 +229,20 @@ def test_prompt_tokenization_invariants(adapter_kv):
     adapter, _ = adapter_kv
     tokenizer = adapter.tokenizer()
     tokens = list(tokenizer.encode(_PROMPT_FIXTURE))
+    # Pin the exact tokenized length. The opening doc + test module
+    # docstring both refer to "34 tokens (mod 16 == 2)" when walking
+    # through block-count arithmetic; an even-35 or 47 drift would
+    # still satisfy the >= 33 / %16 != 0 guards below but invalidate
+    # those block-count worked examples. Fail loudly on any change.
+    assert len(tokens) == 34, (
+        f"prompt must tokenize to exactly 34 tokens under the pinned "
+        f"Qwen3-0.6B tokenizer shipped with this fixture (opening doc "
+        f"§8.1 + module docstring quote block counts against this "
+        f"specific length); got len={len(tokens)}. A tokenizer change "
+        f"is the most likely cause — re-select _PROMPT_FIXTURE to a "
+        f"value that again yields 34 tokens (mod 16 == 2), or update "
+        f"every downstream block-count reference together."
+    )
     assert len(tokens) >= _PROMPT_MIN_TOKENS, (
         f"prompt must tokenize to >= {_PROMPT_MIN_TOKENS} tokens "
         f"(2 × block_size + 1) to satisfy batcher invariant S-5 "

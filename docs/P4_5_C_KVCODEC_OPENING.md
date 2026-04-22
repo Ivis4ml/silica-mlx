@@ -59,21 +59,28 @@ P-4.5-C ships:
 3. `SyntheticPrefixBlockStore.resident_bytes()` — sums the stored
    `CodedBlock.resident_bytes`. A **parallel observable**, not yet a
    replacement for the budgeter's per-block formula.
-4. `tests/test_kvcodec_integration.py` with encode-side counter
-   assertion on a cold first-request call through
-   `Engine.generate_batch([prompt], params, prefix_cache=shared_pc,
-   max_batch_size=1)` with a prompt tokenizing to
-   ≥ `2 × block_size + 1` tokens (the `+1` reserves the suffix prefill
-   token batcher invariant S-5 edge 1 requires — see §6.1), decode-side
-   counter assertion on a paired second call through the *same*
-   `shared_pc`, and a numerical-identity assertion that the coded path's
-   token stream matches the no-codec baseline on `Qwen/Qwen3-0.6B`.
+4. `tests/test_kvcodec_integration.py` — the acceptance entry point is
+   a **single** `Engine.generate_batch([prompt, prompt], params,
+   prefix_cache=shared_pc, max_batch_size=1)` call, not two paired
+   calls. Row 0 admits into the initial cohort (miss-path prefill) and
+   registers its aligned prefix during reclaim; row 1 enters the
+   waiting queue and, on the next step, `_admit_waiting_requests`
+   routes it through the hit path (`_admit_single_hit_row` →
+   `fetch_detached_blocks` → `codec.decode_block`). Encode and decode
+   counters both fire inside this one call. Two consecutive
+   `generate_batch([prompt], ...)` calls with a shared `prefix_cache`
+   would **not** fire `decode_block` because `_prepare_cohort` (initial
+   cohort seal) does not consult the prefix cache — see §8.0 for the
+   design fact and PLAN §10 Q-012 for the follow-up. The prompt must
+   tokenize to ≥ `2 × block_size + 1` tokens (and not an exact
+   multiple of `block_size`) so cold encode and mid-run-hit decode
+   counts match under the batcher's S-5 edge 1 rule — see §6.1 / §8.1.
+   Baseline-identity: the codec path's token stream matches the
+   no-codec `codec=None` pass-through on the same `[p, p]` workload.
    Note: `Engine.generate(prompt, params)` is **not** the verification
-   entry point — it bypasses the `ContinuousBatcher` /
-   `RadixPrefixCache` plumbing entirely and drives `SimpleKVCache` via
-   `_drive`, so the detached-K/V hook is not reached on that path.
-   Verification uses `generate_batch` with an explicit `prefix_cache=`
-   argument.
+   entry point — it bypasses `ContinuousBatcher` / `RadixPrefixCache`
+   entirely and drives `SimpleKVCache` via `_drive`, so the
+   detached-K/V hook is not reached on that path.
 
 P-4.5-C does **not** ship `BlockTQCodec`, does not touch
 `MemoryBudgeter`, does not introduce a compressed-domain attention
@@ -539,10 +546,12 @@ Explicit non-goals so the commit scope is bounded:
   kernel track itself advances (currently trigger-gated, per
   `docs/P2_OPENING.md`).
 - **No bench catalog row.** The verification test lives in
-  `tests/test_kvcodec_integration.py` (dual-gated on the 0.6B HF
-  cache), not in `silica/bench/scenarios.py`. A codec-on bench row
-  lands with P-5 proper when there is an actual memory or quality
-  delta to measure.
+  `tests/test_kvcodec_integration.py`, cache-presence gated on the
+  local Qwen3-0.6B HF cache (no env-var strong gate — mirrors
+  `tests/test_engine_admission_reorder.py` §5 since the 0.6B forward
+  is cheap enough not to warrant one). Not in
+  `silica/bench/scenarios.py`. A codec-on bench row lands with P-5
+  proper when there is an actual memory or quality delta to measure.
 
 ---
 
@@ -774,16 +783,20 @@ preservation contract or explicitly update this invariant.
   resident prefix bytes are not currently exposed at the budgeter
   layer; the P-4.5-C parallel observable at the store layer fills
   that gap (see §8.3).
-- `silica/engine/__init__.py::ChatSession._record_tail_metrics`
-  (~ line 175) — the only runtime reader of
-  `kv_manager.budget().resident_bytes`; used only for
+- `silica/engine/__init__.py::Engine._record_tail_metrics`
+  (~ line 165) — the only runtime reader of
+  `kv_manager.budget().resident_bytes`; used only for the
   `resident_mb` metric output, not for admission decisions.
+  (`ChatSession` lives in `silica/chat/session.py` and does not
+  read this field; the earlier reference to `ChatSession` here was a
+  symbol-lookup slip.)
 - `docs/PLAN.md` §7 P-5 Strategy — target of the line-539 amendment
   landing in this commit.
 - `docs/P4_5_CHUNKED_PREFILL_OPENING.md` — companion opening doc for
   the P-4.5-B bridge; cited for the three-layer acceptance criterion
-  precedent (chunked-prefill's fp16 batch-composition drift; §8.4
-  above argues this spike is not subject to that precedent).
+  precedent (chunked-prefill's fp16 batch-composition drift; §8.3
+  above argues this spike is not subject to that precedent because
+  Option (B) does not change batch composition).
 - D-003 (PLAN §9) — no compressed-domain attention fast path in v0.1.
 - D-009 (PLAN §9) — MLX-native hot path; no `torch.Tensor` in
   `silica.*` runtime.
