@@ -714,13 +714,66 @@ Already shipped at P-4.4. Under P-5 it becomes the **independent** column: `scri
 
 Six clauses. (a)–(c) carry forward from PLAN §7 P-5 Acceptance (with (b) and (c) rewritten in this opening — see below), (d) is new, (e) is the opening's "reproducibility is the point" anchor, (f) is the regression lock.
 
-### (a) Per-block reconstruction error vs vqbench
+### (a) Per-block reconstruction error vs vqbench — split in two (2026-04-22)
 
-Metric: per-block relative Frobenius error `||K_decoded - K_original||_F / ||K_original||_F` (same for V), computed block-by-block on a fixed calibration set. silica MLX-native `BlockTQCodec` on Qwen3.5-0.8B (or larger), compared against the vqbench NumPy reference on the same calibration set under the same metric, must satisfy:
+Acceptance (a) splits into an **algorithmic parity** half that lands
+with the MLX codec itself (P-5-A.1c) and a **real-activation + vqbench
+subprocess** half that lands when the bench harness has the subprocess
+plumbing in place (P-5-C). The split reflects scope: the MLX hot path
+is a self-contained unit that deserves its own parity gate on every
+developer machine; the real-activation comparison against vqbench's
+own codec requires vqbench's venv (scipy / torch / transformers) and a
+loaded model, which are bench-harness-adjacent.
 
-  `ε_recon < 2 × fp16 round-trip baseline noise`
+**(a-algo) — P-5-A.1c — algorithmic parity vs in-test NumPy reference.**
 
-where the baseline is established by vqbench's own fp16 encode→decode round trip on the same calibration set. Tightened at P-5-A implementation time based on measured baseline noise (likely in the 1e-3 to 1e-4 range).
+Metric: per-block relative Frobenius error
+`||silica_MLX_out - numpy_reference_out||_F / ||numpy_reference_out||_F`,
+computed on a fixed synthetic Gaussian input. The NumPy reference
+reimplements vqbench's `block_mse.py` encode/decode verbatim but
+uses only `silica.vq._calibration.haar_rotation` +
+`lloyd_max_codebook` as shared inputs (those helpers are verbatim
+NumPy ports of vqbench's calibration, already paper-reference-pinned
+at `tests/test_calibration.py::test_lloyd_max_matches_paper_reference`).
+All hot-path arithmetic — matmul, block split, scale extraction,
+quantize, centroid lookup, norm correction, inverse rotate — is
+independent of silica's `BlockTurboQuantMSE`.
+
+Gate: per-block relative Frobenius error `< 5e-3` on the
+``{vq_block_size, num_bits} ∈ {32, 64} × {3, 4}`` grid; `< 1e-3` on
+the production-recommended `B=64 b=4` row (regression lock). Observed
+values measured 2026-04-22 on `(1, 4, 16, 128)` Gaussian at seed 42:
+BlockTQ paths ≈ 2.1e-4, scalar (`B=d=64`) ≈ 1.2e-3. Tolerance headroom
+catches reshape / rotation-direction / argmin-vs-searchsorted
+tie-break drift while absorbing seed variation.
+
+Test: `tests/test_block_tq_vqbench_xcheck.py` (landed P-5-A.1c).
+Runs on every developer machine; no vqbench, scipy, HF cache, or
+model-load dependency. This is the primary guardrail that the MLX
+translation of vqbench's BlockTQ algorithm is numerically faithful.
+
+**(a-real) — P-5-C — real Qwen activations vs vqbench subprocess.**
+
+Metric: same per-block relative Frobenius error, but inputs are real
+K/V activations extracted from a loaded Qwen3.5-0.8B (or larger)
+forward pass, and the reference side runs vqbench's
+`BlockTurboQuantMSE` **in a vqbench venv subprocess** (scipy / torch /
+transformers unavailable in silica's venv; D-009 forbids importing
+them here). Builds on P-5-C's existing `silica.bench.vqbench_baseline`
+subprocess driver + a new recon-specific driver script that takes
+a tensor blob + codec config, emits recon MSE to stdout.
+
+Gate: `ε_recon < 2 × fp16 round-trip baseline noise`, where the
+baseline is established by vqbench's own fp16 encode→decode round
+trip on the same calibration set (matches the original P-5 opening
+Acceptance (a) wording). Tightened at P-5-C implementation time based
+on measured baseline noise (likely 1e-3 to 1e-4 range).
+
+Gating: dual — HF cache has Qwen3.5-0.8B AND
+`VQBENCH_PYTHON_EXECUTABLE` is set to a vqbench-aware Python. Both
+gates miss → test skips. Matches the dual-gate pattern of
+`test_engine_admission_reorder.py::test_q010_*` (HF cache) +
+`silica/bench/vqbench_baseline.py` (`VQBENCH_PYTHON_EXECUTABLE`).
 
 ### (b) End-to-end PPL-delta cross-check vs vqbench
 
@@ -806,7 +859,7 @@ Scope:
 
 Acceptance:
 
-- (a) vqbench recon-error cross-check: silica `BlockTurboQuantMSE(vq_block_size=64, num_bits=4)` on Qwen3.5-0.8B (or larger) vs vqbench NumPy reference per §7(a).
+- (a-algo) algorithmic parity vs in-test NumPy reference — closed by `tests/test_block_tq_vqbench_xcheck.py` in P-5-A.1c, per §7(a) split. (a-real) — real Qwen activations + vqbench subprocess — defers to P-5-C where the bench harness already owns the subprocess + HF-cache plumbing.
 - New: `tests/test_block_tq.py::test_block_equals_scalar_when_B_equals_d` — shipping the Block invariant vqbench already pins.
 
 Blocked by: P-5-A.0.
