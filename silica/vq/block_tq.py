@@ -86,6 +86,15 @@ class BlockTurboQuantMSE:
         dtype: output dtype for ``decode_tensor`` (D-003: fp16).
     """
 
+    # Output dtypes permitted on the D-003 path. fp32 is deliberately
+    # rejected — attention kernels (mlx-lm SDPA) operate on fp16 /
+    # bfloat16; letting a codec return fp32 would silently promote
+    # downstream K/V, doubling active-KV residency and breaking the
+    # budgeter's fp16 baseline arithmetic. bfloat16 is left in the set
+    # so Gemma-style models (which use bf16 K/V) can install BlockTQ
+    # without a dtype widening.
+    _ALLOWED_DTYPES: tuple[mx.Dtype, ...] = (mx.float16, mx.bfloat16)
+
     def __init__(
         self,
         *,
@@ -117,6 +126,12 @@ class BlockTurboQuantMSE:
             raise ValueError(
                 f"head_dim={head_dim} must be a multiple of 8 for sub-byte "
                 f"packing (see silica.vq.core.packing)"
+            )
+        if dtype not in self._ALLOWED_DTYPES:
+            raise ValueError(
+                f"dtype must be one of {self._ALLOWED_DTYPES} (D-003 — "
+                f"decode_tensor output is consumed by fp16 / bf16 SDPA); "
+                f"got {dtype}"
             )
 
         self.block_size = block_size
@@ -151,13 +166,41 @@ class BlockTurboQuantMSE:
     def encode_tensor(self, x: mx.array) -> BlockTQPayload:
         """Quantize ``x`` (one side of one block) into a ``BlockTQPayload``.
 
-        Input shape: ``(1, n_kv_heads, kv_block_size, head_dim)`` fp16,
-        as produced by ``ContinuousBatcher._extract_and_insert_prefix``
-        and consumed by ``SyntheticPrefixBlockStore.register_detached``.
-        Leading axes are flattened to ``n_vectors = 1 × n_kv_heads ×
+        Input shape must be exactly
+        ``(1, n_kv_heads, kv_block_size, head_dim)`` — the shape
+        ``ContinuousBatcher._extract_and_insert_prefix`` produces and
+        ``SyntheticPrefixBlockStore.register_detached`` passes through.
+        Leading axes are flattened to ``n_vectors = n_kv_heads ×
         kv_block_size`` so the last-axis quantization is purely
         vector-in / vector-out.
+
+        Raises:
+            ValueError: if ``x.shape`` does not match the codec's
+                configured ``(1, n_kv_heads, block_size, head_dim)`` or
+                if ``x.dtype`` does not match ``self.dtype``. Wrong-
+                shape inputs with a coincidentally matching element
+                count would silently decode into a different semantic
+                layout, corrupting K/V; the strict check catches the
+                miswire at encode time.
         """
+        expected_shape = (1, self._n_kv_heads, self.block_size, self._head_dim)
+        if tuple(x.shape) != expected_shape:
+            raise ValueError(
+                f"BlockTurboQuantMSE.encode_tensor: input shape "
+                f"{tuple(x.shape)} does not match codec's configured "
+                f"{expected_shape}. VectorCodec operates on one side "
+                f"(K or V) of one detached block; reshape at the caller "
+                f"if semantic layout differs."
+            )
+        if x.dtype != self.dtype:
+            raise ValueError(
+                f"BlockTurboQuantMSE.encode_tensor: input dtype "
+                f"{x.dtype} does not match codec dtype {self.dtype}. "
+                f"A silent upcast from bf16 to fp16 (or vice versa) "
+                f"would leak rounding into the Haar rotation and shift "
+                f"the decoded output relative to vqbench reference."
+            )
+
         flat = x.reshape(-1, self._head_dim).astype(mx.float32)
         n_vectors = flat.shape[0]
 

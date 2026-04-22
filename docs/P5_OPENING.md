@@ -30,7 +30,7 @@ Key decisions pinned in this opening:
 2. **Interface — side-level codec, pair-level store.** `KVCodec` (the pair-level Protocol today) splits into a side-level `VectorCodec[P]` Protocol that operates on a single tensor (either K or V, never both), and the `SyntheticPrefixBlockStore` is where the K and V codecs are held separately and dispatched per side. A pair-level convenience wrapper `KVCodec = (VectorCodec, VectorCodec)` pair type alias exists for call sites that pin the same codec for both; it is documentation, not a separate Protocol. `CodedBlock` — which today is a pair `(k, v, resident_bytes)` — splits into per-side `CodedPayload` instances; each carries its own `resident_bytes` (D-012 canonical, must equal the sum of `.nbytes` of every `mx.array` field on the payload). `IdentityCodec` becomes a `VectorCodec[RawFp16Payload]` baseline. `BlockTurboQuantMSE` is a `VectorCodec[BlockTQPayload]`; RaBitQ a `VectorCodec[RaBitQPayload]`. This resolves the internal contradiction from the earlier draft where a pair-level `encode_block(k, v)` could not cleanly serve `k_codec != v_codec` split configurations. PLAN §7 P-5 Scope already foreshadows a refactor; this opening locks **side-level**.
 3. **Granularity disambiguation** — kvcache-block-size (token-axis, default 16, radix-cache granularity) and vq-block-size (head_dim-axis, typically 32 or 64, BlockTQ algorithm's per-scale block) are **two orthogonal concepts**. A single `register_detached` call encodes `n_kv_heads × kvcache_block_size` vectors (each `R^head_dim`); each vector is internally split into `head_dim / vq_block_size` quantization sub-blocks. This doc uses `kv_block` vs `vq_block` everywhere; never "block" alone.
 4. **K/V split codec** — `SyntheticPrefixBlockStore` extends to `SyntheticPrefixBlockStore(block_size, k_codec=..., v_codec=...)` (the single-`codec=` kwarg from P-4.5-C.1 becomes a shorthand for `k_codec=v_codec=codec`). This resolves PLAN §10 Q-008 in the same commit as P-5-A lands — per Q-008 the lean was Option A ("K and V get independent codecs"), now confirmed by vqbench's split-codec production recommendation (K on BlockTQ, V on BlockTQ for the 4-bit K+V config; other configs want V on identity for K-only comparisons).
-5. **Offline / runtime boundary** — Haar rotation matrices and Lloyd-Max codebooks are **offline calibration** artefacts. They are computed once at codec construction via NumPy + `scipy.stats.norm` (the vqbench algorithms verbatim) and serialized into fp16 `mx.array` constants on the codec instance. Runtime `encode_tensor` / `decode_tensor` see zero NumPy — all hot-path work is pure `mx.array`. This is not a D-009 violation; D-009 forbids runtime NumPy, not construction-time calibration.
+5. **Offline / runtime boundary** — Haar rotation matrices and Lloyd-Max codebooks are **offline calibration** artefacts. They are computed once at codec construction via NumPy + stdlib `math` (the vqbench algorithms verbatim, except `scipy.stats.norm` is replaced with stdlib `math.erf` / `math.exp` — see §5.2) and serialized into **fp32** `mx.array` constants on the codec instance (P-5-A.1a landing: fp16 would lose precision on the Haar matmul and near the Lloyd-Max centroid boundaries). Runtime `encode_tensor` / `decode_tensor` see zero NumPy — all hot-path work is pure `mx.array`, with the output cast back to fp16 / bf16 at the D-003 boundary. This is not a D-009 violation; D-009 forbids runtime NumPy, not construction-time calibration.
 6. **Reproducibility story — two-track** — silica grows its own MLX-native streaming PPL oracle (`silica.bench.ppl_oracle`) so silica's own bench harness can report `{ΔPPL, compression, decode tok/s}` columns in one `python -m scripts.bench --kv-codec <name>` invocation. The existing `silica/bench/vqbench_baseline.py` (P-4.4, already shipped) continues to serve as the **independent** cross-check column via subprocess. Same pattern as P-3-D3.1's "direct mlx-lm batched reference" vs "Silica single-request" dual reference.
 7. **Acceptance adds a decode-speed regression gate on a prefix-hit workload** — PLAN §7 P-5 Acceptance currently specifies (a) per-block reconstruction error, (b) end-to-end PPL drift, and (c) admits more with same budget. This opening rewrites (b) as a PPL-delta cross-check (not absolute) and (c) as a prefix-residency headroom gate (not a blanket admission multiplier), and adds (d) `decode_tok_s ≥ 0.85 × IdentityCodec_baseline` on a new `qwen3.5-0.8b-prefix-hit-decode` row (existing smoke / B=1 parity rows run `prefix_cache=None` so never exercise the codec; the new row is `[p, p] max_batch_size=1 prefix_cache=True` and measures row 1's seeded-admission decode tok/s specifically). Q-007 moves from "deferred" to "partially resolved": decode overhead does not enter admission decisions in v0.1, but it does gate P-5 landing.
 
@@ -90,7 +90,7 @@ vqbench REPORT §3.1 (Qwen3.5-4B, WikiText-2 first 512 tokens, chunk=256, 3 seed
 
 The three intents above combine into a stronger framing: P-5 is not "ship BlockTQ", it is **build the MLX-native VQ codec platform that BlockTQ is the first inhabitant of**. Three consequences:
 
-**1.4.1 MLX-native codec hot path, not an MLX-wrapped reference.** vqbench's `block_turboquant_mse.py` is NumPy + PyTorch running on CPU / MPS; its `VQBenchCache` compresses K/V tensors **after** HF's attention module has materialized them in torch memory. Even if silica imported that code verbatim, the payload would still flow through `torch.Tensor → .numpy() → mx.array` on every `register_detached` and the reverse on every `fetch_detached_blocks`. D-009 forbids that. P-5 rewrites the encode / decode hot path in pure `mx.array` operations (`mx.multiply`, `mx.searchsorted`, `mx.take`, bitwise ops) so the tensors that enter a codec came from MLX attention and the tensors that leave it go back into MLX attention without a torch round trip. The NumPy + `scipy.stats.norm` code stays — but only for offline calibration at codec construction (Haar seeds, Lloyd-Max codebook). §2.2 expands this boundary; §4 and §5.2 pin the hot-path rules.
+**1.4.1 MLX-native codec hot path, not an MLX-wrapped reference.** vqbench's `block_turboquant_mse.py` is NumPy + PyTorch running on CPU / MPS; its `VQBenchCache` compresses K/V tensors **after** HF's attention module has materialized them in torch memory. Even if silica imported that code verbatim, the payload would still flow through `torch.Tensor → .numpy() → mx.array` on every `register_detached` and the reverse on every `fetch_detached_blocks`. D-009 forbids that. P-5 rewrites the encode / decode hot path in pure `mx.array` operations (`mx.matmul`, `mx.multiply`, `mx.linalg.norm`, `mx.argmin` — MLX lacks `mx.searchsorted`, so quantization uses a broadcast `argmin` against the Lloyd-Max centroids directly, equivalent to midpoint-boundary lookup; `mx.take` / fancy indexing for centroid lookup; bitwise ops for sub-byte packing) so the tensors that enter a codec came from MLX attention and the tensors that leave it go back into MLX attention without a torch round trip. The NumPy calibration code stays — but only for offline codec construction (Haar seeds, Lloyd-Max codebook). §2.2 expands this boundary; §4 and §5.2 pin the hot-path rules.
 
 **1.4.2 Adding a new codec must be a bounded, mechanical change.** The target is: a future contributor adds a fifth VQ method (say, `ProductQuantizer` or a new hand-designed codec) by
 
@@ -115,7 +115,7 @@ This is why §8's sub-unit structure invests P-5-A.0 in the Protocol + payload +
 
 ### 2.2 D-009 — MLX-native runtime hot path
 
-`silica.vq.*` runtime code must import only `mx` / `mlx.*` / `mlx_lm.*`. NumPy / scipy / PyTorch are **calibration-time only** (codec `__init__` runs once, produces fp16 `mx.array` constants). This is enforced by the test `test_no_numpy_at_runtime` which greps the module for NumPy symbol reads (except inside `__init__`).
+`silica.vq.*` runtime code must import only `mx` / `mlx.*` / `mlx_lm.*`. NumPy is **calibration-time only** (the NumPy quarantine `silica.vq._calibration` produces write-protected `np.ndarray` outputs; codec `__init__` uploads them as **fp32** `mx.array` constants — fp16 would lose precision on the Haar matmul and near Lloyd-Max centroid midpoints). scipy is not used at all — the standard-normal CDF / PDF needed inside Lloyd-Max come from stdlib `math.erf` + `math.exp`. This is enforced by `tests/test_calibration.py::test_calibration_module_is_the_numpy_quarantine_exception` which greps every `silica.vq.*` module (including package `__init__.py`) for `import numpy` / `from numpy` and asserts only `_calibration` has them.
 
 ### 2.3 Q-009 / R-7 — no MLX variable-length attention
 
@@ -388,8 +388,10 @@ class BlockTurboQuantMSE:
 
     def encode_tensor(self, x) -> BlockTQPayload:
         # --- runtime, 100% mx.array ---
-        # ... Haar rotate, split into vq_blocks, per-block norm,
-        #     scalar searchsorted against self._boundaries,
+        # ... validate shape + dtype against codec config,
+        #     Haar rotate (fp32 matmul), split into vq_blocks, per-block
+        #     norm, scalar quantize via mx.argmin((y - centroids)²)
+        #     (broadcast-replaces mx.searchsorted which MLX lacks),
         #     pack_sub_byte to uint8
         ...
 ```
@@ -443,7 +445,7 @@ Per-vector (flattened to `(n_kv_heads × kv_block_size, head_dim)`):
 1. `x_norm = mx.linalg.norm(x, axis=-1, keepdims=True)` — one fp16 scalar per vector.
 2. `x_hat = x / max(x_norm, 1e-30)`.
 3. `y = x_hat @ rotation.T` — Haar rotate. Matmul against the cached `(head_dim, head_dim)` constant.
-4. `indices = mx.searchsorted(boundaries, y).astype(mx.uint8)` (int in `[0, 2^num_bits)`). `num_bits ≤ 8` is enforced at codec construction; extending beyond 8 bits per coordinate would overflow uint8 and require a uint16 payload refactor, but the P-5 codec catalog caps at 4 bits so this is never triggered in v0.1.
+4. `indices = mx.argmin((y[..., None] - centroids) ** 2, axis=-1).astype(mx.uint8)` (int in `[0, 2^num_bits)`). MLX lacks `mx.searchsorted`; broadcast-argmin over the `(..., 2^num_bits)` distance tensor is semantically equivalent to boundary lookup for Lloyd-Max-optimal codebooks because the boundaries are exactly the midpoints between adjacent centroids. `num_bits ≤ 8` is enforced at codec construction; extending beyond 8 bits per coordinate would overflow uint8 and require a uint16 payload refactor, but the P-5 codec catalog caps at 4 bits so this is never triggered in v0.1.
 5. `packed_indices = pack_sub_byte(indices, num_bits=b)` — `silica.vq.core.packing`; produces `uint8` array of shape `(n, ceil(d × b / 8))`.
 6. Payload: `BlockTQPayload` with `n_vq_blocks = 1` (i.e. `vq_block_size = head_dim` — one global scale per vector). There is no separate `TQPayload` dataclass; Scalar TQ is represented as the degenerate `B = d` case of the same `BlockTQPayload` schema. `scales` shape becomes `(n_vectors, 1)` fp16, `packed_indices` shape `(n_vectors, ceil(head_dim × num_bits / 8))` uint8.
 
@@ -463,11 +465,15 @@ Algorithm: vqbench `methods/turboquant/block_mse.py` + `BlockTQ.md`. Per-vq-bloc
 Encode (batched over `n_vectors`):
 
 ```python
-y = x @ rotation.T                                                  # Haar rotate
+y = x @ rotation.T                                                  # Haar rotate (fp32 matmul)
 y_blocks = y.reshape(n, n_vq_blocks, vq_block_size)                 # (n, d/B, B)
 scales = mx.linalg.norm(y_blocks, axis=-1, keepdims=True)           # (n, d/B, 1)
 y_normed = y_blocks / mx.maximum(scales, 1e-30)
-indices = mx.searchsorted(boundaries, y_normed).astype(mx.uint8)    # (n, d/B, B), int in [0, 2^b)
+# MLX lacks mx.searchsorted — broadcast-and-argmin replaces the
+# boundary lookup. Equivalent under Lloyd-Max-optimal codebooks
+# because boundaries are midpoints between adjacent centroids.
+diff = y_normed[..., None] - centroids                              # (n, d/B, B, 2^b)
+indices = mx.argmin(diff * diff, axis=-1).astype(mx.uint8)          # (n, d/B, B)
 indices_flat = indices.reshape(n, head_dim)                         # flat-last
 packed_indices = pack_sub_byte(indices_flat, num_bits=b)            # (n, ceil(d × b / 8)) uint8
 ```
@@ -782,7 +788,7 @@ Blocked by: nothing (P-4.5 closed).
 
 Scope:
 
-- `silica.vq.block_tq.BlockTurboQuantMSE` — MLX-native encode / decode. Haar rotation via matmul against `_calibration`-produced fp16 constant; per-vq-block norm extraction; Lloyd-Max scalar quantize via `mx.searchsorted`; bit-pack via `pack_sub_byte`.
+- `silica.vq.block_tq.BlockTurboQuantMSE` — MLX-native encode / decode. Haar rotation via fp32 matmul against `_calibration`-produced fp32 constant (fp16 rotation matrix would erode Lloyd-Max boundary precision); per-vq-block norm extraction; Lloyd-Max scalar quantize via broadcast `mx.argmin((y - centroids)²)` (MLX lacks `mx.searchsorted`); bit-pack via `pack_sub_byte`. Input shape + dtype validated at `encode_tensor`: strict match against the codec's configured `(1, n_kv_heads, block_size, head_dim)` and `dtype ∈ {fp16, bf16}`.
 - `silica.vq.turboquant.TurboQuantMSE` — thin alias `TurboQuantMSE = lambda head_dim, num_bits, **kw: BlockTurboQuantMSE(head_dim=head_dim, vq_block_size=head_dim, num_bits=num_bits, **kw)`. No separate class body.
 - `silica.bench.codec_registry` — `CodecSpec` dataclass + initial entries for `fp16`, `tq_mse_b4`, `tq_mse_b3`, `block_tq_{b64,b32}_{b3,b4}` (no RaBitQ yet; P-5-B adds those).
 - PLAN updates: Q-008 in §10 flipped to `resolved 2026-XX-XX → Option A (independent K/V codecs via k_codec/v_codec kwargs, landed P-5-A.1)`.

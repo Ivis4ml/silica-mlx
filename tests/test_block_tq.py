@@ -26,6 +26,7 @@ Covers:
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
@@ -103,6 +104,66 @@ def test_rejects_nonpositive_n_kv_heads() -> None:
 def test_rejects_nonpositive_head_dim() -> None:
     with pytest.raises(ValueError, match="head_dim"):
         _codec(head_dim=0)
+
+
+def test_rejects_fp32_dtype() -> None:
+    """D-003: decode_tensor output is consumed by fp16 / bf16 SDPA;
+    silently returning fp32 would double active-KV residency and
+    break the budgeter's fp16 baseline arithmetic."""
+    with pytest.raises(ValueError, match="dtype"):
+        _codec(dtype=mx.float32)
+
+
+def test_accepts_bfloat16_dtype() -> None:
+    """bf16 is in the allowed set so Gemma-style K/V layouts can install
+    BlockTQ without a dtype widening."""
+    codec = _codec(dtype=mx.bfloat16)
+    assert codec.dtype == mx.bfloat16
+
+
+# ---------------------------------------------------------------------------
+# encode_tensor input validation (shape + dtype)
+# ---------------------------------------------------------------------------
+
+
+def test_encode_tensor_rejects_wrong_n_kv_heads() -> None:
+    """Input shape `(1, wrong_heads, block_size, head_dim)` with the
+    same total element count as the codec's configured shape would
+    silently quantize into a wrong layout without this check."""
+    codec = _codec()  # n_kv_heads=4, block_size=16, head_dim=64
+    # Same total elements (4 * 16 * 64 = 4096) but different (heads, block).
+    x = mx.zeros((1, 8, 8, HEAD_DIM), dtype=DTYPE)
+    with pytest.raises(ValueError, match="input shape"):
+        codec.encode_tensor(x)
+
+
+def test_encode_tensor_rejects_wrong_block_size() -> None:
+    codec = _codec()
+    # Same total elements but (block_size, head_dim) swapped arithmetically.
+    x = mx.zeros((1, N_KV_HEADS, 32, 32), dtype=DTYPE)
+    with pytest.raises(ValueError, match="input shape"):
+        codec.encode_tensor(x)
+
+
+def test_encode_tensor_rejects_wrong_head_dim() -> None:
+    codec = _codec()
+    x = mx.zeros((1, N_KV_HEADS, BLOCK_SIZE, HEAD_DIM // 2), dtype=DTYPE)
+    with pytest.raises(ValueError, match="input shape"):
+        codec.encode_tensor(x)
+
+
+def test_encode_tensor_rejects_wrong_leading_axis() -> None:
+    codec = _codec()
+    x = mx.zeros((2, N_KV_HEADS, BLOCK_SIZE, HEAD_DIM), dtype=DTYPE)
+    with pytest.raises(ValueError, match="input shape"):
+        codec.encode_tensor(x)
+
+
+def test_encode_tensor_rejects_wrong_dtype() -> None:
+    codec = _codec(dtype=mx.float16)
+    x = mx.zeros((1, N_KV_HEADS, BLOCK_SIZE, HEAD_DIM), dtype=mx.bfloat16)
+    with pytest.raises(ValueError, match="input dtype"):
+        codec.encode_tensor(x)
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +440,7 @@ def test_different_seeds_different_output() -> None:
 def test_block_tq_module_has_no_numpy_import() -> None:
     import silica.vq.block_tq as mod
 
-    src = open(mod.__file__).read()
+    src = Path(mod.__file__).read_text()
     assert "import numpy" not in src, (
         "silica.vq.block_tq must not import NumPy on the hot path; "
         "calibration-time NumPy lives in silica.vq._calibration"
@@ -390,7 +451,7 @@ def test_block_tq_module_has_no_numpy_import() -> None:
 def test_turboquant_module_has_no_numpy_import() -> None:
     import silica.vq.turboquant as mod
 
-    src = open(mod.__file__).read()
+    src = Path(mod.__file__).read_text()
     assert "import numpy" not in src
     assert "from numpy" not in src
 
