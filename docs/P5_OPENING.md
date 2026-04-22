@@ -578,22 +578,25 @@ The registry is a dict of `CodecSpec` metadata, not bare factory lambdas. Every 
 @dataclass(frozen=True)
 class CodecSpec:
     id: str                              # registry key, e.g. "block_tq_b64_b4"
-    family: str                          # "tq_mse" | "block_tq" | "rabitq_1bit" | "ext_rabitq" | "identity"
-    bits_per_value: float                # effective bits/dim, e.g. 4.25 for Block B=64 b=4 (metadata-inclusive)
+    family: str                          # "fp16" | "tq_mse" | "block_tq" | "rabitq" | "ext_rabitq"
+    bits_per_value: float                # nominal bits/dim, e.g. 4.25 for Block B=64 b=4 (metadata-inclusive)
     k_supported: bool                    # may be used as k_codec
     v_supported: bool                    # may be used as v_codec
     requires_fit: bool                   # needs fit(X) calibration call before use (RaBitQ)
-    payload_packed: bool                 # sub-byte bit-packed (False for identity / fp16)
+    payload_packed: bool                 # sub-byte bit-packed (False for fp16 baseline)
     production_recommended: bool         # vqbench-recommended production setting
     factory: Callable[..., VectorCodec]  # constructed with head_dim=... bound by BenchRunner
 
-_KV_CODEC_REGISTRY: dict[str, CodecSpec] = {
+# CODEC_REGISTRY (public name as landed in P-5-A.1b). The CodecSpec
+# dataclass also exposes ``effective_bits_per_value(head_dim)`` for the
+# head-dim-dependent scalar TQ case.
+CODEC_REGISTRY: dict[str, CodecSpec] = {
     "fp16": CodecSpec(
-        id="fp16", family="identity", bits_per_value=16.0,
+        id="fp16", family="fp16", bits_per_value=16.0,
         k_supported=True, v_supported=True,
         requires_fit=False, payload_packed=False,
         production_recommended=False,
-        factory=lambda **kw: None,                                 # pass-through
+        factory=_identity_factory,                                 # IdentityCodec
     ),
     "block_tq_b64_b4": CodecSpec(
         id="block_tq_b64_b4", family="block_tq", bits_per_value=4.25,
@@ -863,7 +866,7 @@ Scope:
 - Bench rows: the `qwen3.5-0.8b-wikitext-ppl-*`, `qwen3.5-0.8b-compression`, `qwen3.5-0.8b-admission-headroom-prefix-heavy` rows from §6.5. (`qwen3.5-0.8b-prefix-hit-decode` and its oracle ship with P-5-A.3.)
 - Variance / multi-seed plumbing in `BenchRunner`: per-(scenario, codec, seed) row in the JSONL output; markdown table with `mean ± std` columns.
 - Acceptance: (b) PPL-delta cross-check vs vqbench; (e) full vqbench table reproducible in one flag; (f) no regression.
-- Tests: `tests/test_bench_codec_registry.py` (CodecSpec honesty), `tests/test_ppl_oracle.py` (chunk invariance + teacher-forced entry point correctness), extensions to `tests/test_bench_runner.py` / `tests/test_bench_cli.py`.
+- Tests: `tests/test_codec_registry.py` (CodecSpec honesty; landed in P-5-A.1b), `tests/test_ppl_oracle.py` (chunk invariance + teacher-forced entry point correctness), extensions to `tests/test_bench_runner.py` / `tests/test_bench_cli.py`.
 
 Blocked by: P-5-A.1 (needs at least BlockTQ live to produce a non-fp16 column). Can interleave with P-5-B.
 
