@@ -285,6 +285,14 @@ class SyntheticPrefixBlockStore:
         self._source_refs: dict[int, int] = {}
         self._hit_refs: dict[int, int] = {}
         self._detached: dict[int, tuple[_DetachedLayer, ...]] = {}
+        # Number of layers per detached block, learned from the first
+        # ``register_detached`` call. Subsequent calls assert match.
+        # ``resident_bytes_per_block`` uses this to scale one codec
+        # round trip's bytes up to the actual eviction unit (one radix
+        # block_id covers all layers) — without it the budgeter
+        # under-counts bytes freed per eviction by a factor of
+        # num_layers and over-rejects.
+        self._num_layers: int | None = None
 
     def _encode_layer(self, k: mx.array, v: mx.array) -> _DetachedLayer:
         """Encode one layer's K and V tensors per the resolved side codecs.
@@ -398,6 +406,22 @@ class SyntheticPrefixBlockStore:
                 f"block {block_id}: detached K/V already registered "
                 f"(duplicate register — caller bug)"
             )
+        # Track num_layers for resident_bytes_per_block accounting.
+        # Homogeneous-shape models (Qwen3-family, P-5-A scope) pass the
+        # same num_layers on every call; heterogeneous support is a
+        # P-5-A follow-up (opening §2.6). Asserting consistency here
+        # surfaces drift early rather than silently returning wrong
+        # eviction-bytes numbers to the budgeter.
+        n_layers = len(per_layer_kv)
+        if self._num_layers is None:
+            self._num_layers = n_layers
+        elif self._num_layers != n_layers:
+            raise ValueError(
+                f"block {block_id}: register_detached got {n_layers} "
+                f"layers but store was initialized to "
+                f"{self._num_layers}; heterogeneous-shape support is "
+                f"P-5-A follow-up scope (opening §2.6)"
+            )
         self._detached[block_id] = tuple(
             self._encode_layer(k, v) for k, v in per_layer_kv
         )
@@ -435,6 +459,51 @@ class SyntheticPrefixBlockStore:
     def live_block_ids(self) -> frozenset[int]:
         """Snapshot of all block ids with nonzero source refs."""
         return frozenset(self._source_refs.keys())
+
+    def resident_bytes_per_block(self) -> int | None:
+        """Bytes freed by evicting one radix ``block_id`` under the
+        currently-bound codecs.
+
+        One radix ``block_id`` covers **all layers** of one token-
+        block: ``register_detached(bid, per_layer_kv)`` stores
+        ``len(per_layer_kv) == num_layers`` ``_DetachedLayer`` entries
+        for that id, and ``RadixPrefixCache.evict_until(n)`` drops all
+        of them together on eviction. This method must therefore
+        return ``num_layers × (k_codec.resident_bytes(1) +
+        v_codec.resident_bytes(1))`` — not just the per-layer figure.
+        Returning the single-layer value would cause
+        ``MemoryBudgeter.admit`` to under-count bytes freed per
+        eviction by a factor of ``num_layers`` and reject requests
+        that should fit via single-block eviction (regression-locked
+        by ``tests/test_memory_budgeter.py::test_mode_c_admit_evicts_one_block_when_shortfall_between_single_and_all_layer_bytes``).
+
+        ``num_layers`` is learned from the first ``register_detached``
+        call; before that (no blocks yet registered) the method
+        returns ``None`` — the budgeter's ``_evict_bytes_per_block``
+        then falls back to the fp16 baseline, which is harmless
+        because no evictable blocks exist at that point anyway.
+
+        Returns ``None`` on the pass-through path (both ``k_codec``
+        and ``v_codec`` ``None``). Pass-through stores raw
+        ``mx.array`` references whose per-block size the store does
+        not track symbolically; callers fall back to their own
+        ``bytes_per_token × block_size`` formula (the
+        ``MemoryBudgeter`` fp16 baseline).
+
+        Consumed by ``silica.scheduler.budget.MemoryBudgeter`` under
+        ``account_prefix_residency=True``, via a structural capability
+        check (``hasattr(store, 'resident_bytes_per_block')``). Paged
+        backend does not implement this; the budgeter's capability
+        check treats absence as "fall back to fp16 baseline".
+        """
+        if self._k_codec is None or self._v_codec is None:
+            return None
+        if self._num_layers is None:
+            return None
+        per_layer = (
+            self._k_codec.resident_bytes(1) + self._v_codec.resident_bytes(1)
+        )
+        return self._num_layers * per_layer
 
     def resident_bytes(self) -> int:
         """Sum of per-side ``CodedPayload.resident_bytes`` across all detached blocks.

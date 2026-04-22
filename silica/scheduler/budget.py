@@ -139,7 +139,31 @@ class MemoryBudgeter:
         bytes_per_token: int,
         block_size: int,
         cap_bytes: int,
+        account_prefix_residency: bool = True,
     ) -> None:
+        """Construct a ``MemoryBudgeter``.
+
+        ``account_prefix_residency`` (P-5-A.2, opening §4.7):
+
+        - ``True`` (default) — new P-5 behaviour. ``headroom_bytes()``
+          subtracts ``prefix_cache.store.resident_bytes()`` when the
+          bound store exposes that method (synthetic stores do; paged
+          stores do not — absence is treated as zero prefix residency
+          via a ``hasattr`` capability check). Under ``IdentityCodec``
+          this is honest fp16 bytes (§4.7 mode B); under compressed
+          codecs it is honest compressed bytes (§4.7 mode C).
+          Evict-shortfall math consults
+          ``store.resident_bytes_per_block()`` for the same reason.
+        - ``False`` — P-4.5 byte-for-byte regression path (§4.7 mode
+          A). ``headroom_bytes() = cap - weights - reserved``; the
+          evict branch uses the fp16 ``bytes_per_token × block_size``
+          formula. Set by the P-4.5 close regression sweep and by any
+          caller pinning pre-P-5 behaviour.
+
+        Active-KV reservation (``worst_case_bytes``) remains at fp16
+        worst-case under both modes — D-003 keeps the active-KV upper
+        bound at fp16 regardless of codec.
+        """
         if weights_bytes < 0:
             raise ValueError(
                 f"weights_bytes must be >= 0, got {weights_bytes}"
@@ -157,6 +181,7 @@ class MemoryBudgeter:
         self._bytes_per_token = bytes_per_token
         self._block_size = block_size
         self._cap_bytes = cap_bytes
+        self._account_prefix_residency = account_prefix_residency
         # FIFO-order list of req_ids that have been admitted and not
         # released; appended on apply_admit, removed on release. Preempt
         # policy uses the tail (newest DECODE).
@@ -171,6 +196,7 @@ class MemoryBudgeter:
         prefix_cache: RadixPrefixCache,
         weights_bytes: int,
         cap_bytes: int,
+        account_prefix_residency: bool = True,
     ) -> "MemoryBudgeter":
         """Construct a ``MemoryBudgeter`` for a concrete ``ModelAdapter``.
 
@@ -215,6 +241,7 @@ class MemoryBudgeter:
             bytes_per_token=bytes_per_token,
             block_size=prefix_cache.block_size,
             cap_bytes=cap_bytes,
+            account_prefix_residency=account_prefix_residency,
         )
 
     # --- inspection ---
@@ -235,12 +262,46 @@ class MemoryBudgeter:
         return sum(self._reserved_per_req.values())
 
     def headroom_bytes(self) -> int:
-        """Cap minus weights minus current reservation (can be negative)."""
+        """Bytes available for a new admission (can be negative).
+
+        Under ``account_prefix_residency=True`` (default), subtracts
+        prefix-cache residency in addition to weights + reserved:
+        ``headroom = cap - weights - reserved - prefix_resident``.
+        Under ``account_prefix_residency=False``, falls back to the
+        P-4.5 byte-for-byte formula ``cap - weights - reserved`` (§4.7
+        mode A regression path).
+
+        Prefix residency is read via a structural capability check
+        (``hasattr(store, 'resident_bytes')``) — synthetic stores
+        expose it, paged stores do not (paged-backend residency is
+        not modelled in v0.1 per D-003 / Q-009 / R-7); paged path
+        treats absence as zero residency.
+        """
         return (
             self._cap_bytes
             - self._weights_bytes
             - self.reserved_bytes()
+            - self._prefix_resident_bytes()
         )
+
+    def _prefix_resident_bytes(self) -> int:
+        """Prefix-cache residency consumed by the bound store.
+
+        Zero under ``account_prefix_residency=False`` OR when the
+        bound store does not expose ``resident_bytes()`` (paged
+        backend). Otherwise returns the store's honest per-side
+        payload-byte sum (fp16 under IdentityCodec, compressed under
+        BlockTQ / RaBitQ).
+        """
+        if not self._account_prefix_residency:
+            return 0
+        store = self._pc.store if self._pc is not None else None
+        if store is None:
+            return 0
+        fn = getattr(store, "resident_bytes", None)
+        if not callable(fn):
+            return 0
+        return int(fn())
 
     def worst_case_bytes(self, n_prompt: int, max_tokens: int) -> int:
         """Upper-bound KV bytes for a request with this shape."""
@@ -279,7 +340,7 @@ class MemoryBudgeter:
 
         # (2) Try evicting unpinned prefix-cache source blocks.
         evictable_blocks = self._count_evictable_prefix_blocks()
-        block_bytes = self._kv_bytes_per_block()
+        block_bytes = self._evict_bytes_per_block()
         if evictable_blocks > 0 and block_bytes > 0:
             blocks_needed = (shortfall + block_bytes - 1) // block_bytes
             if blocks_needed <= evictable_blocks:
@@ -342,13 +403,47 @@ class MemoryBudgeter:
     # --- internals ---
 
     def _kv_bytes_per_block(self) -> int:
-        """Bytes per radix block.
+        """fp16-baseline bytes per radix block.
 
         ``bytes_per_token * block_size`` — matches ``PagedKVCache``'s
-        internal accounting and is dimensionally what the evict-
-        shortfall math wants to divide the byte shortfall by.
+        internal accounting. Used as the fp16-worst-case fallback in
+        :meth:`_evict_bytes_per_block` when no store-level per-block
+        residency is exposed.
         """
         return self._bytes_per_token * self._block_size
+
+    def _evict_bytes_per_block(self) -> int:
+        """Actual bytes freed by evicting one prefix-cache block.
+
+        Under ``account_prefix_residency=True`` (default), consults
+        the bound store's ``resident_bytes_per_block()`` — honest
+        per-block residency reflecting codec compression. Falls back
+        to the fp16 ``bytes_per_token × block_size`` baseline when
+        the flag is off, when no store is bound, when the store does
+        not expose the method (paged backend), or when the method
+        returns ``None`` (synthetic pass-through path — no codec
+        installed, per-block raw size not symbolically tracked).
+
+        The evict-shortfall math in :meth:`admit` divides
+        ``shortfall_bytes`` by this value to get ``blocks_needed``;
+        using honest per-block bytes under a compressed codec
+        reflects real bytes-freed rather than the fp16 estimate. This
+        is §4.7 bullet 3 of the opening doc. Reservation math
+        (``worst_case_bytes``) still uses the fp16 formula — D-003
+        keeps the active-KV upper bound at fp16 regardless of codec.
+        """
+        if not self._account_prefix_residency:
+            return self._kv_bytes_per_block()
+        store = self._pc.store if self._pc is not None else None
+        if store is None:
+            return self._kv_bytes_per_block()
+        fn = getattr(store, "resident_bytes_per_block", None)
+        if not callable(fn):
+            return self._kv_bytes_per_block()
+        per_block = fn()
+        if per_block is None:
+            return self._kv_bytes_per_block()
+        return int(per_block)
 
     def _count_evictable_prefix_blocks(self) -> int:
         """Best-effort count of leaf blocks with zero live hits.

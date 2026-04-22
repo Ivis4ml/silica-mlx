@@ -1899,8 +1899,15 @@ def test_evict_decision_calls_evict_until_and_admits() -> None:
     _bootstrap_block_into(pc)
 
     adapter = _admit_adapter(script=(7,))
+    # account_prefix_residency=False pins pre-P-5 mode (A) headroom
+    # arithmetic; this test's numerical tuning (cap=160, filler=96 →
+    # headroom=64) was written before P-5-A.2 added prefix-residency
+    # charging. Mode (A) preserves the cap - weights - reserved formula
+    # so the evict-path decision logic under test remains exercised.
+    # P-5-C will add mode-(B/C) bench rows with their own arithmetic.
     budgeter = MemoryBudgeter.for_adapter(
-        adapter, prefix_cache=pc, weights_bytes=0, cap_bytes=160
+        adapter, prefix_cache=pc, weights_bytes=0, cap_bytes=160,
+        account_prefix_residency=False,
     )
     budgeter.apply_admit("filler", 96)
     b = ContinuousBatcher(
@@ -1938,8 +1945,15 @@ def test_evict_underrun_aborts_without_admit_or_reservation() -> None:
     _bootstrap_block_into(pc)
 
     adapter = _admit_adapter(script=(7,))
+    # account_prefix_residency=False pins pre-P-5 mode (A) headroom
+    # arithmetic; this test's numerical tuning (cap=160, filler=96 →
+    # headroom=64) was written before P-5-A.2 added prefix-residency
+    # charging. Mode (A) preserves the cap - weights - reserved formula
+    # so the evict-path decision logic under test remains exercised.
+    # P-5-C will add mode-(B/C) bench rows with their own arithmetic.
     budgeter = MemoryBudgeter.for_adapter(
-        adapter, prefix_cache=pc, weights_bytes=0, cap_bytes=160
+        adapter, prefix_cache=pc, weights_bytes=0, cap_bytes=160,
+        account_prefix_residency=False,
     )
     budgeter.apply_admit("filler", 96)
     b = ContinuousBatcher(
@@ -1981,8 +1995,14 @@ def test_evict_underrun_does_not_block_later_queue_items() -> None:
     _bootstrap_block_into(pc)
 
     adapter = _admit_adapter(script=(7,))
+    # account_prefix_residency=False — same rationale as the other
+    # test_evict_* cases above: pinned to mode (A) so the pre-P-5
+    # headroom arithmetic this evict-path test is tuned against stays
+    # valid. Mode-(B/C) prefix-residency behaviour is covered by the
+    # new P-5-A.2 mode-specific tests in test_memory_budgeter.py.
     budgeter = MemoryBudgeter.for_adapter(
-        adapter, prefix_cache=pc, weights_bytes=0, cap_bytes=256
+        adapter, prefix_cache=pc, weights_bytes=0, cap_bytes=256,
+        account_prefix_residency=False,
     )
     budgeter.apply_admit("filler", 96)
     b = ContinuousBatcher(

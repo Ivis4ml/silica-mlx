@@ -8,11 +8,12 @@ budgeter itself never mutates those objects (decide / apply separation).
 
 from __future__ import annotations
 
+import mlx.core as mx
 import pytest
 
 from silica.kvcache.paged import PagedKVCache
 from silica.kvcache.prefix import RadixPrefixCache
-from silica.kvcache.store import PagedPrefixBlockStore
+from silica.kvcache.store import PagedPrefixBlockStore, SyntheticPrefixBlockStore
 from silica.scheduler.budget import (
     AdmitAfterEvictDecision,
     AdmitAfterPreemptDecision,
@@ -617,3 +618,536 @@ def test_admit_without_apply_admit_sees_unchanged_headroom() -> None:
     # No reservation was committed — headroom never moved.
     assert tight.reserved_bytes() == 0
     assert tight.headroom_bytes() == per_req
+
+
+# =============================================================================
+# P-5-A.2 — account_prefix_residency three-mode accounting (§4.7)
+# =============================================================================
+
+
+def _synthetic_pc(
+    block_size: int = 16,
+) -> tuple[RadixPrefixCache, SyntheticPrefixBlockStore]:
+    """Build a RadixPrefixCache over a bare SyntheticPrefixBlockStore
+    (pass-through — no codec installed). Returns ``(pc, store)`` —
+    mypy cannot narrow ``pc.store: PrefixBlockStore`` back to the
+    concrete synthetic type, so returning the store avoids casts at
+    every call site that reads ``resident_bytes`` /
+    ``resident_bytes_per_block``.
+    """
+    store = SyntheticPrefixBlockStore(block_size=block_size)
+    pc = RadixPrefixCache(block_size=block_size, store=store)
+    return pc, store
+
+
+def _synthetic_pc_with_codec(
+    block_size: int = 16, *, codec: object
+) -> tuple[RadixPrefixCache, SyntheticPrefixBlockStore]:
+    store = SyntheticPrefixBlockStore(
+        block_size=block_size, codec=codec  # type: ignore[arg-type]
+    )
+    pc = RadixPrefixCache(block_size=block_size, store=store)
+    return pc, store
+
+
+def _register_one_detached_block(
+    pc: RadixPrefixCache, *, n_kv_heads: int = 2, head_dim: int = 64
+) -> int:
+    """Allocate + retain + register one detached block on the store; returns
+    the block id. Shape matches what the codec expects:
+    ``(1, n_kv_heads, block_size, head_dim)``."""
+    store = pc.store
+    bid = store.allocate_id()
+    store.retain_source(bid)
+    # Two layers' worth of per-layer (K, V) tuples.
+    n_layers = 2
+    layer_kv: list[tuple[mx.array, mx.array]] = []
+    for _ in range(n_layers):
+        shape = (1, n_kv_heads, store.block_size, head_dim)
+        k = mx.zeros(shape, dtype=mx.float16)
+        v = mx.zeros(shape, dtype=mx.float16)
+        layer_kv.append((k, v))
+    store.register_detached(bid, layer_kv)
+    return int(bid)
+
+
+# --- Mode (A): account_prefix_residency=False (P-4.5 regression path) ---
+
+
+def test_mode_a_headroom_is_cap_minus_weights_minus_reserved_byte_for_byte() -> None:
+    """§4.7 mode (A): ``account_prefix_residency=False`` keeps headroom
+    at the P-4.5 formula regardless of store state. Regression-lock
+    for the P-4.5 close sweep."""
+    pc, store = _synthetic_pc(block_size=16)
+    budgeter = MemoryBudgeter(
+        prefix_cache=pc,
+        weights_bytes=1000,
+        bytes_per_token=8,
+        block_size=16,
+        cap_bytes=5000,
+        account_prefix_residency=False,
+    )
+    # Register a detached block to prove residency is NOT charged.
+    _register_one_detached_block(pc, n_kv_heads=2, head_dim=64)
+    # Headroom should still equal cap - weights - reserved = 4000.
+    assert budgeter.headroom_bytes() == 4000
+
+
+def test_mode_a_evict_bytes_per_block_is_fp16_baseline() -> None:
+    """Mode (A) evict-shortfall uses the fp16 ``bytes_per_token ×
+    block_size`` formula regardless of any codec residency
+    information the store might expose."""
+    pc, store = _synthetic_pc(block_size=16)
+    budgeter = MemoryBudgeter(
+        prefix_cache=pc,
+        weights_bytes=0,
+        bytes_per_token=8,
+        block_size=16,
+        cap_bytes=10_000,
+        account_prefix_residency=False,
+    )
+    assert budgeter._evict_bytes_per_block() == 8 * 16  # type: ignore[attr-defined]
+
+
+# --- Mode (B): account_prefix_residency=True, IdentityCodec ---
+
+
+def test_mode_b_charges_fp16_prefix_residency() -> None:
+    """§4.7 mode (B): with ``account_prefix_residency=True`` + a
+    synthetic store (pass-through counts raw tensor bytes), headroom
+    subtracts honest fp16 per-payload bytes."""
+    pc, store = _synthetic_pc(block_size=16)
+    budgeter = MemoryBudgeter(
+        prefix_cache=pc,
+        weights_bytes=0,
+        bytes_per_token=8,
+        block_size=16,
+        cap_bytes=1_000_000,
+        account_prefix_residency=True,
+    )
+    # Empty store → no residency yet.
+    assert budgeter.headroom_bytes() == 1_000_000
+
+    # Register one block; headroom drops by the exact per-payload byte sum.
+    _register_one_detached_block(pc, n_kv_heads=2, head_dim=64)
+    prefix = store.resident_bytes()
+    assert prefix > 0
+    assert budgeter.headroom_bytes() == 1_000_000 - prefix
+
+
+def test_mode_b_identity_codec_honest_fp16_residency() -> None:
+    """Under ``codec=IdentityCodec(...)`` shorthand, the store wraps
+    tensors in ``RawFp16Payload`` whose ``resident_bytes`` equals
+    ``.nbytes`` of the wrapped fp16 tensor. Mode (B) charges these
+    honestly — the count matches the pass-through path."""
+    from silica.kvcache.codec import IdentityCodec
+
+    n_kv_heads, head_dim, block_size = 2, 64, 16
+    ic = IdentityCodec(
+        block_size=block_size, n_kv_heads=n_kv_heads, head_dim=head_dim
+    )
+    pc, store = _synthetic_pc_with_codec(block_size=block_size, codec=ic)
+    budgeter = MemoryBudgeter(
+        prefix_cache=pc,
+        weights_bytes=0,
+        bytes_per_token=8,
+        block_size=block_size,
+        cap_bytes=1_000_000,
+        account_prefix_residency=True,
+    )
+    _register_one_detached_block(pc, n_kv_heads=n_kv_heads, head_dim=head_dim)
+    # Identity payload bytes == raw .nbytes; per-block = 2 layers × 2
+    # sides × n_kv_heads × block_size × head_dim × 2 (fp16 bytes).
+    expected_per_block = 2 * 2 * n_kv_heads * block_size * head_dim * 2
+    assert store.resident_bytes() == expected_per_block
+    assert budgeter.headroom_bytes() == 1_000_000 - expected_per_block
+
+
+# --- Mode (C): account_prefix_residency=True, BlockTQ compressed ---
+
+
+def test_mode_c_blocktq_residency_is_compressed() -> None:
+    """§4.7 mode (C): BlockTQ codec compresses K/V; store residency
+    and thus headroom subtraction reflect compressed bytes, producing
+    larger headroom than mode (B) at the same cap."""
+    from silica.vq import BlockTurboQuantMSE
+
+    n_kv_heads, head_dim, block_size = 2, 64, 16
+
+    block_tq = BlockTurboQuantMSE(
+        block_size=block_size,
+        n_kv_heads=n_kv_heads,
+        head_dim=head_dim,
+        vq_block_size=32,
+        num_bits=4,
+    )
+    pc_compressed, store_compressed = _synthetic_pc_with_codec(
+        block_size=block_size, codec=block_tq
+    )
+    budgeter_c = MemoryBudgeter(
+        prefix_cache=pc_compressed,
+        weights_bytes=0,
+        bytes_per_token=8,
+        block_size=block_size,
+        cap_bytes=1_000_000,
+        account_prefix_residency=True,
+    )
+    _register_one_detached_block(pc_compressed, n_kv_heads=n_kv_heads, head_dim=head_dim)
+    compressed_bytes = store_compressed.resident_bytes()
+
+    # Mode (B) baseline for comparison.
+    from silica.kvcache.codec import IdentityCodec
+
+    ic = IdentityCodec(
+        block_size=block_size, n_kv_heads=n_kv_heads, head_dim=head_dim
+    )
+    pc_ident, store_ident = _synthetic_pc_with_codec(block_size=block_size, codec=ic)
+    budgeter_b = MemoryBudgeter(
+        prefix_cache=pc_ident,
+        weights_bytes=0,
+        bytes_per_token=8,
+        block_size=block_size,
+        cap_bytes=1_000_000,
+        account_prefix_residency=True,
+    )
+    _register_one_detached_block(pc_ident, n_kv_heads=n_kv_heads, head_dim=head_dim)
+    identity_bytes = store_ident.resident_bytes()
+
+    # BlockTQ residency < IdentityCodec residency on the same block.
+    assert compressed_bytes < identity_bytes
+    # Headroom under mode (C) > headroom under mode (B) at same cap.
+    assert budgeter_c.headroom_bytes() > budgeter_b.headroom_bytes()
+
+
+def test_mode_c_evict_bytes_per_block_is_compressed() -> None:
+    """Mode (C) ``_evict_bytes_per_block`` reads from
+    ``store.resident_bytes_per_block()`` — honest compressed bytes,
+    smaller than the fp16 baseline.
+
+    Register one block first so ``num_layers`` is learned and the
+    store returns a concrete per-block figure (not ``None``). Also
+    anchor an orthogonal check: the returned value equals
+    ``store.resident_bytes() // num_blocks`` — bytes freed per block
+    matches the honest eviction unit.
+    """
+    from silica.vq import BlockTurboQuantMSE
+
+    n_kv_heads, head_dim, block_size = 2, 64, 16
+    n_layers = 2
+    block_tq = BlockTurboQuantMSE(
+        block_size=block_size,
+        n_kv_heads=n_kv_heads,
+        head_dim=head_dim,
+        vq_block_size=32,
+        num_bits=4,
+    )
+    pc, store = _synthetic_pc_with_codec(block_size=block_size, codec=block_tq)
+    _register_one_detached_block(pc, n_kv_heads=n_kv_heads, head_dim=head_dim)
+    # bytes_per_token set to a fp16-equivalent so the fallback would be
+    # the fp16 baseline; mode (C) should read smaller compressed number.
+    bpt_fp16 = 2 * n_kv_heads * head_dim * 2  # K + V × n_kv_heads × head_dim × 2 bytes
+    budgeter = MemoryBudgeter(
+        prefix_cache=pc,
+        weights_bytes=0,
+        bytes_per_token=bpt_fp16,
+        block_size=block_size,
+        cap_bytes=1_000_000,
+        account_prefix_residency=True,
+    )
+    fp16_baseline = bpt_fp16 * block_size * n_layers
+    evict_bytes = budgeter._evict_bytes_per_block()  # type: ignore[attr-defined]
+    compressed_per_block = store.resident_bytes_per_block()
+    assert compressed_per_block is not None
+    assert evict_bytes == compressed_per_block
+    # Orthogonal: honest per-eviction-unit bytes == total / num_blocks.
+    num_blocks = len(store.live_block_ids())
+    assert compressed_per_block == store.resident_bytes() // num_blocks
+    assert evict_bytes < fp16_baseline
+
+
+# --- Capability fallback: paged store lacks resident_bytes ---
+
+
+def test_paged_store_falls_back_to_mode_a_like() -> None:
+    """``PagedPrefixBlockStore`` does not implement ``resident_bytes``;
+    the ``hasattr`` capability check falls back to zero residency, so
+    mode (B) with a paged-backed cache behaves like mode (A) on the
+    headroom math. Regression-lock for the pre-P-5 budgeter tests
+    above which use this code path."""
+    b, _, _ = _make(cap_bytes=5000, weights_bytes=1000)
+    # Default account_prefix_residency=True (from for_adapter default),
+    # but paged store lacks the capability → fallback to 0.
+    # This test uses the module's _make() which returns a budgeter
+    # with the paged-store path.
+    assert b._account_prefix_residency is True  # type: ignore[attr-defined]
+    assert b.headroom_bytes() == 4000  # cap - weights, no residency
+
+
+# --- D-003: reservation math stays fp16 regardless of mode ---
+
+
+def test_worst_case_bytes_is_fp16_under_all_modes() -> None:
+    """D-003: reservation (``worst_case_bytes``) is always fp16
+    worst-case, regardless of codec or ``account_prefix_residency``.
+    Active-KV is fp16-scratched per mlx-lm SDPA's contract."""
+    from silica.kvcache.codec import IdentityCodec
+    from silica.vq import BlockTurboQuantMSE
+
+    n_kv_heads, head_dim, block_size = 2, 64, 16
+
+    ic = IdentityCodec(
+        block_size=block_size, n_kv_heads=n_kv_heads, head_dim=head_dim
+    )
+    btq = BlockTurboQuantMSE(
+        block_size=block_size,
+        n_kv_heads=n_kv_heads,
+        head_dim=head_dim,
+        vq_block_size=32,
+        num_bits=4,
+    )
+
+    pc_a, _ = _synthetic_pc(block_size=block_size)
+    pc_b, _ = _synthetic_pc_with_codec(block_size=block_size, codec=ic)
+    pc_c, _ = _synthetic_pc_with_codec(block_size=block_size, codec=btq)
+    configs = [
+        ("mode_a_passthrough", pc_a, False),
+        ("mode_b_identity", pc_b, True),
+        ("mode_c_blocktq", pc_c, True),
+    ]
+    for label, pc, flag in configs:
+        budgeter = MemoryBudgeter(
+            prefix_cache=pc,
+            weights_bytes=0,
+            bytes_per_token=8,
+            block_size=block_size,
+            cap_bytes=10_000,
+            account_prefix_residency=flag,
+        )
+        # n_prompt + max_tokens = 10, bpt = 8 → worst = 80, fp16-baseline.
+        assert budgeter.worst_case_bytes(5, 5) == 80, f"{label}: worst_case_bytes changed"
+
+
+# --- resident_bytes_per_block on the store ---
+
+
+def test_synthetic_store_resident_bytes_per_block_is_none_passthrough() -> None:
+    """Pass-through store (no codec) returns ``None`` — caller falls
+    back to its own fp16 formula."""
+    pc, store = _synthetic_pc(block_size=16)
+    assert store.resident_bytes_per_block() is None
+
+
+def test_synthetic_store_resident_bytes_per_block_is_none_before_any_register() -> None:
+    """Even with codecs bound, the method returns ``None`` before any
+    ``register_detached`` call — ``num_layers`` has not been learned
+    yet. Safe because no evictable blocks exist at that point; the
+    budgeter falls back to the fp16 baseline which is never
+    consulted in the absence of evictable blocks."""
+    from silica.kvcache.codec import IdentityCodec
+
+    n_kv_heads, head_dim, block_size = 2, 64, 16
+    ic = IdentityCodec(
+        block_size=block_size, n_kv_heads=n_kv_heads, head_dim=head_dim
+    )
+    _pc, store = _synthetic_pc_with_codec(block_size=block_size, codec=ic)
+    assert store.resident_bytes_per_block() is None
+
+
+def test_synthetic_store_resident_bytes_per_block_includes_all_layers() -> None:
+    """Regression lock for P-5-A.2 review finding H-1: the eviction
+    unit is one radix ``block_id`` (covers all layers), not one
+    layer's K+V. ``resident_bytes_per_block`` must therefore return
+    ``num_layers × (k_codec.resident_bytes(1) + v_codec.resident_bytes(1))``.
+
+    Invariant: when one block is registered,
+    ``resident_bytes_per_block() == resident_bytes() // len(live_block_ids())``.
+    Under the pre-fix implementation this was False — ``resident_bytes``
+    summed across layers while ``resident_bytes_per_block`` returned
+    single-layer bytes, off by a factor of num_layers.
+    """
+    from silica.kvcache.codec import IdentityCodec
+
+    n_kv_heads, head_dim, block_size = 2, 64, 16
+    n_layers = 2
+    ic = IdentityCodec(
+        block_size=block_size, n_kv_heads=n_kv_heads, head_dim=head_dim
+    )
+    pc, store = _synthetic_pc_with_codec(block_size=block_size, codec=ic)
+    _register_one_detached_block(pc, n_kv_heads=n_kv_heads, head_dim=head_dim)
+
+    per_block = store.resident_bytes_per_block()
+    assert per_block is not None
+    total = store.resident_bytes()
+    num_blocks = len(store.live_block_ids())
+    assert num_blocks == 1
+    # Honest eviction-unit arithmetic — the whole radix block id frees
+    # these many bytes when evict_until(1) runs.
+    assert per_block == total // num_blocks
+
+    # Also pin the value to the expected formula for this shape:
+    # num_layers × 2 sides × (block_size × n_kv_heads × head_dim × 2 bytes).
+    expected = n_layers * 2 * (block_size * n_kv_heads * head_dim * 2)
+    assert per_block == expected
+
+
+def test_synthetic_store_register_detached_rejects_heterogeneous_num_layers() -> None:
+    """P-5-A scope is homogeneous-shape models (opening §2.6); the
+    store enforces constant ``num_layers`` across all
+    ``register_detached`` calls. Heterogeneous support is a P-5-A
+    follow-up, not a silent wrong-answer path."""
+    from silica.kvcache.codec import IdentityCodec
+
+    n_kv_heads, head_dim, block_size = 2, 64, 16
+    ic = IdentityCodec(
+        block_size=block_size, n_kv_heads=n_kv_heads, head_dim=head_dim
+    )
+    pc, store = _synthetic_pc_with_codec(block_size=block_size, codec=ic)
+    _register_one_detached_block(pc, n_kv_heads=n_kv_heads, head_dim=head_dim)
+
+    # Second block registered with a different num_layers — must raise.
+    bid2 = store.allocate_id()
+    store.retain_source(bid2)
+    layer_kv_three = [
+        (
+            mx.zeros((1, n_kv_heads, block_size, head_dim), dtype=mx.float16),
+            mx.zeros((1, n_kv_heads, block_size, head_dim), dtype=mx.float16),
+        )
+        for _ in range(3)  # three layers instead of two
+    ]
+    with pytest.raises(ValueError, match="layers"):
+        store.register_detached(bid2, layer_kv_three)
+
+
+# --- End-to-end admission with evict-one-block (H-1 regression) ----------
+
+
+def _insert_one_detached_radix_block(
+    pc: RadixPrefixCache,
+    *,
+    n_kv_heads: int,
+    head_dim: int,
+    n_layers: int,
+    tokens: list[int] | None = None,
+) -> int:
+    """Insert one block into the RadixPrefixCache via the detached path
+    so it shows up as an evictable leaf in
+    ``_count_evictable_prefix_blocks``. Returns the radix block_id.
+
+    Distinct from ``_register_one_detached_block`` which only touches
+    the store; the radix-path variant is needed for admission tests
+    that go through ``MemoryBudgeter.admit``'s evict branch.
+    """
+    if tokens is None:
+        tokens = list(range(pc.block_size))
+    shape = (1, n_kv_heads, pc.block_size, head_dim)
+    per_layer_block = [
+        (
+            mx.zeros(shape, dtype=mx.float16),
+            mx.zeros(shape, dtype=mx.float16),
+        )
+        for _ in range(n_layers)
+    ]
+    # insert_detached takes token-blocks at the outer level, layers inner.
+    ids = pc.insert_detached(tokens, [per_layer_block])
+    assert len(ids) == 1
+    return int(ids[0])
+
+
+def test_mode_c_admit_evicts_one_block_when_shortfall_between_single_and_all_layer_bytes() -> None:
+    """Regression lock for P-5-A.2 review H-1: ``admit`` must
+    recognise that evicting one radix block_id frees
+    ``num_layers × per-layer-bytes`` — not just one layer's worth.
+
+    Construction: install 1 evictable block whose real eviction value
+    is ``B_total = num_layers × (k_codec.resident_bytes(1) +
+    v_codec.resident_bytes(1))``. Set cap / weights / reservation so
+    shortfall lands between ``B_total // num_layers`` (the wrong per-
+    layer value) and ``B_total`` (the correct all-layer value). The
+    correct behaviour is ``AdmitAfterEvictDecision(n_blocks=1)``; the
+    pre-fix implementation returned ``RejectDecision`` because
+    ``blocks_needed = ceil(shortfall / (B_total // num_layers))`` >
+    1 > ``evictable_blocks == 1``.
+    """
+    from silica.kvcache.codec import IdentityCodec
+
+    n_kv_heads, head_dim, block_size = 2, 64, 16
+    n_layers = 2
+    ic = IdentityCodec(
+        block_size=block_size, n_kv_heads=n_kv_heads, head_dim=head_dim
+    )
+    pc, store = _synthetic_pc_with_codec(block_size=block_size, codec=ic)
+
+    # Insert 1 evictable radix block (2 layers).
+    _insert_one_detached_radix_block(
+        pc, n_kv_heads=n_kv_heads, head_dim=head_dim, n_layers=n_layers
+    )
+    assert len(store.live_block_ids()) == 1
+    b_total = store.resident_bytes_per_block()
+    assert b_total is not None
+    per_layer = b_total // n_layers
+    # shortfall must land strictly between per_layer and b_total so
+    # the bug (division by per_layer) requires n_blocks = 2 but the
+    # fix (division by b_total) requires n_blocks = 1.
+    shortfall_target = per_layer + 1
+    assert per_layer < shortfall_target < b_total
+
+    # Build a budgeter with cap sized to produce exactly shortfall_target
+    # on a small incoming request. bytes_per_token deliberately chosen
+    # so the fp16 baseline formula doesn't accidentally mask the bug
+    # (we want the codec path to be load-bearing).
+    bpt = 4  # tiny; shortfall is dominated by cap tuning, not bpt
+    new_worst = 8 * bpt  # n_prompt=4, max_tokens=4 → 32 bytes
+    # Pre-reserve enough to make headroom = new_worst - shortfall_target.
+    # Under mode (C) with 1 block registered, prefix residency = b_total.
+    cap_bytes = 100_000
+    weights_bytes = 0
+    budgeter = MemoryBudgeter(
+        prefix_cache=pc,
+        weights_bytes=weights_bytes,
+        bytes_per_token=bpt,
+        block_size=block_size,
+        cap_bytes=cap_bytes,
+        account_prefix_residency=True,
+    )
+    # Headroom at construction = cap - weights - reserved - prefix_resident.
+    # Goal: add a filler reservation so new_worst exceeds headroom by
+    # exactly shortfall_target bytes.
+    current_headroom = budgeter.headroom_bytes()
+    filler = current_headroom - new_worst + shortfall_target
+    assert filler > 0
+    budgeter.apply_admit("filler", filler)
+    # Sanity: shortfall now equals our target.
+    actual_shortfall = new_worst - budgeter.headroom_bytes()
+    assert actual_shortfall == shortfall_target
+
+    decision = budgeter.admit("incoming", n_prompt=4, max_tokens=4)
+    assert isinstance(decision, AdmitAfterEvictDecision), (
+        f"expected AdmitAfterEvictDecision(n_blocks=1), got {type(decision).__name__}. "
+        f"shortfall={actual_shortfall}, b_total={b_total}, per_layer={per_layer}. "
+        f"Pre-fix ``resident_bytes_per_block`` returned per_layer → "
+        f"blocks_needed = ceil({actual_shortfall} / {per_layer}) > 1 → reject."
+    )
+    assert decision.n_blocks == 1, (
+        f"expected n_blocks=1 (one evicted radix block frees all "
+        f"layers), got {decision.n_blocks}"
+    )
+
+
+def test_synthetic_store_resident_bytes_per_block_under_codec() -> None:
+    """Store with codec returns the per-block sum of K+V codec
+    ``resident_bytes(1)`` × num_layers — bytes freed by evicting one
+    radix block_id."""
+    from silica.kvcache.codec import IdentityCodec
+
+    n_kv_heads, head_dim, block_size = 2, 64, 16
+    n_layers = 2
+    ic = IdentityCodec(
+        block_size=block_size, n_kv_heads=n_kv_heads, head_dim=head_dim
+    )
+    pc, store = _synthetic_pc_with_codec(block_size=block_size, codec=ic)
+    # Register one block so num_layers is known.
+    _register_one_detached_block(pc, n_kv_heads=n_kv_heads, head_dim=head_dim)
+    per_block = store.resident_bytes_per_block()
+    # num_layers × 2 sides × block_size × n_kv_heads × head_dim × 2 bytes.
+    expected = n_layers * 2 * (block_size * n_kv_heads * head_dim * 2)
+    assert per_block == expected
