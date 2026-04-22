@@ -45,22 +45,44 @@ kernel will define its own detached-K/V model when the trigger-gated
 track starts. Step 2 ships only the synthetic backend; the Paged
 backend lands with step 3 (RadixPrefixCache refactor).
 
-**KVCodec hook (P-4.5-C.1, docs/P4_5_C_KVCODEC_OPENING.md §3.2 / §6).**
+**VectorCodec hook — side-level K/V dispatch (P-5-A.0.4).**
 
-``SyntheticPrefixBlockStore`` accepts an optional ``codec: KVCodec``
-kwarg. When supplied, ``register_detached`` calls
-``codec.encode_block(k, v)`` per layer and stores the resulting
-``CodedBlock`` objects; ``fetch_detached`` calls
-``codec.decode_block(cb)`` per layer to return shape-preserving fp16
-``(K, V)`` tuples the downstream ``build_seeded_batch_kv`` expects.
-When ``codec`` is ``None`` (the pre-C.1 default), the store runs a
-pass-through path that wraps the raw tensors in ``CodedBlock`` with
-``resident_bytes = k.nbytes + v.nbytes`` — semantically identical to
-``IdentityCodec`` but without requiring ``n_kv_heads`` / ``head_dim``
-construction arguments. Either path preserves the external return
-shape contract; the two paths produce byte-identical outputs on the
-hit path under ``IdentityCodec`` because the codec returns its input
-tensors by reference.
+``SyntheticPrefixBlockStore`` accepts three codec kwargs:
+
+- ``codec``: shorthand that sets both sides to the same ``VectorCodec``
+  instance (``k_codec = v_codec = codec``).
+- ``k_codec`` / ``v_codec``: explicit side-level codecs; used when K and
+  V require different configurations (vqbench's split-codec pattern).
+
+Resolution rules (first match wins; any other combination raises
+``ValueError`` at construction):
+
+- All three ``None`` → pass-through store; ``_detached`` holds raw
+  ``(K, V)`` ``mx.array`` references with no payload wrapping. Byte-
+  for-byte identical to the pre-P-5 ``codec=None`` default.
+- ``codec=X``, both side kwargs ``None`` → ``self._k_codec = self._v_codec = X``.
+- ``k_codec=K``, ``v_codec=V`` (both non-``None``), ``codec=None`` →
+  split dispatch: K side runs through ``K.encode_tensor`` /
+  ``K.decode_tensor``, V side through ``V``'s.
+- ``codec=X`` combined with any non-``None`` side kwarg → raise.
+- Exactly one of ``k_codec`` / ``v_codec`` ``None`` → raise (both or
+  neither for the split form; asymmetric configs pass an explicit
+  ``IdentityCodec`` on the identity side).
+
+When either codec is supplied, ``register_detached`` calls
+``k_codec.encode_tensor(k)`` and ``v_codec.encode_tensor(v)``
+independently per layer and stores the pair in a private
+``_DetachedLayer`` dataclass; ``fetch_detached`` calls
+``k_codec.decode_tensor`` / ``v_codec.decode_tensor`` to return
+shape-preserving fp16 ``(K, V)`` tuples the downstream
+``build_seeded_batch_kv`` expects. Either path preserves the external
+return shape contract; pass-through and ``IdentityCodec`` produce
+byte-identical outputs on the hit path because the codec returns its
+input tensor by reference (``RawFp16Payload.t is original``).
+
+Block-size precondition applies uniformly: after resolution, every
+effective codec must satisfy ``codec.block_size == store.block_size``.
+The shorthand form asserts once; the split form asserts both sides.
 
 The ``PagedPrefixBlockStore`` deliberately does not accept a codec —
 Option (A) / (C) codec integration on the active-KV path is excluded
@@ -71,14 +93,29 @@ in v0.1 by D-003 (no compressed-domain attention) and Q-009 / R-7
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import mlx.core as mx
 
-from silica.kvcache.codec import CodedBlock, KVCodec
+from silica.kvcache.codec import CodedPayload, VectorCodec
 
 if TYPE_CHECKING:
     from silica.kvcache.paged import PagedKVCache
+
+
+@dataclass(frozen=True, slots=True)
+class _DetachedLayer:
+    """One layer's K/V payloads (or raw tensors) for one detached block.
+
+    Internal to ``SyntheticPrefixBlockStore`` — not exported. The pass-
+    through path (all three codec kwargs ``None`` at store construction)
+    holds raw ``mx.array`` references. The codec path holds concrete
+    ``CodedPayload`` subclasses produced by the effective side codec.
+    """
+
+    k: CodedPayload | mx.array
+    v: CodedPayload | mx.array
 
 
 @runtime_checkable
@@ -198,31 +235,91 @@ class SyntheticPrefixBlockStore:
         self,
         *,
         block_size: int,
-        codec: KVCodec | None = None,
+        k_codec: VectorCodec | None = None,
+        v_codec: VectorCodec | None = None,
+        codec: VectorCodec | None = None,
     ) -> None:
         if block_size <= 0:
             raise ValueError(f"block_size must be > 0, got {block_size}")
-        if codec is not None and codec.block_size != block_size:
+
+        # Rule 1: codec= shorthand cannot combine with split kwargs.
+        if codec is not None and (k_codec is not None or v_codec is not None):
             raise ValueError(
-                f"codec.block_size ({codec.block_size}) must match "
+                "codec= shorthand cannot be combined with k_codec / v_codec "
+                "kwargs; pass codec=X for symmetric K+V, or k_codec=K, "
+                "v_codec=V for split"
+            )
+
+        # Rule 2: split form is both-or-neither (when codec is None).
+        if codec is None and (k_codec is None) != (v_codec is None):
+            raise ValueError(
+                "k_codec and v_codec must be both provided or both None; "
+                "mixed None / non-None is not supported — pass an explicit "
+                "IdentityCodec on the identity side for asymmetric configs"
+            )
+
+        # Resolve effective side codecs.
+        if codec is not None:
+            effective_k: VectorCodec | None = codec
+            effective_v: VectorCodec | None = codec
+        else:
+            effective_k = k_codec
+            effective_v = v_codec
+
+        # Rule 3: block_size precondition applies to every effective codec.
+        if effective_k is not None and effective_k.block_size != block_size:
+            raise ValueError(
+                f"k_codec.block_size ({effective_k.block_size}) must match "
                 f"store.block_size ({block_size})"
             )
+        if effective_v is not None and effective_v.block_size != block_size:
+            raise ValueError(
+                f"v_codec.block_size ({effective_v.block_size}) must match "
+                f"store.block_size ({block_size})"
+            )
+
         self.block_size = block_size
-        self._codec = codec
+        self._k_codec = effective_k
+        self._v_codec = effective_v
         self._next_id: int = 0
         self._source_refs: dict[int, int] = {}
         self._hit_refs: dict[int, int] = {}
-        self._detached: dict[int, tuple[CodedBlock, ...]] = {}
+        self._detached: dict[int, tuple[_DetachedLayer, ...]] = {}
 
-    def _encode(self, k: mx.array, v: mx.array) -> CodedBlock:
-        if self._codec is None:
-            return CodedBlock(k=k, v=v, resident_bytes=k.nbytes + v.nbytes)
-        return self._codec.encode_block(k, v)
+    def _encode_layer(self, k: mx.array, v: mx.array) -> _DetachedLayer:
+        """Encode one layer's K and V tensors per the resolved side codecs.
 
-    def _decode(self, block: CodedBlock) -> tuple[mx.array, mx.array]:
-        if self._codec is None:
-            return block.k, block.v
-        return self._codec.decode_block(block)
+        Pass-through sides (``None`` codec) store the raw tensor by
+        reference; codec sides run ``encode_tensor`` and store the
+        returned ``CodedPayload``.
+        """
+        k_payload: CodedPayload | mx.array = (
+            k if self._k_codec is None else self._k_codec.encode_tensor(k)
+        )
+        v_payload: CodedPayload | mx.array = (
+            v if self._v_codec is None else self._v_codec.encode_tensor(v)
+        )
+        return _DetachedLayer(k=k_payload, v=v_payload)
+
+    def _decode_layer(self, layer: _DetachedLayer) -> tuple[mx.array, mx.array]:
+        """Reconstruct fp16 K and V tensors for one layer."""
+        if isinstance(layer.k, mx.array):
+            k_out = layer.k
+        else:
+            assert self._k_codec is not None, (
+                "pass-through K payload stored but k_codec is not None — "
+                "invariant violation"
+            )
+            k_out = self._k_codec.decode_tensor(layer.k)
+        if isinstance(layer.v, mx.array):
+            v_out = layer.v
+        else:
+            assert self._v_codec is not None, (
+                "pass-through V payload stored but v_codec is not None — "
+                "invariant violation"
+            )
+            v_out = self._v_codec.decode_tensor(layer.v)
+        return k_out, v_out
 
     def allocate_id(self) -> int:
         """Return a monotonically-increasing fresh block id.
@@ -302,7 +399,7 @@ class SyntheticPrefixBlockStore:
                 f"(duplicate register — caller bug)"
             )
         self._detached[block_id] = tuple(
-            self._encode(k, v) for k, v in per_layer_kv
+            self._encode_layer(k, v) for k, v in per_layer_kv
         )
 
     def fetch_detached(
@@ -312,7 +409,7 @@ class SyntheticPrefixBlockStore:
             raise KeyError(
                 f"block {block_id}: no detached K/V registered"
             )
-        return tuple(self._decode(cb) for cb in self._detached[block_id])
+        return tuple(self._decode_layer(layer) for layer in self._detached[block_id])
 
     def release_detached(self, block_id: int) -> None:
         if block_id not in self._detached:
@@ -340,26 +437,41 @@ class SyntheticPrefixBlockStore:
         return frozenset(self._source_refs.keys())
 
     def resident_bytes(self) -> int:
-        """Sum of ``CodedBlock.resident_bytes`` across all detached blocks.
+        """Sum of per-side ``CodedPayload.resident_bytes`` across all detached blocks.
 
         Parallel observable per P-4.5-C.0 opening doc §6.2 / §8.3 —
         the total resident prefix-cache K/V bytes held by this store.
-        Under the default pass-through path (no codec) or under
-        ``IdentityCodec``, this equals ``len(live_block_ids()) ×
-        num_layers × block_size × (2 × n_kv_heads × head_dim ×
-        dtype.size)``. Under a future non-identity codec (BlockTQ /
-        RaBitQ, P-5 proper) it reflects the compressed residency.
+        Each ``_DetachedLayer`` contributes ``k.resident_bytes +
+        v.resident_bytes`` when the sides are codec payloads, or
+        ``k.nbytes + v.nbytes`` when they are raw mx.array (pass-through
+        path). Under the default pass-through or under ``IdentityCodec``,
+        the total equals ``len(live_block_ids()) × num_layers ×
+        block_size × (2 × n_kv_heads × head_dim × dtype.size)``. Under a
+        future non-identity codec (BlockTQ / RaBitQ, P-5 proper) it
+        reflects the compressed residency.
 
         Intentionally **not** on the ``PrefixBlockStore`` Protocol —
         the paged backend does not track per-layer physical K/V
         residency this way, and adding it to the Protocol would force
         ``PagedPrefixBlockStore`` to choose between a wrong number and
-        a ``NotImplementedError`` at the Protocol boundary.
+        a ``NotImplementedError`` at the Protocol boundary. Consumers
+        that need to read this from any ``PrefixBlockStore`` (e.g. the
+        P-5-A.2 ``MemoryBudgeter``) must use a structural capability
+        check (``SupportsResidentBytes`` Protocol or a ``hasattr``
+        guard) rather than assuming every store exposes it.
         """
-        return sum(
-            sum(cb.resident_bytes for cb in coded_tuple)
-            for coded_tuple in self._detached.values()
-        )
+        total = 0
+        for layers in self._detached.values():
+            for layer in layers:
+                if isinstance(layer.k, mx.array):
+                    total += int(layer.k.nbytes)
+                else:
+                    total += layer.k.resident_bytes
+                if isinstance(layer.v, mx.array):
+                    total += int(layer.v.nbytes)
+                else:
+                    total += layer.v.resident_bytes
+        return total
 
 
 class PagedPrefixBlockStore:

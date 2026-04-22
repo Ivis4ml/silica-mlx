@@ -101,6 +101,24 @@ class RadixPrefixCache:
         self._tick = 0
         self.hits: int = 0
 
+    @property
+    def store(self) -> PrefixBlockStore:
+        """Read-only access to the underlying ``PrefixBlockStore``.
+
+        Consumers outside this module should use ``prefix_cache.store``
+        rather than poking ``prefix_cache._store``. Lands in P-5-A.0.4 so
+        the P-5-A.2 ``MemoryBudgeter`` can read ``store.resident_bytes()``
+        without reaching into a private attribute.
+
+        Note: ``resident_bytes()`` is deliberately **not** on the
+        ``PrefixBlockStore`` Protocol — see the rationale in
+        ``silica/kvcache/store.py::SyntheticPrefixBlockStore.resident_bytes``.
+        Consumers that need to read it must use a structural capability
+        check (``SupportsResidentBytes`` Protocol or a ``hasattr`` guard),
+        not assume every store exposes it.
+        """
+        return self._store
+
     # --- public surface ---
 
     @property

@@ -14,8 +14,8 @@ plus a planned mini-sglang outer layer for Phase 8. Target: run dense
 | P-2 | Continuous batching, radix prefix cache, memory-budget admission, preempt+replay | ✅ complete |
 | P-3 | Family adapters — Qwen3 dense, Qwen3.5 hybrid DeltaNet, Gemma4-31B dense, Qwen3.5-MoE, Gemma4-MoE | ✅ mostly (`C5` preempt/replay with recurrent-state snapshot pending; `E4` batched MoE pending) |
 | P-4 | Unified bench harness — runner, oracles, 15 registered scenarios, JSONL + Markdown reports, vqbench subprocess PPL | ✅ complete; P-4 exit surfaced Q-010 chunked-prefill trigger → P-4.5 bridge planned |
-| P-4.5 | P-4 exit bridge — chunked-prefill minimal + KVCodec runtime integration spike | ⏳ A complete; B / C planned |
-| P-5 | VQ KV compression (BlockTQ / RaBitQ) | Stub (`IdentityCodec` today; not on hot path — P-4.5-C resolves integration point) |
+| P-4.5 | P-4 exit bridge — chunked-prefill minimal + VectorCodec runtime integration spike | ✅ complete (v1.6.9) |
+| P-5 | VQ KV compression (BlockTQ / RaBitQ) | ⏳ P-5-A.0 scaffolding shipped (v1.7.0 — side-level `VectorCodec[P]`, bit-packing, Lloyd-Max calibration, K/V split store); P-5-A.1 BlockTQ hot path next |
 | P-6 | Weight streaming | Stub (`ResidentWeightProvider` today) |
 | P-7 | Speculative decoding (DraftTarget / EAGLE / Medusa) | Stub (`NoopDraftEngine` today) |
 | P-8 | OpenAI-compatible HTTP server + session layer | ⏳ planned (leaning T1 tail, after P-5) |
@@ -367,7 +367,7 @@ silica/
     __init__.py           # re-exports Engine
     __main__.py           # python -m silica → CLI
     core/                 # events, logger, profiler, request FSM, sampler, sampling params
-    kvcache/              # I-2 KVManager, I-3 KVCodec, paged bookkeeping, radix prefix cache, prefix block store
+    kvcache/              # I-2 KVManager, I-3 VectorCodec, paged bookkeeping, radix prefix cache, prefix block store
     scheduler/            # ContinuousBatcher, MemoryBudgeter, seed_kv helper
     models/               # I-1 ModelAdapter + family adapters (qwen3, qwen3_5, qwen3_5_moe, gemma4, gemma4_moe) + factory
     mlx/                  # thin wrappers over mlx-lm's forward signature
@@ -381,12 +381,12 @@ silica/
 ```
 
 The five frozen interfaces — `ModelAdapter` (I-1), `KVManager`
-(I-2), `KVCodec` (I-3), `WeightProvider` (I-4), `DraftEngine`
-(I-5) — are defined in their respective subpackages as
-`typing.Protocol`s and are the integration points for native
-capabilities (Principle 9 in PLAN.md). Each phase from P-3 onwards
-replaces a stub with a real implementation behind the same
-interface.
+(I-2), `VectorCodec[P]` (I-3, side-level since P-5-A.0.4),
+`WeightProvider` (I-4), `DraftEngine` (I-5) — are defined in their
+respective subpackages as `typing.Protocol`s and are the integration
+points for native capabilities (Principle 9 in PLAN.md). Each phase
+from P-3 onwards replaces a stub with a real implementation behind
+the same interface.
 
 ---
 
@@ -446,15 +446,26 @@ P-4.5 bridges both.
     ordering) → scheduler change under `silica/scheduler/batcher.py`
     → TTFT-under-concurrency ratio `< 3×` and greedy-output
     bit-identity regression lock.
-  - **P-4.5-C** — KVCodec runtime integration spike:
-    `docs/P5_OPENING.md` enumerating the three integration points
-    (active `BatchKVCache` / detached prefix store / cache wrapper),
-    then wire `IdentityCodec.encode_block` / `decode_block` into
-    the live forward path so BlockTQ has a real seam.
-- **P-5** — BlockTQ `KVCodec` implementation (MLX-native rewrite
-  of the vqbench numeric reference; cross-check via
-  `scripts/vqbench_baseline.py`). RaBitQ deferred until BlockTQ
-  acceptance clears; see `docs/PLAN.md` §7 P-5.
+  - **P-4.5-C** — VectorCodec runtime integration spike (complete,
+    v1.6.9): `docs/P4_5_C_KVCODEC_OPENING.md` enumerated the three
+    integration points (active `BatchKVCache` / detached prefix store
+    / cache wrapper) and landed Option (B); `IdentityCodec` is wired
+    through `SyntheticPrefixBlockStore.register_detached` /
+    `fetch_detached` end-to-end on the Qwen3-0.6B path.
+- **P-5** — VQ KV compression platform:
+  - **P-5-A.0** (complete, v1.7.0) — scaffolding: side-level
+    `VectorCodec[P]` Protocol + `CodedPayload` hierarchy
+    (`RawFp16Payload` / `BlockTQPayload` / `RaBitQPayload`),
+    MLX-native bit-packing (`silica.vq.core.packing`), NumPy-
+    quarantined offline helpers (`silica.vq._calibration` — Haar
+    rotation + Lloyd-Max codebook), K/V split store dispatch
+    (`SyntheticPrefixBlockStore(k_codec=, v_codec=)`), `RadixPrefixCache.store`
+    property. Q-008 resolved to side-level Protocol + store-level split.
+  - **P-5-A.1** (next) — BlockTurboQuantMSE hot path on the shipped
+    scaffold, MLX-native rewrite of the vqbench numeric reference;
+    cross-check via `silica/bench/vqbench_baseline.py`.
+  - **P-5-B / P-5-C** — RaBitQ family, bench harness extensions,
+    vqbench parity table; see `docs/PLAN.md` §7 P-5.
 - **P-8** — OpenAI-compatible HTTP server + session layer (wraps
   `ChatSession` with routing, auth, streaming SSE / WebSocket).
   Leaning T1 tail per Q-002 progress; sequenced after P-5 so the

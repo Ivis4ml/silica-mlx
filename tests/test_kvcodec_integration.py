@@ -1,27 +1,30 @@
-"""P-4.5-C.1 KVCodec runtime-integration tests.
+"""P-4.5-C.1 VectorCodec runtime-integration tests (side-level API after P-5-A.0.4).
 
 Verifies that the Option (B) hook in ``SyntheticPrefixBlockStore``
 (see docs/P4_5_C_KVCODEC_OPENING.md §3.2 / §6 / §8) turns
-``IdentityCodec.encode_block`` / ``decode_block`` into runtime callers
+``IdentityCodec.encode_tensor`` / ``decode_tensor`` into runtime callers
 on the real Qwen3-0.6B forward path. Five assertions, matching the
 opening doc's §8 acceptance specification:
 
   §8.1 — Encode counter on cold admission (miss path:
          ``_extract_and_insert_prefix`` runs on row termination →
          ``RadixPrefixCache.insert_detached`` →
-         ``store.register_detached`` → ``codec.encode_block`` per
-         layer per aligned block).
+         ``store.register_detached`` → ``k_codec.encode_tensor`` +
+         ``v_codec.encode_tensor`` per layer per aligned block —
+         two side calls per layer rather than one pair call, hence
+         the counter arithmetic multiplies by 2 under the shorthand).
   §8.2 — Decode counter on a second prompt admitted mid-run over the
          *same* ``shared_pc`` (hit path:
          ``_admit_waiting_requests`` → ``peek`` →
          ``_admit_single_hit_row`` → ``lookup`` →
          ``fetch_detached_blocks`` → ``store.fetch_detached`` →
-         ``codec.decode_block``). The hit path only fires under
-         mid-run admission, never under the initial cohort seal in
-         ``_prepare_cohort``; the test therefore uses a single
-         ``generate_batch([p, p], max_batch_size=1)`` call so the
-         second prompt enters the waiting queue and lights up the
-         hit branch after row 0 reclaims and registers its prefix.
+         ``k_codec.decode_tensor`` + ``v_codec.decode_tensor``). The
+         hit path only fires under mid-run admission, never under the
+         initial cohort seal in ``_prepare_cohort``; the test therefore
+         uses a single ``generate_batch([p, p], max_batch_size=1)``
+         call so the second prompt enters the waiting queue and
+         lights up the hit branch after row 0 reclaims and registers
+         its prefix.
   §8.3 — ``store.resident_bytes()`` equals the radix-node-derived
          total ``len(store.live_block_ids()) × num_layers ×
          block_size × (2 × n_kv_heads × head_dim × dtype.size)`` and
@@ -76,7 +79,7 @@ import pytest
 from silica.core.events import BatchEvent
 from silica.core.sampling import SamplingParams
 from silica.engine import Engine
-from silica.kvcache.codec import CodedBlock, IdentityCodec, KVCodec
+from silica.kvcache.codec import IdentityCodec, RawFp16Payload, VectorCodec
 from silica.kvcache.prefix import RadixPrefixCache
 from silica.kvcache.store import SyntheticPrefixBlockStore
 from silica.models.factory import adapter_for_repo
@@ -119,9 +122,17 @@ _SKIP_REASON = (
 
 
 class _CountingIdentityCodec:
-    """IdentityCodec wrapper that counts ``encode_block`` / ``decode_block``
-    invocations. Delegates all real work to an inner IdentityCodec so
-    byte-identity against the no-codec baseline is preserved.
+    """Side-level ``VectorCodec[RawFp16Payload]`` wrapper that counts
+    ``encode_tensor`` / ``decode_tensor`` invocations.
+
+    Delegates to an inner ``IdentityCodec`` so byte-identity against the
+    no-codec baseline is preserved. When installed via the ``codec=X``
+    shorthand on ``SyntheticPrefixBlockStore``, the store sets
+    ``k_codec = v_codec = self`` so K and V calls flow through the same
+    instance: ``encode_calls`` tallies ``2 × num_layers`` per
+    ``register_detached`` call (K-side + V-side combined through this
+    one counter). Split-mode K/V dispatch independence is regression-
+    locked separately in ``tests/test_prefix_store.py``.
     """
 
     def __init__(
@@ -130,31 +141,26 @@ class _CountingIdentityCodec:
         block_size: int,
         n_kv_heads: int,
         head_dim: int,
-        k_dtype: mx.Dtype = mx.float16,
-        v_dtype: mx.Dtype = mx.float16,
+        dtype: mx.Dtype = mx.float16,
     ) -> None:
         self._inner = IdentityCodec(
             block_size=block_size,
             n_kv_heads=n_kv_heads,
             head_dim=head_dim,
-            k_dtype=k_dtype,
-            v_dtype=v_dtype,
+            dtype=dtype,
         )
         self.block_size = block_size
-        self.k_dtype = k_dtype
-        self.v_dtype = v_dtype
+        self.dtype = dtype
         self.encode_calls = 0
         self.decode_calls = 0
 
-    def encode_block(self, k: mx.array, v: mx.array) -> CodedBlock:
+    def encode_tensor(self, x: mx.array) -> RawFp16Payload:
         self.encode_calls += 1
-        return self._inner.encode_block(k, v)
+        return self._inner.encode_tensor(x)
 
-    def decode_block(
-        self, block: CodedBlock
-    ) -> tuple[mx.array, mx.array]:
+    def decode_tensor(self, payload: RawFp16Payload) -> mx.array:
         self.decode_calls += 1
-        return self._inner.decode_block(block)
+        return self._inner.decode_tensor(payload)
 
     def logical_bytes(self, num_tokens: int) -> int:
         return self._inner.logical_bytes(num_tokens)
@@ -283,20 +289,24 @@ def test_encode_and_decode_counters_on_paired_prompts(
     ``fetch_detached_blocks`` → ``fetch_detached`` →
     ``decode_block`` fires.
 
-    Encode-side assertion:
-      encode_calls >= floor(len / block_size) × num_layers
+    Encode-side assertion (side-level API, P-5-A.0.4):
+      encode_calls >= floor(len / block_size) × num_layers × 2
       (``_extract_and_insert_prefix`` uses
       ``aligned_tokens = (computed_len // block_size) × block_size``;
       ``computed_len`` at row-0 termination is ``prompt_len +
       max_tokens``, so the floor divides by block_size without the
-      ``- 1`` adjustment).
+      ``- 1`` adjustment. Under the side-level codec, each aligned
+      block generates **one K-side encode plus one V-side encode** —
+      the ``× 2`` factor. Installed here via ``codec=`` shorthand so
+      both sides flow through the same counter.)
 
     Decode-side assertion:
-      decode_calls >= floor((len - 1) / block_size) × num_layers
+      decode_calls >= floor((len - 1) / block_size) × num_layers × 2
       (``_admit_single_hit_row`` uses ``max_aligned = ((prompt_len -
       1) // block_size) × block_size`` to leave at least one suffix
       token for the first-token prefill — ``silica/scheduler/batcher.py``
-      ~ line 1011 / S-5 edge 1).
+      ~ line 1011 / S-5 edge 1. The ``× 2`` factor is the K-side +
+      V-side split per the side-level API.)
 
     Under the guarded tokenization (§1: ``len % block_size != 0``),
     these two lower bounds are equal.
@@ -334,23 +344,26 @@ def test_encode_and_decode_counters_on_paired_prompts(
     # Lower-bound by floor(prompt_len / block_size) which is always
     # <= the actual aligned count and does not depend on decode
     # length: if future decode-tokens count changes, this assertion
-    # stays valid.
+    # stays valid. Under the side-level API every aligned block fires
+    # one K-side + one V-side encode_tensor call through the shared
+    # counting codec, so multiply by 2.
     expected_encode_blocks = prompt_len // _BLOCK_SIZE
-    assert counting_codec.encode_calls >= expected_encode_blocks * n_layers, (
+    expected_encode_calls = expected_encode_blocks * n_layers * 2
+    assert counting_codec.encode_calls >= expected_encode_calls, (
         f"expected encode_calls >= {expected_encode_blocks} blocks × "
-        f"{n_layers} layers = "
-        f"{expected_encode_blocks * n_layers}; got "
+        f"{n_layers} layers × 2 sides = {expected_encode_calls}; got "
         f"{counting_codec.encode_calls}"
     )
 
     # Decode-side: row 1 mid-run admit hits the prefix with
     # usable_hit_blocks = floor((prompt_len - 1) / block_size).
+    # Same × 2 factor for the K-side + V-side decode_tensor calls.
     usable_hit_blocks = (prompt_len - 1) // _BLOCK_SIZE
-    assert counting_codec.decode_calls >= usable_hit_blocks * n_layers, (
+    expected_decode_calls = usable_hit_blocks * n_layers * 2
+    assert counting_codec.decode_calls >= expected_decode_calls, (
         f"expected decode_calls >= {usable_hit_blocks} usable-hit "
-        f"blocks × {n_layers} layers = "
-        f"{usable_hit_blocks * n_layers}; got "
-        f"{counting_codec.decode_calls}"
+        f"blocks × {n_layers} layers × 2 sides = {expected_decode_calls}; "
+        f"got {counting_codec.decode_calls}"
     )
 
     # D-2 defensive invariant: every source-ref'd block has detached K/V.
@@ -440,11 +453,12 @@ def test_codec_path_token_stream_matches_no_codec_baseline(
     byte-identical token streams whether the store is constructed with
     ``codec=None`` (pass-through) or ``codec=IdentityCodec(...)``.
 
-    Rationale: ``CodedBlock.__init__`` assigns ``k`` / ``v`` by
-    reference without copy (``silica/kvcache/codec.py`` :98-99); both
-    paths therefore hand ``build_seeded_batch_kv`` the same underlying
-    ``mx.array`` objects, producing bitwise-identical concatenated
-    K / V and bitwise-identical greedy-argmax token streams.
+    Rationale: ``RawFp16Payload.t`` is the original tensor held by
+    reference (``silica/kvcache/codec.py::IdentityCodec.encode_tensor``
+    assigns without copy); both paths therefore hand
+    ``build_seeded_batch_kv`` the same underlying ``mx.array`` objects,
+    producing bitwise-identical concatenated K / V and bitwise-identical
+    greedy-argmax token streams.
 
     Deliberately uses ``temperature=0.0`` and ``stop_token_ids=()`` so
     the sampler path is deterministic and both runs spend the full
@@ -453,7 +467,7 @@ def test_codec_path_token_stream_matches_no_codec_baseline(
     adapter, kv = adapter_kv
     layout = adapter.kv_layout()
 
-    def paired_run(codec: KVCodec | None) -> dict[int, list[int]]:
+    def paired_run(codec: VectorCodec | None) -> dict[int, list[int]]:
         # Fresh Engine + pc + store each run so no state leaks between
         # the baseline and codec paths. Use the same ``[p, p]``
         # workload as §8.1-§8.3 so both encode (row 0 termination +
@@ -488,8 +502,10 @@ def test_codec_path_token_stream_matches_no_codec_baseline(
 
     assert baseline_tokens == codec_tokens, (
         "IdentityCodec path must produce byte-identical tokens vs "
-        "no-codec pass-through baseline (both paths store the same "
-        "(k, v) refs inside CodedBlock without copy). "
+        "no-codec pass-through baseline (both paths hand the same "
+        "tensor refs to build_seeded_batch_kv — pass-through stores "
+        "raw mx.array in _DetachedLayer, IdentityCodec wraps in "
+        "RawFp16Payload whose .t holds the same reference). "
         f"baseline={baseline_tokens} codec={codec_tokens}"
     )
     # Row 1 walks the hit path on both runs; its token stream is where
@@ -512,14 +528,14 @@ def test_identity_codec_path_preserves_tensor_references() -> None:
     ``mx.array`` objects that were originally handed to
     ``store.register_detached``.
 
-    IdentityCodec.encode_block wraps ``(k, v)`` in a ``CodedBlock``
-    without copying (``silica/kvcache/codec.py`` :98-99);
-    IdentityCodec.decode_block returns ``(block.k, block.v)`` by
-    reference. A future codec that silently inserts a defensive copy
-    anywhere in this chain would regress from "byte-identical
-    reference" to "byte-identical value" without failing any other
-    test in this suite. This tripwire uses ``is`` to detect the
-    regression the moment it happens.
+    Under the side-level API, ``IdentityCodec.encode_tensor`` returns
+    ``RawFp16Payload(t=x)`` without copying ``x`` and
+    ``decode_tensor(payload)`` returns ``payload.t``. A future codec
+    that silently inserts a defensive copy anywhere in this chain
+    would regress from "byte-identical reference" to "byte-identical
+    value" without failing any other test in this suite. This
+    tripwire uses ``is`` to detect the regression the moment it
+    happens.
 
     Runs without HF cache — uses synthetic tensors end-to-end.
     """
@@ -548,8 +564,8 @@ def test_identity_codec_path_preserves_tensor_references() -> None:
     assert fk is k, (
         "IdentityCodec path must return the same K tensor reference "
         "that was handed to register_detached; a defensive copy "
-        "anywhere in encode/decode_block would break byte-identity "
-        "silently. Got a different object."
+        "anywhere in encode_tensor / decode_tensor would break byte-"
+        "identity silently. Got a different object."
     )
     assert fv is v, (
         "IdentityCodec path must return the same V tensor reference "
@@ -559,11 +575,11 @@ def test_identity_codec_path_preserves_tensor_references() -> None:
 
 def test_no_codec_pass_through_also_preserves_tensor_references() -> None:
     """Same reference invariant for the ``codec=None`` pass-through
-    branch of ``SyntheticPrefixBlockStore._encode`` / ``_decode``.
-    Ensures the two paths (pass-through / IdentityCodec) agree on
-    reference-level behaviour, so any C.1-visible byte-identity
-    between them is inherited by §8.4 rather than arising from a
-    coincidental value equality.
+    branch of ``SyntheticPrefixBlockStore._encode_layer`` /
+    ``_decode_layer``. Ensures the two paths (pass-through /
+    IdentityCodec) agree on reference-level behaviour, so any C.1-
+    visible byte-identity between them is inherited by §8.4 rather
+    than arising from a coincidental value equality.
     """
     block_size = 8
     n_kv_heads = 2

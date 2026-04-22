@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 
-from silica.kvcache.codec import IdentityCodec, KVCodec
+from silica.kvcache.codec import IdentityCodec, VectorCodec
 from silica.kvcache.manager import KVManager, NullKVManager
 from silica.models.adapter import ModelAdapter, StubModelAdapter
 from silica.speculative.engine import DraftEngine, NoopDraftEngine
@@ -43,12 +43,12 @@ INTERFACE_TABLE: list[tuple[str, type, Any, tuple[str, ...]]] = [
         ("block_size",),
     ),
     (
-        "I-3 KVCodec",
-        KVCodec,
+        "I-3 VectorCodec",
+        VectorCodec,
         lambda: IdentityCodec(
             block_size=16, n_kv_heads=2, head_dim=8
         ),
-        ("block_size", "k_dtype", "v_dtype"),
+        ("block_size", "dtype"),
     ),
     (
         "I-4 WeightProvider",

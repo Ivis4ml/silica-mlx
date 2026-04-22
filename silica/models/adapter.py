@@ -90,7 +90,7 @@ class ModelConfig:
 
 @dataclass
 class KVLayout:
-    """Per-layer KV shape — consumed by KVCodec and the KV allocator.
+    """Per-layer KV shape — consumed by ``VectorCodec`` and the KV allocator.
 
     The four required fields describe the dominant / single KV shape on
     homogeneous-shape models (plain Qwen3, Qwen3.5 dense). For adapters

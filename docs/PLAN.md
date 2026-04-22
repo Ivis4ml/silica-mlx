@@ -2,9 +2,9 @@
 
 | Field        | Value                                                                      |
 | ------------ | -------------------------------------------------------------------------- |
-| Version      | v1.6.9                                                                     |
+| Version      | v1.7.0                                                                     |
 | Last updated | 2026-04-21                                                                 |
-| Status       | P-0..P-4.5 complete; P-5 next                                              |
+| Status       | P-0..P-4.5 complete; P-5-A.0 scaffolding shipped (v1.7.0); P-5-A.1 next    |
 | Maintainer   | Xin Zhou                                                                   |
 | Source       | `docs/PLAN.md` (single source of truth)                                    |
 
@@ -280,23 +280,26 @@ class KVManager(Protocol):
 3. `get_computed_blocks` is the prefix cache lookup (naming aligned with vLLM v1's `kv_cache_manager.get_computed_blocks`); it returns the list of already-computed blocks so the scheduler can reuse and pin them on admission.
 4. `available_blocks()` is a fast, block-granular path. It is **not** equivalent to `budget().headroom`: the latter is byte-granular (influenced by the codec's logical/resident ratio), the former is block-granular and gives the scheduler an O(1) "can I admit one more request?" check.
 
-### I-3 KVCodec
+### I-3 VectorCodec
 
-Uniform abstraction for KV encoding and decoding. v0.1 **does not include** a compressed-domain attention fast path (D-003).
+Uniform abstraction for KV encoding and decoding. **Side-level** as of P-5-A.0.4: one `VectorCodec[P]` instance operates on one tensor (either K or V from one block of one layer). Pair-level dispatch lives in the store (`SyntheticPrefixBlockStore(k_codec=, v_codec=)` or the `codec=` shorthand). v0.1 **does not include** a compressed-domain attention fast path (D-003).
 
 ```python
-class KVCodec(Protocol):
-    block_size: int
-    k_dtype: mx.Dtype
-    v_dtype: mx.Dtype
+P = TypeVar("P", bound=CodedPayload)
 
-    def encode_block(self, k: mx.array, v: mx.array) -> CodedBlock: ...
-    def decode_block(self, block: CodedBlock) -> tuple[mx.array, mx.array]: ...
-    def logical_bytes(self, num_tokens: int) -> int: ...   # fp16 baseline equivalent
-    def resident_bytes(self, num_blocks: int) -> int: ...  # actual storage
+class VectorCodec(Protocol, Generic[P]):
+    block_size: int
+    dtype: mx.Dtype
+
+    def encode_tensor(self, x: mx.array) -> P: ...          # one side, one block
+    def decode_tensor(self, payload: P) -> mx.array: ...    # fp16 output (D-003)
+    def logical_bytes(self, num_tokens: int) -> int: ...    # fp16 baseline, one side
+    def resident_bytes(self, num_blocks: int) -> int: ...   # actual storage, one side
 ```
 
-**Key constraint:** a codec sees one layer's K/V only; it is unaware of batch, scheduler, or model structure.
+Concrete payload subclasses (`CodedPayload` hierarchy): `RawFp16Payload` (identity), `BlockTQPayload` (packed indices + per-vq-block scales), `RaBitQPayload` (packed indices + norm_o + ip_coeff). Every subclass enforces D-012 honesty at construction: declared `resident_bytes` must equal the sum of `.nbytes` across all `mx.array` fields.
+
+**Key constraint:** a codec sees one tensor only; it is unaware of batch, scheduler, model structure, or the partner side (K / V dispatch is a store concern). Pre-P-5-A.0.4 I-3 used a pair-level `KVCodec.encode_block(k, v) -> CodedBlock` shape; that signature is retired and the old `CodedBlock` / `KVCodec` names are removed from the codebase. Historical P-4.5-C records in §7 and the amendment log keep their original wording because they describe past state.
 
 ### I-4 WeightProvider
 
@@ -956,18 +959,17 @@ Resolved questions are not deleted. Mark `Status: resolved` and append a `Resolu
 - **Blocks:** finalization of the P-5 scheduler admission policy; coupled with Q-001 (VQ codec auto-selection).
 - **Next step:** decide after Phase 4 bench, with real BlockTQ / RaBitQ decode-overhead data. At resolution, also decide whether `feedback_kvcodec_interface.md` memory is updated.
 
-### Q-008 — KVCodec K/V pair configuration
+### Q-008 — VectorCodec K/V pair configuration (resolved 2026-04-22, P-5-A.0.4)
 
 - **Raised:** 2026-04-14.
-- **Status:** open.
-- **Question:** should `KVCodec` expose K/V pair configuration at the **interface level** (e.g. `KVCodec(key_method=..., value_method=...)`), letting users explicitly pick different codecs for K and V? Or should it stay hidden inside each codec's constructor?
-- **Context:** vqbench explicitly uses different codecs for K and V — K needs unbiased inner-product estimation (`TurboQuantProd` / `QJL`), V needs low-MSE reconstruction (`TurboQuantMSE` / `BlockTurboQuantMSE`); this is the basis of `KVCacheCompressor(key_q, value_q)` in `vqbench/vqbench/kv_cache/compressor.py`. Today's I-3 `encode_block(k, v) -> CodedBlock` takes a single codec object that may internally hold two quantizers, but does not **externally** expose the choice. This becomes concrete when P-5's `BlockTQCodec` constructor is designed.
-- **Options:**
-  - **A. Internal handling, I-3 contract unchanged.** Each codec (e.g. `BlockTQCodec`) accepts `key_method` / `value_method` as constructor args; I-3's signature doesn't move. **Pro:** I-3 stays minimal, swapping codecs doesn't affect the scheduler. **Con:** users have to learn each codec's constructor.
-  - **B. I-3 adds a pair contract.** Split `KVCodec` into `KeyCodec` + `ValueCodec` Protocols with a top-level `KVCodecPair` composer. **Pro:** K/V asymmetry is visible in the types. **Con:** I-3 grows from one interface to three; P-0 freeze complexity rises.
-  - **C. `KVCodec.from_pair(key_method, value_method)` class method** — exposes pair intent without changing the signature.
-- **Blocks:** design of the concrete P-5 `BlockTQCodec` constructor; may affect Q-001's granularity of auto-selection.
-- **Next step:** decide when P-5 starts. Current lean: Option A (most conservative, I-3 minimal).
+- **Status:** resolved.
+- **Resolution:** side-level `VectorCodec[P]` Protocol operating on a single tensor, plus store-level `k_codec` / `v_codec` kwargs on `SyntheticPrefixBlockStore` carrying the K/V pair dispatch. The `codec=` kwarg is kept as a shorthand for `k_codec = v_codec = codec` so the common symmetric case stays one line; split configurations pass both sides explicitly; any combination of `codec=` with a side kwarg, or a mixed None/non-None split, raises at construction. See §6 I-3 above for the Protocol, `silica/kvcache/store.py` for the dispatch, and `docs/P5_A_U4_STORE_MIGRATION.md` §1 for the full rule table. The pre-P-5 pair-level `KVCodec` / `CodedBlock` names and the historical A / B / C option labels below are **superseded** by this fourth path.
+- **Question (historical):** should `KVCodec` expose K/V pair configuration at the **interface level** (e.g. `KVCodec(key_method=..., value_method=...)`), letting users explicitly pick different codecs for K and V? Or should it stay hidden inside each codec's constructor?
+- **Context (historical):** vqbench explicitly uses different codecs for K and V — K needs unbiased inner-product estimation (`TurboQuantProd` / `QJL`), V needs low-MSE reconstruction (`TurboQuantMSE` / `BlockTurboQuantMSE`); this is the basis of `KVCacheCompressor(key_q, value_q)` in `vqbench/vqbench/kv_cache/compressor.py`. Pre-P-5 I-3's `encode_block(k, v) -> CodedBlock` took a single codec object that could internally hold two quantizers but did not externally expose the choice.
+- **Options (superseded by the resolution above):**
+  - **A. Internal handling, I-3 contract unchanged.** Each codec accepts `key_method` / `value_method` as constructor args; I-3's signature doesn't move. *Superseded — the side-level Protocol makes K/V split visible on the store without forcing every codec's constructor to grow K/V args.*
+  - **B. I-3 adds a pair contract.** Split `KVCodec` into `KeyCodec` + `ValueCodec` Protocols with a top-level `KVCodecPair` composer. *Superseded — the chosen path collapses the pair into the store rather than splitting the codec Protocol into two.*
+  - **C. `KVCodec.from_pair(key_method, value_method)` class method.** *Superseded — no factory method needed; shorthand `codec=` argument plus explicit `k_codec=` / `v_codec=` is the surface users actually interact with.*
 
 ### Q-009 — MLX paged-attention kernel availability and quality
 
@@ -1073,6 +1075,18 @@ Local reference implementations sit at the repo root. **Algorithm / architecture
 ---
 
 ## 13. Changelog
+
+- **v1.7.0** (2026-04-22): **P-5-A.0 scaffolding — side-level VectorCodec[P] + packing + calibration + store migration.** Opens P-5 proper with the four P-5-A.0 sub-unit commits plus doc sync. No functional change to the active codec path — `IdentityCodec` continues to be the only shipping codec, byte-identity against the pre-P-5 token stream is preserved by the P-4.5-C.1 integration test suite. The scaffolding unblocks P-5-A.1 (BlockTurboQuantMSE hot path + Q-008 resolved on the store seam).
+  - **`silica/kvcache/codec.py`** (rewrite) — retires the pre-P-5 pair-level `KVCodec` Protocol, `CodedBlock` dataclass, and pair-level `IdentityCodec`. New side-level `VectorCodec[P]` Protocol (one tensor in, one `CodedPayload` subclass out); new `CodedPayload` hierarchy (`RawFp16Payload`, `BlockTQPayload`, `RaBitQPayload`) with D-012 honesty enforced at `__post_init__`; new side-level `IdentityCodec(block_size, n_kv_heads, head_dim, dtype=fp16)` implementing `VectorCodec[RawFp16Payload]`. Signatures drop `k_dtype` / `v_dtype` in favour of a single per-side `dtype`. `resident_bytes` / `logical_bytes` are per-side.
+  - **`silica/kvcache/store.py`** — `SyntheticPrefixBlockStore.__init__` gains `k_codec` / `v_codec` / `codec` kwargs. `codec=` is a shorthand for `k_codec = v_codec = codec`; any combination of `codec=` with a side kwarg, or mixed-None split (one side None, one non-None), raises `ValueError`. All three `None` is the pass-through path with byte-for-byte pre-P-5 behaviour. `_detached` storage moves from `tuple[CodedBlock, ...]` to `tuple[_DetachedLayer, ...]` where `_DetachedLayer` is a private frozen dataclass holding per-side `CodedPayload | mx.array` (raw on pass-through, coded otherwise). `resident_bytes()` sums per-side payloads, branching on the raw-vs-coded discriminant.
+  - **`silica/kvcache/prefix.py`** — new `RadixPrefixCache.store` read-only property returning `PrefixBlockStore` (non-optional, matches constructor invariant). Forward-pointer for P-5-A.2 `MemoryBudgeter` consumer; must use a `SupportsResidentBytes` structural check rather than assuming every store implements `resident_bytes()`.
+  - **`silica/vq/core/packing.py`** (new, P-5-A.0.2) — MLX-native `pack_sub_byte` / `unpack_sub_byte`, bit-plane layout, `num_bits ∈ {1, 2, 3, 4}`, `d % 8 == 0`. Shared across TurboQuantMSE / BlockTurboQuantMSE / RaBitQ / ExtRaBitQ.
+  - **`silica/vq/_calibration.py`** (new, P-5-A.0.3) — NumPy quarantine. `haar_rotation(d, seed)` (Stewart 1980 QR + sign-fix) and `lloyd_max_codebook(num_bits, sigma)` (Lloyd-Max for N(0, sigma^2); uses stdlib `math.erf` + `math.exp` rather than scipy). Write-protected outputs, cached by construction args. The sole module under `silica.vq.*` permitted to import NumPy; enforced by a `pkgutil.walk_packages`-based quarantine test.
+  - **§6 I-3 amendment (in-place).** Canonical interface table now documents `VectorCodec[P]`; pair-level `KVCodec` / `CodedBlock` signatures removed from the active table. Historical P-4.5-C entries in §7 and the amendment log keep their original wording as past-state records.
+  - **§10 Q-008 resolved.** Side-level `VectorCodec[P]` + store-level `k_codec` / `v_codec` split. The historical A / B / C option labels are explicitly marked superseded (the new path collapses the pair into the store rather than into the codec constructor or a second Protocol).
+  - **Test migration.** `tests/test_vector_codec.py` (13 payload + Protocol tests), `tests/test_packing.py` (63 tests), `tests/test_calibration.py` (42 tests) — all added in earlier P-5-A.0 commits. This commit adds `tests/test_prefix_store.py` side-level cases (15 new: constructor rejections, pass-through identity, shorthand dispatch, split-mode K/V independence, per-side `resident_bytes` arithmetic) and rewrites `tests/test_kvcodec.py` (side-level API), `tests/test_interfaces.py` (I-3 `KVCodec` → `VectorCodec`, attribute tuple), `tests/test_kvcodec_integration.py` (`_CountingIdentityCodec` implements `VectorCodec`; counter arithmetic doubles for K/V split; byte-identity invariants preserved).
+  - **Doc sync.** `docs/P5_OPENING.md` carries forward. `docs/P5_A_U4_STORE_MIGRATION.md` is the Unit 4 implementation checklist. `README.md` I-3 terminology refreshed to `VectorCodec`.
+  - **Next step:** P-5-A.1 (BlockTurboQuantMSE hot path on the shipped scaffold).
 
 - **v1.6.9** (2026-04-21): **P-4.5 close — Acceptance regression sweep against the post-C.1 tree.** No code changes. Verifies and flips the four P-4.5 Acceptance checkboxes that were intentionally deferred out of the C.1 implementation commit (`f3a6171`) per its "remaining P-4.5 close gates" note.
   - **Header:** Version v1.6.8 → v1.6.9; Status "P-0..P-4.5 complete; P-5 next".

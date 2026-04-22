@@ -1,27 +1,27 @@
-"""silica.kvcache.codec — codec interface and identity baseline.
+"""silica.kvcache.codec — side-level VectorCodec[P] Protocol + IdentityCodec baseline.
 
-P-5-A.0 refactor in progress (see ``docs/P5_OPENING.md`` §4):
+I-3 interface definition (see ``docs/PLAN.md`` §6, updated at P-5-A.0.4).
 
-- New side-level ``VectorCodec[P]`` Protocol + ``CodedPayload`` hierarchy
-  defined first. A ``VectorCodec`` operates on one tensor at a time
-  (either K or V from one block of one layer); pair-level dispatch moves
-  up into ``SyntheticPrefixBlockStore`` in the store-migration commit.
-- Payload honesty is enforced at construction: every concrete
-  ``CodedPayload`` subclass calls ``_verify_resident_bytes`` from
-  ``__post_init__`` to require ``resident_bytes`` equal the sum of
-  ``.nbytes`` across its ``mx.array`` fields (D-012 canonical).
-- Pre-P-5 pair-level ``KVCodec`` / ``CodedBlock`` / ``IdentityCodec`` are
-  retained below under their original names so ``silica.kvcache.store``,
-  ``silica.kvcache.__init__``, and existing tests continue to type-check
-  during this transitional commit. They are retired in the store migration
-  commit once ``SyntheticPrefixBlockStore`` consumes side-level codecs.
+A ``VectorCodec`` operates on one tensor at a time — either K or V from
+one block of one layer; pair-level dispatch lives in
+``SyntheticPrefixBlockStore``, which holds ``k_codec`` / ``v_codec``
+separately and encodes / decodes independently per side. This is the
+side-level resolution of Q-008 — the historical A / B / C options in
+§10 are superseded by the side-level Protocol plus store-level
+``k_codec`` / ``v_codec`` split shipped in P-5-A.0.
+
+Payload honesty is enforced at construction: every concrete
+``CodedPayload`` subclass calls ``_verify_resident_bytes`` from
+``__post_init__`` to require ``resident_bytes`` equal the sum of
+``.nbytes`` across its ``mx.array`` fields (D-012 canonical).
 
 D-003: ``decode_tensor`` returns fp16; no compressed-domain attention.
-D-009: codec runtime bodies are MLX-native (no NumPy / torch); calibration
-helpers live under ``silica.vq._calibration`` (landing as a separate unit).
-D-012: ``resident_bytes`` is the physical footprint owned by this component
-in unified memory; excludes transient scratch / allocator headroom;
-idempotent across repeated calls outside a modifying operation.
+D-009: codec runtime bodies are MLX-native (no NumPy / torch);
+calibration helpers live under ``silica.vq._calibration``.
+D-012: ``resident_bytes`` is the physical footprint owned by this
+component in unified memory; excludes transient scratch / allocator
+headroom; idempotent across repeated calls outside a modifying
+operation.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from typing import Generic, Protocol, TypeVar, runtime_checkable
 import mlx.core as mx
 
 # =============================================================================
-# P-5 side-level interface
+# Payload hierarchy
 # =============================================================================
 
 
@@ -134,6 +134,11 @@ class RaBitQPayload(CodedPayload):
         self._verify_resident_bytes()
 
 
+# =============================================================================
+# VectorCodec[P] Protocol
+# =============================================================================
+
+
 P = TypeVar("P", bound=CodedPayload)
 
 
@@ -171,59 +176,28 @@ class VectorCodec(Protocol, Generic[P]):
 
 
 # =============================================================================
-# Pre-P-5 pair-level interface (retired in the store-migration commit)
+# IdentityCodec — side-level baseline
 # =============================================================================
 
 
-@dataclass
-class CodedBlock:
-    """Pre-P-5 pair-level codec output (``(k, v, resident_bytes)``).
-
-    Retired in the P-5-A.0 store-migration commit; callers should move to
-    the per-side ``CodedPayload`` subclasses above
-    (``RawFp16Payload`` / ``BlockTQPayload`` / ``RaBitQPayload``).
-    """
-
-    k: mx.array
-    v: mx.array
-    resident_bytes: int
-
-
-@runtime_checkable
-class KVCodec(Protocol):
-    """Pre-P-5 pair-level codec Protocol.
-
-    Retired in the P-5-A.0 store-migration commit; callers should move to
-    the side-level ``VectorCodec`` Protocol above.
-
-    ``@runtime_checkable`` verifies method presence only, not class
-    attribute presence; the P-0 interface test asserts attributes separately.
-    """
-
-    block_size: int
-    k_dtype: mx.Dtype
-    v_dtype: mx.Dtype
-
-    def encode_block(self, k: mx.array, v: mx.array) -> CodedBlock: ...
-
-    def decode_block(self, block: CodedBlock) -> tuple[mx.array, mx.array]: ...
-
-    def logical_bytes(self, num_tokens: int) -> int:
-        """fp16-baseline-equivalent bytes for ``num_tokens`` tokens of this layer's K+V."""
-        ...
-
-    def resident_bytes(self, num_blocks: int) -> int:
-        """Physical bytes held for ``num_blocks`` blocks, per D-012 definition."""
-        ...
-
-
 class IdentityCodec:
-    """Pre-P-5 pair-level pass-through codec.
+    """Pass-through ``VectorCodec[RawFp16Payload]`` baseline.
 
-    ``encoded == raw``, ``resident == logical``. Fulfills the old I-3
-    contract for P-4.5-C.1 callers; retired in the P-5-A.0 store-migration
-    commit in favour of a side-level ``IdentityCodec`` that implements
-    ``VectorCodec[RawFp16Payload]``.
+    ``encoded == raw`` (no copy — ``RawFp16Payload.t is original_tensor``
+    and ``decode_tensor(payload) is payload.t``). ``resident == logical``
+    (fp16-equivalent). Fulfills the I-3 contract for P-0 stubs and for
+    the bench-harness baseline column in P-5-C.
+
+    Side-level: one instance represents **one side** (K or V) of the
+    per-layer K/V pair. ``logical_bytes`` / ``resident_bytes`` report
+    one-side bytes; the store sums across sides when reporting total
+    resident prefix-cache residency. Callers that want symmetric K+V use
+    the ``codec=`` shorthand on ``SyntheticPrefixBlockStore``
+    (``k_codec = v_codec = IdentityCodec(...)``); asymmetric
+    configurations pass ``k_codec`` and ``v_codec`` explicitly.
+
+    Principle 9 stub-replacement pattern: this class stays in tree after
+    P-5 as the baseline option on the ``--kv-codec`` switch.
     """
 
     def __init__(
@@ -232,25 +206,22 @@ class IdentityCodec:
         block_size: int,
         n_kv_heads: int,
         head_dim: int,
-        k_dtype: mx.Dtype = mx.float16,
-        v_dtype: mx.Dtype = mx.float16,
+        dtype: mx.Dtype = mx.float16,
     ) -> None:
         self.block_size = block_size
-        self.k_dtype = k_dtype
-        self.v_dtype = v_dtype
+        self.dtype = dtype
         self._n_kv_heads = n_kv_heads
         self._head_dim = head_dim
 
     def _bytes_per_token(self) -> int:
-        per_k = self._n_kv_heads * self._head_dim * self.k_dtype.size
-        per_v = self._n_kv_heads * self._head_dim * self.v_dtype.size
-        return per_k + per_v
+        """fp16-equivalent bytes per token for this one side."""
+        return self._n_kv_heads * self._head_dim * self.dtype.size
 
-    def encode_block(self, k: mx.array, v: mx.array) -> CodedBlock:
-        return CodedBlock(k=k, v=v, resident_bytes=k.nbytes + v.nbytes)
+    def encode_tensor(self, x: mx.array) -> RawFp16Payload:
+        return RawFp16Payload(resident_bytes=int(x.nbytes), t=x)
 
-    def decode_block(self, block: CodedBlock) -> tuple[mx.array, mx.array]:
-        return block.k, block.v
+    def decode_tensor(self, payload: RawFp16Payload) -> mx.array:
+        return payload.t
 
     def logical_bytes(self, num_tokens: int) -> int:
         return num_tokens * self._bytes_per_token()

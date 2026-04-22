@@ -257,7 +257,7 @@ class VectorCodec(Protocol, Generic[P]):
 
 ### 4.2 Store holds per-side codecs and per-side payloads
 
-`SyntheticPrefixBlockStore` is the pair-aware layer. Its detached dict becomes:
+`SyntheticPrefixBlockStore` is the pair-aware layer. Its detached dict becomes (sketch — Unit 4 checklist `docs/P5_A_U4_STORE_MIGRATION.md` §5 refines this to a private `_DetachedLayer` frozen dataclass for readability; the behaviour is the same):
 
 ```python
 self._detached: dict[int, tuple[tuple[CodedPayload, CodedPayload], ...]] = {}
