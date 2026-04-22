@@ -303,6 +303,13 @@ class BenchRunner:
                 )
                 oracle_input = tf_predictions
                 total_tokens = len(tf_predictions)
+            elif scenario.oracle == OracleKind.DECODE_TOK_S_WITH_PREFIX_HIT:
+                prefix_hit_collected, oracle_context = _run_prefix_hit_decode(
+                    scenario, engine, adapter
+                )
+                oracle_input = prefix_hit_collected
+                tokens_dict, _ = prefix_hit_collected
+                total_tokens = sum(len(row) for row in tokens_dict.values())
             else:
                 # SMOKE (and any future single/batched-flexible
                 # oracle). B=1 takes the single-request path,
@@ -341,13 +348,37 @@ class BenchRunner:
             )
 
         snap = engine.metrics.snapshot()
+        # For DECODE_TOK_S_WITH_PREFIX_HIT the headline metrics come
+        # from the oracle's per-row timestamp analysis rather than
+        # engine.metrics — ``Engine.generate_batch`` does not populate
+        # the ``MetricsRegistry`` today, so ``snap.decode_tok_s`` would
+        # be ``None`` on this path even though the oracle has computed
+        # an honest row-1 decode tok/s in metadata. Promoting those
+        # numbers into the standard ``ScenarioResult.decode_tok_s`` /
+        # ``ttft_ms`` fields keeps the JSONL schema homogeneous across
+        # oracles — downstream tools (bench report, A.3c acceptance
+        # gate) do not need to special-case this oracle's metadata
+        # bucket.
+        ttft_ms = snap.ttft_ms
+        decode_tok_s = snap.decode_tok_s
+        if (
+            ok
+            and scenario.oracle == OracleKind.DECODE_TOK_S_WITH_PREFIX_HIT
+        ):
+            row1_decode = metadata.get("row1_decode_tok_s")
+            if isinstance(row1_decode, (int, float)):
+                decode_tok_s = float(row1_decode)
+            row1_first = metadata.get("row1_first_token_ms")
+            if isinstance(row1_first, (int, float)):
+                ttft_ms = float(row1_first)
+
         return ScenarioResult(
             scenario_id=scenario.id,
             status="ok" if ok else "failed",
             reason=oracle_reason,
-            ttft_ms=snap.ttft_ms,
+            ttft_ms=ttft_ms,
             prefill_tok_s=snap.prefill_tok_s,
-            decode_tok_s=snap.decode_tok_s,
+            decode_tok_s=decode_tok_s,
             resident_mb=snap.resident_mb,
             peak_memory_mb=peak_mb,
             total_tokens=total_tokens,
@@ -508,6 +539,42 @@ def _validate_workload_for_oracle(
             return (
                 f"oracle {oracle.value!r} requires exactly 1 prompt, "
                 f"got {len(wl.prompts)}"
+            )
+    elif oracle == OracleKind.DECODE_TOK_S_WITH_PREFIX_HIT:
+        # Front-load the workload-shape check so scenarios with
+        # authoring errors fail BEFORE the adapter + engine are
+        # loaded. Previously these validations lived inside
+        # ``_run_prefix_hit_decode`` and fired after a multi-GB
+        # Qwen3.5-0.8B load.
+        if wl.max_batch_size != 1:
+            return (
+                f"oracle {oracle.value!r} requires max_batch_size=1, "
+                f"got {wl.max_batch_size} — row 1 must enter the "
+                f"waiting queue, which only happens when the initial "
+                f"cohort is size 1"
+            )
+        if len(wl.prompts) != 2:
+            return (
+                f"oracle {oracle.value!r} requires exactly 2 prompts, "
+                f"got {len(wl.prompts)} — the workload drives row 1 "
+                f"into the waiting queue so mid-run admission fires "
+                f"the prefix-hit path"
+            )
+        if wl.prompts[0] != wl.prompts[1]:
+            return (
+                f"oracle {oracle.value!r} requires identical prompts "
+                f"(shared prefix drives row 1 through the full-match "
+                f"hit path); got two different prompts"
+            )
+        if not wl.prefix_cache:
+            return (
+                f"oracle {oracle.value!r} requires prefix_cache=True"
+            )
+        if wl.kv_codec is None:
+            return (
+                f"oracle {oracle.value!r} requires kv_codec to be set "
+                f"explicitly (fp16 baseline vs compressed codec is the "
+                f"whole point of the measurement); got kv_codec=None"
             )
     return None
 
@@ -741,6 +808,126 @@ def _run_smoke_batched(
     )
 
 
+def _run_prefix_hit_decode(
+    scenario: Scenario,
+    engine: Engine,
+    adapter: ModelAdapter,
+) -> tuple[
+    tuple[dict[int, list[int]], dict[int, list[float]]],
+    dict[str, Any],
+]:
+    """Drive the P-5-A.3b ``DECODE_TOK_S_WITH_PREFIX_HIT`` workload.
+
+    Validates the workload shape inline (the scenario schema does
+    not encode "exactly 2 prompts", only that a workload is legal;
+    this oracle pins a specific shape at runtime). Returns the raw
+    per-row token streams + per-row per-token wall-clock timestamps
+    for the oracle to compute ``row1_decode_tok_s`` from. Context
+    carries ``vocab_size`` + the prefix-cache hit counter so the
+    oracle can reject the run when the hit path was never taken
+    (scheduler regression to miss-path only).
+    """
+    wl = scenario.workload
+    if len(wl.prompts) != 2:
+        raise RuntimeError(
+            f"decode_tok_s_with_prefix_hit requires exactly 2 prompts, "
+            f"got {len(wl.prompts)} — the workload shape drives row 1 "
+            f"into the waiting queue so mid-run admission fires the "
+            f"hit path"
+        )
+    if wl.max_batch_size != 1:
+        raise RuntimeError(
+            f"decode_tok_s_with_prefix_hit requires max_batch_size=1, "
+            f"got {wl.max_batch_size} — row 1 must enter the waiting "
+            f"queue, which only happens when max_batch_size keeps the "
+            f"initial cohort at 1"
+        )
+    if not wl.prefix_cache:
+        raise RuntimeError(
+            "decode_tok_s_with_prefix_hit requires prefix_cache=True"
+        )
+    if wl.prompts[0] != wl.prompts[1]:
+        raise RuntimeError(
+            "decode_tok_s_with_prefix_hit requires identical prompts "
+            "(shared prefix drives row 1 through the full-match hit "
+            "path); got two different prompts"
+        )
+
+    params = _build_sampling_params(wl, adapter, include_eos=False)
+    prefix_cache = _maybe_build_prefix_cache(wl, adapter)
+    assert prefix_cache is not None  # wl.prefix_cache=True guarantees this
+
+    collected = _collect_prefix_hit_decode(
+        engine, list(wl.prompts), params, prefix_cache=prefix_cache
+    )
+    context: dict[str, Any] = {
+        "vocab_size": adapter.config.vocab_size,
+        "prefix_cache_hits": int(prefix_cache.hits),
+    }
+    return collected, context
+
+
+def _collect_prefix_hit_decode(
+    engine: Engine,
+    prompts: list[str],
+    params: SamplingParams,
+    *,
+    prefix_cache: Any,
+) -> tuple[dict[int, list[int]], dict[int, list[float]]]:
+    """Collect per-row token streams + per-row per-token timestamps.
+
+    Drives ``generate_batch(prompts, params, max_batch_size=1,
+    prefix_cache=prefix_cache)``. Token-level timestamps are measured
+    from the start of ``generate_batch`` so row 1's first timestamp
+    represents cold-start + prefix-hit admission overhead, and the
+    inter-token intervals after that are the decode-path throughput
+    this oracle measures.
+
+    Returns ``(tokens, timestamps_ms)`` — both dicts keyed by
+    ``req_index`` (0, 1). Strict validation mirrors
+    ``_collect_smoke_batched_tokens``: aborted events and unexpected
+    ``req_index`` values raise ``RuntimeError`` so the outer
+    ``run_scenario`` collapses them to a failed ``ScenarioResult``
+    before the oracle sees the input.
+    """
+    expected_rows = set(range(len(prompts)))
+    tokens: dict[int, list[int]] = {row: [] for row in expected_rows}
+    token_ts_ms: dict[int, list[float]] = {row: [] for row in expected_rows}
+    done_rows: set[int] = set()
+    t_start = time.perf_counter()
+
+    for event in engine.generate_batch(
+        prompts, params, max_batch_size=1, prefix_cache=prefix_cache
+    ):
+        if event.req_index not in expected_rows:
+            raise RuntimeError(
+                f"prefix_hit_decode_unexpected_req_index:{event.req_index}"
+            )
+        if event.kind == "aborted":
+            raise RuntimeError(
+                f"prefix_hit_decode_aborted:row={event.req_index}_"
+                f"reason={event.finish_reason}"
+            )
+        if event.kind == "token":
+            if event.token_id is None:
+                raise RuntimeError(
+                    f"prefix_hit_decode_token_event_missing_id:"
+                    f"row={event.req_index}"
+                )
+            ms = (time.perf_counter() - t_start) * 1000.0
+            token_ts_ms[event.req_index].append(ms)
+            tokens[event.req_index].append(event.token_id)
+        elif event.kind == "done":
+            done_rows.add(event.req_index)
+
+    missing = expected_rows - done_rows
+    if missing:
+        raise RuntimeError(
+            f"prefix_hit_decode_rows_never_completed:{sorted(missing)}"
+        )
+    return tokens, token_ts_ms
+
+
 def _collect_smoke_batched_tokens(
     engine: Engine,
     prompts: list[str],
@@ -935,6 +1122,23 @@ def _maybe_build_prefix_cache(
         from silica.bench.codec_registry import get_codec_spec
 
         spec = get_codec_spec(workload.kv_codec)
+        # A.3b guard: the shorthand installs one codec on both sides
+        # (K and V). P-5-A.1 entries are all symmetric (k_supported
+        # and v_supported both True); this check becomes load-bearing
+        # when P-5-B lands K-only / V-only variants so a future
+        # ``kv_codec="rabitq_k_only"`` scenario fails fast rather
+        # than silently installing an asymmetric codec on the V side
+        # where it is not meant to run.
+        if not (spec.k_supported and spec.v_supported):
+            raise ValueError(
+                f"workload {workload.name!r}: kv_codec="
+                f"{workload.kv_codec!r} is not symmetric "
+                f"(k_supported={spec.k_supported}, "
+                f"v_supported={spec.v_supported}); "
+                f"shorthand installs one codec on both sides. "
+                f"Asymmetric K/V codecs need a split-id field "
+                f"(P-5-C scope) rather than the kv_codec shorthand."
+            )
         layout = adapter.kv_layout()
         codec = spec.factory(
             block_size=block_size,

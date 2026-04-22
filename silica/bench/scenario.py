@@ -59,6 +59,16 @@ class OracleKind(str, Enum):
     B1_PARITY_VS_SINGLE = "b1_parity_vs_single"
     BGT1_DIRECT_BATCHED_REFERENCE = "bgt1_direct_batched_reference"
     TEACHER_FORCED_ARGMAX = "teacher_forced_argmax"
+    # P-5-A.3b. Runs a two-prompt ``max_batch_size=1
+    # prefix_cache=True`` workload so row 1 enters the waiting queue
+    # and is admitted mid-run through the prefix-hit path
+    # (``_admit_single_hit_row`` → ``fetch_detached_blocks`` →
+    # ``codec.decode_tensor`` × 2 × num_layers × num_hit_blocks).
+    # Reports row 1's decode tok/s specifically — the metric the
+    # opening §7(d) gate asserts: BlockTQ row-1 decode tok/s ≥
+    # 0.85 × IdentityCodec row-1 decode tok/s. Scenario authoring
+    # pins the workload shape; runner validates.
+    DECODE_TOK_S_WITH_PREFIX_HIT = "decode_tok_s_with_prefix_hit"
 
 
 @dataclass(frozen=True)

@@ -509,11 +509,162 @@ def teacher_forced_argmax_oracle(
     return (True, None, metadata)
 
 
+def decode_tok_s_with_prefix_hit_oracle(
+    scenario: Scenario, collected: Any, context: Any
+) -> tuple[bool, str | None, dict[str, Any]]:
+    """P-5-A.3b oracle: reports row 1's decode tok/s on the prefix-hit
+    admission path and guards the measurement against trivially-passing
+    scenarios (zero prefix hits, truncated rows, invalid tokens).
+
+    Workload contract (validated by the runner's
+    ``_run_prefix_hit_decode``): exactly 2 identical prompts,
+    ``max_batch_size=1``, ``prefix_cache=True``. Row 0 miss-path
+    prefills + decodes; row 1 enters the waiting queue and is
+    admitted mid-run through ``_admit_single_hit_row``; its decode
+    loop exercises the codec on admission (seeded-prefix K/V) and
+    on every step append.
+
+    ``collected`` is the ``(tokens, token_ts_ms)`` pair from the
+    runner's collector. ``context`` must be a mapping with
+    ``vocab_size`` + ``prefix_cache_hits`` (the radix cache's
+    ``hits`` counter at collection end).
+
+    Metric definition:
+
+    - ``row1_decode_tok_s = (N - 1) / ((t_last - t_first) / 1000.0)``
+      where ``N = len(token_ts_ms[1])`` and timestamps are in ms
+      from the start of ``generate_batch``. Dividing by ``N - 1``
+      (not ``N``) and using ``t_last - t_first`` (not ``t_last``)
+      excludes row 1's first-token latency, which is dominated by
+      the seeded-admission overhead (prefix decode × num_layers) —
+      not the steady-state decode tok/s the gate is comparing.
+    - ``row1_first_token_ms = token_ts_ms[1][0]`` is surfaced
+      separately in metadata so the seeded-admission overhead can
+      be inspected side-by-side with the steady-state throughput.
+
+    Gates:
+
+    - Every row must emit ≥ 1 valid token (token_id is int in vocab
+      range).
+    - Row 1 must emit ≥ 2 tokens — the inter-token interval formula
+      needs at least two samples; 1-token rows would divide by zero
+      and silently report infinity.
+    - ``prefix_cache_hits >= 1`` — if the hit counter is zero, the
+      workload somehow ran the miss path on row 1 (scheduler
+      regression or a scenario-authoring error); the reported
+      decode tok/s would reflect a different path than the
+      measurement claims.
+
+    The 0.85× ratio gate itself is not part of this oracle — it is
+    a comparison between two scenarios (BlockTQ vs fp16 baseline),
+    driven by the A.3c acceptance test. This oracle's job is to
+    report an honest row-1 decode tok/s.
+    """
+    if not isinstance(context, dict):
+        return (False, "decode_tok_s_missing_context", {})
+    if "vocab_size" not in context or "prefix_cache_hits" not in context:
+        return (
+            False,
+            "decode_tok_s_context_missing_required_keys",
+            {"keys_present": sorted(context)},
+        )
+    vocab_size = int(context["vocab_size"])
+    prefix_cache_hits = int(context["prefix_cache_hits"])
+
+    if (
+        not isinstance(collected, tuple)
+        or len(collected) != 2
+        or not isinstance(collected[0], dict)
+        or not isinstance(collected[1], dict)
+    ):
+        return (False, "decode_tok_s_collected_shape_mismatch", {})
+    tokens, token_ts_ms = collected
+
+    # Shape + vocab validation per row.
+    for row_idx in sorted(tokens):
+        row_tokens = tokens[row_idx]
+        if not row_tokens:
+            return (
+                False,
+                f"decode_tok_s_row_{row_idx}_no_tokens_emitted",
+                {},
+            )
+        for i, tok in enumerate(row_tokens):
+            if not isinstance(tok, int):
+                return (
+                    False,
+                    f"decode_tok_s_row_{row_idx}_token_{i}_not_int:"
+                    f"{type(tok).__name__}",
+                    {},
+                )
+            if tok < 0 or tok >= vocab_size:
+                return (
+                    False,
+                    f"decode_tok_s_row_{row_idx}_token_{i}_out_of_vocab:"
+                    f"{tok}",
+                    {},
+                )
+
+    if 1 not in tokens or 1 not in token_ts_ms:
+        return (False, "decode_tok_s_row_1_missing", {})
+    row1_ts = token_ts_ms[1]
+    if len(row1_ts) < 2:
+        return (
+            False,
+            "decode_tok_s_row_1_needs_at_least_2_tokens_for_interval",
+            {"row1_tokens": len(row1_ts)},
+        )
+
+    if prefix_cache_hits < 1:
+        return (
+            False,
+            "decode_tok_s_prefix_cache_never_hit",
+            {"prefix_cache_hits": prefix_cache_hits},
+        )
+
+    # Steady-state inter-token throughput excluding first-token.
+    interval_s = (row1_ts[-1] - row1_ts[0]) / 1000.0
+    if interval_s <= 0.0:
+        return (
+            False,
+            "decode_tok_s_row_1_nonpositive_interval",
+            {"interval_s": interval_s},
+        )
+    row1_decode_tok_s = (len(row1_ts) - 1) / interval_s
+    row1_first_token_ms = row1_ts[0]
+
+    # Row 0's steady-state — miss path, for side-by-side comparison.
+    row0_ts = token_ts_ms.get(0, [])
+    if len(row0_ts) >= 2:
+        row0_interval_s = (row0_ts[-1] - row0_ts[0]) / 1000.0
+        row0_decode_tok_s: float | None = (
+            (len(row0_ts) - 1) / row0_interval_s
+            if row0_interval_s > 0.0
+            else None
+        )
+        row0_first_token_ms: float | None = row0_ts[0]
+    else:
+        row0_decode_tok_s = None
+        row0_first_token_ms = None
+
+    metadata: dict[str, Any] = {
+        "row1_decode_tok_s": row1_decode_tok_s,
+        "row1_first_token_ms": row1_first_token_ms,
+        "row0_decode_tok_s": row0_decode_tok_s,
+        "row0_first_token_ms": row0_first_token_ms,
+        "row0_tokens": len(tokens.get(0, [])),
+        "row1_tokens": len(tokens[1]),
+        "prefix_cache_hits": prefix_cache_hits,
+    }
+    return (True, None, metadata)
+
+
 ORACLES: dict[OracleKind, OracleFn] = {
     OracleKind.SMOKE: smoke_oracle,
     OracleKind.B1_PARITY_VS_SINGLE: b1_parity_oracle,
     OracleKind.BGT1_DIRECT_BATCHED_REFERENCE: bgt1_direct_batched_reference_oracle,
     OracleKind.TEACHER_FORCED_ARGMAX: teacher_forced_argmax_oracle,
+    OracleKind.DECODE_TOK_S_WITH_PREFIX_HIT: decode_tok_s_with_prefix_hit_oracle,
 }
 
 
@@ -522,5 +673,6 @@ __all__ = [
     "b1_parity_oracle",
     "bgt1_direct_batched_reference_oracle",
     "teacher_forced_argmax_oracle",
+    "decode_tok_s_with_prefix_hit_oracle",
     "ORACLES",
 ]
