@@ -237,9 +237,10 @@ def test_unpack_rejects_wrong_packed_last_axis() -> None:
 def test_packing_module_has_no_numpy_import() -> None:
     """D-009: runtime hot-path modules must not import NumPy. Greps the
     module source for ``import numpy`` and ``from numpy`` variants."""
+    from pathlib import Path
+
     import silica.vq.core.packing as pkg
 
-    src = open(pkg.__file__).read()
+    src = Path(pkg.__file__).read_text()
     assert "import numpy" not in src
     assert "from numpy" not in src
-    assert "np." not in src

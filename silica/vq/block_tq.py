@@ -83,7 +83,11 @@ class BlockTurboQuantMSE:
             dequantized block to unit norm before rescaling. Matches
             the ``turboquant_plus`` production behaviour and improves
             recon error.
-        dtype: output dtype for ``decode_tensor`` (D-003: fp16).
+        dtype: output dtype for ``decode_tensor``. D-003 restricts
+            this to ``{mx.float16, mx.bfloat16}`` — attention kernels
+            (mlx-lm SDPA) operate on fp16 / bf16; fp32 is rejected.
+            ``mx.float16`` is the default; ``mx.bfloat16`` is allowed
+            for Gemma-style models that carry bf16 K/V.
     """
 
     # Output dtypes permitted on the D-003 path. fp32 is deliberately
@@ -146,10 +150,11 @@ class BlockTurboQuantMSE:
         self._norm_correction = norm_correction
         self._seed = seed
 
-        # -- Offline calibration (NumPy / scipy — quarantined to
-        #    silica.vq._calibration). Upload the outputs as frozen
-        #    fp32 mx.array constants held on the codec instance.
-        #    Runtime hot path reads only these mx.array fields.
+        # -- Offline calibration (NumPy + stdlib math — scipy not used;
+        #    Lloyd-Max uses math.erf / math.exp. All NumPy is quarantined
+        #    to silica.vq._calibration). Upload the outputs as frozen
+        #    fp32 mx.array constants held on the codec instance. Runtime
+        #    hot path reads only these mx.array fields.
         rotation_np = haar_rotation(head_dim, seed)  # (d, d), float64, read-only
         sigma = 1.0 / math.sqrt(vq_block_size)
         centroids_np, _boundaries_np = lloyd_max_codebook(num_bits, sigma)

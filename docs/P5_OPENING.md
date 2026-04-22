@@ -366,20 +366,28 @@ Invariant tested at P-5-A.1: on the boundary `vq_block_size = head_dim`, `BlockT
 
 ### 4.6 Offline calibration vs runtime
 
-Codec construction runs offline (NumPy + scipy):
+Codec construction runs offline (NumPy + stdlib ``math``):
 
 ```python
 class BlockTurboQuantMSE:
     def __init__(self, *, head_dim, vq_block_size, num_bits, seed=42, norm_correction=True):
-        # --- offline, NumPy + scipy, run once ---
-        rotation_np = _haar_rotation_numpy(head_dim, seed)              # (head_dim, head_dim)
-        centroids_np, boundaries_np = _lloyd_max_codebook_numpy(
+        # --- offline, NumPy + stdlib math (scipy not used; Lloyd-Max
+        #     uses math.erf / math.exp for the standard-normal CDF / PDF),
+        #     run once ---
+        rotation_np = haar_rotation(head_dim, seed)                     # (head_dim, head_dim) float64
+        centroids_np, _boundaries_np = lloyd_max_codebook(
             num_bits, sigma=1.0 / math.sqrt(vq_block_size),
         )
-        # --- serialize into mx.array fp16 constants ---
-        self._rotation = mx.array(rotation_np, dtype=mx.float16)        # (head_dim, head_dim) fp16
-        self._centroids = mx.array(centroids_np, dtype=mx.float16)       # (2^num_bits,)
-        self._boundaries = mx.array(boundaries_np, dtype=mx.float16)     # (2^num_bits - 1,)
+        # --- serialize as fp32 mx.array constants on the codec instance.
+        #     fp32 matters: fp16 would erode Haar-matmul precision and
+        #     shift values near Lloyd-Max centroid midpoints, flipping
+        #     codebook indices relative to the vqbench reference.
+        #     Memory cost for d=256: 256 KB rotation matrix — tiny vs
+        #     the KV cache. Boundaries are not materialised as an mx.array
+        #     because MLX lacks mx.searchsorted; quantization uses
+        #     broadcast mx.argmin against centroids directly. ---
+        self._rotation = mx.array(rotation_np, dtype=mx.float32)         # (head_dim, head_dim)
+        self._centroids = mx.array(centroids_np, dtype=mx.float32)       # (2^num_bits,)
         # --- configuration ---
         self.block_size = <kv_block_size supplied separately by store>
         self.head_dim = head_dim
