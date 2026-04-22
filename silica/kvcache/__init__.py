@@ -1,6 +1,25 @@
-"""silica.kvcache — KV cache management (I-2 KVManager + I-3 KVCodec)."""
+"""silica.kvcache — KV cache management (I-2 KVManager + I-3 KVCodec).
 
-from silica.kvcache.codec import CodedBlock, IdentityCodec, KVCodec
+Codec exports carry two generations during the P-5-A.0 transition:
+
+- Pre-P-5 pair-level: ``CodedBlock`` / ``KVCodec`` / ``IdentityCodec`` —
+  still the types ``SyntheticPrefixBlockStore`` consumes today.
+- P-5 side-level: ``VectorCodec[P]`` Protocol + ``CodedPayload`` hierarchy
+  (``RawFp16Payload`` / ``BlockTQPayload`` / ``RaBitQPayload``) — the target
+  shape; reached by the store-migration commit that retires the pair-level
+  names and rewires the store's dispatch to run K and V codecs independently.
+"""
+
+from silica.kvcache.codec import (
+    BlockTQPayload,
+    CodedBlock,
+    CodedPayload,
+    IdentityCodec,
+    KVCodec,
+    RaBitQPayload,
+    RawFp16Payload,
+    VectorCodec,
+)
 from silica.kvcache.manager import (
     BlockList,
     KVHandle,
@@ -20,7 +39,9 @@ from silica.kvcache.store import (
 
 __all__ = [
     "BlockList",
+    "BlockTQPayload",
     "CodedBlock",
+    "CodedPayload",
     "IdentityCodec",
     "KVCodec",
     "KVHandle",
@@ -31,8 +52,11 @@ __all__ = [
     "PagedPrefixBlockStore",
     "PrefixBlockStore",
     "PrefixHit",
+    "RaBitQPayload",
     "RadixPrefixCache",
+    "RawFp16Payload",
     "RowState",
     "SimpleKVCache",
     "SyntheticPrefixBlockStore",
+    "VectorCodec",
 ]
