@@ -44,6 +44,28 @@ The Paged backend stubs ``register_detached`` / ``fetch_detached`` /
 kernel will define its own detached-K/V model when the trigger-gated
 track starts. Step 2 ships only the synthetic backend; the Paged
 backend lands with step 3 (RadixPrefixCache refactor).
+
+**KVCodec hook (P-4.5-C.1, docs/P4_5_C_KVCODEC_OPENING.md §3.2 / §6).**
+
+``SyntheticPrefixBlockStore`` accepts an optional ``codec: KVCodec``
+kwarg. When supplied, ``register_detached`` calls
+``codec.encode_block(k, v)`` per layer and stores the resulting
+``CodedBlock`` objects; ``fetch_detached`` calls
+``codec.decode_block(cb)`` per layer to return shape-preserving fp16
+``(K, V)`` tuples the downstream ``build_seeded_batch_kv`` expects.
+When ``codec`` is ``None`` (the pre-C.1 default), the store runs a
+pass-through path that wraps the raw tensors in ``CodedBlock`` with
+``resident_bytes = k.nbytes + v.nbytes`` — semantically identical to
+``IdentityCodec`` but without requiring ``n_kv_heads`` / ``head_dim``
+construction arguments. Either path preserves the external return
+shape contract; the two paths produce byte-identical outputs on the
+hit path under ``IdentityCodec`` because the codec returns its input
+tensors by reference.
+
+The ``PagedPrefixBlockStore`` deliberately does not accept a codec —
+Option (A) / (C) codec integration on the active-KV path is excluded
+in v0.1 by D-003 (no compressed-domain attention) and Q-009 / R-7
+(no MLX variable-length SDPA).
 """
 
 from __future__ import annotations
@@ -52,6 +74,8 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import mlx.core as mx
+
+from silica.kvcache.codec import CodedBlock, KVCodec
 
 if TYPE_CHECKING:
     from silica.kvcache.paged import PagedKVCache
@@ -170,14 +194,35 @@ class SyntheticPrefixBlockStore:
     are internal handles, not rows in a paged physical store.
     """
 
-    def __init__(self, *, block_size: int) -> None:
+    def __init__(
+        self,
+        *,
+        block_size: int,
+        codec: KVCodec | None = None,
+    ) -> None:
         if block_size <= 0:
             raise ValueError(f"block_size must be > 0, got {block_size}")
+        if codec is not None and codec.block_size != block_size:
+            raise ValueError(
+                f"codec.block_size ({codec.block_size}) must match "
+                f"store.block_size ({block_size})"
+            )
         self.block_size = block_size
+        self._codec = codec
         self._next_id: int = 0
         self._source_refs: dict[int, int] = {}
         self._hit_refs: dict[int, int] = {}
-        self._detached: dict[int, tuple[tuple[mx.array, mx.array], ...]] = {}
+        self._detached: dict[int, tuple[CodedBlock, ...]] = {}
+
+    def _encode(self, k: mx.array, v: mx.array) -> CodedBlock:
+        if self._codec is None:
+            return CodedBlock(k=k, v=v, resident_bytes=k.nbytes + v.nbytes)
+        return self._codec.encode_block(k, v)
+
+    def _decode(self, block: CodedBlock) -> tuple[mx.array, mx.array]:
+        if self._codec is None:
+            return block.k, block.v
+        return self._codec.decode_block(block)
 
     def allocate_id(self) -> int:
         """Return a monotonically-increasing fresh block id.
@@ -257,7 +302,7 @@ class SyntheticPrefixBlockStore:
                 f"(duplicate register — caller bug)"
             )
         self._detached[block_id] = tuple(
-            (k, v) for k, v in per_layer_kv
+            self._encode(k, v) for k, v in per_layer_kv
         )
 
     def fetch_detached(
@@ -267,7 +312,7 @@ class SyntheticPrefixBlockStore:
             raise KeyError(
                 f"block {block_id}: no detached K/V registered"
             )
-        return self._detached[block_id]
+        return tuple(self._decode(cb) for cb in self._detached[block_id])
 
     def release_detached(self, block_id: int) -> None:
         if block_id not in self._detached:
@@ -293,6 +338,28 @@ class SyntheticPrefixBlockStore:
     def live_block_ids(self) -> frozenset[int]:
         """Snapshot of all block ids with nonzero source refs."""
         return frozenset(self._source_refs.keys())
+
+    def resident_bytes(self) -> int:
+        """Sum of ``CodedBlock.resident_bytes`` across all detached blocks.
+
+        Parallel observable per P-4.5-C.0 opening doc §6.2 / §8.3 —
+        the total resident prefix-cache K/V bytes held by this store.
+        Under the default pass-through path (no codec) or under
+        ``IdentityCodec``, this equals ``len(live_block_ids()) ×
+        num_layers × block_size × (2 × n_kv_heads × head_dim ×
+        dtype.size)``. Under a future non-identity codec (BlockTQ /
+        RaBitQ, P-5 proper) it reflects the compressed residency.
+
+        Intentionally **not** on the ``PrefixBlockStore`` Protocol —
+        the paged backend does not track per-layer physical K/V
+        residency this way, and adding it to the Protocol would force
+        ``PagedPrefixBlockStore`` to choose between a wrong number and
+        a ``NotImplementedError`` at the Protocol boundary.
+        """
+        return sum(
+            sum(cb.resident_bytes for cb in coded_tuple)
+            for coded_tuple in self._detached.values()
+        )
 
 
 class PagedPrefixBlockStore:

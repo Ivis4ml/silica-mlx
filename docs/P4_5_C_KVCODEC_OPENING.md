@@ -549,31 +549,58 @@ Explicit non-goals so the commit scope is bounded:
 ## 8. Live-forward acceptance specification
 
 Four assertions, each tied to a specific call site or observable. All
-run on `Qwen/Qwen3-0.6B` (cached), under the existing
-`SILICA_REAL_QWEN3` gate pattern used elsewhere in the test suite.
+on-device assertions run on `Qwen/Qwen3-0.6B` (cached); cache-presence
+gates follow the same pattern
+`tests/test_engine_admission_reorder.py` §5 uses.
 
-### 8.0 Why `generate_batch` rather than `generate`
+### 8.0 Entry point and workload shape
 
-`Engine.generate(prompt, params)` drives `self._kv_manager` (= a P-1
-`SimpleKVCache`) via `self._drive` — a pure single-request path that
-calls `adapter.prefill` / `adapter.decode_step` without routing through
-the `ContinuousBatcher`. It has no `prefix_cache` parameter; the
-detached-K/V hook is not reached.
+**`Engine.generate(prompt, params)`** drives `self._kv_manager` (= a
+P-1 `SimpleKVCache`) via `self._drive` — a pure single-request path
+that calls `adapter.prefill` / `adapter.decode_step` without routing
+through `ContinuousBatcher`. It takes no `prefix_cache` argument and
+never touches the detached-K/V hook. Do not use it for verification.
 
-`Engine.generate_batch(prompts, params, *, prefix_cache=...,
-max_batch_size=...)` drives `ContinuousBatcher` and is the only entry
+**`Engine.generate_batch(prompts, params, *, prefix_cache=...,
+max_batch_size=...)`** drives `ContinuousBatcher` and is the entry
 point that exercises `RadixPrefixCache.insert_detached` /
 `fetch_detached_blocks` → `SyntheticPrefixBlockStore.register_detached`
-/ `fetch_detached`. Every acceptance clause in §8.1–§8.4 therefore
-uses `generate_batch([prompt], params, prefix_cache=shared_pc,
-max_batch_size=1)`, even though the workload is one prompt.
+/ `fetch_detached`. But not every `generate_batch` shape exercises the
+hit branch — and the choice of shape is load-bearing for acceptance:
 
-### 8.1 Encode-side counter on cold first request
+- **Initial cohort (`_prepare_cohort`) does not consult the prefix
+  cache.** Every admission that goes through `batcher.add_request`
+  before the first `step()` is sealed into the initial cohort and runs
+  a miss-path batched prefill unconditionally. Prefix-cache lookup
+  (`peek` → `_admit_single_hit_row`) only fires inside
+  `_admit_waiting_requests`, i.e. mid-run admission after the initial
+  cohort has already run its prefill. This is a P-2 Option B design
+  fact, not a bug (cross-cohort prefix reuse would complicate the
+  cohort-seal invariant and was deferred); it is recorded as open
+  question **Q-012** in PLAN §10 for a follow-up look.
+- **Consequence for C.1 acceptance:** two consecutive
+  `generate_batch([prompt], ..., prefix_cache=shared_pc,
+  max_batch_size=1)` calls would *both* run miss-path prefills — the
+  second call's single admission is sealed into its own fresh initial
+  cohort and never queries `shared_pc`. Encode fires on both calls
+  (prefix is registered when row 0 terminates); decode never fires.
+  The acceptance must instead use a **single** `generate_batch([p,
+  p], ..., prefix_cache=shared_pc, max_batch_size=1)` call: prompt 0
+  admits into the initial cohort and runs miss-path prefill; prompt 1
+  enters the waiting queue; after row 0 terminates and reclaim
+  registers its aligned prefix (via `_extract_and_insert_prefix`),
+  the next `step()` invokes `_admit_waiting_requests`, which routes
+  prompt 1 through `_admit_single_hit_row` → `fetch_detached_blocks`
+  → `codec.decode_block`. The single-call `[p, p]` workload shape
+  therefore exercises both paths in one go and is what every
+  assertion below uses.
+
+### 8.1 Encode + decode counters on paired-prompt single call
 
 Construct a counting-wrapper `IdentityCodec` that increments
-`encode_calls` and `decode_calls` on each method, and build the
+`encode_calls` / `decode_calls` on each method, and build the
 `RadixPrefixCache` with a `SyntheticPrefixBlockStore(codec=...)` that
-wraps this counter. Run:
+wraps this counter. Run one `generate_batch` call:
 
 ```python
 from silica.engine import Engine
@@ -586,78 +613,68 @@ engine = Engine(adapter, kv)
 store = SyntheticPrefixBlockStore(block_size=16, codec=counting_codec)
 shared_pc = RadixPrefixCache(block_size=16, store=store)
 events = list(engine.generate_batch(
-    [prompt], params, prefix_cache=shared_pc, max_batch_size=1,
+    [prompt, prompt],  # two copies — see §8.0
+    params,
+    prefix_cache=shared_pc,
+    max_batch_size=1,
 ))
 ```
 
 (Construction pattern mirrors `scripts/bench_p2_baseline.py:149-150`
 and `scripts/probe_p2_preload.py:113` — `adapter_for_repo(repo)` +
 `Engine(adapter, kv)`. The `SyntheticPrefixBlockStore(codec=...)`
-constructor kwarg is the C.1 deliverable; it does not exist in the
-pre-C.1 tree.)
+constructor kwarg is the C.1 deliverable.)
 
-The first admission flows through the batcher's miss path:
-`_admit_miss_cohort` → `RadixPrefixCache.insert_detached` →
-`store.register_detached` → `codec.encode_block` per layer per
-newly-inserted block.
+Row 0 flows through the miss path:
+`_admit_miss_cohort` → initial-cohort prefill → decode until
+`max_tokens` → terminal →
+`_extract_and_insert_prefix` → `insert_detached` →
+`store.register_detached` → `codec.encode_block` per layer per aligned
+block.
 
-**Assertion:** `encode_calls >= block_count × num_layers` where
-`block_count = floor(len(prompt_tokens) / block_size)`.
+Row 1 then enters `_admit_waiting_requests`, which sees the now-
+populated prefix: `peek` → `_admit_single_hit_row` → `lookup` →
+`fetch_detached_blocks` → `store.fetch_detached` →
+`codec.decode_block` per layer per usable hit block.
 
-**Prompt-length requirement:** `len(prompt_tokens) >= 2 × block_size +
-1 = 33` (with default Qwen3 `block_size = 16`). The `+1` satisfies the
-batcher invariant S-5 edge 1 — `_admit_single_hit_row` reserves at
-least one suffix token via `max_aligned = ((len - 1) // block_size) ×
-block_size` (see `silica/scheduler/batcher.py` ~ line 1011), so a
-33-token prompt produces `max_aligned = 32` and exactly 2 aligned
-hit-able blocks on the paired repeat. Without the `+1`, a 32-token
-prompt encodes 2 blocks on cold admission but the repeat-hit path
-would only decode 1 block — making §8.1 and §8.2 assert different
-block counts on the same prompt, which would be confusing. A
-catalog-test-style `test_prompt_actually_tokenizes_to_at_least_33_tokens`
-invariant (loads the real Qwen3 tokenizer) guards against future
-tokenization changes silently reducing the count; it follows the same
-pattern the BGT1-parity catalog test uses.
+**Encode assertion:**
+`encode_calls >= floor(len(prompt_tokens) / block_size) × num_layers`.
+(`_extract_and_insert_prefix` slices `aligned_tokens = (computed_len
+// block_size) × block_size` with `computed_len ≥ prompt_len`, so the
+lower bound uses `floor(prompt_len / block_size)` without the `- 1`
+adjustment.)
 
-**Cold-run decode assertion:** `decode_calls == 0`. A single cold
-request does not produce a prefix-cache hit — its own blocks are not
-in the tree when it prefills.
+**Decode assertion:**
+`decode_calls >= floor((len(prompt_tokens) - 1) / block_size) × num_layers`.
+`_admit_single_hit_row` in `silica/scheduler/batcher.py` around line
+1011 uses `max_aligned = ((len - 1) // block_size) * block_size` to
+leave at least one suffix token for first-token prefill — invariant
+S-5 edge 1.
 
-### 8.2 Decode-side counter on paired repeat-prompt
+**Prompt-length requirement:** `len(prompt_tokens) >= 2 * block_size + 1`,
+which equals 33 under the default Qwen3 `block_size = 16`, **and**
+`len(prompt_tokens) % block_size != 0`. Under the guarded length,
+`floor(len / bs) == floor((len - 1) / bs)`, so both assertions use
+the same `block_count` lower bound and a count asymmetry would signal
+a real integration bug. An exact multiple of `block_size` would split
+them by one block and the two clauses would assert different numbers
+on the same prompt — confusing rather than informative. A
+catalog-test-style `test_prompt_tokenization_invariants` guards both
+halves against tokenizer changes; under the `_PROMPT_FIXTURE` shipped
+with C.1 the prompt measures 34 tokens (mod 16 == 2).
 
-With the same `shared_pc` (importantly — the caller owns the prefix
-cache across `generate_batch` invocations, per the `prefix_cache`
-kwarg docstring), issue a second `generate_batch([prompt], params,
-prefix_cache=shared_pc, max_batch_size=1)` with the same prompt (or
-any prompt whose block-aligned prefix matches the first). The
-second admission routes through the hit path: `peek` →
-`RadixPrefixCache.lookup` → `fetch_detached_blocks` →
-`store.fetch_detached` → `codec.decode_block` per layer per hit block.
-
-**Assertion:** on the second request, `decode_calls >= usable_hit_blocks
-× num_layers` where
-`usable_hit_blocks = floor((len(prompt_tokens) - 1) / block_size)`.
-With the `len ≥ 33` requirement above, this equals 2 and matches the
-`encode_calls` count from §8.1.
-
-**Rationale for splitting the encode / decode acceptance:** a single
-cold `generate_batch` call exercises `register_detached` only;
-`fetch_detached` fires only on a second request that hits the prefix
-cache. The original PLAN wording "≥ 1 call per active KV block on a
+The original PLAN wording "≥ 1 call per active KV block on a
 single-request `Engine.generate('Hello', max_tokens=4)` run"
-overspecified — "Hello" tokenizes to ≪ `block_size`, so the prefix
-tree has zero aligned nodes and the paired assertion has nothing to
-count; and even with a longer prompt, a single cold run exercises
-encode only, so a decode-side bug would pass silently. PLAN's
-acceptance bullet is amended in the same commit as this opening doc
-(not deferred to C.1) to match the two-clause specification above.
+overspecified on three axes (wrong entry point; "Hello" tokenizes to
+≪ `block_size`; a single cold request never fires the decode path);
+PLAN is amended in the same commit as this opening to match §8.1
+above.
 
-### 8.3 `store.resident_bytes()` parity with the radix-tree total
+### 8.2 `store.resident_bytes()` parity with the radix-tree total
 
-On the same paired run:
+After the same `[p, p]` workload:
 
 ```python
-# after cold admission
 store = shared_pc._store
 total_blocks = len(store.live_block_ids())       # total resident prefix blocks
 num_layers = engine._adapter.config.num_layers
@@ -676,31 +693,32 @@ The right-hand side is **not** `_count_evictable_prefix_blocks ×
 _kv_bytes_per_block`. That budgeter helper counts *leaf nodes with
 zero live hits* — the eviction-candidate set — and deliberately skips
 internal radix nodes (see `silica/scheduler/budget.py` ~ line 353).
-For a 33-token prompt the tree is a chain (root → node1 → node2); only
-node2 is a leaf, so the budgeter would report 1 block while the store
-holds 2 and the radix tree has `node_count() == 2`. `node_count()` is
-the total-resident view this §8.3 assertion requires.
+For a 34-token prompt the tree is a chain (root → node1 → node2);
+only node2 is a leaf, so the budgeter would report 1 block while the
+store holds 2 and the radix tree has `node_count() == 2`.
+`node_count()` is the total-resident view this §8.2 assertion
+requires.
 
-Under a future BlockTQCodec, `store.resident_bytes()` diverges from the
-`total_blocks × num_layers × block_size × bytes_per_token_per_layer`
-formula (the whole point of the codec). P-5 proper will extend §8.3
-into a "store is the authority" assertion and let the budgeter read
-it; the P-4.5-C test pins only today's identity invariant.
+Under a future BlockTQCodec, `store.resident_bytes()` diverges from
+the `total_blocks × num_layers × block_size ×
+bytes_per_token_per_layer` formula (the whole point of the codec).
+P-5 proper will extend §8.2 into a "store is the authority"
+assertion and let the budgeter read it; the P-4.5-C test pins only
+today's identity invariant.
 
-### 8.4 Baseline-identity numerical invariant
+### 8.3 Baseline-identity numerical invariant
 
-Run the same paired `generate_batch` pattern once with a non-codec
-`SyntheticPrefixBlockStore` (today's code, detached K/V stored as raw
-tuples — `codec=None` default if we keep backward compatibility, or an
-equivalent baseline construction) and once with the counting
-`IdentityCodec`-wrapped store. Assert both runs' emitted token
-sequences are byte-identical — not within fp16 tolerance, but exactly
-equal.
+Run the same `[p, p] max_batch_size=1` workload twice — once with a
+no-codec `SyntheticPrefixBlockStore(block_size=...)` (`codec=None`,
+pass-through), once with a `SyntheticPrefixBlockStore(block_size=...,
+codec=IdentityCodec(...))`. Both row 0's and row 1's emitted token
+sequences must be byte-identical between the two runs — not within
+fp16 tolerance, but exactly equal.
 
 Under `IdentityCodec.decode_block(block)` returning `(block.k,
 block.v)` (`silica/kvcache/codec.py:101-102`), the concatenated
 `mx.concatenate(k_parts, axis=2)` in `build_seeded_batch_kv` produces
-a tensor that is bitwise identical to what the no-codec path
+a tensor that is bitwise identical to what the pass-through path
 produces — `CodedBlock.__init__` at `codec.py:98-99` assigns `k` / `v`
 by reference without copy. Any divergence here is an integration bug,
 not an fp16 drift issue; the codec literally does nothing.
@@ -712,14 +730,26 @@ batch composition, so the fp16 drift problem that forced the
 three-layer criterion in chunked-prefill acceptance does not arise.
 Byte-identity is achievable and strictly stronger; use it.
 
-**C.1 implementation note (not part of this opening):** the
-byte-identity test should assert at the tensor-reference level
-(`is` / `id()`) on the per-block K/V returned by `fetch_detached`, not
-just value equality via `mx.array_equal` — a future codec that
-silently inserts a defensive copy inside `encode_block` or
-`decode_block` would regress from "byte-identical reference" to
-"byte-identical value" silently, but the `is`-level check would fail
-loudly. Recorded here so it lands with the C.1 test.
+The `[p, p]` shape matters for §8.3 specifically because row 1
+exercises the hit path on both runs. A single-prompt shape would only
+exercise the miss path, and §8.3 would fall back to comparing fp16
+prefill outputs — which is still a valid byte-identity claim under
+`IdentityCodec` but loses the hit-path coverage that catches codec
+bugs inside `decode_block`.
+
+### 8.4 Tensor-reference tripwire (C.1 implementation note)
+
+The §8.3 token-stream byte-identity assertion is value-level. A
+future codec that silently inserts a defensive copy inside
+`encode_block` or `decode_block` would regress from byte-identical-
+reference to byte-identical-value without failing §8.3 — the copied
+tensor holds the same bytes. The C.1 test adds a tripwire that uses
+`is` / `id()` on the per-block K/V returned by `fetch_detached`
+after a direct `register_detached` round-trip on synthetic tensors,
+asserting reference preservation. Runs without the HF cache so it
+stays green on cold CI. Recorded here so future codec authors know
+the tripwire exists and either match the IdentityCodec reference-
+preservation contract or explicitly update this invariant.
 
 ---
 
