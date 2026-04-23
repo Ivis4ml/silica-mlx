@@ -3,7 +3,7 @@
 | Field        | Value                                                 |
 | ------------ | ----------------------------------------------------- |
 | Phase        | P-5-C.2 (codec-backed PPL oracle + bench rows)        |
-| Status       | Step 3a landed; step 3b pending                       |
+| Status       | Step 3a + step 3b landed                              |
 | Depends on   | C.2 step 1 (oracle, commit `e25893a`), step 2 (loader, commit `72c686f`) |
 | Maintainer   | Xin Zhou                                              |
 | Opened       | 2026-04-23                                            |
@@ -31,8 +31,12 @@ bench rows on the Qwen3-0.6B adapter:
 | `qwen3-0.6b-wikitext-ppl-block-tq-b64-b4`   | `block_tq_b64_b4` | `teacher_forced_chunked_nll_with_codec`     |
 | `qwen3-0.6b-wikitext-ppl-ext-rabitq-b4`     | `ext_rabitq_b4`   | `teacher_forced_chunked_nll_with_codec`     |
 
-The fp16 row establishes the baseline PPL; the three codec rows
-report ΔPPL against the baseline. Model pinned to Qwen3-0.6B for
+The fp16 row records the baseline PPL; the three codec rows
+record raw PPL numbers for later pairing. ΔPPL vs fp16 is a
+downstream derivation (bench report / C.6 vqbench cross-check)
+and is **not** wired into the runner in step 3a — the oracle
+accepts a ``context["ppl_fp16"]`` for future use, but
+``_run_ppl`` never populates it. Model pinned to Qwen3-0.6B for
 consistency with the existing `qwen3-0.6b-prefix-hit-decode-*`
 rows (`has_recurrent_state=False`, accepts `RadixPrefixCache`).
 
@@ -339,9 +343,10 @@ Integration with a real Qwen3-0.6B lives in step 3b.
       step 3a emits raw PPL numbers only; ΔPPL vs the fp16
       baseline is a downstream derivation (bench report / C.6
       vqbench cross-check), not wired into the runner in 3a.
-- [ ] End-to-end bench CLI smoke (`python -m scripts.bench --scenario
-      qwen3-0.6b-wikitext-ppl-fp16`) — deferred to step 3b
-      alongside the `prepare_wikitext2_cache.py` script.
+- [x] End-to-end bench CLI smoke landed in step 3b as
+      `tests/test_bench_ppl_scenarios_integration.py` (cache +
+      wikitext + env-var triple-gated; exercises fp16 row via
+      `BenchRunner._run_one` on real Qwen3-0.6B weights).
 - [x] Adjacent regression sweep green: 204-test sweep across
       `test_ppl_oracle_fn`, `test_run_ppl`, `test_ppl_oracle`,
       `test_ppl_oracle_codec`, `test_wikitext_loader`,
@@ -351,47 +356,73 @@ Integration with a real Qwen3-0.6B lives in step 3b.
       that keeps `_run_ppl`'s `ModelAdapter` type annotation honest
       at test sites using a subset-Protocol fake adapter).
 
-## 4. Design — step 3b (forward reference)
+## 4. Step 3b (landed)
 
-### 4.1 `scripts/prepare_wikitext2_cache.py`
+### 4.1 `scripts/prepare_wikitext2_cache.py` (landed)
 
-Standalone script (no `silica.*` imports beyond stdlib + HF
-datasets) that extracts `wikitext-2-raw-v1` test split, joins the
-`text` field with double newlines, and writes UTF-8 to
-`~/.cache/silica/wikitext2-test.txt`.
+Standalone one-shot preparer. The silica bench runtime does **not**
+depend on `datasets`; `from datasets import load_dataset` is
+deferred into `main()` so an import-time absence still lets
+argument parsing and `--help` succeed with a clean
+`SystemExit("install with: uv pip install datasets ...")`.
 
-```python
-# scripts/prepare_wikitext2_cache.py
-from __future__ import annotations
-from pathlib import Path
+Text format mirrors vqbench's streaming_ppl preprocessing verbatim:
+`"\n\n".join(row["text"] for row in ds)`. No `.strip()`, no
+empty-line filter — WikiText-2's article-boundary empty rows are
+part of the tokenizer-consumed signal; stripping would drift
+silica PPL from vqbench REPORT numbers.
 
-def main() -> None:
-    from datasets import load_dataset
-    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
-    text = "\n\n".join(row["text"] for row in ds)
-    out_path = Path.home() / ".cache" / "silica" / "wikitext2-test.txt"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(text, encoding="utf-8")
-    print(f"Wrote {len(text):,} chars to {out_path}")
+Write is atomic via a sibling tempfile + `os.replace` so a
+mid-write interrupt cannot leave a truncated file that satisfies
+the runner's `is_file()` gate but breaks `load_wikitext_text`.
 
-if __name__ == "__main__":
-    main()
-```
+### 4.2 `tests/test_prepare_wikitext2_cache.py` (landed, 12 tests)
 
-### 4.2 Integration test
+Stubs `sys.modules["datasets"]` with a fake `load_dataset` that
+returns a list of `{"text": ...}` rows. Pins:
 
-`tests/test_bench_ppl_scenarios_integration.py` (new, cache-gated):
+- Default output path matches
+  `silica.bench.scenarios._WIKITEXT2_DEFAULT_PATH` (drift-lock).
+- Text join uses `"\n\n"` between rows; empty rows preserved.
+- `load_dataset` called with `("wikitext", "wikitext-2-raw-v1",
+  split="test")`.
+- Atomic write: tempfile leaves no residue on success; a simulated
+  `os.replace` failure keeps the pre-existing file intact.
+- CLI flow: `--out <path>` writes there, default `--out` resolves
+  via `Path.home()`, existing file is no-op without `--overwrite`.
+- `datasets` import absence → `SystemExit` with install hint, not
+  `ImportError`.
 
-- Dual gate: HF cache present for `Qwen/Qwen3-0.6B` AND wikitext
-  cache file present at `~/.cache/silica/wikitext2-test.txt`.
-- Runs `BenchRunner.run(_QWEN3_0_6B_WIKITEXT_PPL_FP16)` end-to-end.
-- Asserts `status=="ok"`, `metadata["n_tokens"] > 0`,
-  `metadata["ppl"]` finite and positive.
+### 4.3 `tests/test_bench_ppl_scenarios_integration.py` (landed)
 
-Codec rows deliberately not run in this integration test — their
-codec path is already covered by `test_prefix_hit_decode_speed_gate.py`
-(A.3c + B.3), and a real-model PPL run for three codecs per CI
-sweep is expensive for marginal coverage.
+Triple-gated real-model test (matches the prefix-hit decode +
+P3 model-smoke pattern):
+
+1. `Qwen/Qwen3-0.6B` HF cache present.
+2. WikiText cache file present at the scenario's configured
+   `wikitext_path`.
+3. `SILICA_SKIP_MODEL_TESTS` env var not set to `"1"`.
+
+Two tests:
+
+- `test_qwen3_0_6b_wikitext_ppl_fp16_end_to_end` — runs
+  `BenchRunner._run_one(_SCENARIO)` with real Qwen3-0.6B weights +
+  real tokenizer + real WikiText file. Asserts `status == "ok"`,
+  `metadata["ppl"]` finite and positive, `n_tokens >=
+  min_scored_tokens`, `total_tokens == n_tokens`. Verifies the
+  whole "tokenizer + weights + runner + gate + oracle" chain.
+- `test_wikitext_missing_cache_skips_before_model_load` — runs
+  the scenario with a bogus `wikitext_path` override; asserts
+  `status == "skipped"` and `reason.startswith(
+  "wikitext_cache_missing:")`. Active whenever the Qwen3-0.6B HF
+  cache is present, regardless of WikiText cache file state —
+  the test verifies the gate itself, independent of whether the
+  real end-to-end path would have worked.
+
+Codec rows deliberately excluded — the C.2 counting-codec harness
++ A.3c / B.3 prefix-hit decode tests already cover the
+encode/decode path. 3b's marginal value is proving the full
+real-model chain works for one configuration.
 
 ## 5. Open questions (resolved during step 3a implementation)
 
@@ -452,3 +483,12 @@ return (fp16 baseline) vs populated cache (codec path).
   extended with a PPL wikitext-path gate so missing cache
   file skips pre-load; (4) scenario descriptions no longer
   claim runner-side ΔPPL propagation (not wired in 3a).
+- **2026-04-23**: step 3b landed —
+  `scripts/prepare_wikitext2_cache.py` one-shot preparer
+  (atomic write, datasets-import deferred, vqbench-faithful
+  `"\n\n".join(text)`), `tests/test_prepare_wikitext2_cache.py`
+  (12 tests, fake `datasets` module), and
+  `tests/test_bench_ppl_scenarios_integration.py` (triple-gated
+  real-model e2e + wikitext-missing-gate regression lock).
+  Top-level §1 summary sentence corrected to reflect
+  raw-PPL-only 3a output.
