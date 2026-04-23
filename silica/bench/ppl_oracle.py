@@ -1,60 +1,69 @@
 """silica.bench.ppl_oracle — MLX-native teacher-forced streaming PPL.
 
-P-5-C.1 core: evaluate perplexity of a token sequence under the model
-currently bound to a :class:`ModelAdapter`, with chunked streaming so
-arbitrarily long contexts do not need to fit in one forward pass.
+Two entry points, one per P-5-C sub-unit:
 
-Algorithm mirrors vqbench's ``vqbench/validation/streaming_ppl.py``
-``evaluate_streaming_ppl`` verbatim at the math level (manual NLL,
-chunk-boundary scoring, shared cache across chunks):
+- :func:`teacher_forced_chunked_nll` — P-5-C.1 landed. Cache-agnostic
+  fp16 baseline oracle. One ``BatchKVCache`` allocated at sequence
+  start via ``adapter.make_batch_cache([0])`` and *shared across
+  chunks* (mlx-lm mutates in place); chunk-boundary scored via the
+  previous chunk's last logit; within-chunk scored via shift-by-1.
+  The codec is **never** exercised on this path — whatever cache the
+  adapter hands out is used directly. Mirrors vqbench's
+  ``validation/streaming_ppl.py`` math at the fp16 baseline.
 
-1. Allocate one cache list at sequence start via
-   ``adapter.make_batch_cache([0])``. Do **not** reset between chunks —
-   mlx-lm mutates the cache in place so prior chunks' K/V remain
-   available when the next chunk runs. This is what makes the PPL
-   result chunk-size invariant.
-2. For each ``chunk`` of ``chunk_size`` tokens, forward through the
-   model using the (growing) cache list and grab all-position logits
-   ``(1, chunk_len, V)``. Use :func:`forward_batched_full` — the
-   last-position-only ``forward_batched`` is insufficient.
-3. **Chunk boundary scoring**: starting from the second chunk, the
-   first token of the current chunk is predicted from the last
-   position of the previous chunk's logits. Add
-   ``CE(prev_last_logit, chunk_tokens[:, 0])`` to the running nll.
-4. **Within-chunk scoring**: for every position ``i > 0`` within a
-   chunk, the model predicts ``chunk_tokens[i]`` from
-   ``logits[:, i - 1, :]``. The standard shift-by-1 computation
-   ``CE(logits[:, :-1, :], chunk_tokens[:, 1:])`` captures this.
-5. Total scored tokens = ``seq_len - 1`` (the very first token has no
-   prior context; every other token is scored exactly once).
+- :func:`teacher_forced_chunked_nll_with_codec` — P-5-C.2 landing.
+  Codec-backed arm. Each chunk ≥ 1 seeds a **fresh** per-chunk
+  ``BatchKVCache`` from the prior prefix blocks (``prefix_cache.lookup``
+  → ``fetch_detached_blocks`` → :func:`build_seeded_batch_kv`) — the
+  decode-tensor hot path fires here. After each forward, the newly-
+  grown aligned-prefix blocks are extracted from the post-forward
+  cache and re-registered via ``prefix_cache.insert_detached`` so the
+  next chunk can consume them through the codec — the encode-tensor
+  hot path fires here. A payload under a non-identity codec (BlockTQ,
+  ExtRaBitQ) loses information on the store round trip, so ΔPPL
+  against the fp16 baseline becomes an observable. Under
+  ``IdentityCodec`` the two entry points coincide (lossless round
+  trip — regression-locked in the C.2 test suite).
 
-Chunk invariance is a correctness invariant: PPL(chunk=128) must
-equal PPL(chunk=256) must equal PPL(chunk=512) to within fp rounding.
-Test pinned in :mod:`tests.test_ppl_oracle`.
+Chunk-invariance invariant (C.1): ``PPL(chunk=128) == PPL(chunk=256)
+== PPL(chunk=512)`` to within fp rounding. Tested in
+:mod:`tests.test_ppl_oracle` (C.1) and :mod:`tests.test_ppl_oracle_codec`
+(C.2 under identity codec — the codec-backed path must match the
+shared-cache fp16 baseline to fp tolerance).
 
 Scope boundary:
 
-- This module takes ``token_ids`` as input; it does not tokenize raw
-  text. C.2 will add a tokenizer wrapper for the WikiText-2 bench
-  row. Keeping the oracle helper text-free makes unit testing
-  cheaper (no network / dataset dependency) and lets the same helper
-  power future PPL evaluations against arbitrary token streams.
-- The compressed KV-cache arm (compressed-codec streaming PPL) is
-  also deferred — v0.1 ships PPL against the *bound* adapter's cache
-  (fp16 `BatchKVCache` or compressed `SyntheticPrefixBlockStore`-
-  derived caches once wiring exists). For P-5-C.1 the oracle is used
-  by the fp16 baseline row; later scenarios swap the adapter's cache
-  to the compressed path.
+- Both entry points take ``token_ids`` as input; they do not tokenize
+  raw text. C.2's WikiText-2 loader lands as a separate helper so the
+  oracle itself stays text-free and unit-testable without a tokenizer
+  or dataset dependency.
+- Neither entry point routes through ``Engine.generate_batch`` — that
+  is a sampling API that does not return positional logits. Both go
+  straight through ``adapter._model`` (scheduler convention) using
+  :func:`silica.mlx.runner.forward_batched_full` for all-position
+  logits.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, cast
 
 import mlx.core as mx
 
 from silica.mlx.runner import forward_batched_full
+from silica.scheduler.seed_kv import build_seeded_batch_kv
+
+
+def _mx_1d_to_int_list(arr: mx.array) -> list[int]:
+    """Convert a 1-D ``mx.array`` of integer token ids to ``list[int]``.
+
+    Wraps ``.tolist()`` + ``cast`` to satisfy mypy's strict view of the
+    union-returning stub; at runtime a 1-D integer array always gives
+    a ``list[int]``.
+    """
+    raw = cast(list[int], arr.tolist())
+    return [int(x) for x in raw]
 
 
 def teacher_forced_chunked_nll(
@@ -173,6 +182,300 @@ def teacher_forced_chunked_nll(
         mx.eval(prev_last_logit)
 
     return total_nll, total_tokens
+
+
+def teacher_forced_chunked_nll_with_codec(
+    adapter: Any,
+    prefix_cache: Any,
+    token_ids: mx.array,
+    *,
+    chunk_size: int = 256,
+) -> tuple[float, int]:
+    """Cumulative teacher-forced NLL routed through a ``RadixPrefixCache``.
+
+    The P-5-C.2 codec-backed oracle arm. Unlike
+    :func:`teacher_forced_chunked_nll` (which shares the adapter's
+    ``BatchKVCache`` across chunks verbatim, never touching the
+    codec), this entry point rebuilds the cache each chunk from the
+    prior aligned-prefix blocks owned by ``prefix_cache`` — the store's
+    ``encode_tensor`` / ``decode_tensor`` hot path fires on every
+    insertion and retrieval.
+
+    Per-chunk flow:
+
+    1. **Chunk 0 (cold).** Allocate a fresh
+       ``adapter.make_batch_cache([0])``; run the forward. The cache
+       has no pre-forward K/V to decode.
+    2. **Chunk i ≥ 1 (hit).** Look up the aligned prefix
+       ``tokens[:i * chunk_size]`` in ``prefix_cache``;
+       ``fetch_detached_blocks`` decodes every hit block through the
+       store's per-side codecs (``decode_tensor`` fires here), then
+       :func:`build_seeded_batch_kv` wires the decoded K/V into a
+       fresh ``BatchKVCache(B=1)``. The new chunk is forwarded through
+       that seeded cache.
+    3. **After each forward.** Extract every aligned block from the
+       post-forward cache up to the aligned high-water mark; call
+       ``prefix_cache.insert_detached`` which registers the newly
+       computed blocks through the store (``encode_tensor`` fires
+       here) and touches the already-present duplicate-prefix blocks
+       (no re-encode).
+
+    Scoring mirrors :func:`teacher_forced_chunked_nll` verbatim:
+    chunk-boundary token scored against the previous chunk's last
+    logit (materialized via ``mx.contiguous`` + ``mx.eval`` before the
+    next seed rebuild discards the current cache), within-chunk
+    scored via the shift-by-1 pattern.
+
+    Under :class:`silica.kvcache.codec.IdentityCodec` the codec is a
+    lossless round trip and this function's returned ``(nll_sum,
+    n_tokens)`` matches :func:`teacher_forced_chunked_nll` on the same
+    token stream to fp rounding (regression-locked in the C.2 test
+    suite). Under a lossy codec (BlockTQ, ExtRaBitQ), prior chunks'
+    K/V is distorted on the encode/decode round trip; the resulting
+    NLL delta against the fp16 baseline is the ΔPPL the bench row
+    reports.
+
+    Args:
+        adapter: same contract as :func:`teacher_forced_chunked_nll`
+            — must expose ``_model`` (the mlx-lm module) and
+            ``make_batch_cache([0])`` (fresh per-layer ``BatchKVCache``
+            list at batch=1, ``left_padding=[0]``).
+        prefix_cache: a :class:`silica.kvcache.prefix.RadixPrefixCache`
+            whose backing store is a
+            :class:`silica.kvcache.store.SyntheticPrefixBlockStore`
+            with the desired ``k_codec`` / ``v_codec`` installed. The
+            cache is expected to be empty at entry (the oracle drives
+            insertions itself) but is not required to be; pre-populated
+            caches simply become a cold-start amortization for long
+            sequences.
+        token_ids: ``(1, seq_len)`` ``mx.array`` of token ids. B=1 only.
+        chunk_size: tokens per forward. Must be a positive multiple of
+            ``prefix_cache.block_size`` — the oracle relies on each
+            chunk's boundary being aligned with block granularity so
+            that ``prefix_cache.lookup`` returns a full prefix hit for
+            every token seen so far. Misalignment would leave a tail
+            of tokens outside the prefix cache's coverage and break
+            the seeded-cache-per-chunk assumption. vqbench's
+            ``streaming_ppl`` uses ``chunk_size=256`` against its own
+            ``block_size=16`` KV-cache block; silica mirrors the
+            divisibility contract.
+
+    Returns:
+        ``(nll_sum, n_tokens_scored)`` — same shape as the C.1 oracle.
+        Feed into :func:`perplexity_from_nll` for PPL.
+
+    Raises:
+        ValueError: shape / B / chunk_size validation; also raised
+            when ``chunk_size % prefix_cache.block_size != 0``.
+    """
+    if token_ids.ndim != 2:
+        raise ValueError(
+            f"token_ids must be 2-D (1, seq_len); got shape "
+            f"{tuple(token_ids.shape)}"
+        )
+    B, seq_len = token_ids.shape
+    if B != 1:
+        raise ValueError(
+            f"teacher_forced_chunked_nll_with_codec supports B=1 only "
+            f"(streaming PPL is per-sequence); got B={B}"
+        )
+    if chunk_size < 1:
+        raise ValueError(f"chunk_size must be >= 1; got {chunk_size}")
+    block_size = prefix_cache.block_size
+    if chunk_size % block_size != 0:
+        raise ValueError(
+            f"chunk_size ({chunk_size}) must be a positive multiple of "
+            f"prefix_cache.block_size ({block_size}); misaligned chunks "
+            f"leave a tail outside the prefix cache's block-granular "
+            f"coverage and break the seeded-cache-per-chunk contract."
+        )
+    if seq_len == 0:
+        return 0.0, 0
+
+    model = adapter._model
+
+    total_nll = 0.0
+    total_tokens = 0
+    prev_last_logit: mx.array | None = None
+    num_layers: int | None = None
+
+    for start in range(0, seq_len, chunk_size):
+        end = min(start + chunk_size, seq_len)
+        chunk_tokens = token_ids[:, start:end]  # (1, chunk_len)
+        chunk_len = end - start
+
+        if start == 0:
+            # Cold path — no prior prefix, allocate a fresh cache.
+            cache_list = adapter.make_batch_cache([0])
+            num_layers = len(cache_list)
+        else:
+            # Hit path — look up aligned prefix and seed a fresh cache
+            # from the store-owned decoded K/V. ``lookup`` increments
+            # hit refs; the ``release`` call after ``fetch_detached_blocks``
+            # matches the scheduler's admission-hit pattern.
+            assert num_layers is not None
+            prefix_token_list = _mx_1d_to_int_list(token_ids[0, :start])
+            hit = prefix_cache.lookup(prefix_token_list)
+            # ``lookup`` retained hit refs on every returned block; the
+            # matched scheduler pattern releases them after the seeded
+            # cache is materialized. Wrap in ``try/finally`` so a
+            # partial-hit RuntimeError or an exception from
+            # ``fetch_detached_blocks`` / ``build_seeded_batch_kv``
+            # does not leak live-hit refs into the store — a leaked
+            # ref would poison later eviction / reuse if the caller
+            # shares this ``prefix_cache`` across sequences.
+            try:
+                if hit.num_hit_tokens != start:
+                    raise RuntimeError(
+                        f"prefix_cache.lookup returned {hit.num_hit_tokens} "
+                        f"hit tokens; expected full prefix hit of {start} "
+                        f"tokens (chunk_size % block_size contract broken, "
+                        f"or prefix cache lost blocks between chunks)."
+                    )
+                detached_blocks = prefix_cache.fetch_detached_blocks(
+                    hit.block_ids
+                )
+                cache_list = build_seeded_batch_kv(
+                    detached_blocks, num_layers=num_layers
+                )
+            finally:
+                prefix_cache.release(hit.block_ids)
+
+        logits = forward_batched_full(
+            model, chunk_tokens, cache_list
+        )  # (1, chunk_len, V)
+
+        # Chunk-boundary score — predict chunk_tokens[:, 0] from the
+        # previous chunk's last-position logit. Same pattern as the
+        # C.1 oracle.
+        if prev_last_logit is not None:
+            target = chunk_tokens[:, 0]
+            total_nll += float(
+                _cross_entropy_sum(prev_last_logit, target).item()
+            )
+            total_tokens += 1
+
+        # Within-chunk score — shift-by-1 over chunk_tokens.
+        if chunk_len > 1:
+            within_logits = logits[:, :-1, :]
+            within_targets = chunk_tokens[:, 1:]
+            total_nll += float(
+                _cross_entropy_sum(
+                    within_logits.reshape(-1, within_logits.shape[-1]),
+                    within_targets.reshape(-1),
+                ).item()
+            )
+            total_tokens += chunk_len - 1
+
+        # Materialize the boundary logit now — the next iteration
+        # throws away ``cache_list`` and the lazy slice would lose
+        # its source. Same detach pattern as the C.1 oracle.
+        prev_last_logit = mx.contiguous(
+            logits[:, -1, :].astype(mx.float32)
+        )
+        mx.eval(prev_last_logit)
+
+        # Extract every aligned block covered by the current cache
+        # ([0, aligned_end)) and hand the prefix over to
+        # ``prefix_cache.insert_detached``. Duplicate-prefix branches
+        # (blocks already registered from prior chunks) are touched
+        # without re-encoding; only the newly-computed tail blocks
+        # fire ``encode_tensor`` on the store's codecs.
+        aligned_end = (end // block_size) * block_size
+        if aligned_end > 0:
+            detached_to_insert = _extract_aligned_blocks_from_seeded_cache(
+                cache_list, block_size, aligned_end
+            )
+            prefix_tokens_to_insert = _mx_1d_to_int_list(
+                token_ids[0, :aligned_end]
+            )
+            prefix_cache.insert_detached(
+                prefix_tokens_to_insert, detached_to_insert
+            )
+
+    return total_nll, total_tokens
+
+
+def _extract_aligned_blocks_from_seeded_cache(
+    cache_list: list[Any],
+    block_size: int,
+    num_aligned_tokens: int,
+) -> list[list[tuple[mx.array, mx.array]]]:
+    """Slice per-block K/V out of a B=1 ``BatchKVCache`` list.
+
+    Returns a list indexed ``[block_idx][layer_idx] -> (K, V)`` that
+    :meth:`silica.kvcache.prefix.RadixPrefixCache.insert_detached`
+    consumes. Each ``(K, V)`` has shape
+    ``(1, n_kv_heads, block_size, head_dim)`` — the shape contract
+    ``build_seeded_batch_kv`` and ``register_detached`` share.
+
+    Precondition: every cache in ``cache_list`` has
+    ``left_padding[0] == 0`` (B=1 fresh admission). The seeded caches
+    the oracle builds satisfy this by construction (:func:`build_seeded_batch_kv`
+    sets ``left_padding=[0]``); the cold-path cache from
+    ``adapter.make_batch_cache([0])`` does too.
+
+    Slices are passed through ``mx.contiguous`` **and**
+    ``mx.eval`` before return so the extracted arrays carry their own
+    materialized backing, not lazy views into the cache's internal
+    tensors. The oracle's outer loop discards ``cache_list`` on the
+    next iteration (chunks rebuild a fresh seeded cache) — a lazy
+    slice held by the store would source from a dead cache on
+    subsequent decode. Mirrors the eager-materialization step
+    :meth:`silica.scheduler.batcher.ContinuousBatcher._extract_and_insert_prefix`
+    performs before every ``insert_detached`` call.
+
+    Raises:
+        ValueError: if ``num_aligned_tokens`` is not a non-negative
+            multiple of ``block_size``, or any layer's cache is
+            missing its K/V (forward never ran).
+    """
+    if num_aligned_tokens < 0:
+        raise ValueError(
+            f"num_aligned_tokens must be >= 0; got {num_aligned_tokens}"
+        )
+    if num_aligned_tokens % block_size != 0:
+        raise ValueError(
+            f"num_aligned_tokens ({num_aligned_tokens}) must be a "
+            f"multiple of block_size ({block_size})"
+        )
+    num_blocks = num_aligned_tokens // block_size
+    num_layers = len(cache_list)
+
+    detached: list[list[tuple[mx.array, mx.array]]] = []
+    for b_idx in range(num_blocks):
+        start = b_idx * block_size
+        end = start + block_size
+        per_layer: list[tuple[mx.array, mx.array]] = []
+        for layer_idx in range(num_layers):
+            cache_obj = cache_list[layer_idx]
+            keys = cache_obj.keys
+            values = cache_obj.values
+            if keys is None or values is None:
+                raise ValueError(
+                    f"layer {layer_idx} has no cache state "
+                    f"(forward never ran or cache was filtered)."
+                )
+            k = mx.contiguous(keys[:, :, start:end, :])
+            v = mx.contiguous(values[:, :, start:end, :])
+            per_layer.append((k, v))
+        detached.append(per_layer)
+
+    # Eager-materialize every extracted slice before the caller
+    # registers it. IdentityCodec passes the ``mx.array`` reference
+    # straight through into the store's ``_DetachedLayer``, and
+    # quantizing codecs may produce payload fields that are still
+    # lazy views over these slices. Either way the store must not
+    # hold a view into the soon-to-be-discarded ``cache_list``.
+    mx.eval(
+        *[
+            arr
+            for per_layer in detached
+            for (k, v) in per_layer
+            for arr in (k, v)
+        ]
+    )
+    return detached
 
 
 def perplexity_from_nll(nll_sum: float, n_tokens: int) -> float:
