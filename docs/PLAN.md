@@ -3,8 +3,8 @@
 | Field        | Value                                                                      |
 | ------------ | -------------------------------------------------------------------------- |
 | Version      | v1.7.0                                                                     |
-| Last updated | 2026-04-21                                                                 |
-| Status       | P-0..P-4.5 complete; P-5-A.0 scaffolding shipped (v1.7.0); P-5-A.1 next    |
+| Last updated | 2026-04-23                                                                 |
+| Status       | P-0..P-4.5 complete; P-5-A / P-5-B landed; P-5-C.1 landed; P-5-C.2 next    |
 | Maintainer   | Xin Zhou                                                                   |
 | Source       | `docs/PLAN.md` (single source of truth)                                    |
 
@@ -561,7 +561,7 @@ Each Phase uses the same structure: `ID / Goal / Scope / Strategy / Deliverables
     - **(b) End-to-end PPL drift.** Under the Qwen3.5-4B `BlockTurboQuantMSE B=64` 4-bit K+V configuration, Silica `BlockTQCodec`'s end-to-end perplexity deviates from the `vqbench/REPORT.md` baseline by `ε_ppl < 0.01` absolute.
     - Both must pass; passing only one is insufficient.
 - **Dependencies:** P-4.5.
-- **Status:** planned.
+- **Status:** in-progress. Sub-units P-5-A.0 / A.1 / A.3 and P-5-B.1 / B.2 / B.3 landed; P-5-C.1 landed (teacher-forced streaming PPL oracle + `forward_batched_full`, fp16 baseline only — the codec-backed oracle arm lives in P-5-C.2). P-5-C.2 is next. Deliverables above are the PLAN-freeze coarse list; the working sub-unit decomposition is maintained in `docs/P5_OPENING.md` §8.
 - **Notes:** concrete implementation details for BlockTQ / RaBitQ reference `turboquant_plus/` (gitignored reference impl).
 
 ### P-6 Phase 6 — Weight Streaming

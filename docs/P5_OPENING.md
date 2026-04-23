@@ -50,7 +50,7 @@ Two design intents, stated by the user and pinned in the PLAN header:
 
 **Intent 1 — integrate VQ into an MLX-native runtime.** vqbench established that 4-bit K+V compression is production-feasible; it did not ship a runtime. vqbench's code runs NumPy + PyTorch on CPU/MPS, compresses the KV cache **after** the HF attention module ran, and its `VQBenchCache` is a `transformers.DynamicCache` subclass — the D-010 anti-pattern silica explicitly rejects (`docs/PLAN.md` D-010 Consequences). P-5 turns the empirical validation into running code on the same MLX path that serves the P-4.5-closed scheduler.
 
-**Intent 2 — make VQ method comparison a first-class operation inside silica.** User wants `python -m scripts.bench --kv-codec block_tq_b64_b4 --scenario qwen3.5-0.8b-wikitext-ppl` (or similar) to produce the same ΔPPL / compression / decode tok/s columns that vqbench currently reports through bespoke scripts (`scripts/reproduce_qwen35_4b_headline.py`, `scripts/variance_qwen35_4b.py`, etc.). That requires:
+**Intent 2 — make VQ method comparison a first-class operation inside silica.** User wants `python -m scripts.bench --kv-codec block_tq_b64_b4 --scenario qwen3-0.6b-wikitext-ppl` (or similar) to produce the same ΔPPL / compression / decode tok/s columns that vqbench currently reports through bespoke scripts (`scripts/reproduce_qwen35_4b_headline.py`, `scripts/variance_qwen35_4b.py`, etc.). That requires:
 
 - A codec switch at `silica.kvcache.store` (already shipped as of P-4.5-C.1).
 - Three real codec families wired to that switch (P-5-A / P-5-B).
@@ -105,7 +105,7 @@ Performance escalation inside the MLX boundary, in order: plain MLX Python (curr
 1. implementing a `VectorCodec[NewPayload]` subclass under `silica/vq/<family>/<new_codec>.py`,
 2. defining a `NewPayload(CodedPayload)` dataclass with bit-packed `mx.array` fields whose `.nbytes` sum equals the declared `resident_bytes`,
 3. registering one `CodecSpec` entry in `silica.vq.registry` with a stable `id` string and `spec.factory`,
-4. running `scripts/bench.py --kv-codec <new_id> --scenario qwen3.5-0.8b-wikitext-ppl` to see ΔPPL / compression / decode tok/s alongside every other codec.
+4. running `scripts/bench.py --kv-codec <new_id> --scenario qwen3-0.6b-wikitext-ppl` to see ΔPPL / compression / decode tok/s alongside every other codec.
 
 No scheduler edits, no model-adapter edits, no store-interface edits — the extensibility surface is one file in `silica/vq/<family>/` plus one registry entry. §4.1 (Protocol), §6.1 (CodecSpec), and §8 (sub-unit structure) are designed backwards from this "five-minute new-codec story".
 
@@ -176,7 +176,7 @@ Acceptance consequence: §7(d) must be measured on the ladder step that actually
 - `silica.kvcache.codec` side-level generic-Protocol refactor: new `VectorCodec[P]` plus `CodedPayload` base with per-codec payloads (`RawFp16Payload`, `BlockTQPayload`, `RaBitQPayload`). Retires the pre-P-5 pair-level `KVCodec` / `CodedBlock` shipped in P-4.5-C.1.
 - `SyntheticPrefixBlockStore` K/V split: `k_codec` / `v_codec` kwargs.
 - `silica.bench.ppl_oracle` — MLX-native WikiText-2 streaming PPL, chunk=256, same semantics as vqbench's `validation/streaming_ppl.py`.
-- `silica.bench.scenarios` `--kv-codec` parametrization + codec-specific bench rows (`qwen3.5-0.8b-wikitext-ppl`, `qwen3.5-0.8b-compression`, `qwen3-0.6b-prefix-hit-decode-{fp16,block-tq-b64-b4}`). Note: the decode-speed rows target Qwen3-0.6B rather than Qwen3.5-0.8B because Qwen3.5-0.8B is hybrid-DeltaNet (`has_recurrent_state=True`) and `ContinuousBatcher` refuses `RadixPrefixCache` on recurrent adapters — see docs/P3_DELTANET_SURVEY.md C-open-3. Plain Qwen3-0.6B (28 GLOBAL layers, head_dim=128) exercises the same prefix-hit codec hot path and the BlockTQ-vs-identity ratio is head-dim / layer-count independent, so the 0.85× threshold carries over. The PPL and compression rows stay on Qwen3.5-0.8B because those oracles do not invoke `RadixPrefixCache`. An earlier draft named the row `qwen3.5-0.8b-decode-speed` but that was inconsistent with the prefix-hit workload the gate requires.
+- `silica.bench.scenarios` `--kv-codec` parametrization + codec-specific bench rows (`qwen3-0.6b-wikitext-ppl-{fp16,tq-mse-b4,block-tq-b64-b4,ext-rabitq-b4}`, `qwen3-0.6b-compression`, `qwen3-0.6b-prefix-hit-decode-{fp16,block-tq-b64-b4,ext-rabitq-b4}`). All P-5 rows target Qwen3-0.6B — a non-recurrent Qwen3 adapter that `ContinuousBatcher` accepts with `RadixPrefixCache`. The original draft put the PPL and compression rows on Qwen3.5-0.8B on the reasoning "the oracle does not need `RadixPrefixCache`", but P-5-C.2's codec-backed PPL arm does seed per-chunk caches from a prefix cache, so keeping every P-5 row on one tokenizer / one adapter shape removes a cross-row variability source. (Qwen3.5-0.8B is hybrid-DeltaNet (`has_recurrent_state=True`) and `ContinuousBatcher` refuses `RadixPrefixCache` on recurrent adapters — see `docs/P3_DELTANET_SURVEY.md` C-open-3 — so it cannot carry the C.2 codec-backed PPL arm regardless.)
 - `MemoryBudgeter` prefix-residency accounting — three explicit modes per §4.7: (A) `account_prefix_residency=False` recovers the P-4.5 byte-for-byte headroom formula as a regression lock; (B) IdentityCodec store bound + flag on charges honest fp16 residency in `headroom_bytes()`; (C) compressed codec bound + flag on charges compressed residency. Evict-shortfall continues to use LRU count-based eviction in v0.1 (`AdmitAfterEvictDecision(n_blocks)` unchanged), but `bytes_freed_by_evicting` reads `resident_bytes_per_block` off the store rather than the fp16 constant. The P-4.5-C.0 opening §6.2 foreshadowed this transition; §4.7 is the full spec.
 
 ### 3.2 Explicitly out of scope
@@ -620,7 +620,7 @@ CODEC_REGISTRY: dict[str, CodecSpec] = {
 }
 ```
 
-`scripts/bench.py --kv-codec block_tq_b64_b4 --scenario qwen3.5-0.8b-wikitext-ppl` threads the registry lookup through `BenchRunner.engine_factory`: the runner resolves `spec.factory(head_dim=adapter.kv_layout().head_dim)` once, checks `spec.k_supported` / `spec.v_supported` against the bench row's K-only vs K+V request, and installs the resulting `VectorCodec` on the `RadixPrefixCache.store` via `k_codec` / `v_codec`. For `--all-kv-codecs --k-only`, the runner iterates entries with `spec.k_supported=True` and constructs pairs `(codec, None)`.
+`scripts/bench.py --kv-codec block_tq_b64_b4 --scenario qwen3-0.6b-wikitext-ppl` threads the registry lookup through `BenchRunner.engine_factory`: the runner resolves `spec.factory(head_dim=adapter.kv_layout().head_dim)` once, checks `spec.k_supported` / `spec.v_supported` against the bench row's K-only vs K+V request, and installs the resulting `VectorCodec` on the `RadixPrefixCache.store` via `k_codec` / `v_codec`. For `--all-kv-codecs --k-only`, the runner iterates entries with `spec.k_supported=True` and constructs pairs `(codec, None)`.
 
 Adding a new VQ method is one `CodecSpec` entry and one concrete `VectorCodec[P]` class — no bench-table code changes, no CLI flag plumbing, no per-codec conditionals in reporting. This is the "可以持续接入更多 VQ 方法的平台" user intent made operational at the registry layer.
 
@@ -628,74 +628,74 @@ Adding a new VQ method is one `CodecSpec` entry and one concrete `VectorCodec[P]
 
 vqbench's `validation/streaming_ppl.py` faithfully computes chunked PPL: for each chunk, current tokens use exact K/V, past chunks are served from compressed `VQBenchCache`. silica's MLX-native port uses the same semantics but **cannot go through `Engine.generate_batch`**: that entry point is a **sampling** API — it emits `BatchEvent(kind="token", token_id=...)` stream via `Sampler`, and never returns the positional logits tensor that per-token cross-entropy requires. Even `temperature=0` greedy returns the argmax token id, not the full vocab distribution. PPL computation needs teacher-forced positional logits for every token position in the chunk, not sampled tokens.
 
-P-5-C therefore introduces a **new teacher-forced entry point** that drives the adapter + prefix-cache + codec at a lower level than `generate_batch`:
+The P-5-C split:
+
+- **P-5-C.1 landed** — a cache-agnostic fp16 baseline oracle plus the `forward_batched_full` runner entry point. No codec path; the oracle drives whatever `BatchKVCache` the adapter hands out and mutates it in place across chunks (the cache-sharing semantics is what makes PPL chunk-size invariant).
+- **P-5-C.2 (next)** — a codec-backed oracle arm that seeds each chunk's cache from a `RadixPrefixCache` whose store carries a `VectorCodec`. This is the variant that actually exercises `encode_tensor` / `decode_tensor`. The C.1 oracle does **not** go through the codec; any PPL-delta claim against a VQ codec must route through the C.2 arm.
+
+#### 6.2.1 P-5-C.1 entry point (landed)
 
 ```python
 # silica/bench/ppl_oracle.py
 
-def teacher_forced_chunked_logits(
-    adapter: ModelAdapter,
-    prefix_cache: RadixPrefixCache,          # carries the codec-installed store
-    token_ids: Sequence[int],
+def teacher_forced_chunked_nll(
+    adapter: Any,
+    token_ids: mx.array,            # (1, seq_len) token ids
     *,
     chunk_size: int = 256,
-) -> mx.array:
-    """
-    Return per-position logits `shape (len(token_ids), vocab_size)` under
-    the 'current chunk exact, past chunks compressed' semantics.
+) -> tuple[float, int]:
+    """Cumulative teacher-forced NLL + scored-token count.
 
-    Per chunk i ≥ 1: seed a fresh BatchKVCache(B=1) with
-    fetch_detached_blocks over the aligned prefix ``token_ids[: i * chunk_size]``,
-    forward the suffix ``token_ids[i * chunk_size : (i + 1) * chunk_size]``
-    through ``silica.mlx.runner.forward_batched_full`` at teacher-forced
-    positions (new entry point — see below), capture full-vocab logits.
-    After the forward completes, extract the newly-grown aligned-prefix
-    blocks and insert_detached them so chunk i+1 sees them as
-    decompressable K/V. Chunk 0 is the cold miss path (no prefix to seed
-    from).
+    Allocates one ``BatchKVCache`` list via ``adapter.make_batch_cache([0])``
+    and reuses it across every chunk — mlx-lm mutates the cache in place,
+    so prior chunks' K/V remain available when the next chunk runs. This
+    is what makes the returned NLL chunk-size invariant; the unit test
+    regression-locks the same property vqbench's ``streaming_ppl`` module
+    pins (``test_ppl_oracle.py::TestChunkInvariance``).
+
+    Within each chunk the standard shift-by-1 CE
+    (``logits[:, :-1, :]`` vs ``tokens[:, 1:]``) scores all-but-first
+    positions. The chunk-boundary token is scored against the previous
+    chunk's final logit (``prev_last_logit`` is materialized via
+    ``mx.contiguous`` + ``mx.eval`` before the next forward mutates the
+    shared cache).
     """
+
+
+def perplexity_from_nll(nll_sum: float, n_tokens: int) -> float:
+    """exp(nll_sum / n_tokens). n_tokens == 0 → inf (aggregation-friendly);
+    n_tokens < 0 raises ValueError (caller-side accounting bug)."""
 ```
 
-Why a new runner entry point: the existing `silica.mlx.runner.forward_batched` explicitly returns per-row **last-position** logits `(B, V)` (see `silica/mlx/runner.py:54,66-68`) — it slices `logits[:, -1, :]` internally so `Sampler` / `ContinuousBatcher` never have to worry about allocating the full `(B, T, V)` tensor for decode loops. The teacher-forced PPL oracle needs every position's logits to compute per-token CE on the suffix chunk, so P-5-C adds a sibling entry point:
+`adapter._model` / `adapter.make_batch_cache([0])` are the scheduler-convention attribute and method used by `silica.scheduler.batcher`; formalizing them as a Protocol is v0.2 scope. Token IDs come in as `(1, seq_len)` — streaming PPL is a per-sequence quantity; caller aggregates across sequences via NLL sum + token count before taking `exp`.
+
+The sibling runner entry point `silica.mlx.runner.forward_batched_full(model, tokens, cache_list) -> (B, T, V)` landed with C.1; the existing last-position-only `forward_batched` is now a thin wrapper (`forward_batched_full(...)[:, -1, :]`) so sampling and teacher-forcing cannot drift. See `test_runner_forward_batched.py::test_forward_batched_is_last_position_of_full` for the bit-identical equality lock.
+
+#### 6.2.2 P-5-C.2 entry point (planned)
+
+The codec-backed variant seeds a `RadixPrefixCache` whose store owns a `VectorCodec`. Each chunk ≥ 1 fires `codec.decode_tensor` on the aligned prefix and `codec.encode_tensor` on the newly-grown tail, so the codec hot path is fully exercised. Target signature (subject to C.2 design finalization):
 
 ```python
-def forward_batched_full(
-    model: Any,
-    tokens: mx.array,          # (B, T) — teacher-forced suffix tokens
-    cache_list: list[Any],     # seeded prefix cache (mutated in-place)
-) -> mx.array:                 # (B, T, V) — full positional logits
-    """Teacher-forced forward returning all-position logits.
-
-    Unlike forward_batched (which slices to (B, V) for sampling), this
-    keeps the full (B, T, V) output so callers that need per-position
-    CE (PPL oracle, log-likelihood tools) can index every position.
-    Callers must not mix this with sampling — allocate (B, T, V) only
-    when every position is actually consumed.
-    """
-    if tokens.ndim != 2:
-        raise ValueError(...)
-    return model(tokens, cache=cache_list)  # (B, T, V)
+def teacher_forced_chunked_nll_with_codec(
+    adapter: Any,
+    prefix_cache: RadixPrefixCache,   # store carries k_codec / v_codec
+    token_ids: mx.array,
+    *,
+    chunk_size: int = 256,
+) -> tuple[float, int]:
+    ...
 ```
 
-Call-site pattern follows the existing bench direct-reference path (`silica/bench/runner.py:663-685`): the oracle obtains the MLX module via `model = adapter.build(ResidentWeightProvider())` and the seeded per-layer cache via `cache = adapter.make_batch_cache(left_padding=[0])` (B=1), then seeds that cache from `fetch_detached_blocks` / `build_seeded_batch_kv` before each chunk's forward. `ModelAdapter` does **not** expose a `.model` attribute — `build(weight_provider)` is the canonical entry point (`silica/models/adapter.py:164`).
+C.2 tests route through a counting codec / store stand-in that asserts both `encode_tensor` and `decode_tensor` are actually invoked — a quantized PPL row that silently equals fp16 because no encode/decode fired is the specific failure mode the counting harness is there to catch.
 
-Then `teacher_forced_chunked_logits` calls `forward_batched_full(model, suffix[None], cache)`, takes `[0]` to drop the batch axis, and accumulates per-chunk `(chunk_size, vocab_size)` slices into the returned `(len(token_ids), vocab_size)` tensor. CE is computed downstream by the caller under its own softmax — `forward_batched_full` stays shape-preserving.
-
-This wraps the **same** primitives `ContinuousBatcher._admit_single_hit_row` uses (`RadixPrefixCache.lookup` → `fetch_detached_blocks` → `build_seeded_batch_kv` → forward) but collects full positional `logits` instead of sampling. It bypasses `Sampler` / `ContinuousBatcher` entirely — the PPL oracle is a thin harness around the adapter and the prefix cache, not a client of the engine's sampling loop.
-
-CE alignment with vqbench: for chunk i's suffix tokens `S = token_ids[i*chunk : (i+1)*chunk]`, `forward_batched_full` returns logits at positions `[0, 1, …, len(S)-1]` corresponding to next-token predictions for `S[0], S[1], …, S[-1]`. Per-token CE is computed as `-log softmax(logits[t])[S[t+1]]` for `t in [0, len(S)-2]` on a chunk-internal loop, with the chunk-boundary token (`S[0]` for chunk i ≥ 1) handled explicitly using the final logit from chunk i-1's forward — the same explicit-boundary pattern vqbench's `validation/streaming_ppl.py` uses. No HF `shift_labels`-style silent drop.
-
-Design notes:
+#### 6.2.3 Shared design notes
 
 - **Chunk size 256**, matches vqbench.
-- **Manual per-token CE with explicit boundary handling:** HF's `shift_labels` silently drops one token per chunk boundary and breaks chunk invariance; silica's port mirrors vqbench's explicit boundary loop (test regression-locked same way `tests/test_streaming_ppl.py::test_baseline_chunk_invariance` does in vqbench).
-- **WikiText-2 first N tokens** as a bench-row parameter; default matches vqbench headline (512 tokens ≈ 2 chunks).
-- **Not through `Engine.generate_batch`** — the teacher-forced path does not go through the sampler or the scheduler. This deliberately avoids Q-012's initial-cohort-no-prefix-lookup limitation because the oracle drives admission manually per chunk.
-- **Does go through the codec** — every chunk i ≥ 1 fires `codec.decode_tensor` on the aligned prefix and `codec.encode_tensor` on the newly-grown chunk's aligned tail. The codec hot path is fully exercised.
+- **Manual per-token CE with explicit boundary handling:** HF's `shift_labels` silently drops one token per chunk boundary and breaks chunk invariance; silica's port mirrors vqbench's explicit boundary loop. C.1 regression-locks this via `test_ppl_oracle.py` chunk invariance across `{8, 16, 32, 64, 128}` at `rel=1e-5, abs=1e-5` against a full-sequence NumPy-style reference, the same shape vqbench's `tests/test_streaming_ppl.py::test_baseline_chunk_invariance` does.
+- **WikiText-2 first N tokens** — C.2 bench-row parameter; default matches vqbench headline (512 tokens ≈ 2 chunks). The C.1 oracle itself is text-free — token IDs only, so unit tests run without a tokenizer or dataset dependency.
+- **Not through `Engine.generate_batch`** — neither C.1 nor C.2 routes through the sampler or scheduler. This deliberately avoids Q-012's initial-cohort-no-prefix-lookup limitation because the oracle drives admission manually per chunk (C.2) or runs straight on the adapter's cache (C.1).
 
-This new entry point is the P-5-C deliverable that Codex review correctly flagged as missing; the opening earlier hand-waved "`generate_batch` with a carefully-constructed workload" which does not produce positional logits.
-
-Output: `{ppl_fp16: float, ppl_quant: float, delta_ppl: float, delta_pct: float}` — same schema as `silica/bench/vqbench_baseline.py` so the two columns are directly comparable in the bench table.
+C.2 output schema: `{ppl_fp16: float, ppl_quant: float, delta_ppl: float, delta_pct: float}` — same as `silica/bench/vqbench_baseline.py` so the two columns align in the bench table.
 
 ### 6.3 Variance / multi-seed runs
 
@@ -709,11 +709,11 @@ Already shipped at P-4.4. Under P-5 it becomes the **independent** column: `scri
 
 | id                                 | codec                 | oracle       | purpose                                      |
 | ---------------------------------- | --------------------- | ------------ | -------------------------------------------- |
-| `qwen3.5-0.8b-wikitext-ppl-fp16`    | `fp16`                | PPL          | baseline, P-4.1 already has the infra        |
-| `qwen3.5-0.8b-wikitext-ppl-tq4`     | `tq_mse_b4`           | PPL          | Scalar 4-bit K+V                             |
-| `qwen3.5-0.8b-wikitext-ppl-block4`  | `block_tq_b64_b4`     | PPL          | Production recommendation                    |
-| `qwen3.5-0.8b-wikitext-ppl-rabitq` | `ext_rabitq_b4`       | PPL          | RaBitQ family                                |
-| `qwen3.5-0.8b-compression`          | cross-codec           | STORAGE      | One row per codec, reports `resident_bytes` |
+| `qwen3-0.6b-wikitext-ppl-fp16`              | `fp16`            | PPL          | C.2 baseline; C.1 oracle drives the adapter's fp16 cache |
+| `qwen3-0.6b-wikitext-ppl-tq-mse-b4`         | `tq_mse_b4`       | PPL          | Scalar 4-bit K+V                             |
+| `qwen3-0.6b-wikitext-ppl-block-tq-b64-b4`   | `block_tq_b64_b4` | PPL          | Production recommendation                    |
+| `qwen3-0.6b-wikitext-ppl-ext-rabitq-b4`     | `ext_rabitq_b4`   | PPL          | RaBitQ family                                |
+| `qwen3-0.6b-compression`                    | cross-codec       | STORAGE      | One row per codec, reports `resident_bytes`  |
 | `qwen3-0.6b-prefix-hit-decode-fp16` | `fp16`                | DECODE_TOK_S_WITH_PREFIX_HIT | Acceptance gate (d) baseline; `[p, p] max_batch_size=1 prefix_cache=True`. Qwen3-0.6B rather than Qwen3.5-0.8B — the latter is hybrid-DeltaNet, `ContinuousBatcher` refuses `RadixPrefixCache` on `has_recurrent_state=True` adapters (docs/P3_DELTANET_SURVEY.md C-open-3). Same workload shape; the ratio gate is codec-relative so the target swap is neutral |
 | `qwen3-0.6b-prefix-hit-decode-block-tq-b64-b4` | `block_tq_b64_b4` | DECODE_TOK_S_WITH_PREFIX_HIT | P-5-A.3c acceptance gate (d) BlockTQ arm; same workload shape as the fp16 row |
 | `qwen3-0.6b-prefix-hit-decode-ext-rabitq-b4` | `ext_rabitq_b4` | DECODE_TOK_S_WITH_PREFIX_HIT | P-5-B.3 acceptance gate ExtRaBitQ arm; same workload shape, same 0.85× threshold as the BlockTQ arm. `rabitq_b1` is deliberately excluded (K-only, cannot install via symmetric `kv_codec=` shorthand) |
@@ -806,7 +806,7 @@ Rewritten from PLAN §7 P-5 Acceptance's original "admits more requests under th
 - Under a codec, `store.resident_bytes()` is smaller than it would be under IdentityCodec by roughly the codec's compression ratio on prefix-cache K/V.
 - Smaller prefix residency → larger headroom → `new_worst ≤ headroom` fits step (1) of `admit()` for more incoming requests → more Admit decisions, fewer Reject / evict-path decisions.
 
-Gate, verifiable on a new bench row `qwen3.5-0.8b-admission-headroom-prefix-heavy` (§6.5). Both rows run with `account_prefix_residency=True` (§4.7 mode (B) vs mode (C)) so the residency numbers are directly comparable; mode (A) is the separate regression lock, not a leg of this comparison:
+Gate, verifiable on a new bench row `qwen3-0.6b-admission-headroom-prefix-heavy` (§6.5). Both rows run with `account_prefix_residency=True` (§4.7 mode (B) vs mode (C)) so the residency numbers are directly comparable; mode (A) is the separate regression lock, not a leg of this comparison:
 
 1. Warmup the prefix cache via a shared-prefix cohort until `store.resident_bytes() ≥ 0.5 × cap_bytes` under `SyntheticPrefixBlockStore(codec=IdentityCodec(...))` (§4.7 mode (B); fp16 residency honestly charged). Record the count `N_fp16` of subsequent concurrent admissions that `MemoryBudgeter.admit()` returns `AdmitDecision` for before the first `RejectDecision`.
 2. Repeat under `block_tq_b64_b4` (§4.7 mode (C)) with the same workload and `cap_bytes`. Record `N_block`.
@@ -829,7 +829,7 @@ Rationale: Q-007 flagged that decode overhead was not baked into admission in v0
 
 ### (e) vqbench table reproducible inside silica in one flag
 
-`scripts/bench.py --scenario qwen3.5-0.8b-wikitext-ppl --all-kv-codecs --seeds 42,43,44 --vqbench-xcheck` produces a markdown table with columns `{codec, bits/val, mean ΔPPL, std, K vs fp16, Total KV vs fp16, decode_tok_s, vqbench_cross}` across the full codec registry. Column values match vqbench REPORT §3.1 (after scaling from Qwen3.5-4B to Qwen3.5-0.8B) within the (b) PPL gate. This is the **"轻松完整复现 vqbench 的比较"** user intent made operational.
+`scripts/bench.py --scenario qwen3-0.6b-wikitext-ppl --all-kv-codecs --seeds 42,43,44 --vqbench-xcheck` produces a markdown table with columns `{codec, bits/val, mean ΔPPL, std, K vs fp16, Total KV vs fp16, decode_tok_s, vqbench_cross}` across the full codec registry. Column values match vqbench REPORT §3.1 (after scaling from Qwen3.5-4B to Qwen3-0.6B) within the (b) PPL gate. This is the **"轻松完整复现 vqbench 的比较"** user intent made operational.
 
 ### (f) No regression
 
@@ -887,7 +887,7 @@ Scope:
 
 Acceptance:
 
-- (c) prefix-residency headroom gate on the new `qwen3.5-0.8b-admission-headroom-prefix-heavy` bench row (defined in §6.5 / §7 (c)). Comparison is mode (C) vs mode (B) — both paying honest residency — not mode (C) vs mode (A).
+- (c) prefix-residency headroom gate on the new `qwen3-0.6b-admission-headroom-prefix-heavy` bench row (defined in §6.5 / §7 (c)). Comparison is mode (C) vs mode (B) — both paying honest residency — not mode (C) vs mode (A).
 - Mode-(A) regression unit test (`tests/test_budgeter_mode_a_regression.py`): with `account_prefix_residency=False`, `budgeter.headroom_bytes()` equals `cap_bytes - weights_bytes - reserved_bytes()` byte-for-byte on identical `(cap, weights, admissions)` inputs — i.e. the pre-P-5 formula. Demonstrates that turning the flag off recovers the P-4.5 code path exactly.
 - Mode-(B) baseline-honesty unit test (same file): with `account_prefix_residency=True` and `SyntheticPrefixBlockStore(codec=IdentityCodec(...))` bound + a detached fixture of known block count, `budgeter.headroom_bytes()` == `cap - weights - reserved - (n_blocks × fp16_bytes_per_block)`. This pins that IdentityCodec's mode (B) charges the real fp16 count rather than zero.
 - (f) regression — the 328 P-4.5 close tests remain green, achieved by defaulting `account_prefix_residency=True` but rerunning the P-4.5 suite under `account_prefix_residency=False` (the P-4.5 tests never exercise prefix-cache residency admission bounds, so mode (A) is a no-op for them — the gate is that turning the flag on under IdentityCodec must not regress any existing test's admission verdict).
@@ -928,17 +928,62 @@ Blocked by: P-5-A (landed).
 
 ### P-5-C — Reproducibility + variance + cross-check
 
+Decomposed into six sub-units. C.1 has landed; C.2 is next. The original flat scope below was rewritten in the C.1 opening commit.
+
+#### P-5-C.1 — Teacher-forced streaming PPL oracle (landed 2026-04-23)
+
+Scope (shipped):
+
+- `silica.mlx.runner.forward_batched_full(model, tokens, cache_list) -> (B, T, V)` — new entry point returning all-position logits. Existing `forward_batched` rewired to `forward_batched_full(...)[:, -1, :]` so sampling and teacher-forced paths cannot drift (regression-locked by `test_runner_forward_batched.py::test_forward_batched_is_last_position_of_full`).
+- `silica.bench.ppl_oracle.teacher_forced_chunked_nll(adapter, token_ids, *, chunk_size) -> (nll_sum, n_tokens)` — cache-agnostic fp16 baseline oracle. One `BatchKVCache` allocated via `adapter.make_batch_cache([0])` and *shared across chunks* (mlx-lm mutates in place); chunk-boundary token scored via the previous chunk's last logit (materialized with `mx.contiguous` + `mx.eval` before the next forward mutates the cache); within-chunk scored via shift-by-1. `perplexity_from_nll(nll_sum, n_tokens) -> float` wraps to `exp(mean)` (`n==0 → inf` for aggregation, `n<0 → ValueError`).
+- `tests/test_ppl_oracle.py` — 19 tests. Self-contained fake adapter/model/cache stack where logits depend on absolute cache-offset position, so chunk invariance is meaningful. Parametrized across chunks `{8, 16, 32, 64, 128}` at `rel=1e-5, abs=1e-5`.
+
+Scope deferrals (out of C.1, in C.2):
+
+- Codec-backed oracle arm. C.1 drives the adapter's bound cache (fp16 baseline); the codec path runs through a `RadixPrefixCache` whose store carries a `VectorCodec` and is driven by `teacher_forced_chunked_nll_with_codec` in C.2. Any ΔPPL vs VQ claim goes through the C.2 arm.
+- WikiText-2 loader. The C.1 oracle is text-free (token IDs only) — the unit tests use a synthetic fake model so they run without tokenizer or dataset dependency.
+
+Blocked by: P-5-A.1 (landed).
+
+#### P-5-C.2 — Codec-backed PPL + WikiText bench rows (next)
+
 Scope:
 
-- `silica.bench.ppl_oracle.teacher_forced_chunked_logits` — MLX-native teacher-forced streaming PPL entry point. Does **not** go through `Engine.generate_batch`; drives `adapter` + `RadixPrefixCache` + `fetch_detached_blocks` + `build_seeded_batch_kv` + the new `silica.mlx.runner.forward_batched_full` (returns full-positional `(B, T, V)` logits; sibling to the existing `forward_batched` which slices to `(B, V)` for sampling) to collect per-position logits (§6.2). Test: chunk-invariance regression lock mirroring vqbench's `tests/test_streaming_ppl.py`.
-- `silica.mlx.runner.forward_batched_full` — new runner entry point returning the full `(B, T, V)` logits from `model(tokens, cache=cache_list)` without the last-position slice that `forward_batched` applies. Dedicated to teacher-forced callers; `Sampler` and `ContinuousBatcher` continue to use `forward_batched`. See §6.2 for the signature and rationale.
-- `scripts/bench.py` CLI extensions: `--kv-codec <id>` (registry dispatch), `--seeds 42,43,44` (multi-seed sweep), `--all-kv-codecs` (iterate every `CodecSpec`), `--vqbench-xcheck` (run the P-4.4 subprocess path alongside the silica oracle and compare ΔPPL deltas per §7 (b)).
-- Bench rows: the `qwen3.5-0.8b-wikitext-ppl-*`, `qwen3.5-0.8b-compression`, `qwen3.5-0.8b-admission-headroom-prefix-heavy` rows from §6.5. (`qwen3-0.6b-prefix-hit-decode-{fp16,block-tq-b64-b4}` ship with P-5-A.3; `qwen3-0.6b-prefix-hit-decode-ext-rabitq-b4` ships with P-5-B.3.)
-- Variance / multi-seed plumbing in `BenchRunner`: per-(scenario, codec, seed) row in the JSONL output; markdown table with `mean ± std` columns.
-- Acceptance: (b) PPL-delta cross-check vs vqbench; (e) full vqbench table reproducible in one flag; (f) no regression.
-- Tests: `tests/test_codec_registry.py` (CodecSpec honesty; landed in P-5-A.1b), `tests/test_ppl_oracle.py` (chunk invariance + teacher-forced entry point correctness), extensions to `tests/test_bench_runner.py` / `tests/test_bench_cli.py`.
+- `silica.bench.ppl_oracle.teacher_forced_chunked_nll_with_codec(adapter, prefix_cache, token_ids, *, chunk_size)` — second oracle entry point. Seeds each chunk's `BatchKVCache` from `prefix_cache.lookup` → `fetch_detached_blocks` → `build_seeded_batch_kv`; after each forward, extracts the newly-grown aligned-prefix blocks and `insert_detached` them so chunk i+1 can consume them through the codec. Tests assert `encode_tensor` / `decode_tensor` are invoked via a counting-codec / counting-store stand-in — a quantized PPL row silently equal to fp16 because the codec never fired is the specific failure mode the counter is there to catch.
+- `silica.bench.oracles` gains `PPL` `OracleKind`.
+- WikiText-2 loader: deterministic local-cache path, no live download at bench time; tiny fixture under `tests/fixtures/` for offline unit tests.
+- Bench rows: `qwen3-0.6b-wikitext-ppl-{fp16, tq-mse-b4, block-tq-b64-b4, ext-rabitq-b4}` per §6.5 (four rows, all on Qwen3-0.6B for consistency with the decode-speed and compression rows; scenario-id hyphenation mirrors the prefix-hit decode rows).
 
-Blocked by: P-5-A.1 (needs at least BlockTQ live to produce a non-fp16 column). Can interleave with P-5-B.
+Blocked by: P-5-C.1 (landed), P-5-A.1 (landed).
+
+#### P-5-C.3 — STORAGE oracle + compression / admission-headroom rows
+
+Scope:
+
+- `silica.bench.oracles` gains `STORAGE` `OracleKind` reading `prefix_cache.store.resident_bytes()`.
+- Bench rows: `qwen3-0.6b-compression` (per-codec resident-bytes column) and `qwen3-0.6b-admission-headroom-prefix-heavy` (§4.7 admission-signal row demonstrating the `resident_bytes`-aware budgeter).
+
+#### P-5-C.4 — Variance / multi-seed plumbing
+
+Scope:
+
+- `BenchRunner` — per-(scenario, codec, seed) JSONL rows; `--seeds 42,43,44` CLI flag; markdown table `mean ± std` aggregation column.
+
+#### P-5-C.5 — `--kv-codec` / `--all-kv-codecs` CLI
+
+Scope:
+
+- `scripts/bench.py` — `--kv-codec <id>` (registry dispatch through `BenchRunner.engine_factory`), `--all-kv-codecs` (iterate every `CodecSpec`), `--k-only` selection. The registry layer already exists (P-5-A.1b); C.5 is the CLI surface only.
+
+#### P-5-C.6 — vqbench subprocess cross-check
+
+Scope:
+
+- `--vqbench-xcheck` flag on `scripts/bench.py` — invokes the P-4.4 `silica/bench/vqbench_baseline.py` subprocess path alongside the silica oracle and reports the ΔPPL-delta per §7 (b).
+
+Acceptance: (b) PPL-delta cross-check vs vqbench; (e) full vqbench table reproducible in one flag; (f) no regression. Closed out at C.6 land.
+
+Blocked by: P-5-A.1 (needs at least BlockTQ live to produce a non-fp16 column). C.2 depends on C.1; C.3-C.6 can interleave with P-5-B.
 
 ---
 
