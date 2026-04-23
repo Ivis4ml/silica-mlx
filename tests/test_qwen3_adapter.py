@@ -39,8 +39,33 @@ class _PlainSelfAttn:
 
 
 @dataclass
+class _ProjWithWeight:
+    """Minimal stand-in for ``mlx.nn.Linear`` exposing ``.weight`` only."""
+
+    weight: mx.array
+
+
+@dataclass
+class _PlainSelfAttnWithProj:
+    """Variant carrying projection weights so ``Qwen3Adapter._infer_attn_dtype``
+    can read the dtype off ``sa.k_proj.weight`` instead of hitting the
+    ``mx.float16`` fallback. Needed to cover the primary (not fallback)
+    branch of the dtype inference — real loaded Qwen3 checkpoints ship
+    bf16 projections, and the P-5-A.3c dtype-inference fix is what
+    stopped ``BlockTurboQuantMSE.encode_tensor`` from rejecting legitimate
+    bf16 K/V on the prefix-cache codec path.
+    """
+
+    n_kv_heads: int = 8
+    k_proj: _ProjWithWeight | None = None
+    q_proj: _ProjWithWeight | None = None
+    v_proj: _ProjWithWeight | None = None
+    o_proj: _ProjWithWeight | None = None
+
+
+@dataclass
 class _PlainLayer:
-    self_attn: _PlainSelfAttn | None = None
+    self_attn: _PlainSelfAttn | _PlainSelfAttnWithProj | None = None
 
 
 @dataclass
@@ -165,6 +190,50 @@ def test_kv_layout_returns_zeros_for_empty_layer_stack() -> None:
     assert layout.num_layers == 0
     assert layout.n_kv_heads == 0
     assert layout.head_dim == 0
+
+
+def _make_adapter_with_proj_dtype(
+    dtype: mx.Dtype,
+) -> Qwen3Adapter:
+    """Build a fake model whose ``self_attn.k_proj.weight`` has the
+    given dtype, so ``Qwen3Adapter._infer_attn_dtype`` exercises the
+    primary (projection-reading) branch rather than the fallback.
+    """
+    sa = _PlainSelfAttnWithProj(
+        k_proj=_ProjWithWeight(weight=mx.zeros((128, 128), dtype=dtype)),
+    )
+
+    class _ModelWithProjWeights:
+        def __init__(self) -> None:
+            self.model_type = "qwen3"
+            self.args = _PlainArgs()
+            self.layers = [_PlainLayer(self_attn=sa) for _ in range(4)]
+
+    kv = SimpleKVCache([KVCache() for _ in range(4)])
+    return Qwen3Adapter(
+        _ModelWithProjWeights(), _FakeTokenizer(), kv_manager=kv
+    )
+
+
+def test_kv_layout_reads_bfloat16_from_projection_weight() -> None:
+    """P-5-A.3c regression lock — ``_infer_attn_dtype`` must read the
+    real projection-weight dtype, not hardcoded fp16. Qwen3 checkpoints
+    on HF ship bfloat16; the pre-A.3c hardcoded ``mx.float16`` caused
+    ``BlockTurboQuantMSE.encode_tensor`` to reject legitimate bf16
+    K/V at the codec-installed ``SyntheticPrefixBlockStore`` path.
+    """
+    adapter = _make_adapter_with_proj_dtype(mx.bfloat16)
+    assert adapter.kv_layout().dtype == mx.bfloat16
+
+
+def test_kv_layout_reads_float16_from_projection_weight() -> None:
+    """Parallel fp16 lock — the primary branch must also handle fp16
+    checkpoints correctly. Failure here would mean the projection-
+    reading loop is either short-circuited or always returning a
+    fixed dtype.
+    """
+    adapter = _make_adapter_with_proj_dtype(mx.float16)
+    assert adapter.kv_layout().dtype == mx.float16
 
 
 # --- attention_pattern: plain Qwen3 is all GLOBAL, no hybrid ---

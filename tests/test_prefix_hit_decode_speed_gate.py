@@ -23,9 +23,9 @@ Metal-kernel-compile leak) would fail loudly here.
 
 Dual gate, mirroring ``test_q010_ratio_below_threshold_on_five_runs``:
 
-- ``Qwen/Qwen3.5-0.8B`` present in the local HF cache (cheap to
-  populate by running the ``qwen3.5-0.8b-b1-parity`` bench row
-  once).
+- ``Qwen/Qwen3-0.6B`` present in the local HF cache (cheap to
+  populate by running any cache-only Qwen3-0.6B bench row, e.g.
+  ``qwen3-0.6b-smoke``, once).
 - ``SILICA_PREFIX_HIT_DECODE_TIMING=1`` in the environment, OR
   ``pytest -m prefix_hit_decode_timing`` explicit marker selection
   (the ``conftest.py::pytest_collection_modifyitems`` hook skips by
@@ -81,29 +81,6 @@ _SKIP_HF_CACHE_REASON = (
 _N_WARMUP_PAIRS = 1  # runs discarded — covers Metal compile + cache warmup
 _N_MEASURED_PAIRS = 3  # alternating fp16 / BlockTQ samples per codec
 _RATIO_THRESHOLD = 0.85  # BlockTQ median / fp16 median >= this
-
-
-@pytest.fixture(scope="module")
-def _adapter_engine() -> Any:
-    """Load Qwen3.5-0.8B once per test-module invocation and reuse
-    across all 8 scenario runs. Loading takes O(seconds) on cold
-    cache; reloading per scenario would dominate total test time and
-    add variance unrelated to the decode-speed claim under test.
-
-    Shared across runs because the per-scenario state the runner
-    actually cares about — a fresh ``RadixPrefixCache`` + codec-
-    installed store — is constructed inside ``_run_one`` per call.
-    The engine's ``MetricsRegistry`` is reused, but this oracle
-    does not consume ``snap.decode_tok_s`` (metadata's
-    ``row1_decode_tok_s`` is the headline number per A.3b H-1),
-    so accumulation across runs is harmless.
-    """
-    from silica.engine import Engine
-    from silica.models.factory import adapter_for_repo
-
-    adapter, kv = adapter_for_repo(_REPO)
-    engine = Engine(adapter, kv)
-    return adapter, engine
 
 
 def _run_scenario(runner: BenchRunner, scenario_id: str) -> ScenarioResult:

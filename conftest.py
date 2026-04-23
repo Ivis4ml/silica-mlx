@@ -18,14 +18,17 @@ assertion passed. The finalizer can fire at three different moments:
 3. During Python interpreter teardown, after pytest has fully exited.
    ``warnings.filters`` is whatever module-level state remained.
 
-No single fix covers all three. This conftest combines three layers:
+No single fix covers all three. This conftest combines five layers:
 
 1. **Monkey-patch** ``_warnings.warn`` and ``warnings.warn_explicit`` —
    the Python and C entry points warning emission ultimately funnels
    through — to silently drop the three known SWIG messages. This sits
    above filter-list resolution, surviving every ``catch_warnings``
    block (``catch_warnings`` saves / restores ``warnings.filters`` and
-   ``warnings.showwarning``, never function attributes).
+   ``warnings.showwarning``, never function attributes). Note: C-level
+   ``PyType_Ready`` uses internal ``_warnings.c::warn_explicit`` and
+   bypasses these Python-level patches, so layers 4 + 5 cover that
+   path.
 2. **``pytest_collection_modifyitems``** adds three
    ``pytest.mark.filterwarnings`` entries to every collected test.
    Marker filters are applied by ``catch_warnings_for_item`` AFTER
@@ -33,13 +36,37 @@ No single fix covers all three. This conftest combines three layers:
    cmdline flag, so our ignores prepend ahead of ``error`` inside each
    test's catch_warnings block and win matching priority.
 3. **Module-level ``warnings.filterwarnings``** for the
-   outside-catch_warnings teardown window (belt + braces; layer 1
-   already covers this but leaving the filter in place keeps
-   filter-based diagnostic tools accurate).
+   outside-catch_warnings teardown window (belt + braces).
+4. **Pre-fire PyType_Ready via a top-of-conftest
+   ``import sentencepiece``.** Sentencepiece's SWIG types emit the
+   three warnings exactly once in the process — at the first
+   ``PyType_Ready`` call, i.e. the initial import. Forcing that
+   import here (AFTER the module-level ``filterwarnings`` calls in
+   layer 3, BEFORE pytest enters any ``catch_warnings_for_item``
+   context) makes the single emission happen while our ``ignore``
+   filters are at position 0 of ``warnings.filters``. Subsequent
+   pytest imports hit the ``sys.modules`` cache, so no filter state
+   pytest later establishes (including a collection-phase
+   ``catch_warnings`` that prepends ``-W error`` ahead of our ini
+   filters) can cause re-emission.
+5. **``atexit`` re-prepend** of the three ignore filters. At
+   interpreter shutdown the ``<sys>:0: swigvarlink`` warning fires
+   during SWIG's C-module finalizer, **after** pytest has
+   unconfigured its session ``catch_warnings``. Whatever filter
+   state pytest leaves behind is what matches at that instant. If
+   ``-W error`` survived into teardown (version-sensitive
+   ``catch_warnings`` restore, Python-level ``-W error`` passed via
+   ``sys.warnoptions``, etc.), the C-level finalizer's raised
+   exception aborts the process with SIGSEGV / exit 139 even though
+   every test passed. Re-prepending our ignore filters via
+   ``atexit`` guarantees they are at position 0 of
+   ``warnings.filters`` when the finalizer runs.
 
 Normal ``-W error`` behaviour on all other DeprecationWarnings is
 preserved — layer 1 only short-circuits the three known SWIG messages;
-everything else delegates to the original function.
+everything else delegates to the original function. Layers 3-5 all
+use message-specific regexes, so only the three SWIG texts are
+affected.
 
 **Q-010 timing-test gating.** ``test_q010_ratio_below_threshold_on_five_runs``
 is a wall-clock on-device timing measurement, noise-prone under
@@ -146,6 +173,46 @@ for _msg in _SWIG_IGNORE_MESSAGES:
     warnings.filterwarnings(
         "ignore", message=_msg, category=DeprecationWarning
     )
+
+
+# ----- layer 4: pre-fire sentencepiece PyType_Ready -------------------------
+#
+# Force the single process-wide SWIG type-initialization window to
+# land NOW, while layers 1-3 are all active and pytest has not yet
+# entered a ``catch_warnings_for_item`` context. After this import
+# ``sentencepiece`` is in ``sys.modules`` and subsequent imports
+# from test modules are cache hits — ``PyType_Ready`` does not
+# re-fire, so the three DeprecationWarnings simply cannot be emitted
+# again in this process. If the package is not installed, there is
+# nothing to pre-fire and nothing to suppress.
+
+try:
+    import sentencepiece as _sentencepiece_prefire  # noqa: F401
+except ImportError:
+    pass
+
+
+# ----- layer 5: atexit re-prepend (interpreter teardown) --------------------
+#
+# Re-register the three ignore filters at ``atexit`` so that whatever
+# ``warnings.filters`` state pytest leaves behind on exit, our three
+# ignores are at position 0 when the SWIG C-module finalizer fires
+# the ``<sys>:0: swigvarlink`` warning during ``Py_Finalize``.
+# ``atexit`` handlers run before module finalizers, so by the time
+# the SWIG finalizer emits the warning our ignores are already in
+# place.
+
+import atexit  # noqa: E402
+
+
+def _reinstall_swig_filters_at_exit() -> None:
+    for msg in _SWIG_IGNORE_MESSAGES:
+        warnings.filterwarnings(
+            "ignore", message=msg, category=DeprecationWarning
+        )
+
+
+atexit.register(_reinstall_swig_filters_at_exit)
 
 
 # =============================================================================
