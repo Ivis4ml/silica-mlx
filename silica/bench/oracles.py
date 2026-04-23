@@ -55,6 +55,7 @@ premature structure into the oracle seam.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from silica.bench.scenario import OracleFn, OracleKind, Scenario
@@ -659,12 +660,147 @@ def decode_tok_s_with_prefix_hit_oracle(
     return (True, None, metadata)
 
 
+def ppl_oracle(
+    scenario: Scenario, collected: Any, context: Any
+) -> tuple[bool, str | None, dict[str, Any]]:
+    """P-5-C.2 oracle: structural validation of the PPL result
+    produced by the runner's ``_run_ppl`` driver.
+
+    The driver computes ``(nll_sum, n_tokens)`` via
+    :func:`silica.bench.ppl_oracle.teacher_forced_chunked_nll`
+    (fp16 baseline when ``workload.kv_codec is None``) or
+    :func:`silica.bench.ppl_oracle.teacher_forced_chunked_nll_with_codec`
+    (codec-backed when ``workload.kv_codec`` names a registry entry),
+    then wraps the perplexity via :func:`perplexity_from_nll` into
+    ``collected = {"nll_sum", "n_tokens", "ppl"}``.
+
+    Validation here is **structural only**: field presence, types,
+    finite ``ppl``, non-negative ``n_tokens``, and an optional floor
+    from ``scenario.oracle_config["min_scored_tokens"]`` (defaults to
+    1 — a zero-scored-token run is almost always a caller-side
+    configuration bug).
+
+    The ΔPPL magnitude gate — "codec ΔPPL against fp16 baseline is
+    below ε_ppl" — is C.6's vqbench cross-check responsibility, not
+    this oracle's. When ``context["ppl_fp16"]`` is supplied the
+    oracle surfaces ``delta_ppl`` / ``delta_ppl_pct`` in metadata
+    for downstream consumers (bench report, C.6 acceptance); it does
+    not gate on their values here.
+
+    Args:
+        scenario: the bench scenario carrying ``oracle_config``
+            (reads ``min_scored_tokens``).
+        collected: the per-row result dict the runner produced; must
+            contain ``nll_sum`` (float), ``n_tokens`` (int), and
+            ``ppl`` (float).
+        context: runner-supplied context dict. Reads the optional
+            ``ppl_fp16`` for ΔPPL computation; also copies all keys
+            into metadata.
+
+    Returns:
+        ``(ok, reason, metadata)``. Metadata surfaces the full
+        collected numbers + the context's chunk_size / max_tokens /
+        wikitext_path / kv_codec plus the computed delta_ppl when
+        available.
+    """
+    if not isinstance(collected, dict):
+        return (False, "ppl_collected_shape_mismatch", {})
+    for field in ("nll_sum", "n_tokens", "ppl"):
+        if field not in collected:
+            return (
+                False,
+                f"ppl_collected_missing_field:{field}",
+                {"fields_present": sorted(collected)},
+            )
+
+    try:
+        nll_sum = float(collected["nll_sum"])
+        n_tokens = int(collected["n_tokens"])
+        ppl = float(collected["ppl"])
+    except (TypeError, ValueError) as exc:
+        return (
+            False,
+            f"ppl_collected_field_not_castable:{exc!s}",
+            {},
+        )
+
+    if n_tokens < 0:
+        return (
+            False,
+            "ppl_n_tokens_negative",
+            {"n_tokens": n_tokens},
+        )
+
+    min_scored_tokens = int(
+        scenario.oracle_config.get("min_scored_tokens", 1)
+    )
+    if n_tokens < min_scored_tokens:
+        return (
+            False,
+            "ppl_n_tokens_below_min_scored_tokens",
+            {
+                "n_tokens": n_tokens,
+                "min_scored_tokens": min_scored_tokens,
+            },
+        )
+
+    if not math.isfinite(ppl) or ppl < 0.0:
+        return (
+            False,
+            "ppl_not_finite_or_negative",
+            {"ppl": ppl},
+        )
+
+    metadata: dict[str, Any] = {
+        "nll_sum": nll_sum,
+        "n_tokens": n_tokens,
+        "ppl": ppl,
+    }
+    # Forward context fields the runner supplied (chunk_size,
+    # max_tokens, wikitext_path, kv_codec, ppl_fp16) so the bench
+    # report can show them alongside the PPL number without the
+    # oracle having to know every possible key.
+    if isinstance(context, dict):
+        for key, value in context.items():
+            metadata.setdefault(key, value)
+
+    # ΔPPL computation when a baseline is supplied in ``context``.
+    # Step 3a does NOT propagate the fp16 baseline between rows at
+    # runtime — ``_run_ppl`` never populates ``ppl_fp16``, so every
+    # in-tree PPL row currently records ``delta_ppl = None``. The
+    # plumbing here is future-facing: a downstream bench-report
+    # pass (or the C.6 vqbench cross-check) can call this oracle
+    # with a populated ``ppl_fp16`` context when comparing codec
+    # rows to their baseline, and delta / delta_pct appear in
+    # metadata. Keeping the computation here rather than in the
+    # report layer means ``ppl`` and ``delta_ppl`` stay produced
+    # by one function, so they cannot drift.
+    ppl_fp16 = None
+    if isinstance(context, dict):
+        raw = context.get("ppl_fp16")
+        if raw is not None:
+            try:
+                ppl_fp16 = float(raw)
+            except (TypeError, ValueError):
+                ppl_fp16 = None
+
+    if ppl_fp16 is not None and math.isfinite(ppl_fp16) and ppl_fp16 > 0.0:
+        metadata["delta_ppl"] = ppl - ppl_fp16
+        metadata["delta_ppl_pct"] = (ppl - ppl_fp16) / ppl_fp16 * 100.0
+    else:
+        metadata.setdefault("delta_ppl", None)
+        metadata.setdefault("delta_ppl_pct", None)
+
+    return (True, None, metadata)
+
+
 ORACLES: dict[OracleKind, OracleFn] = {
     OracleKind.SMOKE: smoke_oracle,
     OracleKind.B1_PARITY_VS_SINGLE: b1_parity_oracle,
     OracleKind.BGT1_DIRECT_BATCHED_REFERENCE: bgt1_direct_batched_reference_oracle,
     OracleKind.TEACHER_FORCED_ARGMAX: teacher_forced_argmax_oracle,
     OracleKind.DECODE_TOK_S_WITH_PREFIX_HIT: decode_tok_s_with_prefix_hit_oracle,
+    OracleKind.PPL: ppl_oracle,
 }
 
 
@@ -674,5 +810,6 @@ __all__ = [
     "bgt1_direct_batched_reference_oracle",
     "teacher_forced_argmax_oracle",
     "decode_tok_s_with_prefix_hit_oracle",
+    "ppl_oracle",
     "ORACLES",
 ]

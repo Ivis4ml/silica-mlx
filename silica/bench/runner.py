@@ -174,6 +174,14 @@ def _check_gates(scenario: Scenario) -> str | None:
       * ``gate_env_var`` (if set) must equal ``"1"`` (strong gate
         for scenarios whose forward is expensive enough to warrant
         explicit opt-in).
+
+    ``OracleKind.PPL`` rows additionally require the pre-extracted
+    WikiText text file at ``oracle_config['wikitext_path']`` to be
+    present on disk. Skipping before the engine load avoids loading
+    ~600 MB of Qwen3-0.6B weights only to fail on a missing
+    tokenizer input; the cost asymmetry between "HF cache hit +
+    wikitext missing" and "HF cache hit + wikitext present" is
+    large enough to warrant a gate check, not a runtime raise.
     """
     cache = hf_cache_path_for_repo(scenario.repo)
     if not cache.exists():
@@ -181,6 +189,13 @@ def _check_gates(scenario: Scenario) -> str | None:
     if scenario.gate_env_var is not None:
         if os.environ.get(scenario.gate_env_var) != "1":
             return f"env_var_not_set:{scenario.gate_env_var}"
+    if scenario.oracle == OracleKind.PPL:
+        wikitext_path = scenario.oracle_config.get("wikitext_path")
+        if wikitext_path is None:
+            return "ppl_wikitext_path_missing_in_oracle_config"
+        wp = Path(str(wikitext_path))
+        if not wp.is_file():
+            return f"wikitext_cache_missing:{wp}"
     return None
 
 
@@ -310,6 +325,14 @@ class BenchRunner:
                 oracle_input = prefix_hit_collected
                 tokens_dict, _ = prefix_hit_collected
                 total_tokens = sum(len(row) for row in tokens_dict.values())
+            elif scenario.oracle == OracleKind.PPL:
+                # PPL bypasses engine.generate_batch entirely — the
+                # oracle is teacher-forced and needs positional logits,
+                # not sampled tokens. ``_run_ppl`` drives the adapter
+                # directly via silica.bench.ppl_oracle.
+                ppl_collected, oracle_context = _run_ppl(scenario, adapter)
+                oracle_input = ppl_collected
+                total_tokens = int(ppl_collected["n_tokens"])
             else:
                 # SMOKE (and any future single/batched-flexible
                 # oracle). B=1 takes the single-request path,
@@ -1077,6 +1100,120 @@ def _default_teacher_forced_reference(
     mx.eval(logits)
     positional = logits[0, prompt_len - 1 : prompt_len - 1 + target_len, :]
     return [int(mx.argmax(positional[i]).item()) for i in range(target_len)]
+
+
+def _run_ppl(
+    scenario: Scenario, adapter: ModelAdapter
+) -> tuple[dict[str, float | int], dict[str, Any]]:
+    """Drive the P-5-C.2 ``OracleKind.PPL`` workload.
+
+    Does **not** go through ``engine.generate_batch`` — the PPL
+    oracle is teacher-forced and needs positional logits, not
+    sampled tokens. Reads the pre-extracted WikiText text file from
+    ``scenario.oracle_config['wikitext_path']``, tokenizes with the
+    adapter's bound tokenizer, then dispatches:
+
+    - ``workload.kv_codec is None`` → fp16 baseline path
+      (:func:`silica.bench.ppl_oracle.teacher_forced_chunked_nll`).
+      No prefix cache is built; the oracle uses the adapter's own
+      ``BatchKVCache``.
+    - otherwise → codec-backed path
+      (:func:`silica.bench.ppl_oracle.teacher_forced_chunked_nll_with_codec`).
+      Builds a fresh :class:`RadixPrefixCache` with the named codec
+      via :func:`_maybe_build_prefix_cache` (kwarg-compatible; no
+      engine dependency for the oracle itself).
+
+    ``oracle_config`` keys:
+
+    - ``wikitext_path``: filesystem path to a UTF-8 text file.
+      Required.
+    - ``chunk_size``: default 256 (vqbench REPORT headline).
+    - ``max_tokens``: cap on tokenized length (default 512).
+    - ``min_scored_tokens``: oracle-side floor on ``n_tokens``;
+      read by :func:`ppl_oracle`, not here.
+
+    Returns:
+        ``(collected, context)``. ``collected`` is
+        ``{"nll_sum": float, "n_tokens": int, "ppl": float}``;
+        ``context`` carries ``chunk_size`` / ``max_tokens`` /
+        ``wikitext_path`` / ``kv_codec`` for the oracle to forward
+        into metadata.
+    """
+    from silica.bench.ppl_oracle import (
+        perplexity_from_nll,
+        teacher_forced_chunked_nll,
+        teacher_forced_chunked_nll_with_codec,
+    )
+    from silica.bench.wikitext import (
+        load_wikitext_text,
+        tokenize_for_ppl,
+    )
+
+    cfg = scenario.oracle_config
+    if "wikitext_path" not in cfg:
+        raise RuntimeError(
+            f"scenario {scenario.id!r}: OracleKind.PPL requires "
+            f"oracle_config['wikitext_path']"
+        )
+    wikitext_path = Path(cfg["wikitext_path"])
+    chunk_size = int(cfg.get("chunk_size", 256))
+    max_tokens = int(cfg.get("max_tokens", 512))
+
+    if chunk_size < 1:
+        raise RuntimeError(
+            f"scenario {scenario.id!r}: oracle_config['chunk_size'] "
+            f"must be >= 1; got {chunk_size}"
+        )
+
+    text = load_wikitext_text(wikitext_path)
+    # ``ModelAdapter.tokenizer`` is a method, not a property (see
+    # silica/models/adapter.py); bound-method-as-tokenizer would
+    # trip ``tokenize_for_ppl``'s encode-attribute check. Call it.
+    tokenizer = adapter.tokenizer()
+    # Floor the tokenized length at one full chunk so the oracle
+    # scores at least ``chunk_size - 1`` within-chunk tokens. A
+    # single-chunk scenario with a short tokenized length would
+    # silently produce a degenerate NLL; loud failure at tokenize
+    # time is more useful than a near-zero PPL downstream.
+    tokens = tokenize_for_ppl(
+        tokenizer,
+        text,
+        max_tokens=max_tokens,
+        min_tokens=chunk_size,
+    )
+
+    prefix_cache = _maybe_build_prefix_cache(scenario.workload, adapter)
+
+    if prefix_cache is None:
+        # fp16 baseline path — kv_codec is None AND prefix_cache=False.
+        nll_sum, n_tokens = teacher_forced_chunked_nll(
+            adapter, tokens, chunk_size=chunk_size
+        )
+    else:
+        # Codec-backed path — build_seeded_batch_kv seeds per-chunk
+        # caches from prefix_cache; encode / decode fire on every
+        # chunk boundary.
+        nll_sum, n_tokens = teacher_forced_chunked_nll_with_codec(
+            adapter,
+            prefix_cache,
+            tokens,
+            chunk_size=chunk_size,
+        )
+
+    ppl = perplexity_from_nll(nll_sum, n_tokens)
+
+    collected: dict[str, float | int] = {
+        "nll_sum": float(nll_sum),
+        "n_tokens": int(n_tokens),
+        "ppl": float(ppl),
+    }
+    context: dict[str, Any] = {
+        "chunk_size": chunk_size,
+        "max_tokens": max_tokens,
+        "wikitext_path": str(wikitext_path),
+        "kv_codec": scenario.workload.kv_codec,
+    }
+    return collected, context
 
 
 def _maybe_build_prefix_cache(

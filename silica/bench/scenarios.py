@@ -131,6 +131,8 @@ passes its gates.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from silica.bench.scenario import OracleKind, Scenario, Workload
 
 _QWEN3_0_6B_SMOKE = Scenario(
@@ -760,6 +762,161 @@ _QWEN3_0_6B_TTFT_UNDER_CONCURRENCY = Scenario(
 )
 
 
+# =============================================================================
+# P-5-C.2 step 3 — WikiText-2 PPL rows on Qwen3-0.6B.
+#
+# The four rows share the same tokenized WikiText-2 input (default
+# ``~/.cache/silica/wikitext2-test.txt``, populate via
+# ``scripts/prepare_wikitext2_cache.py``). The ``fp16`` row is the
+# baseline — runs through ``teacher_forced_chunked_nll`` on the
+# adapter's own ``BatchKVCache`` (no prefix cache, no codec). The
+# three compression rows run through
+# ``teacher_forced_chunked_nll_with_codec`` with a fresh
+# ``RadixPrefixCache`` whose store carries the named codec; each
+# chunk >= 1 decodes the prior prefix blocks (codec hot path fires)
+# and encodes the newly-grown tail.
+#
+# Model pinned to Qwen3-0.6B for consistency with the A.3 / B.3
+# decode-speed rows — Qwen3.5-0.8B is hybrid-DeltaNet and
+# ``ContinuousBatcher`` refuses ``RadixPrefixCache`` on recurrent
+# adapters.
+# =============================================================================
+
+_WIKITEXT2_DEFAULT_PATH = str(
+    Path.home() / ".cache" / "silica" / "wikitext2-test.txt"
+)
+
+_WIKITEXT_PPL_ORACLE_CONFIG: dict[str, int | str] = {
+    "wikitext_path": _WIKITEXT2_DEFAULT_PATH,
+    # vqbench REPORT headline runs 512 tokens (two 256-token chunks).
+    "chunk_size": 256,
+    "max_tokens": 512,
+    # At least one full chunk of scored tokens — a zero-scored-token
+    # run is a measurement degenerate that the oracle should reject
+    # loudly.
+    "min_scored_tokens": 256,
+}
+
+
+_QWEN3_0_6B_WIKITEXT_PPL_FP16 = Scenario(
+    id="qwen3-0.6b-wikitext-ppl-fp16",
+    repo="Qwen/Qwen3-0.6B",
+    workload=Workload(
+        name="wikitext-ppl-fp16",
+        # PPL bypasses engine.generate_batch entirely — the runner's
+        # ``_run_ppl`` reads wikitext_path + drives the adapter via
+        # silica.bench.ppl_oracle. prompts / max_tokens carry no
+        # signal for this oracle.
+        prompts=(),
+        max_tokens=0,
+        max_batch_size=1,
+        prefix_cache=False,
+        temperature=0.0,
+        top_p=1.0,
+        kv_codec=None,
+    ),
+    oracle=OracleKind.PPL,
+    oracle_config=dict(_WIKITEXT_PPL_ORACLE_CONFIG),
+    gate_env_var=None,
+    description=(
+        "P-5-C.2 baseline PPL row. Teacher-forced streaming PPL on "
+        "WikiText-2 raw test split (chunk_size=256, max_tokens=512 "
+        "matching vqbench REPORT headline). Cache-agnostic fp16 "
+        "baseline — drives the adapter's own BatchKVCache across "
+        "chunks (shared cache, chunk-invariant). Cache-only gate "
+        "plus WikiText cache file presence at "
+        "~/.cache/silica/wikitext2-test.txt (populate once via "
+        "scripts/prepare_wikitext2_cache.py)."
+    ),
+)
+
+
+_QWEN3_0_6B_WIKITEXT_PPL_TQ_MSE_B4 = Scenario(
+    id="qwen3-0.6b-wikitext-ppl-tq-mse-b4",
+    repo="Qwen/Qwen3-0.6B",
+    workload=Workload(
+        name="wikitext-ppl-tq-mse-b4",
+        prompts=(),
+        max_tokens=0,
+        max_batch_size=1,
+        prefix_cache=True,
+        temperature=0.0,
+        top_p=1.0,
+        kv_codec="tq_mse_b4",
+    ),
+    oracle=OracleKind.PPL,
+    oracle_config=dict(_WIKITEXT_PPL_ORACLE_CONFIG),
+    gate_env_var=None,
+    description=(
+        "P-5-C.2 TurboQuantMSE 4-bit K+V PPL row. Same workload "
+        "shape as qwen3-0.6b-wikitext-ppl-fp16 but routes every "
+        "chunk's prior prefix through ``tq_mse_b4`` "
+        "encode/decode. Emits a raw PPL number; ΔPPL vs the fp16 "
+        "baseline is a downstream derivation (bench report / C.6 "
+        "vqbench cross-check) — step 3a does not propagate the "
+        "fp16 PPL between rows at runtime."
+    ),
+)
+
+
+_QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4 = Scenario(
+    id="qwen3-0.6b-wikitext-ppl-block-tq-b64-b4",
+    repo="Qwen/Qwen3-0.6B",
+    workload=Workload(
+        name="wikitext-ppl-block-tq-b64-b4",
+        prompts=(),
+        max_tokens=0,
+        max_batch_size=1,
+        prefix_cache=True,
+        temperature=0.0,
+        top_p=1.0,
+        kv_codec="block_tq_b64_b4",
+    ),
+    oracle=OracleKind.PPL,
+    oracle_config=dict(_WIKITEXT_PPL_ORACLE_CONFIG),
+    gate_env_var=None,
+    description=(
+        "P-5-C.2 BlockTurboQuantMSE B=64 4-bit K+V PPL row. "
+        "Production recommendation per vqbench REPORT §3.1 "
+        "(strictly lossless at std=0% across three seeds on "
+        "Qwen3.5-4B; 3.76x total-KV compression). silica mirrors "
+        "the configuration on Qwen3-0.6B; the row emits a raw PPL "
+        "number at step 3a. ΔPPL against the fp16 baseline is a "
+        "downstream computation (bench report / C.6 vqbench "
+        "cross-check), not wired into the per-row runner in 3a."
+    ),
+)
+
+
+_QWEN3_0_6B_WIKITEXT_PPL_EXT_RABITQ_B4 = Scenario(
+    id="qwen3-0.6b-wikitext-ppl-ext-rabitq-b4",
+    repo="Qwen/Qwen3-0.6B",
+    workload=Workload(
+        name="wikitext-ppl-ext-rabitq-b4",
+        prompts=(),
+        max_tokens=0,
+        max_batch_size=1,
+        prefix_cache=True,
+        temperature=0.0,
+        top_p=1.0,
+        kv_codec="ext_rabitq_b4",
+    ),
+    oracle=OracleKind.PPL,
+    oracle_config=dict(_WIKITEXT_PPL_ORACLE_CONFIG),
+    gate_env_var=None,
+    description=(
+        "P-5-C.2 ExtRaBitQ 4-bit K+V PPL row. RaBitQ family arm "
+        "of the PPL bench; effective bits/coord = 4 + 48/head_dim "
+        "(head_dim=128 -> 4.375). Emits a raw PPL number at step "
+        "3a; ΔPPL derivation against fp16 is downstream. "
+        "rabitq_b1 is deliberately excluded: K-only codec "
+        "(``v_supported=False``) that cannot install via the "
+        "symmetric ``kv_codec=`` shorthand, and its hypercube "
+        "MSE is worse than BlockTQ at matching bit budget."
+    ),
+)
+
+
 BUILTIN_SCENARIOS: dict[str, Scenario] = {
     _QWEN3_0_6B_SMOKE.id: _QWEN3_0_6B_SMOKE,
     _QWEN3_0_6B_B1_PARITY.id: _QWEN3_0_6B_B1_PARITY,
@@ -773,6 +930,10 @@ BUILTIN_SCENARIOS: dict[str, Scenario] = {
     _QWEN3_0_6B_PREFIX_HIT_DECODE_FP16.id: _QWEN3_0_6B_PREFIX_HIT_DECODE_FP16,
     _QWEN3_0_6B_PREFIX_HIT_DECODE_BLOCK_TQ_B64_B4.id: _QWEN3_0_6B_PREFIX_HIT_DECODE_BLOCK_TQ_B64_B4,
     _QWEN3_0_6B_PREFIX_HIT_DECODE_EXT_RABITQ_B4.id: _QWEN3_0_6B_PREFIX_HIT_DECODE_EXT_RABITQ_B4,
+    _QWEN3_0_6B_WIKITEXT_PPL_FP16.id: _QWEN3_0_6B_WIKITEXT_PPL_FP16,
+    _QWEN3_0_6B_WIKITEXT_PPL_TQ_MSE_B4.id: _QWEN3_0_6B_WIKITEXT_PPL_TQ_MSE_B4,
+    _QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4.id: _QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4,
+    _QWEN3_0_6B_WIKITEXT_PPL_EXT_RABITQ_B4.id: _QWEN3_0_6B_WIKITEXT_PPL_EXT_RABITQ_B4,
     _QWEN3_5_27B_SMOKE.id: _QWEN3_5_27B_SMOKE,
     _QWEN3_5_MOE_SMOKE.id: _QWEN3_5_MOE_SMOKE,
     _GEMMA4_31B_SMOKE.id: _GEMMA4_31B_SMOKE,

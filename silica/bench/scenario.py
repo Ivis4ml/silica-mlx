@@ -69,6 +69,19 @@ class OracleKind(str, Enum):
     # 0.85 × IdentityCodec row-1 decode tok/s. Scenario authoring
     # pins the workload shape; runner validates.
     DECODE_TOK_S_WITH_PREFIX_HIT = "decode_tok_s_with_prefix_hit"
+    # P-5-C.2 step 3. Teacher-forced streaming PPL on a tokenized
+    # WikiText-2 test split. Does **not** go through
+    # ``engine.generate_batch``; the runner drives
+    # :func:`silica.bench.ppl_oracle.teacher_forced_chunked_nll`
+    # (fp16 baseline) or
+    # :func:`silica.bench.ppl_oracle.teacher_forced_chunked_nll_with_codec`
+    # (codec-backed) depending on ``workload.kv_codec``.
+    # ``oracle_config`` carries ``wikitext_path`` (local UTF-8 text
+    # file), ``chunk_size`` (default 256), ``max_tokens`` (default
+    # 512), and ``min_scored_tokens`` (floor on ``n_tokens``,
+    # default 1). ``collected`` payload shape is
+    # ``{"nll_sum": float, "n_tokens": int, "ppl": float}``.
+    PPL = "ppl"
 
 
 @dataclass(frozen=True)
