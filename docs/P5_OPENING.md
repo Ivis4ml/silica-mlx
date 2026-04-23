@@ -715,7 +715,8 @@ Already shipped at P-4.4. Under P-5 it becomes the **independent** column: `scri
 | `qwen3.5-0.8b-wikitext-ppl-rabitq` | `ext_rabitq_b4`       | PPL          | RaBitQ family                                |
 | `qwen3.5-0.8b-compression`          | cross-codec           | STORAGE      | One row per codec, reports `resident_bytes` |
 | `qwen3-0.6b-prefix-hit-decode-fp16` | `fp16`                | DECODE_TOK_S_WITH_PREFIX_HIT | Acceptance gate (d) baseline; `[p, p] max_batch_size=1 prefix_cache=True`. Qwen3-0.6B rather than Qwen3.5-0.8B — the latter is hybrid-DeltaNet, `ContinuousBatcher` refuses `RadixPrefixCache` on `has_recurrent_state=True` adapters (docs/P3_DELTANET_SURVEY.md C-open-3). Same workload shape; the ratio gate is codec-relative so the target swap is neutral |
-| `qwen3-0.6b-prefix-hit-decode-block-tq-b64-b4` | `block_tq_b64_b4` | DECODE_TOK_S_WITH_PREFIX_HIT | Acceptance gate (d) codec arm; same workload shape as the fp16 row |
+| `qwen3-0.6b-prefix-hit-decode-block-tq-b64-b4` | `block_tq_b64_b4` | DECODE_TOK_S_WITH_PREFIX_HIT | P-5-A.3c acceptance gate (d) BlockTQ arm; same workload shape as the fp16 row |
+| `qwen3-0.6b-prefix-hit-decode-ext-rabitq-b4` | `ext_rabitq_b4` | DECODE_TOK_S_WITH_PREFIX_HIT | P-5-B.3 acceptance gate ExtRaBitQ arm; same workload shape, same 0.85× threshold as the BlockTQ arm. `rabitq_b1` is deliberately excluded (K-only, cannot install via symmetric `kv_codec=` shorthand) |
 
 `qwen3.5-4B` rows follow once compute budget allows — vqbench headline is on 4B, not 0.8B. The `STORAGE` oracle is new; reports pure memory without requiring PPL compute; useful for `qwen3.5-27B` where PPL compute is expensive.
 
@@ -913,15 +914,17 @@ Blocked by: P-5-A.1. Can land in parallel with A.2.
 
 ### P-5-B — `RaBitQ1Bit` + `ExtRaBitQ`
 
-Scope:
-- `silica.vq.rabitq.rabitq_1bit.RaBitQ1Bit` + bit-pack sign storage.
-- `silica.vq.rabitq.rabitq_ext.ExtRaBitQ` + integer-grid codebook.
-- `RaBitQPayload` + optional centroid fit (no-op by default).
-- Bench rows: `qwen3.5-0.8b-wikitext-ppl-rabitq`, variants at B=1/2/3/4.
-- Acceptance: (a) recon-error cross-check for ExtRaBitQ; (d) decode-speed gate.
-- Tests: `tests/test_kvcodec_integration.py` cases for `RaBitQPayload`.
+Scope (landed in sub-units B.1a-c + B.2a-c + B.3):
 
-Blocked by: P-5-A.
+- `silica.vq.rabitq.rabitq_1bit.RaBitQ1Bit` (B.1a) + bit-pack sign storage; `RaBitQPayload` with three fp16 fields (`norm_o`, `ip_coeff`, packed sign bits). Centroid pinned at zero per §5.3; `fit()` is a no-op.
+- `silica.vq.rabitq.rabitq_ext.ExtRaBitQ` (B.2a) + integer-grid codebook; `ExtRaBitQPayload(RaBitQPayload)` subclass adds per-vector fp16 `scale`. `offset` omitted — see §5.4 amendment. `mx.round` half-to-even rounding matches `np.round` and is regression-locked in tests.
+- `tests/test_rabitq_1bit_parity.py` (B.1c) + `tests/test_rabitq_ext_parity.py` (B.2c) — NumPy reference transcribed inline (no vqbench import); fp16-rounded shared input. B.2c uses fp32 reference to match silica's MLX precision and bounds indices/decoded at fractional-mismatch / relative-Frobenius rather than bit-for-bit (boundary-precision fuzz across Metal vs CPU fp32 matmul).
+- `silica.bench.codec_registry` gains `rabitq_b1` (B.1b, K-only `v_supported=False`) + `ext_rabitq_b{2,3,4}` (B.2b, symmetric). `effective_bits_per_value` gets `rabitq` (`+32/head_dim`) and `ext_rabitq` (`+48/head_dim`) branches.
+- `silica.bench.scenarios` gains `qwen3-0.6b-prefix-hit-decode-ext-rabitq-b4` (B.3) as the ExtRaBitQ arm of the §7(d) decode-speed gate.
+- `tests/test_prefix_hit_decode_speed_gate.py` (B.3) extends the P-5-A.3c gate with a matched ExtRaBitQ arm at the same 0.85× threshold. `rabitq_b1` is deliberately not gated — K-only codec that cannot install via the symmetric `kv_codec=` shorthand, and its hypercube MSE is worse than BlockTQ at matching bit budget.
+- Acceptance: (d) decode-speed gate landed for both BlockTQ and ExtRaBitQ arms.
+
+Blocked by: P-5-A (landed).
 
 ### P-5-C — Reproducibility + variance + cross-check
 
@@ -930,7 +933,7 @@ Scope:
 - `silica.bench.ppl_oracle.teacher_forced_chunked_logits` — MLX-native teacher-forced streaming PPL entry point. Does **not** go through `Engine.generate_batch`; drives `adapter` + `RadixPrefixCache` + `fetch_detached_blocks` + `build_seeded_batch_kv` + the new `silica.mlx.runner.forward_batched_full` (returns full-positional `(B, T, V)` logits; sibling to the existing `forward_batched` which slices to `(B, V)` for sampling) to collect per-position logits (§6.2). Test: chunk-invariance regression lock mirroring vqbench's `tests/test_streaming_ppl.py`.
 - `silica.mlx.runner.forward_batched_full` — new runner entry point returning the full `(B, T, V)` logits from `model(tokens, cache=cache_list)` without the last-position slice that `forward_batched` applies. Dedicated to teacher-forced callers; `Sampler` and `ContinuousBatcher` continue to use `forward_batched`. See §6.2 for the signature and rationale.
 - `scripts/bench.py` CLI extensions: `--kv-codec <id>` (registry dispatch), `--seeds 42,43,44` (multi-seed sweep), `--all-kv-codecs` (iterate every `CodecSpec`), `--vqbench-xcheck` (run the P-4.4 subprocess path alongside the silica oracle and compare ΔPPL deltas per §7 (b)).
-- Bench rows: the `qwen3.5-0.8b-wikitext-ppl-*`, `qwen3.5-0.8b-compression`, `qwen3.5-0.8b-admission-headroom-prefix-heavy` rows from §6.5. (`qwen3-0.6b-prefix-hit-decode-{fp16,block-tq-b64-b4}` and their oracle ship with P-5-A.3.)
+- Bench rows: the `qwen3.5-0.8b-wikitext-ppl-*`, `qwen3.5-0.8b-compression`, `qwen3.5-0.8b-admission-headroom-prefix-heavy` rows from §6.5. (`qwen3-0.6b-prefix-hit-decode-{fp16,block-tq-b64-b4}` ship with P-5-A.3; `qwen3-0.6b-prefix-hit-decode-ext-rabitq-b4` ships with P-5-B.3.)
 - Variance / multi-seed plumbing in `BenchRunner`: per-(scenario, codec, seed) row in the JSONL output; markdown table with `mean ± std` columns.
 - Acceptance: (b) PPL-delta cross-check vs vqbench; (e) full vqbench table reproducible in one flag; (f) no regression.
 - Tests: `tests/test_codec_registry.py` (CodecSpec honesty; landed in P-5-A.1b), `tests/test_ppl_oracle.py` (chunk invariance + teacher-forced entry point correctness), extensions to `tests/test_bench_runner.py` / `tests/test_bench_cli.py`.

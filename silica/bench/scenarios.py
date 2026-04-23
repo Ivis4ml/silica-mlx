@@ -415,6 +415,46 @@ _QWEN3_0_6B_PREFIX_HIT_DECODE_BLOCK_TQ_B64_B4 = Scenario(
 )
 
 
+_QWEN3_0_6B_PREFIX_HIT_DECODE_EXT_RABITQ_B4 = Scenario(
+    id="qwen3-0.6b-prefix-hit-decode-ext-rabitq-b4",
+    repo="Qwen/Qwen3-0.6B",
+    workload=Workload(
+        name="prefix-hit-decode-ext-rabitq-b4",
+        prompts=(
+            _PREFIX_HIT_DECODE_SHARED_PROMPT,
+            _PREFIX_HIT_DECODE_SHARED_PROMPT,
+        ),
+        max_tokens=16,
+        max_batch_size=1,
+        prefix_cache=True,
+        temperature=0.0,
+        top_p=1.0,
+        kv_codec="ext_rabitq_b4",
+    ),
+    oracle=OracleKind.DECODE_TOK_S_WITH_PREFIX_HIT,
+    gate_env_var=None,
+    description=(
+        "P-5-B.3 compression row — ExtRaBitQ arm of the prefix-hit "
+        "decode-speed acceptance gate. Identical workload shape to "
+        "qwen3-0.6b-prefix-hit-decode-fp16 but with kv_codec="
+        "'ext_rabitq_b4' — ExtRaBitQ num_bits=4 (symmetric K+V, "
+        "effective bits/coord = 4 + 48/head_dim = 4.375 at "
+        "head_dim=128). Row 1's seeded-admission path exercises "
+        "``k_codec.decode_tensor`` + ``v_codec.decode_tensor`` × "
+        "num_layers × num_hit_blocks with ExtRaBitQ's integer-grid "
+        "codebook lookup + per-vector scale multiply + re-"
+        "normalization + inverse rotation; the codec overhead this "
+        "scenario measures. The B.3 acceptance test compares this "
+        "row's decode_tok_s against the paired fp16 baseline to gate "
+        "ExtRaBitQ ≥ 0.85× identity (same threshold as BlockTQ). "
+        "rabitq_b1 is deliberately excluded from the gate — it is "
+        "K-only (``v_supported=False``) so the symmetric kv_codec= "
+        "shorthand cannot install it, and its hypercube MSE is worse "
+        "than BlockTQ at matching bit budget. Cache-only gate."
+    ),
+)
+
+
 _QWEN3_5_27B_SMOKE = Scenario(
     id="qwen3.5-27b-smoke",
     repo="mlx-community/Qwen3.5-27B-4bit",
@@ -732,6 +772,7 @@ BUILTIN_SCENARIOS: dict[str, Scenario] = {
     _QWEN3_5_0_8B_B1_PARITY.id: _QWEN3_5_0_8B_B1_PARITY,
     _QWEN3_0_6B_PREFIX_HIT_DECODE_FP16.id: _QWEN3_0_6B_PREFIX_HIT_DECODE_FP16,
     _QWEN3_0_6B_PREFIX_HIT_DECODE_BLOCK_TQ_B64_B4.id: _QWEN3_0_6B_PREFIX_HIT_DECODE_BLOCK_TQ_B64_B4,
+    _QWEN3_0_6B_PREFIX_HIT_DECODE_EXT_RABITQ_B4.id: _QWEN3_0_6B_PREFIX_HIT_DECODE_EXT_RABITQ_B4,
     _QWEN3_5_27B_SMOKE.id: _QWEN3_5_27B_SMOKE,
     _QWEN3_5_MOE_SMOKE.id: _QWEN3_5_MOE_SMOKE,
     _GEMMA4_31B_SMOKE.id: _GEMMA4_31B_SMOKE,
