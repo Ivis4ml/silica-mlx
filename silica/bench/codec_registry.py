@@ -7,7 +7,7 @@ and exposes a factory that produces a ready-to-use codec given the
 per-side shape params (``block_size``, ``n_kv_heads``, ``head_dim``,
 ``dtype``).
 
-Registered entries (P-5-A.1b + P-5-B.1b scope):
+Registered entries (P-5-A.1b + P-5-B.1b + P-5-B.2b scope):
 
 - ``fp16``: IdentityCodec baseline. 16 bits/value; no compression.
 - ``tq_mse_b3`` / ``tq_mse_b4``: Scalar TurboQuantMSE (aliased to
@@ -23,13 +23,19 @@ Registered entries (P-5-A.1b + P-5-B.1b scope):
   installation via the ``kv_codec=`` shorthand is explicitly rejected
   at ``_maybe_build_prefix_cache`` time so a mis-wired scenario fails
   fast rather than silently quantizing V with a K-only codec.
+- ``ext_rabitq_b{2,3,4}``: ExtRaBitQ (P-5-B.2b). Multi-bit integer-
+  grid codec with per-vector fp16 ``norm_o`` + fp16 ``ip_coeff`` +
+  fp16 ``scale`` metadata. Symmetric (``v_supported=True``): multi-
+  bit reconstruction MSE is competitive with BlockTQ on V, and the
+  unbiased-estimator attention path works on either side. Effective
+  bits per coordinate is ``num_bits + 48 / head_dim`` — three fp16
+  scalars amortize to ``48 / head_dim``, one more fp16 than the
+  ``rabitq`` family (which has two: ``norm_o`` + ``ip_coeff``).
 
 Only ``block_tq_b64_b4`` is ``production_recommended`` — vqbench REPORT
 §3.1 shows it is strictly lossless at ``std = 0.000%`` across three
 seeds on Qwen3.5-4B WikiText-2, delivering 3.76× total-KV compression.
 All other entries are bench-row / comparison configs.
-
-P-5-B.2 adds ExtRaBitQ entries (``ext_rabitq_b{2,3,4}``).
 """
 
 from __future__ import annotations
@@ -40,7 +46,7 @@ from dataclasses import dataclass
 import mlx.core as mx
 
 from silica.kvcache.codec import IdentityCodec, VectorCodec
-from silica.vq import BlockTurboQuantMSE, RaBitQ1Bit, TurboQuantMSE
+from silica.vq import BlockTurboQuantMSE, ExtRaBitQ, RaBitQ1Bit, TurboQuantMSE
 
 # Every factory takes the per-side shape via kwargs and returns a
 # ready-to-use VectorCodec. The registry binds codec-specific knobs
@@ -56,8 +62,8 @@ class CodecSpec:
     Attributes:
         id: unique string identifier (stable across versions; used by
             the ``--kv-codec`` CLI flag and bench JSONL rows).
-        family: ``"fp16"`` | ``"tq_mse"`` | ``"block_tq"`` | ``"rabitq"``
-            (P-5-B.2 will add ``"ext_rabitq"``).
+        family: ``"fp16"`` | ``"tq_mse"`` | ``"block_tq"`` | ``"rabitq"`` |
+            ``"ext_rabitq"``.
         bits_per_value: nominal bits per coordinate. For BlockTQ this
             is exact (``num_bits + 16 / vq_block_size``, head-dim-
             independent). For scalar TQ it is ``float(num_bits)``; the
@@ -66,6 +72,9 @@ class CodecSpec:
             when head_dim is known. For RaBitQ it is ``float(num_bits)``
             (nominal); the true value is higher by ``32 / head_dim``
             from two per-vector fp16 scalars (``norm_o`` + ``ip_coeff``).
+            For ExtRaBitQ it is ``float(num_bits)`` (nominal); the true
+            value is higher by ``48 / head_dim`` from three per-vector
+            fp16 scalars (``norm_o`` + ``ip_coeff`` + ``scale``).
         k_supported: whether this codec can serve as the K-side codec
             in ``SyntheticPrefixBlockStore(k_codec=..., v_codec=...)``.
         v_supported: whether this codec can serve as the V-side codec.
@@ -109,18 +118,23 @@ class CodecSpec:
         ``num_bits + 16 / head_dim`` (the per-vector fp16 scale
         amortizes to ``16 / head_dim`` bits per coordinate). For RaBitQ
         this is ``num_bits + 32 / head_dim`` (two per-vector fp16
-        scalars: ``norm_o`` and ``ip_coeff``, amortizing to
-        ``32 / head_dim`` bits per coordinate). For fp16 baseline this
-        is 16.
+        scalars: ``norm_o`` and ``ip_coeff``). For ExtRaBitQ this is
+        ``num_bits + 48 / head_dim`` — three per-vector fp16 scalars
+        (``norm_o`` + ``ip_coeff`` + ``scale``), one more than RaBitQ
+        because ExtRaBitQ stores a per-vector dequantization scale
+        (constant across vectors in v0.1; carried per-vector for
+        schema parity with future data-driven variants). For fp16
+        baseline this is 16.
 
         Raises:
             ValueError: if ``head_dim`` is not a positive integer, or
                 if ``family`` is not one of the known values. The
-                positive-head_dim guard matters for ``tq_mse`` and
-                ``rabitq`` families where ``head_dim`` appears in the
-                denominator; ``head_dim = 0`` would otherwise divide-
-                by-zero, and a negative head_dim would produce a
-                meaningless negative bits/value result.
+                positive-head_dim guard matters for ``tq_mse``,
+                ``rabitq``, and ``ext_rabitq`` families where
+                ``head_dim`` appears in the denominator; ``head_dim =
+                0`` would otherwise divide-by-zero, and a negative
+                head_dim would produce a meaningless negative
+                bits/value result.
         """
         if head_dim <= 0:
             raise ValueError(
@@ -134,6 +148,8 @@ class CodecSpec:
             return float(self.bits_per_value)
         if self.family == "rabitq":
             return float(self.bits_per_value) + 32.0 / float(head_dim)
+        if self.family == "ext_rabitq":
+            return float(self.bits_per_value) + 48.0 / float(head_dim)
         raise ValueError(f"unknown codec family: {self.family!r}")
 
 
@@ -220,6 +236,30 @@ def _rabitq_b1_factory(
         num_bits=1,
         dtype=dtype,
     )
+
+
+def _make_ext_rabitq_factory(num_bits: int) -> CodecFactory:
+    """Return a factory that builds ``ExtRaBitQ`` with the given
+    ``num_bits``. Maker closure (not module-level function) because
+    the catalog ships three variants ``b ∈ {2, 3, 4}`` — mirrors
+    ``_make_block_tq_factory`` / ``_make_scalar_tq_factory``."""
+
+    def factory(
+        *,
+        block_size: int,
+        n_kv_heads: int,
+        head_dim: int,
+        dtype: mx.Dtype = mx.float16,
+    ) -> VectorCodec:
+        return ExtRaBitQ(
+            block_size=block_size,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            num_bits=num_bits,
+            dtype=dtype,
+        )
+
+    return factory
 
 
 # =============================================================================
@@ -340,6 +380,57 @@ CODEC_REGISTRY: dict[str, CodecSpec] = {
         # comparison tables, not for production.
         production_recommended=False,
         factory=_rabitq_b1_factory,
+    ),
+    "ext_rabitq_b2": CodecSpec(
+        id="ext_rabitq_b2",
+        family="ext_rabitq",
+        # Nominal 2 bits/coord. effective adds 48/head_dim for the
+        # fp16 (norm_o + ip_coeff + scale) triple; head_dim=64 → 2.75.
+        bits_per_value=2.0,
+        k_supported=True,
+        # Symmetric: ExtRaBitQ's multi-bit reconstruction MSE is
+        # competitive with BlockTQ on V, and the unbiased estimator
+        # attention path works on either side. Unlike rabitq_b1 (1-bit
+        # K-only), ExtRaBitQ is valid under the symmetric kv_codec=
+        # shorthand.
+        v_supported=True,
+        # Centroid pinned at zero (§5.3); fit() is a no-op.
+        requires_fit=False,
+        payload_packed=True,
+        # Bench-row only; B=2 has the weakest reconstruction in the
+        # ext_rabitq family and is not production-pinned.
+        production_recommended=False,
+        factory=_make_ext_rabitq_factory(num_bits=2),
+    ),
+    "ext_rabitq_b3": CodecSpec(
+        id="ext_rabitq_b3",
+        family="ext_rabitq",
+        bits_per_value=3.0,  # effective: 3 + 48/head_dim → 3.75 @ d=64
+        k_supported=True,
+        v_supported=True,
+        requires_fit=False,
+        payload_packed=True,
+        # vqbench REPORT §3.1: ExtRaBitQ at 3-bit K+V is the worst of
+        # the three families (+3.73% ΔPPL); bench row for ladder
+        # comparison, not production.
+        production_recommended=False,
+        factory=_make_ext_rabitq_factory(num_bits=3),
+    ),
+    "ext_rabitq_b4": CodecSpec(
+        id="ext_rabitq_b4",
+        family="ext_rabitq",
+        bits_per_value=4.0,  # effective: 4 + 48/head_dim → 4.75 @ d=64
+        k_supported=True,
+        v_supported=True,
+        requires_fit=False,
+        payload_packed=True,
+        # vqbench REPORT §3.1: ExtRaBitQ at 4-bit K+V is seed-dependent
+        # (+0.262% ± 0.371%); lossless at 4-bit K-only. The single
+        # production recommendation remains block_tq_b64_b4, so this
+        # is a bench-row only — P-5-B.3 uses it as the ExtRaBitQ arm
+        # of the decode-speed acceptance gate.
+        production_recommended=False,
+        factory=_make_ext_rabitq_factory(num_bits=4),
     ),
 }
 

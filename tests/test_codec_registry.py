@@ -36,7 +36,7 @@ from silica.bench.codec_registry import (
     list_codec_ids,
 )
 from silica.kvcache.codec import VectorCodec
-from silica.vq import BlockTurboQuantMSE, RaBitQ1Bit
+from silica.vq import BlockTurboQuantMSE, ExtRaBitQ, RaBitQ1Bit
 
 # Shared shape defaults for factory-smoke tests.
 BLOCK_SIZE = 16
@@ -79,6 +79,9 @@ def test_expected_codec_ids_present() -> None:
         "block_tq_b64_b3",
         "block_tq_b64_b4",
         "rabitq_b1",
+        "ext_rabitq_b2",
+        "ext_rabitq_b3",
+        "ext_rabitq_b4",
     }
     assert set(CODEC_REGISTRY.keys()) == expected
 
@@ -101,7 +104,10 @@ def test_fp16_baseline_is_uncompressed() -> None:
 
 
 def test_families_partition_by_prefix() -> None:
-    """id prefix ↔ family mapping."""
+    """id prefix ↔ family mapping. Order matters: ``ext_rabitq_*`` must
+    match before ``rabitq_*`` since ``rabitq`` is a proper prefix of
+    ``ext_rabitq_*`` would NOT be — but the tests use ``startswith`` so
+    the more-specific prefix checks first."""
     for spec in CODEC_REGISTRY.values():
         if spec.id == "fp16":
             assert spec.family == "fp16"
@@ -109,6 +115,8 @@ def test_families_partition_by_prefix() -> None:
             assert spec.family == "tq_mse"
         elif spec.id.startswith("block_tq"):
             assert spec.family == "block_tq"
+        elif spec.id.startswith("ext_rabitq"):
+            assert spec.family == "ext_rabitq"
         elif spec.id.startswith("rabitq"):
             assert spec.family == "rabitq"
         else:
@@ -229,6 +237,45 @@ def test_rabitq_b1_factory_yields_rabitq_1bit() -> None:
     assert isinstance(codec, RaBitQ1Bit)
 
 
+@pytest.mark.parametrize(
+    "codec_id,expected_num_bits",
+    [
+        ("ext_rabitq_b2", 2),
+        ("ext_rabitq_b3", 3),
+        ("ext_rabitq_b4", 4),
+    ],
+)
+def test_ext_rabitq_factory_yields_ext_rabitq(
+    codec_id: str, expected_num_bits: int
+) -> None:
+    """Each ``ext_rabitq_b{B}`` factory must produce an ``ExtRaBitQ``
+    instance with the correct ``num_bits``. ExtRaBitQ's constructor
+    enforces ``num_bits in {2, 3, 4}`` so a factory that threaded the
+    wrong bit count would raise at construction; this test also pins
+    the bit count to the id suffix so a future edit cannot silently
+    re-wire ``ext_rabitq_b3`` to instantiate a B=2 codec."""
+    spec = get_codec_spec(codec_id)
+    codec = spec.factory(
+        block_size=BLOCK_SIZE,
+        n_kv_heads=N_KV_HEADS,
+        head_dim=HEAD_DIM,
+    )
+    assert isinstance(codec, ExtRaBitQ)
+    assert codec._num_bits == expected_num_bits
+
+
+def test_ext_rabitq_family_symmetric() -> None:
+    """All ``ext_rabitq_b{2,3,4}`` entries must declare both
+    ``k_supported`` and ``v_supported`` True. Unlike ``rabitq_b1``
+    (K-only), multi-bit ExtRaBitQ has reconstruction MSE competitive
+    with BlockTQ on V; the symmetric kv_codec= shorthand is valid."""
+    for codec_id in ("ext_rabitq_b2", "ext_rabitq_b3", "ext_rabitq_b4"):
+        spec = get_codec_spec(codec_id)
+        assert spec.family == "ext_rabitq", spec.id
+        assert spec.k_supported, spec.id
+        assert spec.v_supported, spec.id
+
+
 # ---------------------------------------------------------------------------
 # bits_per_value arithmetic
 # ---------------------------------------------------------------------------
@@ -335,6 +382,79 @@ def test_rabitq_b1_effective_matches_silica_resident_bytes() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "codec_id,num_bits",
+    [
+        ("ext_rabitq_b2", 2),
+        ("ext_rabitq_b3", 3),
+        ("ext_rabitq_b4", 4),
+    ],
+)
+def test_ext_rabitq_nominal_bits_per_value_equals_num_bits(
+    codec_id: str, num_bits: int
+) -> None:
+    """Each ``ext_rabitq_b{B}`` stores nominal ``B`` bits per coord.
+    The fp16 metadata overhead (norm_o + ip_coeff + scale) amortizes
+    into :meth:`effective_bits_per_value` and is not counted here."""
+    spec = get_codec_spec(codec_id)
+    assert spec.bits_per_value == float(num_bits)
+
+
+@pytest.mark.parametrize(
+    "codec_id,num_bits,head_dim,expected",
+    [
+        # effective = num_bits + 48/head_dim (three fp16 scalars per vector).
+        ("ext_rabitq_b2", 2, 64, 2.0 + 48.0 / 64),   # 2.75
+        ("ext_rabitq_b2", 2, 128, 2.0 + 48.0 / 128),  # 2.375
+        ("ext_rabitq_b2", 2, 256, 2.0 + 48.0 / 256),  # 2.1875
+        ("ext_rabitq_b3", 3, 64, 3.0 + 48.0 / 64),    # 3.75
+        ("ext_rabitq_b3", 3, 128, 3.0 + 48.0 / 128),  # 3.375
+        ("ext_rabitq_b3", 3, 256, 3.0 + 48.0 / 256),  # 3.1875
+        ("ext_rabitq_b4", 4, 64, 4.0 + 48.0 / 64),    # 4.75
+        ("ext_rabitq_b4", 4, 128, 4.0 + 48.0 / 128),  # 4.375
+        ("ext_rabitq_b4", 4, 256, 4.0 + 48.0 / 256),  # 4.1875
+    ],
+)
+def test_ext_rabitq_effective_bits_per_value_matches_formula(
+    codec_id: str, num_bits: int, head_dim: int, expected: float
+) -> None:
+    """Effective = nominal + 48/head_dim for the ext_rabitq family.
+    48 comes from three per-vector fp16 scalars (``norm_o`` +
+    ``ip_coeff`` + ``scale``) amortized over ``head_dim`` coordinates —
+    one more fp16 than the ``rabitq`` family's 32/head_dim."""
+    spec = get_codec_spec(codec_id)
+    assert spec.effective_bits_per_value(head_dim=head_dim) == pytest.approx(
+        expected
+    )
+
+
+@pytest.mark.parametrize(
+    "codec_id", ["ext_rabitq_b2", "ext_rabitq_b3", "ext_rabitq_b4"]
+)
+def test_ext_rabitq_effective_matches_silica_resident_bytes(
+    codec_id: str,
+) -> None:
+    """Cross-check: the registry's effective_bits_per_value must match
+    ``ExtRaBitQ.resident_bytes / .logical_bytes`` at every supported
+    head_dim. If the two drift (registry says 48/head_dim but the
+    codec stores only 32 or 64 fp16-bits of metadata, or vice versa),
+    this test catches it."""
+    spec = get_codec_spec(codec_id)
+    for head_dim in (64, 128, 256):
+        codec = spec.factory(
+            block_size=BLOCK_SIZE,
+            n_kv_heads=N_KV_HEADS,
+            head_dim=head_dim,
+        )
+        num_tokens = BLOCK_SIZE
+        resident = codec.resident_bytes(num_blocks=1)
+        logical_fp16 = codec.logical_bytes(num_tokens=num_tokens)
+        effective = spec.effective_bits_per_value(head_dim=head_dim)
+        assert resident / logical_fp16 == pytest.approx(
+            effective / 16.0, rel=1e-6
+        )
+
+
 def test_effective_bits_per_value_rejects_unknown_family() -> None:
     bogus = CodecSpec(
         id="bogus",
@@ -355,12 +475,18 @@ def test_effective_bits_per_value_rejects_unknown_family() -> None:
 def test_effective_bits_per_value_rejects_nonpositive_head_dim(
     bad_head_dim: int,
 ) -> None:
-    """head_dim appears in the denominator for tq_mse and rabitq; 0
-    would ZeroDivisionError and a negative value would produce a
-    meaningless negative bits/value. The guard fires before any family
-    branch so even fp16 / block_tq (head-dim-independent families)
-    reject a malformed head_dim consistently."""
-    for codec_id in ("fp16", "tq_mse_b4", "block_tq_b64_b4", "rabitq_b1"):
+    """head_dim appears in the denominator for tq_mse, rabitq, and
+    ext_rabitq; 0 would ZeroDivisionError and a negative value would
+    produce a meaningless negative bits/value. The guard fires before
+    any family branch so even fp16 / block_tq (head-dim-independent
+    families) reject a malformed head_dim consistently."""
+    for codec_id in (
+        "fp16",
+        "tq_mse_b4",
+        "block_tq_b64_b4",
+        "rabitq_b1",
+        "ext_rabitq_b4",
+    ):
         spec = get_codec_spec(codec_id)
         with pytest.raises(ValueError, match="head_dim must be a positive integer"):
             spec.effective_bits_per_value(head_dim=bad_head_dim)
