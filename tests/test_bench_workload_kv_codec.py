@@ -280,3 +280,31 @@ def test_maybe_build_prefix_cache_uses_adapter_layout_for_codec() -> None:
     assert isinstance(v_codec, IdentityCodec)
     assert k_codec.dtype == mx.bfloat16
     assert v_codec.dtype == mx.bfloat16
+
+
+# ---------------------------------------------------------------------------
+# Asymmetric-codec symmetry guard (P-5-B.1b rabitq_b1 is K-only)
+# ---------------------------------------------------------------------------
+
+
+def test_maybe_build_prefix_cache_rejects_rabitq_b1_symmetric_shorthand() -> None:
+    """The ``kv_codec="rabitq_b1"`` shorthand would install RaBitQ1Bit
+    on both K and V sides, but ``rabitq_b1`` declares
+    ``v_supported=False``. The runner must refuse this configuration
+    with a clear error so a scenario cannot silently land an
+    estimator-native K-only codec on V. The error message surfaces
+    both k_supported and v_supported flags so the caller can see which
+    side blocked."""
+    wl = Workload(
+        name="t",
+        prompts=("hi",),
+        max_tokens=4,
+        prefix_cache=True,
+        kv_codec="rabitq_b1",
+    )
+    # head_dim=64 satisfies rabitq_b1's head_dim % 8 == 0 constraint
+    # so construction itself would succeed if the guard weren't there —
+    # proving the guard fires on symmetry, not on shape / dtype.
+    adapter = _StubAdapter(n_kv_heads=4, head_dim=64, num_layers=2)
+    with pytest.raises(ValueError, match="not symmetric"):
+        _maybe_build_prefix_cache(wl, adapter)  # type: ignore[arg-type]

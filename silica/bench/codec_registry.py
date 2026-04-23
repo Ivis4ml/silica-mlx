@@ -7,7 +7,7 @@ and exposes a factory that produces a ready-to-use codec given the
 per-side shape params (``block_size``, ``n_kv_heads``, ``head_dim``,
 ``dtype``).
 
-Registered entries (P-5-A.1b scope):
+Registered entries (P-5-A.1b + P-5-B.1b scope):
 
 - ``fp16``: IdentityCodec baseline. 16 bits/value; no compression.
 - ``tq_mse_b3`` / ``tq_mse_b4``: Scalar TurboQuantMSE (aliased to
@@ -16,15 +16,20 @@ Registered entries (P-5-A.1b scope):
 - ``block_tq_b32_b{3,4}`` / ``block_tq_b64_b{3,4}``: BlockTurboQuantMSE
   with ``vq_block_size`` ∈ {32, 64} and ``num_bits`` ∈ {3, 4}. Exact
   effective bits/value = ``num_bits + 16 / vq_block_size``.
+- ``rabitq_b1``: RaBitQ1Bit (P-5-B.1b). 1-bit hypercube codec with
+  per-vector fp16 ``norm_o`` + fp16 ``ip_coeff`` metadata. K-only
+  (``v_supported=False``) — the estimator-native attention path the
+  ``ip_coeff`` field feeds lives on K by construction; symmetric K+V
+  installation via the ``kv_codec=`` shorthand is explicitly rejected
+  at ``_maybe_build_prefix_cache`` time so a mis-wired scenario fails
+  fast rather than silently quantizing V with a K-only codec.
 
 Only ``block_tq_b64_b4`` is ``production_recommended`` — vqbench REPORT
 §3.1 shows it is strictly lossless at ``std = 0.000%`` across three
 seeds on Qwen3.5-4B WikiText-2, delivering 3.76× total-KV compression.
 All other entries are bench-row / comparison configs.
 
-P-5-B adds RaBitQ family entries (``rabitq_b1``, ``ext_rabitq_b{2,3,4}``).
-Scope boundary is explicit per the opening: no RaBitQ variants ship in
-P-5-A.1.
+P-5-B.2 adds ExtRaBitQ entries (``ext_rabitq_b{2,3,4}``).
 """
 
 from __future__ import annotations
@@ -35,7 +40,7 @@ from dataclasses import dataclass
 import mlx.core as mx
 
 from silica.kvcache.codec import IdentityCodec, VectorCodec
-from silica.vq import BlockTurboQuantMSE, TurboQuantMSE
+from silica.vq import BlockTurboQuantMSE, RaBitQ1Bit, TurboQuantMSE
 
 # Every factory takes the per-side shape via kwargs and returns a
 # ready-to-use VectorCodec. The registry binds codec-specific knobs
@@ -51,27 +56,35 @@ class CodecSpec:
     Attributes:
         id: unique string identifier (stable across versions; used by
             the ``--kv-codec`` CLI flag and bench JSONL rows).
-        family: ``"fp16"`` | ``"tq_mse"`` | ``"block_tq"`` (P-5-B will
-            add ``"rabitq"`` / ``"ext_rabitq"``).
+        family: ``"fp16"`` | ``"tq_mse"`` | ``"block_tq"`` | ``"rabitq"``
+            (P-5-B.2 will add ``"ext_rabitq"``).
         bits_per_value: nominal bits per coordinate. For BlockTQ this
             is exact (``num_bits + 16 / vq_block_size``, head-dim-
             independent). For scalar TQ it is ``float(num_bits)``; the
             true value is higher by ``16 / head_dim`` from the per-
             vector fp16 scale — use :meth:`effective_bits_per_value`
-            when head_dim is known.
+            when head_dim is known. For RaBitQ it is ``float(num_bits)``
+            (nominal); the true value is higher by ``32 / head_dim``
+            from two per-vector fp16 scalars (``norm_o`` + ``ip_coeff``).
         k_supported: whether this codec can serve as the K-side codec
             in ``SyntheticPrefixBlockStore(k_codec=..., v_codec=...)``.
         v_supported: whether this codec can serve as the V-side codec.
+            ``rabitq_b1`` is K-only (``False``) because the estimator-
+            native attention path the ``ip_coeff`` field feeds lives on
+            K by construction. ``_maybe_build_prefix_cache`` rejects
+            the symmetric ``kv_codec=`` shorthand for any spec where
+            ``k_supported and v_supported`` is False so a K-only codec
+            cannot silently land on V.
         requires_fit: whether the codec needs offline fitting on real
-            activations. All P-5-A.1 entries are ``False`` (Haar +
-            Lloyd-Max are analytical / Gaussian-based); RaBitQ /
-            ExtRaBitQ may flip this to ``True`` in P-5-B.
+            activations. All P-5-A.1 and RaBitQ entries are ``False``
+            (Haar + Lloyd-Max are analytical / Gaussian-based; RaBitQ
+            centroid is pinned at zero per opening §5.3).
         payload_packed: whether the payload uses sub-byte packing
             (BlockTQPayload / RaBitQPayload pack indices via
             :mod:`silica.vq.core.packing`; RawFp16Payload does not).
         production_recommended: whether the opening doc (vqbench REPORT
             §3.1) pins this as a production config. Only
-            ``block_tq_b64_b4`` qualifies in P-5-A.1.
+            ``block_tq_b64_b4`` qualifies in P-5-A.1 / P-5-B.
         factory: callable producing a ``VectorCodec`` instance given
             per-side shape params. Signature:
             ``factory(*, block_size, n_kv_heads, head_dim, dtype=fp16)
@@ -94,17 +107,20 @@ class CodecSpec:
         For BlockTQ this equals the stored ``bits_per_value``
         (head-dim-independent). For scalar TQ this is
         ``num_bits + 16 / head_dim`` (the per-vector fp16 scale
-        amortizes to ``16 / head_dim`` bits per coordinate). For fp16
-        baseline this is 16.
+        amortizes to ``16 / head_dim`` bits per coordinate). For RaBitQ
+        this is ``num_bits + 32 / head_dim`` (two per-vector fp16
+        scalars: ``norm_o`` and ``ip_coeff``, amortizing to
+        ``32 / head_dim`` bits per coordinate). For fp16 baseline this
+        is 16.
 
         Raises:
             ValueError: if ``head_dim`` is not a positive integer, or
                 if ``family`` is not one of the known values. The
-                positive-head_dim guard matters for the ``tq_mse``
-                family where ``head_dim`` appears in the denominator;
-                ``head_dim = 0`` would otherwise divide-by-zero, and a
-                negative head_dim would produce a meaningless negative
-                bits/value result.
+                positive-head_dim guard matters for ``tq_mse`` and
+                ``rabitq`` families where ``head_dim`` appears in the
+                denominator; ``head_dim = 0`` would otherwise divide-
+                by-zero, and a negative head_dim would produce a
+                meaningless negative bits/value result.
         """
         if head_dim <= 0:
             raise ValueError(
@@ -116,6 +132,8 @@ class CodecSpec:
             return float(self.bits_per_value) + 16.0 / float(head_dim)
         if self.family == "block_tq":
             return float(self.bits_per_value)
+        if self.family == "rabitq":
+            return float(self.bits_per_value) + 32.0 / float(head_dim)
         raise ValueError(f"unknown codec family: {self.family!r}")
 
 
@@ -182,6 +200,26 @@ def _make_block_tq_factory(vq_block_size: int, num_bits: int) -> CodecFactory:
         )
 
     return factory
+
+
+def _rabitq_b1_factory(
+    *,
+    block_size: int,
+    n_kv_heads: int,
+    head_dim: int,
+    dtype: mx.Dtype = mx.float16,
+) -> VectorCodec:
+    """Produce a ``RaBitQ1Bit`` codec. Only one 1-bit variant exists in
+    the catalog, so no maker closure is needed — a plain module-level
+    function mirrors ``_identity_factory`` rather than the
+    ``_make_*_factory`` pattern used for multi-variant families."""
+    return RaBitQ1Bit(
+        block_size=block_size,
+        n_kv_heads=n_kv_heads,
+        head_dim=head_dim,
+        num_bits=1,
+        dtype=dtype,
+    )
 
 
 # =============================================================================
@@ -276,6 +314,32 @@ CODEC_REGISTRY: dict[str, CodecSpec] = {
         # compression. The single production recommendation in P-5-A.1.
         production_recommended=True,
         factory=_make_block_tq_factory(vq_block_size=64, num_bits=4),
+    ),
+    "rabitq_b1": CodecSpec(
+        id="rabitq_b1",
+        family="rabitq",
+        # Nominal 1 bit per coordinate. effective_bits_per_value(head_dim)
+        # adds 32/head_dim for the fp16 norm_o + fp16 ip_coeff pair; for
+        # head_dim=64 that is 1.5 bits/coord, for head_dim=128 1.25.
+        bits_per_value=1.0,
+        k_supported=True,
+        # K-only per opening §5.3. The estimator-native attention path
+        # the ``ip_coeff`` field feeds lives on K by construction;
+        # installing RaBitQ1Bit on V would waste a per-vector fp16
+        # metadata slot that never contributes to attention output.
+        # ``_maybe_build_prefix_cache`` rejects the symmetric
+        # kv_codec= shorthand for asymmetric specs so scenarios cannot
+        # silently mis-configure.
+        v_supported=False,
+        # P-5-B pins centroid at zero (opening §5.3); no real-activation
+        # fit is needed. The B.2 ExtRaBitQ entries inherit this.
+        requires_fit=False,
+        payload_packed=True,
+        # Bench-row only; the hypercube 1-bit reconstruction MSE is
+        # worse than BlockTQ at matching bit budget. Ships for
+        # comparison tables, not for production.
+        production_recommended=False,
+        factory=_rabitq_b1_factory,
     ),
 }
 

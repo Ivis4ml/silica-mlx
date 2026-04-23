@@ -36,7 +36,7 @@ from silica.bench.codec_registry import (
     list_codec_ids,
 )
 from silica.kvcache.codec import VectorCodec
-from silica.vq import BlockTurboQuantMSE
+from silica.vq import BlockTurboQuantMSE, RaBitQ1Bit
 
 # Shared shape defaults for factory-smoke tests.
 BLOCK_SIZE = 16
@@ -78,6 +78,7 @@ def test_expected_codec_ids_present() -> None:
         "block_tq_b32_b4",
         "block_tq_b64_b3",
         "block_tq_b64_b4",
+        "rabitq_b1",
     }
     assert set(CODEC_REGISTRY.keys()) == expected
 
@@ -108,26 +109,46 @@ def test_families_partition_by_prefix() -> None:
             assert spec.family == "tq_mse"
         elif spec.id.startswith("block_tq"):
             assert spec.family == "block_tq"
+        elif spec.id.startswith("rabitq"):
+            assert spec.family == "rabitq"
         else:
             pytest.fail(f"unclassified id {spec.id!r}")
 
 
-def test_all_entries_support_both_sides() -> None:
-    """P-5-A.1 entries are symmetric — each spec can serve as K codec
-    and V codec. Split configs (vqbench-style K=BlockTQ V=Identity) are
-    expressed by picking two different spec ids at the call site, not
-    by marking one codec K-only."""
+def test_symmetric_entries_support_both_sides() -> None:
+    """All P-5-A.1 entries are symmetric (both K and V). P-5-B lands
+    ``rabitq_b1`` as the first K-only codec; asymmetric specs are
+    exempt here and must independently pass the
+    ``_maybe_build_prefix_cache`` symmetry guard (covered in
+    test_bench_workload_kv_codec.py) so the ``kv_codec=`` shorthand
+    refuses to install them on both sides."""
+    asymmetric_ids = {"rabitq_b1"}
     for spec in CODEC_REGISTRY.values():
-        assert spec.k_supported
-        assert spec.v_supported
+        if spec.id in asymmetric_ids:
+            continue
+        assert spec.k_supported, spec.id
+        assert spec.v_supported, spec.id
 
 
-def test_no_entry_requires_fit_in_p5_a_1() -> None:
-    """BlockTQ + scalar TQ + fp16 are analytical / Gaussian-based;
-    no real-activation fit is needed. RaBitQ / ExtRaBitQ in P-5-B may
-    flip this to True for centroid fits."""
+def test_rabitq_b1_is_k_only() -> None:
+    """``rabitq_b1`` must declare ``v_supported=False``. The estimator-
+    native attention path the ``ip_coeff`` field feeds lives on K; a
+    V-side RaBitQ1Bit would waste the ip_coeff storage without ever
+    consuming it. The symmetry guard in ``_maybe_build_prefix_cache``
+    enforces this at installation time; the spec here declares the
+    intent."""
+    spec = get_codec_spec("rabitq_b1")
+    assert spec.k_supported
+    assert not spec.v_supported
+
+
+def test_no_entry_requires_fit() -> None:
+    """Analytical calibration across the whole P-5-A.1 + P-5-B catalog:
+    BlockTQ + scalar TQ use Haar rotation + Lloyd-Max (Gaussian-based);
+    RaBitQ1Bit uses Haar rotation + zero centroid (P-5-B §5.3). No
+    entry needs a real-activation fit pass."""
     for spec in CODEC_REGISTRY.values():
-        assert not spec.requires_fit
+        assert not spec.requires_fit, spec.id
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +214,21 @@ def test_scalar_tq_factory_yields_block_tq_with_b_equals_d() -> None:
     assert codec._num_vq_blocks == 1
 
 
+def test_rabitq_b1_factory_yields_rabitq_1bit() -> None:
+    """``rabitq_b1`` factory must produce a ``RaBitQ1Bit`` instance —
+    not a BlockTQ alias or a TurboQuant variant. RaBitQ1Bit's own
+    constructor enforces ``num_bits=1`` via the "1-bit-only" ValueError,
+    so the factory cannot silently emit a multi-bit codec; isinstance
+    alone pins the family."""
+    spec = get_codec_spec("rabitq_b1")
+    codec = spec.factory(
+        block_size=BLOCK_SIZE,
+        n_kv_heads=N_KV_HEADS,
+        head_dim=HEAD_DIM,
+    )
+    assert isinstance(codec, RaBitQ1Bit)
+
+
 # ---------------------------------------------------------------------------
 # bits_per_value arithmetic
 # ---------------------------------------------------------------------------
@@ -246,6 +282,59 @@ def test_scalar_tq_nominal_vs_effective_bits(
     )
 
 
+def test_rabitq_b1_nominal_bits_per_value_is_one() -> None:
+    """``rabitq_b1`` stores 1 nominal bit per coordinate. The fp16
+    ``norm_o`` + fp16 ``ip_coeff`` metadata pair is amortized into
+    :meth:`effective_bits_per_value` and is not counted here."""
+    spec = get_codec_spec("rabitq_b1")
+    assert spec.bits_per_value == 1.0
+
+
+@pytest.mark.parametrize(
+    "head_dim,expected",
+    [
+        (64, 1.0 + 32.0 / 64),   # 1.5
+        (128, 1.0 + 32.0 / 128),  # 1.25
+        (256, 1.0 + 32.0 / 256),  # 1.125
+    ],
+)
+def test_rabitq_b1_effective_bits_per_value_matches_formula(
+    head_dim: int, expected: float
+) -> None:
+    """Effective = nominal + 32/head_dim for the RaBitQ family. 32
+    comes from two per-vector fp16 scalars (``norm_o`` + ``ip_coeff``)
+    amortized over ``head_dim`` coordinates."""
+    spec = get_codec_spec("rabitq_b1")
+    assert spec.effective_bits_per_value(head_dim=head_dim) == pytest.approx(
+        expected
+    )
+
+
+def test_rabitq_b1_effective_matches_silica_resident_bytes() -> None:
+    """Cross-check: the registry's effective_bits_per_value must match
+    the byte accounting on the codec itself (``RaBitQ1Bit.resident_bytes``
+    and ``.logical_bytes``). If the two drift, either the registry
+    lies or the codec does; this test catches either."""
+    spec = get_codec_spec("rabitq_b1")
+    for head_dim in (64, 128, 256):
+        codec = spec.factory(
+            block_size=BLOCK_SIZE,
+            n_kv_heads=N_KV_HEADS,
+            head_dim=head_dim,
+        )
+        # 1 block's physical bytes / fp16-equivalent baseline bytes,
+        # scaled up to per-coordinate bits (× 8 bits/byte, scaled by
+        # fp16 overhead ratio).
+        num_tokens = BLOCK_SIZE
+        resident = codec.resident_bytes(num_blocks=1)
+        logical_fp16 = codec.logical_bytes(num_tokens=num_tokens)
+        effective = spec.effective_bits_per_value(head_dim=head_dim)
+        # fp16 baseline is 16 bits/coord; compression ratio = 16 / effective.
+        assert resident / logical_fp16 == pytest.approx(
+            effective / 16.0, rel=1e-6
+        )
+
+
 def test_effective_bits_per_value_rejects_unknown_family() -> None:
     bogus = CodecSpec(
         id="bogus",
@@ -266,12 +355,12 @@ def test_effective_bits_per_value_rejects_unknown_family() -> None:
 def test_effective_bits_per_value_rejects_nonpositive_head_dim(
     bad_head_dim: int,
 ) -> None:
-    """head_dim appears in the denominator for the tq_mse family; 0
+    """head_dim appears in the denominator for tq_mse and rabitq; 0
     would ZeroDivisionError and a negative value would produce a
     meaningless negative bits/value. The guard fires before any family
     branch so even fp16 / block_tq (head-dim-independent families)
     reject a malformed head_dim consistently."""
-    for codec_id in ("fp16", "tq_mse_b4", "block_tq_b64_b4"):
+    for codec_id in ("fp16", "tq_mse_b4", "block_tq_b64_b4", "rabitq_b1"):
         spec = get_codec_spec(codec_id)
         with pytest.raises(ValueError, match="head_dim must be a positive integer"):
             spec.effective_bits_per_value(head_dim=bad_head_dim)
