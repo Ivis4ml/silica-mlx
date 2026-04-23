@@ -1,11 +1,18 @@
 """silica.mlx.runner — low-level MLX forward wrappers.
 
 Thin bridge between Silica's I-1 ``ModelAdapter`` and mlx-lm's duck-typed
-``model(tokens, cache=...)`` forward call. Two entry points:
+``model(tokens, cache=...)`` forward call. Three entry points:
 
+- ``forward_batched_full`` takes 2-D ``(B, T)`` tokens and returns the
+  full positional logits ``(B, T, V)`` that mlx-lm produces. This is
+  the P-5-C.1 entry point that teacher-forced streaming PPL consumes:
+  every position's logits are needed, not just the last.
 - ``forward_batched`` takes 2-D ``(B, T)`` tokens and returns per-row
   last-position logits ``(B, V)``. This is the P-2 ``ContinuousBatcher``
-  path (Unit 16a onwards) and the canonical shape mlx-lm expects.
+  path (Unit 16a onwards) — sampling only looks at the next-token
+  distribution, so the last-position slice is all that is needed.
+  Implemented as a thin ``forward_batched_full(...)[:, -1, :]``
+  wrapper so the two paths cannot silently drift.
 - ``forward`` takes 1-D ``(T,)`` tokens and returns ``(V,)`` — a thin
   adapter over ``forward_batched`` kept so P-1's ``Engine.generate``
   path is unchanged.
@@ -31,12 +38,12 @@ from typing import Any
 import mlx.core as mx
 
 
-def forward_batched(
+def forward_batched_full(
     model: Any,
     tokens: mx.array,
     cache_list: list[Any],
 ) -> mx.array:
-    """Run one mlx-lm forward pass on a batched token tensor.
+    """Run one mlx-lm forward pass and return all-position logits.
 
     Args:
         model: an mlx-lm-compatible module whose ``__call__`` accepts
@@ -51,7 +58,18 @@ def forward_batched(
             mutates the entries in-place via ``update_and_fetch``.
 
     Returns:
-        Per-row last-position logits, shape ``(B, V)``.
+        Full-positional logits, shape ``(B, T, V)`` — mlx-lm's
+        ``model(tokens, cache=cache_list)`` result without a
+        last-position slice. Callers that only need the next-token
+        distribution should use ``forward_batched`` instead.
+
+    P-5-C.1: teacher-forced streaming PPL needs all-position logits so
+    each token's NLL can be scored against the previous position's
+    prediction. The chunked PPL oracle shares one ``cache_list`` across
+    chunks; within a single chunk this function returns the full
+    chunk's logits so the oracle can compute ``CE(logits[:, :-1, :],
+    tokens[:, 1:])`` plus the chunk-boundary token against the
+    previous chunk's last logit.
     """
     if tokens.ndim != 2:
         raise ValueError(
@@ -63,9 +81,31 @@ def forward_batched(
             f"tokens must have non-zero B and T; got shape (B={B}, T={T})"
         )
 
-    logits = model(tokens, cache=cache_list)  # (B, T, V)
+    logits: mx.array = model(tokens, cache=cache_list)  # (B, T, V)
+    return logits
+
+
+def forward_batched(
+    model: Any,
+    tokens: mx.array,
+    cache_list: list[Any],
+) -> mx.array:
+    """Run one mlx-lm forward pass and return last-position logits.
+
+    Thin wrapper over :func:`forward_batched_full` that slices off the
+    last position: ``forward_batched_full(...)[:, -1, :]``. Defined as
+    a wrapper (not an independent model call) so the two entry points
+    cannot drift — any future change to mlx-lm's forward signature
+    lands in one place.
+
+    Args / preconditions: same as :func:`forward_batched_full`.
+
+    Returns:
+        Per-row last-position logits, shape ``(B, V)``.
+    """
+    full = forward_batched_full(model, tokens, cache_list)
     # mx.array subscript returns Any per mlx stubs; slice is always mx.array.
-    return logits[:, -1, :]  # type: ignore[no-any-return]
+    return full[:, -1, :]  # type: ignore[no-any-return]
 
 
 def forward(

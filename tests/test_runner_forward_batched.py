@@ -8,7 +8,7 @@ import mlx.core as mx
 import pytest
 from mlx_lm.models.cache import BatchKVCache, KVCache
 
-from silica.mlx.runner import forward, forward_batched
+from silica.mlx.runner import forward, forward_batched, forward_batched_full
 
 
 class _TracedBatchKVCache(BatchKVCache):
@@ -157,3 +157,95 @@ def test_forward_rejects_empty_input() -> None:
     model = _SingleRequestModel()
     with pytest.raises(ValueError, match="non-empty"):
         forward(model, mx.array([], dtype=mx.int32), [_UnbatchedKV()])
+
+
+# ---------------------------------------------------------------------------
+# forward_batched_full — P-5-C.1 full-position logits entry point
+# ---------------------------------------------------------------------------
+
+
+class _PositionDependentModel:
+    """Duck-typed model whose logits encode absolute position + token id
+    so ``forward_batched`` (last-position only) and
+    ``forward_batched_full`` (all positions) can be distinguished."""
+
+    VOCAB = 5
+    N_KV = 1
+    HEAD_DIM = 4
+
+    def __call__(
+        self, tokens: mx.array, cache: list[Any] | None = None
+    ) -> mx.array:
+        B, T = tokens.shape
+        if cache is not None and cache[0] is not None:
+            k = mx.zeros((B, self.N_KV, T, self.HEAD_DIM), dtype=mx.float16)
+            v = mx.zeros((B, self.N_KV, T, self.HEAD_DIM), dtype=mx.float16)
+            cache[0].update_and_fetch(k, v)
+        # Logits[b, t, v] = b * 100 + t * 10 + v — distinct across every
+        # position so a wrong slice would change the returned values.
+        b_axis = mx.arange(B, dtype=mx.float32).reshape(B, 1, 1) * 100.0
+        t_axis = mx.arange(T, dtype=mx.float32).reshape(1, T, 1) * 10.0
+        v_axis = mx.arange(self.VOCAB, dtype=mx.float32).reshape(1, 1, self.VOCAB)
+        return b_axis + t_axis + v_axis
+
+
+def test_forward_batched_full_returns_btv_shape() -> None:
+    model = _PositionDependentModel()
+    cache = [_TracedBatchKVCache([0, 0])]
+    tokens = mx.zeros((2, 3), dtype=mx.int32)
+    logits = forward_batched_full(model, tokens, cache)
+    assert tuple(logits.shape) == (2, 3, model.VOCAB)
+
+
+def test_forward_batched_is_last_position_of_full() -> None:
+    """``forward_batched`` must equal ``forward_batched_full[:, -1, :]``
+    bit-identically. Guarantees the wrapper refactor does not drift the
+    two callers apart — sampling (last-position) and PPL (all-
+    position) share the same model call."""
+    # Two separate cache instances since forward_batched_full mutates
+    # the first one via update_and_fetch.
+    model = _PositionDependentModel()
+    cache_for_full = [_TracedBatchKVCache([0, 0])]
+    cache_for_last = [_TracedBatchKVCache([0, 0])]
+    tokens = mx.zeros((2, 4), dtype=mx.int32)
+
+    full = forward_batched_full(model, tokens, cache_for_full)
+    last = forward_batched(model, tokens, cache_for_last)
+
+    assert tuple(full.shape) == (2, 4, model.VOCAB)
+    assert tuple(last.shape) == (2, model.VOCAB)
+    assert bool(mx.array_equal(full[:, -1, :], last).item())
+
+
+def test_forward_batched_full_rejects_1d_tokens() -> None:
+    model = _PositionDependentModel()
+    with pytest.raises(ValueError, match="expected 2-D tokens"):
+        forward_batched_full(
+            model, mx.zeros((3,), dtype=mx.int32), [_TracedBatchKVCache([0])]
+        )
+
+
+def test_forward_batched_full_rejects_empty_batch() -> None:
+    model = _PositionDependentModel()
+    with pytest.raises(ValueError, match="non-zero B and T"):
+        forward_batched_full(
+            model, mx.zeros((0, 3), dtype=mx.int32), []
+        )
+
+
+def test_forward_batched_full_rejects_empty_seq() -> None:
+    model = _PositionDependentModel()
+    with pytest.raises(ValueError, match="non-zero B and T"):
+        forward_batched_full(
+            model, mx.zeros((1, 0), dtype=mx.int32), [_TracedBatchKVCache([0])]
+        )
+
+
+def test_forward_batched_full_drives_cache() -> None:
+    """update_and_fetch is called exactly once per forward pass, same
+    as the non-full variant."""
+    model = _PositionDependentModel()
+    traced = _TracedBatchKVCache([0, 0])
+    forward_batched_full(model, mx.zeros((2, 5), dtype=mx.int32), [traced])
+    assert traced.calls == 1
+    assert traced._idx == 5
