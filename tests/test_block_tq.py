@@ -406,6 +406,96 @@ def test_payload_honest_resident_bytes_via_payload_init() -> None:
 
 
 # ---------------------------------------------------------------------------
+# decode_tensor payload shape validation — protects against a payload
+# built for a different (head_dim, num_bits, vq_block_size) configuration
+# silently reshaping into the wrong semantic layout on the codec's return.
+# Mirrors TestRaBitQ1BitDecodeGuards / TestExtRaBitQDecodeGuards.
+# ---------------------------------------------------------------------------
+
+
+class TestBlockTQDecodeGuards:
+    """decode_tensor rejects payloads whose array shapes disagree with the
+    codec's (n_kv_heads, block_size, head_dim, num_bits, vq_block_size)
+    configuration."""
+
+    @staticmethod
+    def _make_payload(
+        *,
+        packed_n_vectors: int,
+        packed_width: int,
+        scales_n_vectors: int,
+        scales_num_vq_blocks: int,
+    ) -> BlockTQPayload:
+        packed = mx.zeros((packed_n_vectors, packed_width), dtype=mx.uint8)
+        scales = mx.zeros(
+            (scales_n_vectors, scales_num_vq_blocks), dtype=mx.float16
+        )
+        resident = int(packed.nbytes) + int(scales.nbytes)
+        return BlockTQPayload(
+            resident_bytes=resident,
+            packed_indices=packed,
+            scales=scales,
+        )
+
+    def test_rejects_wrong_packed_n_vectors(self) -> None:
+        codec = _codec()
+        n_vectors = N_KV_HEADS * BLOCK_SIZE
+        num_vq_blocks = HEAD_DIM // VQ_BLOCK_SIZE
+        bad = self._make_payload(
+            # off-by-N_KV_HEADS: e.g. block_size mismatch on the source
+            packed_n_vectors=n_vectors + N_KV_HEADS,
+            packed_width=NUM_BITS * HEAD_DIM // 8,
+            scales_n_vectors=n_vectors + N_KV_HEADS,
+            scales_num_vq_blocks=num_vq_blocks,
+        )
+        with pytest.raises(ValueError, match="packed_indices shape"):
+            codec.decode_tensor(bad)
+
+    def test_rejects_wrong_packed_width(self) -> None:
+        codec = _codec()
+        n_vectors = N_KV_HEADS * BLOCK_SIZE
+        num_vq_blocks = HEAD_DIM // VQ_BLOCK_SIZE
+        bad = self._make_payload(
+            packed_n_vectors=n_vectors,
+            # e.g. payload was packed under a different num_bits
+            packed_width=(NUM_BITS + 1) * HEAD_DIM // 8,
+            scales_n_vectors=n_vectors,
+            scales_num_vq_blocks=num_vq_blocks,
+        )
+        with pytest.raises(ValueError, match="packed_indices shape"):
+            codec.decode_tensor(bad)
+
+    def test_rejects_wrong_scales_n_vectors(self) -> None:
+        codec = _codec()
+        n_vectors = N_KV_HEADS * BLOCK_SIZE
+        num_vq_blocks = HEAD_DIM // VQ_BLOCK_SIZE
+        bad = self._make_payload(
+            packed_n_vectors=n_vectors,
+            packed_width=NUM_BITS * HEAD_DIM // 8,
+            # scales length disagrees with packed_indices — mismatched
+            # payload assembly
+            scales_n_vectors=n_vectors + 1,
+            scales_num_vq_blocks=num_vq_blocks,
+        )
+        with pytest.raises(ValueError, match="scales shape"):
+            codec.decode_tensor(bad)
+
+    def test_rejects_wrong_scales_num_vq_blocks(self) -> None:
+        codec = _codec()
+        n_vectors = N_KV_HEADS * BLOCK_SIZE
+        num_vq_blocks = HEAD_DIM // VQ_BLOCK_SIZE
+        bad = self._make_payload(
+            packed_n_vectors=n_vectors,
+            packed_width=NUM_BITS * HEAD_DIM // 8,
+            scales_n_vectors=n_vectors,
+            # e.g. payload was built under a different vq_block_size
+            scales_num_vq_blocks=num_vq_blocks + 1,
+        )
+        with pytest.raises(ValueError, match="scales shape"):
+            codec.decode_tensor(bad)
+
+
+# ---------------------------------------------------------------------------
 # Determinism
 # ---------------------------------------------------------------------------
 

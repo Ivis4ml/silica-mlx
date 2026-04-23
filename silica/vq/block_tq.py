@@ -242,7 +242,41 @@ class BlockTurboQuantMSE:
     def decode_tensor(self, payload: BlockTQPayload) -> mx.array:
         """Reconstruct fp16 ``(1, n_kv_heads, kv_block_size, head_dim)``
         tensor from a ``BlockTQPayload``. D-003: output is fp16.
+
+        Payload shape contract: ``packed_indices`` must be
+        ``(n_kv_heads * block_size, num_bits * head_dim // 8)`` and
+        ``scales`` must be ``(n_kv_heads * block_size, num_vq_blocks)``.
+        A payload whose shapes disagree with this codec's configuration
+        (e.g. round-tripped through a different `(head_dim, num_bits,
+        vq_block_size)`) is rejected rather than silently reshaping
+        into an incorrect semantic layout. Mirrors the defensive guards
+        in ``RaBitQ1Bit.decode_tensor`` / ``ExtRaBitQ.decode_tensor``.
         """
+        d = self._head_dim
+        expected_n_vectors = self._n_kv_heads * self.block_size
+        packed_width = self._num_bits * d // 8
+        expected_packed_shape = (expected_n_vectors, packed_width)
+        expected_scales_shape = (expected_n_vectors, self._num_vq_blocks)
+
+        packed_shape = tuple(payload.packed_indices.shape)
+        if packed_shape != expected_packed_shape:
+            raise ValueError(
+                f"BlockTurboQuantMSE.decode_tensor: packed_indices shape "
+                f"{packed_shape} does not match expected "
+                f"{expected_packed_shape} (n_kv_heads={self._n_kv_heads}, "
+                f"block_size={self.block_size}, head_dim={d}, "
+                f"num_bits={self._num_bits})."
+            )
+        scales_shape = tuple(payload.scales.shape)
+        if scales_shape != expected_scales_shape:
+            raise ValueError(
+                f"BlockTurboQuantMSE.decode_tensor: scales shape "
+                f"{scales_shape} does not match expected "
+                f"{expected_scales_shape} (n_kv_heads={self._n_kv_heads}, "
+                f"block_size={self.block_size}, "
+                f"num_vq_blocks={self._num_vq_blocks})."
+            )
+
         packed = payload.packed_indices
         scales = payload.scales
 
