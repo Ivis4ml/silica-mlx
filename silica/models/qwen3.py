@@ -150,7 +150,18 @@ class Qwen3Adapter:
 
     @staticmethod
     def _build_kv_layout(model: Any) -> KVLayout:
-        """KV shape from plain-Qwen3 attributes (``n_kv_heads``, ``args.head_dim``)."""
+        """KV shape from plain-Qwen3 attributes (``n_kv_heads``, ``args.head_dim``).
+
+        ``dtype`` is inferred from a representative attention-projection
+        weight so the layout reflects the actual runtime dtype (Qwen3
+        checkpoints on the hub ship as ``bfloat16``; the pre-P-5-A.3c
+        hardcoded ``float16`` was wrong and caused
+        ``BlockTurboQuantMSE.encode_tensor`` to reject legitimate
+        bf16 K/V on the prefix-cache codec path). Falls back to
+        ``float16`` only if no projection weight is reachable — real
+        loaded checkpoints always have one.
+        """
+        dtype = Qwen3Adapter._infer_attn_dtype(model)
         for layer in model.layers:
             sa = getattr(layer, "self_attn", None)
             if sa is None:
@@ -163,14 +174,36 @@ class Qwen3Adapter:
                 num_layers=len(model.layers),
                 n_kv_heads=n_kv,
                 head_dim=head_dim,
-                dtype=mx.float16,
+                dtype=dtype,
             )
         return KVLayout(
             num_layers=len(model.layers),
             n_kv_heads=0,
             head_dim=0,
-            dtype=mx.float16,
+            dtype=dtype,
         )
+
+    @staticmethod
+    def _infer_attn_dtype(model: Any) -> mx.Dtype:
+        """Read the dtype of a representative attention-projection
+        weight. Qwen3 ships bf16; mlx-lm loads bf16 by default unless
+        forced to fp16. The K/V tensors that hit
+        ``SyntheticPrefixBlockStore.register_detached`` match this
+        dtype, so codec construction must use the same.
+        """
+        for layer in model.layers:
+            sa = getattr(layer, "self_attn", None)
+            if sa is None:
+                continue
+            for attr in ("k_proj", "q_proj", "v_proj", "o_proj"):
+                proj = getattr(sa, attr, None)
+                if proj is None:
+                    continue
+                w = getattr(proj, "weight", None)
+                if w is not None and hasattr(w, "dtype"):
+                    dtype: mx.Dtype = w.dtype
+                    return dtype
+        return mx.float16
 
     @staticmethod
     def _head_dim_from_args(model: Any) -> int:

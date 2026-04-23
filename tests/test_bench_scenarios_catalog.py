@@ -81,7 +81,15 @@ def test_catalog_entry_shape_invariants(
     assert len(wl.prompts) >= 1
     # If the row is single-request, the workload must carry exactly
     # one prompt — runner rejects len(prompts) != 1 for max_batch=1.
-    if wl.max_batch_size == 1:
+    # Exception: DECODE_TOK_S_WITH_PREFIX_HIT is a single-request
+    # oracle that explicitly requires 2 identical prompts so row 1
+    # enters the waiting queue and exercises the mid-run prefix-hit
+    # admission path (opening §7(d)); its authoring validation is in
+    # ``_validate_workload_for_oracle``.
+    if (
+        wl.max_batch_size == 1
+        and scenario.oracle != OracleKind.DECODE_TOK_S_WITH_PREFIX_HIT
+    ):
         assert len(wl.prompts) == 1, (
             f"{scenario.id}: single-request row must have exactly "
             f"one prompt, got {len(wl.prompts)}"

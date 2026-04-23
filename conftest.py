@@ -149,12 +149,36 @@ for _msg in _SWIG_IGNORE_MESSAGES:
 
 
 # =============================================================================
-# Q-010 marker-based gating
+# On-device timing marker gates (Q-010 + prefix-hit-decode)
 # =============================================================================
+#
+# Timing-sensitive tests are opted out of the default sweep via per-
+# marker gates. Each entry in ``_TIMING_GATES`` declares a marker name,
+# its opt-in env var, and a skip reason. Adding a third timing marker
+# is a one-line addition to the table rather than a parallel set of
+# helpers.
+
+_TIMING_GATES: tuple[tuple[str, str, str], ...] = (
+    (
+        "q010_timing",
+        "SILICA_Q010_TIMING",
+        "Q-010 wall-clock timing gate is opted-out by default "
+        "(on-device timing measurement, noise-prone). Set "
+        "SILICA_Q010_TIMING=1 or invoke via ``pytest -m q010_timing``.",
+    ),
+    (
+        "prefix_hit_decode_timing",
+        "SILICA_PREFIX_HIT_DECODE_TIMING",
+        "P-5-A.3c prefix-hit decode-speed gate is opted-out by default "
+        "(on-device wall-clock timing, noise-prone). Set "
+        "SILICA_PREFIX_HIT_DECODE_TIMING=1 or invoke via "
+        "``pytest -m prefix_hit_decode_timing``.",
+    ),
+)
 
 
-def _q010_env_opted_in() -> bool:
-    return os.environ.get("SILICA_Q010_TIMING", "").strip() not in (
+def _env_opted_in(env_var: str) -> bool:
+    return os.environ.get(env_var, "").strip() not in (
         "",
         "0",
         "false",
@@ -162,24 +186,24 @@ def _q010_env_opted_in() -> bool:
     )
 
 
-def _q010_marker_selected(config: Any) -> bool:
-    """Return True iff ``pytest -m`` expression positively selects
-    ``q010_timing`` (distinguishes ``-m q010_timing`` from
-    ``-m "not q010_timing"``)."""
+def _marker_selected(config: Any, marker: str) -> bool:
+    """Return True iff ``pytest -m`` expression positively selects the
+    given marker (distinguishes ``-m <marker>`` from
+    ``-m "not <marker>"``)."""
     expr = config.getoption("-m", default="") or ""
     if not expr:
         return False
-    if "q010_timing" not in expr:
+    if marker not in expr:
         return False
-    return "not q010_timing" not in expr
+    return f"not {marker}" not in expr
 
 
 def pytest_collection_modifyitems(config: Any, items: list[Any]) -> None:
     """Two responsibilities:
 
-    1. Skip ``q010_timing``-marked tests in the default sweep; honour the
-       ``SILICA_Q010_TIMING`` env var and ``-m q010_timing`` as
-       independent opt-ins.
+    1. Skip timing-marker-gated tests in the default sweep; honour each
+       gate's env var and ``-m <marker>`` expression as independent
+       opt-ins. See ``_TIMING_GATES``.
     2. Add three ``filterwarnings`` markers to every collected test — the
        layer-2 defence against ``-W error``'s SIGSEGV-at-teardown on
        sentencepiece's SWIG DeprecationWarnings. Marker filters apply
@@ -189,15 +213,16 @@ def pytest_collection_modifyitems(config: Any, items: list[Any]) -> None:
     """
     import pytest
 
-    # (1) Q-010 gating.
-    skip_marker = pytest.mark.skip(
-        reason=(
-            "Q-010 wall-clock timing gate is opted-out by default "
-            "(on-device timing measurement, noise-prone). Set "
-            "SILICA_Q010_TIMING=1 or invoke via ``pytest -m q010_timing``."
+    # (1) Timing-gate resolution. Precompute per-gate skip markers +
+    # opt-in state so the per-item loop is O(gates × items) not O(...
+    # env reads × items).
+    gate_plan: list[tuple[str, bool, Any]] = []
+    for marker_name, env_var, reason in _TIMING_GATES:
+        opted_in = _env_opted_in(env_var) or _marker_selected(
+            config, marker_name
         )
-    )
-    q010_active = _q010_env_opted_in() or _q010_marker_selected(config)
+        skip_marker = pytest.mark.skip(reason=reason)
+        gate_plan.append((marker_name, opted_in, skip_marker))
 
     # (2) SWIG filter markers — construct once, apply to every test.
     swig_filter_markers = [
@@ -208,9 +233,10 @@ def pytest_collection_modifyitems(config: Any, items: list[Any]) -> None:
     ]
 
     for item in items:
-        # Q-010 skip if not opted in.
-        if not q010_active and "q010_timing" in item.keywords:
-            item.add_marker(skip_marker)
+        # Timing gates: skip marked tests unless their gate is active.
+        for marker_name, opted_in, skip_marker in gate_plan:
+            if not opted_in and marker_name in item.keywords:
+                item.add_marker(skip_marker)
         # SWIG ignores for every test.
         for marker in swig_filter_markers:
             item.add_marker(marker)

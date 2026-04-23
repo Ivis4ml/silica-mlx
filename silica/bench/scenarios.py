@@ -310,6 +310,111 @@ _QWEN3_5_0_8B_B1_PARITY = Scenario(
 )
 
 
+# P-5-A.3c prefix-hit decode-speed bench rows. Both scenarios share
+# the ``_PREFIX_HIT_DECODE_SHARED_PROMPT`` (long enough that Qwen3-0.6B
+# tokenization produces ≥ 2 aligned radix blocks on block_size=16;
+# identical prompts drive row 1 through the full-match hit path under
+# max_batch_size=1). The two rows differ only in ``kv_codec``:
+# ``"fp16"`` is the IdentityCodec baseline; the codec row installs the
+# opening-doc §5.2 production recommendation (BlockTurboQuantMSE B=64
+# 4-bit). The A.3c acceptance gate compares their ``decode_tok_s`` to
+# assert BlockTQ ≥ 0.85× identity.
+#
+# **Model choice (2026-04-22 amendment):** opening §7(d) / §8 P-5-A.3
+# named ``qwen3.5-0.8b-prefix-hit-decode`` as the row id. That target
+# cannot run — Qwen3.5-0.8B is hybrid-DeltaNet (``has_recurrent_state
+# =True``), and ``ContinuousBatcher`` refuses ``RadixPrefixCache`` on
+# models with recurrent state because DeltaNet's running accumulation
+# cannot be sliced into block-aligned prefix K/V (see
+# ``docs/P3_DELTANET_SURVEY.md`` C-open-3). Qwen3-0.6B is the
+# immediate alternative: plain dense GLOBAL attention, 28 layers,
+# head_dim=128, no recurrent state. The BlockTQ-vs-identity ratio
+# the §7(d) gate asserts is head-dim / layer-count independent in
+# theory (both codecs pay the same per-block per-layer traversal
+# cost), so the 0.85× threshold carries from 0.8B to 0.6B.
+_PREFIX_HIT_DECODE_SHARED_PROMPT = (
+    "The continuous-batching scheduler allocates fresh KV blocks at "
+    "admission time, retains source references through the radix "
+    "tree, and releases detached storage only once hit counts drop "
+    "to zero. Prefix-cache hits on mid-run admission seed the "
+    "BatchKVCache from detached per-layer payloads without re-running "
+    "prefill, which is the exact path a compressed codec's "
+    "decode_tensor exercises on every admitted row 1."
+)
+
+
+_QWEN3_0_6B_PREFIX_HIT_DECODE_FP16 = Scenario(
+    id="qwen3-0.6b-prefix-hit-decode-fp16",
+    repo="Qwen/Qwen3-0.6B",
+    workload=Workload(
+        name="prefix-hit-decode-fp16",
+        prompts=(
+            _PREFIX_HIT_DECODE_SHARED_PROMPT,
+            _PREFIX_HIT_DECODE_SHARED_PROMPT,
+        ),
+        max_tokens=16,
+        max_batch_size=1,
+        prefix_cache=True,
+        temperature=0.0,
+        top_p=1.0,
+        kv_codec="fp16",
+    ),
+    oracle=OracleKind.DECODE_TOK_S_WITH_PREFIX_HIT,
+    gate_env_var=None,
+    description=(
+        "P-5-A.3c baseline row. Two identical prompts at "
+        "max_batch_size=1 prefix_cache=True: row 0 admits into the "
+        "initial cohort and runs miss-path prefill + decode; row 1 "
+        "enters the waiting queue and is admitted mid-run through "
+        "_admit_single_hit_row. Under kv_codec='fp16' the store "
+        "installs IdentityCodec, so row 1's seeded-admission + "
+        "decode loop reconstructs fp16 K/V by reference — no "
+        "compression, honest baseline. The oracle reports row 1's "
+        "steady-state decode tok/s (inter-token interval, excluding "
+        "first-token latency). Cache-only gate; the A.3c acceptance "
+        "test compares this row's decode_tok_s against the paired "
+        "block_tq_b64_b4 row to gate BlockTQ ≥ 0.85× identity. "
+        "Opening §7(d) referred to Qwen3.5-0.8B as the target; that "
+        "checkpoint is hybrid-DeltaNet and cannot host "
+        "RadixPrefixCache — amended to Qwen3-0.6B (plain GLOBAL, "
+        "no recurrent state)."
+    ),
+)
+
+
+_QWEN3_0_6B_PREFIX_HIT_DECODE_BLOCK_TQ_B64_B4 = Scenario(
+    id="qwen3-0.6b-prefix-hit-decode-block-tq-b64-b4",
+    repo="Qwen/Qwen3-0.6B",
+    workload=Workload(
+        name="prefix-hit-decode-block-tq-b64-b4",
+        prompts=(
+            _PREFIX_HIT_DECODE_SHARED_PROMPT,
+            _PREFIX_HIT_DECODE_SHARED_PROMPT,
+        ),
+        max_tokens=16,
+        max_batch_size=1,
+        prefix_cache=True,
+        temperature=0.0,
+        top_p=1.0,
+        kv_codec="block_tq_b64_b4",
+    ),
+    oracle=OracleKind.DECODE_TOK_S_WITH_PREFIX_HIT,
+    gate_env_var=None,
+    description=(
+        "P-5-A.3c compression row. Identical workload shape to "
+        "qwen3-0.6b-prefix-hit-decode-fp16 but with kv_codec="
+        "'block_tq_b64_b4' — BlockTurboQuantMSE vq_block_size=64 "
+        "num_bits=4, the opening §5.2 / vqbench REPORT §3.1 "
+        "production recommendation (strictly lossless at std=0% "
+        "across three seeds, 3.76× total-KV compression). Row 1's "
+        "seeded-admission path exercises "
+        "``k_codec.decode_tensor`` + ``v_codec.decode_tensor`` × "
+        "num_layers × num_hit_blocks — the codec overhead this "
+        "scenario measures. Cache-only gate."
+    ),
+)
+
+
 _QWEN3_5_27B_SMOKE = Scenario(
     id="qwen3.5-27b-smoke",
     repo="mlx-community/Qwen3.5-27B-4bit",
@@ -625,6 +730,8 @@ BUILTIN_SCENARIOS: dict[str, Scenario] = {
     _QWEN3_0_6B_TEACHER_FORCED_ARGMAX.id: _QWEN3_0_6B_TEACHER_FORCED_ARGMAX,
     _QWEN3_0_6B_TTFT_UNDER_CONCURRENCY.id: _QWEN3_0_6B_TTFT_UNDER_CONCURRENCY,
     _QWEN3_5_0_8B_B1_PARITY.id: _QWEN3_5_0_8B_B1_PARITY,
+    _QWEN3_0_6B_PREFIX_HIT_DECODE_FP16.id: _QWEN3_0_6B_PREFIX_HIT_DECODE_FP16,
+    _QWEN3_0_6B_PREFIX_HIT_DECODE_BLOCK_TQ_B64_B4.id: _QWEN3_0_6B_PREFIX_HIT_DECODE_BLOCK_TQ_B64_B4,
     _QWEN3_5_27B_SMOKE.id: _QWEN3_5_27B_SMOKE,
     _QWEN3_5_MOE_SMOKE.id: _QWEN3_5_MOE_SMOKE,
     _GEMMA4_31B_SMOKE.id: _GEMMA4_31B_SMOKE,

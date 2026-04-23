@@ -78,6 +78,7 @@ addopts = ["--strict-markers"]
 # Marker registry — ``--strict-markers`` rejects any un-registered marker.
 markers = [
     "q010_timing: Q-010 wall-clock timing gate (on-device, noise-prone); skipped in the default sweep by ``conftest.py::pytest_collection_modifyitems``; opt-in via SILICA_Q010_TIMING=1 env var OR explicit ``pytest -m q010_timing`` selection",
+    "prefix_hit_decode_timing: P-5-A.3c prefix-hit decode-speed ratio gate (on-device wall-clock); skipped in the default sweep; opt-in via SILICA_PREFIX_HIT_DECODE_TIMING=1 OR ``pytest -m prefix_hit_decode_timing``",
 ]
 # Silence the upstream SWIG-generated DeprecationWarnings from
 # `sentencepiece` (Qwen / Gemma tokenizer backend). Python 3.12+
