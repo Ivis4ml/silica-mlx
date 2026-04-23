@@ -333,6 +333,19 @@ class BenchRunner:
                 ppl_collected, oracle_context = _run_ppl(scenario, adapter)
                 oracle_input = ppl_collected
                 total_tokens = int(ppl_collected["n_tokens"])
+            elif scenario.oracle == OracleKind.STORAGE:
+                # STORAGE drives the same shared-prefix 2-prompt
+                # workload DECODE_TOK_S_WITH_PREFIX_HIT uses, then
+                # reads resident_bytes off the store after the
+                # event stream drains. No per-row token stream is
+                # inspected; total_tokens reports the number of
+                # detached blocks registered so the JSONL row still
+                # carries a useful counter.
+                storage_collected, oracle_context = _run_storage(
+                    scenario, engine, adapter
+                )
+                oracle_input = storage_collected
+                total_tokens = int(storage_collected["live_blocks"])
             else:
                 # SMOKE (and any future single/batched-flexible
                 # oracle). B=1 takes the single-request path,
@@ -598,6 +611,46 @@ def _validate_workload_for_oracle(
                 f"oracle {oracle.value!r} requires kv_codec to be set "
                 f"explicitly (fp16 baseline vs compressed codec is the "
                 f"whole point of the measurement); got kv_codec=None"
+            )
+    elif oracle == OracleKind.STORAGE:
+        # Pre-load validation mirrors DECODE_TOK_S_WITH_PREFIX_HIT
+        # verbatim: same shared-prefix 2-prompt workload shape so
+        # the scheduler's _extract_and_insert_prefix fires on row 0
+        # termination and populates the store. Fail-fast before the
+        # engine factory loads weights — matches the A.3b review
+        # M-2 pattern applied to DECODE_TOK_S_WITH_PREFIX_HIT.
+        if wl.max_batch_size != 1:
+            return (
+                f"oracle {oracle.value!r} requires max_batch_size=1, "
+                f"got {wl.max_batch_size} — row 1 must enter the "
+                f"waiting queue, which only happens when the initial "
+                f"cohort is size 1"
+            )
+        if len(wl.prompts) != 2:
+            return (
+                f"oracle {oracle.value!r} requires exactly 2 prompts, "
+                f"got {len(wl.prompts)} — workload shape mirrors "
+                f"DECODE_TOK_S_WITH_PREFIX_HIT so the same codec hot "
+                f"path is exercised"
+            )
+        if wl.prompts[0] != wl.prompts[1]:
+            return (
+                f"oracle {oracle.value!r} requires identical prompts "
+                f"(shared prefix drives row 1 through the full-match "
+                f"hit path); got two different prompts"
+            )
+        if not wl.prefix_cache:
+            return (
+                f"oracle {oracle.value!r} requires prefix_cache=True "
+                f"— the oracle's observable is resident_bytes on the "
+                f"prefix cache's store"
+            )
+        if wl.kv_codec is None:
+            return (
+                f"oracle {oracle.value!r} requires kv_codec to be set "
+                f"(e.g. 'fp16' for IdentityCodec baseline). The "
+                f"pass-through path reports resident_bytes_per_block="
+                f"None and breaks cross-row compression comparisons"
             )
     return None
 
@@ -1100,6 +1153,124 @@ def _default_teacher_forced_reference(
     mx.eval(logits)
     positional = logits[0, prompt_len - 1 : prompt_len - 1 + target_len, :]
     return [int(mx.argmax(positional[i]).item()) for i in range(target_len)]
+
+
+def _run_storage(
+    scenario: Scenario, engine: Engine, adapter: ModelAdapter
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Drive the P-5-C.3 ``OracleKind.STORAGE`` workload.
+
+    Workload shape mirrors the prefix-hit decode rows verbatim (two
+    identical prompts, ``max_batch_size=1``, ``prefix_cache=True``)
+    so the scheduler's ``_extract_and_insert_prefix`` on row-0
+    termination and the ``_admit_single_hit_row`` on row-1
+    admission both fire against the configured codec. After the
+    ``generate_batch`` event stream drains, the store's
+    ``resident_bytes()`` + ``live_block_ids()`` +
+    ``resident_bytes_per_block()`` + the radix cache's own ``hits``
+    counter form the row's observable.
+
+    Workload-shape validation happens pre-load in
+    :func:`_validate_workload_for_oracle`, mirroring the
+    ``DECODE_TOK_S_WITH_PREFIX_HIT`` pattern — authoring errors
+    fail before the engine factory runs.
+
+    Event-stream validation mirrors
+    :func:`_collect_prefix_hit_decode`: an ``aborted`` event or
+    unexpected ``req_index`` or a row that never emits ``done``
+    raises ``RuntimeError``, which the outer ``_run_one`` collapses
+    to a failed ``ScenarioResult``. Skipping this check would let
+    the store snapshot succeed against a half-completed workload
+    and the STORAGE oracle would surface a residency number from a
+    failed run as if it were valid.
+
+    Raises ``RuntimeError`` if the workload completes with zero
+    detached blocks in the store. An empty store after this
+    workload shape means either the scheduler regressed on
+    ``_extract_and_insert_prefix`` or the codec failed to register
+    blocks — either way the ``resident_bytes`` reading would be
+    trivially zero and the row's signal content is zero.
+    """
+    wl = scenario.workload
+    params = _build_sampling_params(wl, adapter, include_eos=False)
+    prefix_cache = _maybe_build_prefix_cache(wl, adapter)
+    assert prefix_cache is not None  # wl.prefix_cache=True guarantees this
+
+    # Drain the batched event stream with the same strictness the
+    # decode-speed path uses — aborted rows, unknown req_index, and
+    # rows that never complete would otherwise leave the workload
+    # "half-run" yet the store snapshot might still look plausible.
+    prompts = list(wl.prompts)
+    expected_rows = set(range(len(prompts)))
+    done_rows: set[int] = set()
+    for event in engine.generate_batch(
+        prompts,
+        params,
+        max_batch_size=wl.max_batch_size,
+        prefix_cache=prefix_cache,
+    ):
+        if event.req_index not in expected_rows:
+            raise RuntimeError(
+                f"storage_unexpected_req_index:{event.req_index}"
+            )
+        if event.kind == "aborted":
+            raise RuntimeError(
+                f"storage_aborted:row={event.req_index}_"
+                f"reason={event.finish_reason}"
+            )
+        if event.kind == "done":
+            done_rows.add(event.req_index)
+
+    missing = expected_rows - done_rows
+    if missing:
+        raise RuntimeError(
+            f"storage_rows_never_completed:{sorted(missing)}"
+        )
+
+    store = prefix_cache.store
+    # ``resident_bytes`` / ``live_block_ids`` / ``resident_bytes_per_block``
+    # are not on the ``PrefixBlockStore`` Protocol — consumers use a
+    # capability check. All four qwen3-0.6b-compression-* rows pin a
+    # codec, so the store is always a ``SyntheticPrefixBlockStore``
+    # with these methods; assert the contract loudly rather than
+    # silently handle a missing attribute.
+    if not hasattr(store, "live_block_ids"):
+        raise RuntimeError(
+            f"storage oracle: prefix cache store "
+            f"{type(store).__name__} lacks live_block_ids(); "
+            f"expected SyntheticPrefixBlockStore"
+        )
+    live_block_ids = store.live_block_ids()
+    live_blocks = len(live_block_ids)
+    if live_blocks == 0:
+        raise RuntimeError(
+            f"storage oracle: workload completed with zero "
+            f"detached blocks in the prefix cache's store. Either "
+            f"_extract_and_insert_prefix did not fire on row 0 "
+            f"termination (scheduler regression) or the codec "
+            f"({wl.kv_codec!r}) failed to register blocks. Empty "
+            f"store means the reported resident_bytes would be "
+            f"trivially zero — fail loud rather than emit noise."
+        )
+
+    resident_bytes = int(store.resident_bytes())
+    bpb_raw = store.resident_bytes_per_block()
+    resident_bytes_per_block: int | None = (
+        int(bpb_raw) if bpb_raw is not None else None
+    )
+    prefix_cache_hits = int(prefix_cache.hits)
+
+    collected: dict[str, Any] = {
+        "resident_bytes": resident_bytes,
+        "resident_bytes_per_block": resident_bytes_per_block,
+        "live_blocks": live_blocks,
+        "prefix_cache_hits": prefix_cache_hits,
+    }
+    context: dict[str, Any] = {
+        "kv_codec": wl.kv_codec,
+        "block_size": prefix_cache.block_size,
+    }
+    return collected, context
 
 
 def _run_ppl(

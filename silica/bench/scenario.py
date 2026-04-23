@@ -82,6 +82,23 @@ class OracleKind(str, Enum):
     # default 1). ``collected`` payload shape is
     # ``{"nll_sum": float, "n_tokens": int, "ppl": float}``.
     PPL = "ppl"
+    # P-5-C.3 step 1. Memory-residency observable for the prefix
+    # cache's store. Drives a shared-prefix 2-prompt workload
+    # (same shape as ``DECODE_TOK_S_WITH_PREFIX_HIT``) so the
+    # scheduler's ``_extract_and_insert_prefix`` / prefix-hit path
+    # fires and populates the ``SyntheticPrefixBlockStore``; after
+    # the workload completes the runner reads
+    # ``prefix_cache.store.resident_bytes()`` plus
+    # ``len(live_block_ids())`` / ``resident_bytes_per_block()`` /
+    # ``prefix_cache.hits`` and hands them to the oracle. The
+    # oracle is pure structural validation (all fields present,
+    # correctly typed, ``resident_bytes >= 0``, ``live_blocks >=
+    # 1``). Cross-codec compression-ratio comparison is a
+    # downstream concern (bench report / C.6 vqbench cross-check),
+    # not gated here. ``collected`` payload shape is
+    # ``{"resident_bytes": int, "resident_bytes_per_block":
+    # int | None, "live_blocks": int, "prefix_cache_hits": int}``.
+    STORAGE = "storage"
 
 
 @dataclass(frozen=True)

@@ -917,6 +917,143 @@ _QWEN3_0_6B_WIKITEXT_PPL_EXT_RABITQ_B4 = Scenario(
 )
 
 
+# =============================================================================
+# P-5-C.3 step 1 — memory-residency rows on Qwen3-0.6B.
+#
+# Same shared-prefix 2-prompt workload the A.3c / B.3 decode-speed
+# rows use, so ``_extract_and_insert_prefix`` on row 0 termination and
+# ``_admit_single_hit_row`` on row 1 admission both fire against the
+# configured codec. Runner's ``_run_storage`` reads
+# ``prefix_cache.store.resident_bytes()`` + live-block count + the
+# per-block resident-bytes figure after the event stream drains.
+#
+# ``fp16`` uses ``kv_codec="fp16"`` (IdentityCodec baseline), NOT
+# ``kv_codec=None``. The pass-through path (``codec=None``) stores raw
+# ``mx.array`` references and reports ``resident_bytes_per_block() ==
+# None``; the IdentityCodec path reports honest per-block fp16
+# residency, giving compression rows a directly-comparable baseline
+# at the same observable (D-012).
+# =============================================================================
+
+
+_QWEN3_0_6B_COMPRESSION_FP16 = Scenario(
+    id="qwen3-0.6b-compression-fp16",
+    repo="Qwen/Qwen3-0.6B",
+    workload=Workload(
+        name="compression-fp16",
+        prompts=(
+            _PREFIX_HIT_DECODE_SHARED_PROMPT,
+            _PREFIX_HIT_DECODE_SHARED_PROMPT,
+        ),
+        max_tokens=16,
+        max_batch_size=1,
+        prefix_cache=True,
+        temperature=0.0,
+        top_p=1.0,
+        kv_codec="fp16",
+    ),
+    oracle=OracleKind.STORAGE,
+    gate_env_var=None,
+    description=(
+        "P-5-C.3 IdentityCodec baseline compression row. Same "
+        "shared-prefix 2-prompt workload as the A.3c decode-speed "
+        "rows; after the event stream drains, the runner reads "
+        "prefix_cache.store.resident_bytes() and live-block "
+        "counts. Under IdentityCodec the resident_bytes equals "
+        "the uncompressed fp16 K/V sum, giving every subsequent "
+        "compression row a directly-comparable baseline. "
+        "Explicitly uses kv_codec='fp16' (not None) so the store "
+        "is SyntheticPrefixBlockStore with IdentityCodec; the "
+        "pass-through path would leave resident_bytes_per_block "
+        "as None and break cross-row compression comparisons. "
+        "Cache-only gate."
+    ),
+)
+
+
+_QWEN3_0_6B_COMPRESSION_TQ_MSE_B4 = Scenario(
+    id="qwen3-0.6b-compression-tq-mse-b4",
+    repo="Qwen/Qwen3-0.6B",
+    workload=Workload(
+        name="compression-tq-mse-b4",
+        prompts=(
+            _PREFIX_HIT_DECODE_SHARED_PROMPT,
+            _PREFIX_HIT_DECODE_SHARED_PROMPT,
+        ),
+        max_tokens=16,
+        max_batch_size=1,
+        prefix_cache=True,
+        temperature=0.0,
+        top_p=1.0,
+        kv_codec="tq_mse_b4",
+    ),
+    oracle=OracleKind.STORAGE,
+    gate_env_var=None,
+    description=(
+        "P-5-C.3 TurboQuantMSE 4-bit K+V compression row. "
+        "Scalar 4-bit quantization; effective bits/coord = 4 + "
+        "2/head_dim (one fp16 scale per vector). Reports raw "
+        "resident_bytes; cross-row compression ratio vs the fp16 "
+        "row is a downstream derivation."
+    ),
+)
+
+
+_QWEN3_0_6B_COMPRESSION_BLOCK_TQ_B64_B4 = Scenario(
+    id="qwen3-0.6b-compression-block-tq-b64-b4",
+    repo="Qwen/Qwen3-0.6B",
+    workload=Workload(
+        name="compression-block-tq-b64-b4",
+        prompts=(
+            _PREFIX_HIT_DECODE_SHARED_PROMPT,
+            _PREFIX_HIT_DECODE_SHARED_PROMPT,
+        ),
+        max_tokens=16,
+        max_batch_size=1,
+        prefix_cache=True,
+        temperature=0.0,
+        top_p=1.0,
+        kv_codec="block_tq_b64_b4",
+    ),
+    oracle=OracleKind.STORAGE,
+    gate_env_var=None,
+    description=(
+        "P-5-C.3 BlockTurboQuantMSE B=64 4-bit K+V compression "
+        "row. Production recommendation per vqbench REPORT §3.1 "
+        "(3.76x total-KV compression on Qwen3.5-4B). The "
+        "resident_bytes number this row surfaces is the headline "
+        "compression observable of P-5."
+    ),
+)
+
+
+_QWEN3_0_6B_COMPRESSION_EXT_RABITQ_B4 = Scenario(
+    id="qwen3-0.6b-compression-ext-rabitq-b4",
+    repo="Qwen/Qwen3-0.6B",
+    workload=Workload(
+        name="compression-ext-rabitq-b4",
+        prompts=(
+            _PREFIX_HIT_DECODE_SHARED_PROMPT,
+            _PREFIX_HIT_DECODE_SHARED_PROMPT,
+        ),
+        max_tokens=16,
+        max_batch_size=1,
+        prefix_cache=True,
+        temperature=0.0,
+        top_p=1.0,
+        kv_codec="ext_rabitq_b4",
+    ),
+    oracle=OracleKind.STORAGE,
+    gate_env_var=None,
+    description=(
+        "P-5-C.3 ExtRaBitQ 4-bit K+V compression row. "
+        "effective bits/coord = 4 + 48/head_dim (head_dim=128 -> "
+        "4.375). Reports raw resident_bytes; compared against the "
+        "fp16 baseline row at the bench report layer."
+    ),
+)
+
+
 BUILTIN_SCENARIOS: dict[str, Scenario] = {
     _QWEN3_0_6B_SMOKE.id: _QWEN3_0_6B_SMOKE,
     _QWEN3_0_6B_B1_PARITY.id: _QWEN3_0_6B_B1_PARITY,
@@ -934,6 +1071,10 @@ BUILTIN_SCENARIOS: dict[str, Scenario] = {
     _QWEN3_0_6B_WIKITEXT_PPL_TQ_MSE_B4.id: _QWEN3_0_6B_WIKITEXT_PPL_TQ_MSE_B4,
     _QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4.id: _QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4,
     _QWEN3_0_6B_WIKITEXT_PPL_EXT_RABITQ_B4.id: _QWEN3_0_6B_WIKITEXT_PPL_EXT_RABITQ_B4,
+    _QWEN3_0_6B_COMPRESSION_FP16.id: _QWEN3_0_6B_COMPRESSION_FP16,
+    _QWEN3_0_6B_COMPRESSION_TQ_MSE_B4.id: _QWEN3_0_6B_COMPRESSION_TQ_MSE_B4,
+    _QWEN3_0_6B_COMPRESSION_BLOCK_TQ_B64_B4.id: _QWEN3_0_6B_COMPRESSION_BLOCK_TQ_B64_B4,
+    _QWEN3_0_6B_COMPRESSION_EXT_RABITQ_B4.id: _QWEN3_0_6B_COMPRESSION_EXT_RABITQ_B4,
     _QWEN3_5_27B_SMOKE.id: _QWEN3_5_27B_SMOKE,
     _QWEN3_5_MOE_SMOKE.id: _QWEN3_5_MOE_SMOKE,
     _GEMMA4_31B_SMOKE.id: _GEMMA4_31B_SMOKE,

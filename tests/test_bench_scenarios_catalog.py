@@ -76,24 +76,70 @@ def test_catalog_entry_shape_invariants(
     )
     assert isinstance(scenario.workload, Workload)
     wl = scenario.workload
-    assert wl.max_tokens >= 1
     assert wl.max_batch_size >= 1
-    assert len(wl.prompts) >= 1
-    # If the row is single-request, the workload must carry exactly
-    # one prompt — runner rejects len(prompts) != 1 for max_batch=1.
-    # Exception: DECODE_TOK_S_WITH_PREFIX_HIT is a single-request
-    # oracle that explicitly requires 2 identical prompts so row 1
-    # enters the waiting queue and exercises the mid-run prefix-hit
-    # admission path (opening §7(d)); its authoring validation is in
-    # ``_validate_workload_for_oracle``.
-    if (
-        wl.max_batch_size == 1
-        and scenario.oracle != OracleKind.DECODE_TOK_S_WITH_PREFIX_HIT
-    ):
-        assert len(wl.prompts) == 1, (
-            f"{scenario.id}: single-request row must have exactly "
-            f"one prompt, got {len(wl.prompts)}"
+
+    # Per-oracle workload-shape contracts. Two OracleKinds bypass
+    # the sampling path entirely (``PPL`` teacher-forces from
+    # ``oracle_config['wikitext_path']``; no prompt / max_tokens
+    # signal) and two others prescribe a 2-prompt shared-prefix
+    # workload at max_batch_size=1 (``DECODE_TOK_S_WITH_PREFIX_HIT``
+    # and ``STORAGE``). Every other oracle follows the single-
+    # prompt single-request or multi-prompt batched default.
+    _PROMPTLESS_ORACLES = {OracleKind.PPL}
+    _SHARED_PREFIX_ORACLES = {
+        OracleKind.DECODE_TOK_S_WITH_PREFIX_HIT,
+        OracleKind.STORAGE,
+    }
+
+    if scenario.oracle in _PROMPTLESS_ORACLES:
+        # PPL rows bypass engine.generate_batch; the runner drives
+        # the oracle directly from oracle_config. prompts=() and
+        # max_tokens=0 are legal and load-bearing ("no prompts
+        # means none of the sampling path runs"). Tokenizer input
+        # lives in oracle_config['wikitext_path'].
+        assert len(wl.prompts) == 0, (
+            f"{scenario.id}: promptless oracle "
+            f"{scenario.oracle.value!r} requires empty prompts, "
+            f"got {len(wl.prompts)}"
         )
+        assert wl.max_tokens == 0, (
+            f"{scenario.id}: promptless oracle "
+            f"{scenario.oracle.value!r} requires max_tokens=0, "
+            f"got {wl.max_tokens}"
+        )
+    elif scenario.oracle in _SHARED_PREFIX_ORACLES:
+        # Shared-prefix rows prescribe exactly 2 identical prompts
+        # at max_batch_size=1; authoring validation lives in
+        # ``_validate_workload_for_oracle``.
+        assert wl.max_tokens >= 1, (
+            f"{scenario.id}: {scenario.oracle.value!r} still "
+            f"drives generate_batch and needs max_tokens>=1, "
+            f"got {wl.max_tokens}"
+        )
+        assert wl.max_batch_size == 1, (
+            f"{scenario.id}: {scenario.oracle.value!r} requires "
+            f"max_batch_size=1, got {wl.max_batch_size}"
+        )
+        assert len(wl.prompts) == 2, (
+            f"{scenario.id}: {scenario.oracle.value!r} requires "
+            f"exactly 2 prompts, got {len(wl.prompts)}"
+        )
+        assert wl.prompts[0] == wl.prompts[1], (
+            f"{scenario.id}: {scenario.oracle.value!r} requires "
+            f"identical prompts to drive shared-prefix row 1 "
+            f"through the full-match hit path"
+        )
+    else:
+        # Default shape: every other oracle runs generate_batch
+        # with max_tokens>=1 and at least one prompt. Single-
+        # request rows (max_batch_size=1) carry exactly one prompt.
+        assert wl.max_tokens >= 1
+        assert len(wl.prompts) >= 1
+        if wl.max_batch_size == 1:
+            assert len(wl.prompts) == 1, (
+                f"{scenario.id}: single-request row must have "
+                f"exactly one prompt, got {len(wl.prompts)}"
+            )
 
 
 def test_get_scenario_round_trips_every_entry() -> None:

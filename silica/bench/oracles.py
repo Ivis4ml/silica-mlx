@@ -794,6 +794,124 @@ def ppl_oracle(
     return (True, None, metadata)
 
 
+def storage_oracle(
+    scenario: Scenario, collected: Any, context: Any
+) -> tuple[bool, str | None, dict[str, Any]]:
+    """P-5-C.3 oracle: structural validation of the prefix-cache
+    store residency snapshot the runner's ``_run_storage`` driver
+    produces after a shared-prefix 2-prompt workload has populated
+    the store.
+
+    The runner collects:
+
+    - ``resident_bytes`` — ``store.resident_bytes()``, the sum of
+      per-side ``CodedPayload.resident_bytes`` across every detached
+      block. Under ``kv_codec="fp16"`` (IdentityCodec) this equals
+      ``num_layers × num_blocks × block_size × (2 × n_kv_heads ×
+      head_dim × dtype.size)``; under a non-identity codec it
+      reflects compressed residency, so the fp16 row is the
+      directly-comparable baseline.
+    - ``resident_bytes_per_block`` — ``store.resident_bytes_per_block()``
+      or ``None`` (the latter under pass-through stores with no
+      codec, not produced by the bench rows since all four
+      ``qwen3-0.6b-compression-*`` rows pin an explicit codec).
+    - ``live_blocks`` — ``len(store.live_block_ids())``.
+    - ``prefix_cache_hits`` — ``prefix_cache.hits``, confirming the
+      hit path actually fired during the 2-prompt workload.
+
+    Validation is **pure structural**: field presence, correct
+    types, ``resident_bytes >= 0``, ``live_blocks >= 1`` (empty-store
+    shape guard — a workload that "ran but did not register any
+    detached prefix" is noise, not a measurement; the runner
+    already surfaces the zero-block case as a ``RuntimeError`` so
+    reaching the oracle with ``live_blocks == 0`` means a silent
+    regression elsewhere). ``resident_bytes_per_block`` must be
+    ``None`` OR a positive int.
+
+    Compression-ratio gate (e.g. ``block_tq_b64_b4`` resident_bytes
+    < ``fp16`` resident_bytes) is NOT enforced here — cross-row
+    numeric comparisons live in the bench report / C.6 vqbench
+    cross-check layers. The oracle's job is to guarantee the
+    per-row numbers are honest and reportable.
+    """
+    if not isinstance(collected, dict):
+        return (False, "storage_collected_shape_mismatch", {})
+    for field in (
+        "resident_bytes",
+        "resident_bytes_per_block",
+        "live_blocks",
+        "prefix_cache_hits",
+    ):
+        if field not in collected:
+            return (
+                False,
+                f"storage_collected_missing_field:{field}",
+                {"fields_present": sorted(collected)},
+            )
+
+    try:
+        resident_bytes = int(collected["resident_bytes"])
+        live_blocks = int(collected["live_blocks"])
+        prefix_cache_hits = int(collected["prefix_cache_hits"])
+    except (TypeError, ValueError) as exc:
+        return (
+            False,
+            f"storage_collected_field_not_castable:{exc!s}",
+            {},
+        )
+
+    raw_bpb = collected["resident_bytes_per_block"]
+    if raw_bpb is None:
+        resident_bytes_per_block: int | None = None
+    else:
+        try:
+            resident_bytes_per_block = int(raw_bpb)
+        except (TypeError, ValueError) as exc:
+            return (
+                False,
+                f"storage_collected_field_not_castable:{exc!s}",
+                {},
+            )
+        if resident_bytes_per_block <= 0:
+            return (
+                False,
+                "storage_resident_bytes_per_block_not_positive",
+                {"resident_bytes_per_block": resident_bytes_per_block},
+            )
+
+    if resident_bytes < 0:
+        return (
+            False,
+            "storage_resident_bytes_negative",
+            {"resident_bytes": resident_bytes},
+        )
+
+    if live_blocks < 1:
+        return (
+            False,
+            "storage_live_blocks_below_one",
+            {"live_blocks": live_blocks},
+        )
+
+    if prefix_cache_hits < 0:
+        return (
+            False,
+            "storage_prefix_cache_hits_negative",
+            {"prefix_cache_hits": prefix_cache_hits},
+        )
+
+    metadata: dict[str, Any] = {
+        "resident_bytes": resident_bytes,
+        "resident_bytes_per_block": resident_bytes_per_block,
+        "live_blocks": live_blocks,
+        "prefix_cache_hits": prefix_cache_hits,
+    }
+    if isinstance(context, dict):
+        for key, value in context.items():
+            metadata.setdefault(key, value)
+    return (True, None, metadata)
+
+
 ORACLES: dict[OracleKind, OracleFn] = {
     OracleKind.SMOKE: smoke_oracle,
     OracleKind.B1_PARITY_VS_SINGLE: b1_parity_oracle,
@@ -801,6 +919,7 @@ ORACLES: dict[OracleKind, OracleFn] = {
     OracleKind.TEACHER_FORCED_ARGMAX: teacher_forced_argmax_oracle,
     OracleKind.DECODE_TOK_S_WITH_PREFIX_HIT: decode_tok_s_with_prefix_hit_oracle,
     OracleKind.PPL: ppl_oracle,
+    OracleKind.STORAGE: storage_oracle,
 }
 
 
@@ -811,5 +930,6 @@ __all__ = [
     "teacher_forced_argmax_oracle",
     "decode_tok_s_with_prefix_hit_oracle",
     "ppl_oracle",
+    "storage_oracle",
     "ORACLES",
 ]
