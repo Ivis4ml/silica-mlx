@@ -3,6 +3,7 @@
 from silica.kvcache.codec import (
     BlockTQPayload,
     CodedPayload,
+    ExtRaBitQPayload,
     IdentityCodec,
     RaBitQPayload,
     RawFp16Payload,
@@ -29,6 +30,7 @@ __all__ = [
     "BlockList",
     "BlockTQPayload",
     "CodedPayload",
+    "ExtRaBitQPayload",
     "IdentityCodec",
     "KVHandle",
     "KVManager",

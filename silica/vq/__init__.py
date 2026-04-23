@@ -6,11 +6,12 @@ Lloyd-Max codebook) are quarantined to ``silica.vq._calibration``.
 """
 
 from silica.vq.block_tq import BlockTurboQuantMSE
-from silica.vq.rabitq import RaBitQ1Bit
+from silica.vq.rabitq import ExtRaBitQ, RaBitQ1Bit
 from silica.vq.turboquant import TurboQuantMSE
 
 __all__ = [
     "BlockTurboQuantMSE",
+    "ExtRaBitQ",
     "RaBitQ1Bit",
     "TurboQuantMSE",
 ]

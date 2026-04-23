@@ -549,15 +549,17 @@ Algorithm: Gao et al., arXiv 2409.09913, §3. Bit-plane decomposition.
 
 Same preprocessing as 1-bit (centroid, normalize, rotate). Quantizer is an integer-grid codebook `{-(2^B - 1), ..., -1, 1, ..., 2^B - 1}` (odd integers centred at zero). Storage is B bits per coordinate plus the metadata header.
 
-Payload (`RaBitQPayload` with multi-bit `packed_indices`):
+Payload (`ExtRaBitQPayload`, subclass of `RaBitQPayload` with an added per-vector `scale` field):
 
 - `packed_indices`: `(n_vectors, ceil(d × B / 8))` `uint8`. At `d=256, B=4` this is `(n_vectors, 128)`; at `B=2` it is `(n_vectors, 64)`. Same `pack_sub_byte(indices, num_bits=B)` helper used by BlockTQ — one bit-packing implementation shared across all sub-byte codecs.
-- `norm_o`, `ip_coeff`, `scale`, `offset`: `(n_vectors,)` fp16 each. Total four fp16 per vector, = 8 bytes.
-- `resident_bytes = packed_indices.nbytes + norm_o.nbytes + ip_coeff.nbytes + scale.nbytes + offset.nbytes` per §4.3. Computed from actual `.nbytes`, not hand arithmetic; a codec claiming `d × B / 8 + 8` while storing `int8` indices would fail the §4.3 fairness test before shipping.
+- `norm_o`, `ip_coeff`, `scale`: `(n_vectors,)` fp16 each. Total three fp16 per vector, = 6 bytes. `scale` is the per-vector **dequantization** scale (inverse of the quantization scale factor); decode multiplies integer codebook values by this to recover the rotated-coordinate range.
+- `resident_bytes = packed_indices.nbytes + norm_o.nbytes + ip_coeff.nbytes + scale.nbytes` per §4.3. Computed from actual `.nbytes`, not hand arithmetic; a codec claiming `d × B / 8 + 6` while storing `int8` indices would fail the §4.3 fairness test before shipping.
+
+**Amendment (P-5-B.2a):** the earlier draft of this section listed four fp16 fields (`norm_o`, `ip_coeff`, `scale`, `offset`). silica's implementation drops `offset` — vqbench's `offset` is `0.0` in every batch and single-vector code path, and its decode does not read the field. Re-adding it in a future variant that actually uses a non-zero affine shift would be an explicit schema extension; paying 2 bytes / vector for a permanent zero is rejected. Effective bits per coordinate is therefore `num_bits + 48 / head_dim` (3 × 16 = 48, not the 4 × 16 = 64 the pre-amendment draft implied).
 
 vqbench REPORT §3.1 shows ExtRaBitQ at 4-bit K+V is seed-dependent (+0.262% ± 0.371%); at 3-bit K+V it is the worst of the three families (+3.73%); at 4-bit K-only it is lossless like the others. P-5-B ships it for bench parity, not as a production recommendation.
 
-Centroid handling follows vqbench: a `fit(X)` method on the codec accepts a calibration tensor and stores the centroid; without fit, centroid is zero. The streaming admission path calls `fit` zero times — the codec runs in default-centroid mode matching vqbench's "no centroid subtraction" baseline row.
+Centroid handling mirrors `RaBitQ1Bit` (§5.3 convention): the codec holds an explicit `_centroid = mx.zeros(head_dim, fp32)` field, encode subtracts and decode adds even though the value is a no-op, and `fit(X)` is a `pass`. Data-driven centroid fits are a v0.2 extension path, not a v0.1 behaviour; pinning centroid at zero in v0.1 matches vqbench's "no centroid subtraction" baseline row and keeps ExtRaBitQ's zero-vector semantics aligned with `RaBitQ1Bit`.
 
 ### 5.5 Method-reference map
 

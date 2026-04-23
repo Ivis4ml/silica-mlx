@@ -121,8 +121,14 @@ class RaBitQ1Bit:
     # VectorCodec surface
     # -------------------------------------------------------------------------
 
-    def fit(self, X: mx.array) -> None:
-        """No-op. Centroid = 0 per opening §5.3 for P-5-B."""
+    def fit(self, X: mx.array) -> None:  # noqa: N803
+        """No-op. Centroid = 0 per opening §5.3 for P-5-B.
+
+        The ``X`` argument is accepted for interface parity with vqbench's
+        ``VectorQuantizer.fit(X)`` signature and future data-driven
+        centroid variants, but is not consumed in v0.1.
+        """
+        del X
 
     def encode_tensor(self, x: mx.array) -> RaBitQPayload:
         """Quantize one side of one block into a RaBitQPayload.

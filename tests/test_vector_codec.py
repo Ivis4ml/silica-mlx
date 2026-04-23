@@ -1,18 +1,26 @@
 """Tests for the P-5 side-level VectorCodec[P] Protocol and CodedPayload hierarchy.
 
-Covers the scaffolding added in P-5-A.0 to ``silica.kvcache.codec``:
+Covers the scaffolding added in P-5-A.0 to ``silica.kvcache.codec`` and
+the multi-bit extension from P-5-B.2a:
 
 - ``CodedPayload._verify_resident_bytes`` enforces D-012 honesty at
   construction: the declared ``resident_bytes`` must equal the sum of
-  ``.nbytes`` across every ``mx.array`` field on the concrete subclass.
-- ``RawFp16Payload`` / ``BlockTQPayload`` / ``RaBitQPayload`` instantiate
-  cleanly when ``resident_bytes`` is honest, and raise ``ValueError``
-  otherwise.
+  ``.nbytes`` across every ``mx.array`` field on the concrete subclass
+  (including fields inherited through the dataclass MRO).
+- ``RawFp16Payload`` / ``BlockTQPayload`` / ``RaBitQPayload`` /
+  ``ExtRaBitQPayload`` instantiate cleanly when ``resident_bytes`` is
+  honest, and raise ``ValueError`` otherwise.
+- ``ExtRaBitQPayload(RaBitQPayload)``: the dataclass subclass carries a
+  per-vector fp16 ``scale`` field on top of the 1-bit payload schema;
+  the D-012 honesty check sums across all four ``mx.array`` fields
+  (``packed_indices``, ``norm_o``, ``ip_coeff``, ``scale``) without
+  code duplication.
 - ``VectorCodec`` is ``@runtime_checkable`` and detects method presence
   across the four required members.
 
-See ``docs/P5_OPENING.md`` §4.3 for the resident_bytes-honesty rule and
-§4.1 for the VectorCodec[P] Protocol shape.
+See ``docs/P5_OPENING.md`` §4.3 for the resident_bytes-honesty rule,
+§4.1 for the VectorCodec[P] Protocol shape, and §5.4 for the
+``ExtRaBitQPayload`` schema + its ``offset`` omission amendment.
 """
 
 from __future__ import annotations
@@ -25,6 +33,7 @@ import pytest
 from silica.kvcache.codec import (
     BlockTQPayload,
     CodedPayload,
+    ExtRaBitQPayload,
     RaBitQPayload,
     RawFp16Payload,
     VectorCodec,
@@ -114,10 +123,12 @@ def test_rabitq_payload_rejects_mismatched_resident_bytes() -> None:
         )
 
 
-def test_rabitq_payload_multi_bit_width() -> None:
-    """ExtRaBitQ uses the same payload class with a wider packed_indices
-    field (``ceil(d × B / 8)``); verify the honesty check scales to the
-    multi-bit case."""
+def test_ext_rabitq_payload_accepts_honest_resident_bytes() -> None:
+    """``ExtRaBitQPayload`` extends ``RaBitQPayload`` with a per-vector
+    fp16 ``scale`` field; the D-012 honesty check must sum across all
+    four ``mx.array`` fields (packed_indices + norm_o + ip_coeff +
+    scale), proving the inherited ``_verify_resident_bytes`` walks the
+    full dataclass MRO and not just the base class's fields."""
     head_dim = 256
     num_bits = 4
     n_vectors = 64
@@ -127,13 +138,51 @@ def test_rabitq_payload_multi_bit_width() -> None:
     packed = mx.zeros(shape=(n_vectors, packed_width), dtype=mx.uint8)
     norm_o = mx.zeros(shape=(n_vectors,), dtype=mx.float16)
     ip_coeff = mx.zeros(shape=(n_vectors,), dtype=mx.float16)
-    total = int(packed.nbytes) + int(norm_o.nbytes) + int(ip_coeff.nbytes)
-    RaBitQPayload(
+    scale = mx.zeros(shape=(n_vectors,), dtype=mx.float16)
+    total = (
+        int(packed.nbytes)
+        + int(norm_o.nbytes)
+        + int(ip_coeff.nbytes)
+        + int(scale.nbytes)
+    )
+    payload = ExtRaBitQPayload(
         resident_bytes=total,
         packed_indices=packed,
         norm_o=norm_o,
         ip_coeff=ip_coeff,
+        scale=scale,
     )
+    assert payload.resident_bytes == total
+    assert payload.packed_indices is packed
+    assert payload.norm_o is norm_o
+    assert payload.ip_coeff is ip_coeff
+    assert payload.scale is scale
+    # Subclass identity: ExtRaBitQPayload is-a RaBitQPayload.
+    assert isinstance(payload, RaBitQPayload)
+
+
+def test_ext_rabitq_payload_rejects_mismatched_resident_bytes() -> None:
+    """Honesty check must fire when the declared ``resident_bytes``
+    ignores the extra ``scale`` field. Catches a would-be bug where
+    ``ExtRaBitQPayload`` inherited ``RaBitQPayload``'s ``__post_init__``
+    without re-running the honesty sum across the extended schema."""
+    n_vectors = 64
+    packed = mx.zeros(shape=(n_vectors, 32), dtype=mx.uint8)
+    norm_o = mx.zeros(shape=(n_vectors,), dtype=mx.float16)
+    ip_coeff = mx.zeros(shape=(n_vectors,), dtype=mx.float16)
+    scale = mx.zeros(shape=(n_vectors,), dtype=mx.float16)
+    # "3-field honest" total — misses the scale nbytes.
+    partial_total = (
+        int(packed.nbytes) + int(norm_o.nbytes) + int(ip_coeff.nbytes)
+    )
+    with pytest.raises(ValueError, match="resident_bytes"):
+        ExtRaBitQPayload(
+            resident_bytes=partial_total,
+            packed_indices=packed,
+            norm_o=norm_o,
+            ip_coeff=ip_coeff,
+            scale=scale,
+        )
 
 
 def test_verify_ignores_non_array_fields() -> None:

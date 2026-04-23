@@ -107,28 +107,72 @@ class BlockTQPayload(CodedPayload):
 
 @dataclass
 class RaBitQPayload(CodedPayload):
-    """RaBitQ / ExtRaBitQ payload (P-5-B core shape; ExtRaBitQ may extend).
+    """RaBitQ 1-bit payload (P-5-B core shape).
 
     Shapes for one side of one block (``n_vectors = n_kv_heads × kv_block_size``,
-    per-vector dimension ``head_dim = d``, bits per coordinate ``num_bits = B``):
+    per-vector dimension ``head_dim = d``):
 
-    - ``packed_indices``: ``uint8``, ``(n_vectors, ceil(d × B / 8))`` —
-      sub-byte-packed codebook indices. For 1-bit RaBitQ the width is
-      ``d / 8`` (sign bits only); for B-bit ExtRaBitQ the width is
-      ``ceil(d × B / 8)``. The same ``pack_sub_byte`` helper handles both.
-    - ``norm_o``: ``fp16``, ``(n_vectors,)`` — per-vector ``||x - centroid||_2``.
+    - ``packed_indices``: ``uint8``, ``(n_vectors, d / 8)`` — sign bits
+      packed via :func:`silica.vq.core.packing.pack_sub_byte` at
+      ``num_bits=1``.
+    - ``norm_o``: ``fp16``, ``(n_vectors,)`` — per-vector
+      ``||x - centroid||_2``.
     - ``ip_coeff``: ``fp16``, ``(n_vectors,)`` — per-vector inner-product
       coefficient ``(x_bar · y)`` from the unbiased estimator.
 
-    The centroid itself lives on the codec instance (fit-once), not on the
-    payload. ExtRaBitQ's additional ``scale`` / ``offset`` per-vector
-    metadata (§5.4 of the opening) ships in P-5-B either as extra fields
-    on this dataclass or as an ``ExtRaBitQPayload`` subclass — deferred.
+    The centroid itself lives on the codec instance (pinned at zero in
+    P-5-B per opening §5.3), not on the payload.
+
+    ExtRaBitQ's multi-bit payload ships as :class:`ExtRaBitQPayload`, a
+    subclass that adds a per-vector fp16 ``scale`` field; see §5.4.
     """
 
     packed_indices: mx.array
     norm_o: mx.array
     ip_coeff: mx.array
+
+    def __post_init__(self) -> None:
+        self._verify_resident_bytes()
+
+
+@dataclass
+class ExtRaBitQPayload(RaBitQPayload):
+    """ExtRaBitQ multi-bit payload (P-5-B.2).
+
+    Extends :class:`RaBitQPayload` with a per-vector fp16 ``scale``
+    field. Shapes for one side of one block (``n_vectors = n_kv_heads ×
+    kv_block_size``, per-vector dimension ``head_dim = d``, bits per
+    coordinate ``num_bits = B ∈ {2, 3, 4}``):
+
+    - ``packed_indices``: ``uint8``, ``(n_vectors, ceil(d × B / 8))`` —
+      odd-integer codebook indices packed at ``num_bits=B`` via
+      :func:`silica.vq.core.packing.pack_sub_byte`. Widths: B=2 → d/4,
+      B=3 → 3d/8, B=4 → d/2.
+    - ``norm_o``, ``ip_coeff``: inherited from ``RaBitQPayload``, both
+      ``fp16 (n_vectors,)``.
+    - ``scale``: ``fp16``, ``(n_vectors,)`` — per-vector
+      **dequantization** scale (inverse of the quantization factor
+      ``(2^B - 1) / (3 · σ)`` with ``σ = 1/sqrt(d)``). Decode multiplies
+      integer codebook values by this scalar to recover the rotated-
+      coordinate range. In v0.1 the value is constant across vectors at
+      a given ``(num_bits, head_dim)`` and stored per-vector only for
+      schema parity with future data-driven variants.
+
+    The vqbench reference carries an ``offset`` field too. silica drops
+    it in v0.1: offset is ``0.0`` in every vqbench batch / single-
+    vector code path, and decode does not read it. See opening §5.4
+    Amendment (P-5-B.2a). Adding it later is a deliberate schema
+    extension, not a silent upgrade.
+
+    ``_verify_resident_bytes`` inspects all :class:`mx.array` fields
+    across the MRO (``packed_indices``, ``norm_o``, ``ip_coeff``,
+    ``scale``), so the D-012 honesty check covers the extended schema
+    without additional code — the explicit ``__post_init__`` here
+    restates the call so the behaviour does not rely on dataclass
+    inheritance subtleties.
+    """
+
+    scale: mx.array
 
     def __post_init__(self) -> None:
         self._verify_resident_bytes()
