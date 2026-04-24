@@ -404,8 +404,141 @@ class TestContextForwarding:
             "max_tokens",
             "wikitext_path",
             "kv_codec",
+            # P-5-D.2a: codec_quality_path always lands in metadata,
+            # even on the fp16 / default path — bench report readers
+            # should never have to branch on "is this key present?"
+            "codec_quality_path",
         }
         assert expected_keys.issubset(context.keys())
         assert context["chunk_size"] == 16
         assert context["max_tokens"] == 32
         assert context["kv_codec"] == "tq_mse_b4"
+
+
+class TestCodecQualityPathDispatcher:
+    """P-5-D.2a — ``codec_quality_path`` selects between the C.2
+    prefix-cache-store path and the D.2a projection-patch path.
+
+    The fp16 fake model in this file does not expose
+    ``.layers[i].self_attn.k_proj`` (the projection-patch surface),
+    so the ``vqbench_aligned`` branch is exercised via a monkey-
+    patched recording spy rather than a real forward through the
+    fake. The spy asserts that dispatch lands on the correct oracle
+    function and forwards the expected codec_factory + seed /
+    wrap_v kwargs.
+    """
+
+    def test_default_quality_path_is_prefix_store_post_rope(
+        self,
+    ) -> None:
+        """No ``codec_quality_path`` key in oracle_config → default
+        ``"prefix_store_post_rope"`` (legacy C.2 behaviour)."""
+        scenario = _make_scenario(kv_codec=None, chunk_size=_BLOCK_SIZE)
+        adapter = _FakePPLAdapter()
+        _, context = _call_run_ppl(scenario, adapter)
+        assert context["codec_quality_path"] == "prefix_store_post_rope"
+
+    def test_explicit_prefix_store_post_rope(self) -> None:
+        scenario = _make_scenario(kv_codec="tq_mse_b4", chunk_size=_BLOCK_SIZE)
+        # Mutate oracle_config in place — the scenario builder above
+        # does not surface this key yet.
+        scenario.oracle_config["codec_quality_path"] = "prefix_store_post_rope"
+        adapter = _FakePPLAdapter()
+        _, context = _call_run_ppl(scenario, adapter)
+        assert context["codec_quality_path"] == "prefix_store_post_rope"
+
+    def test_unknown_quality_path_raises(self) -> None:
+        scenario = _make_scenario(kv_codec=None, chunk_size=_BLOCK_SIZE)
+        scenario.oracle_config["codec_quality_path"] = "not_a_real_path"
+        adapter = _FakePPLAdapter()
+        with pytest.raises(
+            RuntimeError,
+            match="codec_quality_path.*not a known path",
+        ):
+            _call_run_ppl(scenario, adapter)
+
+    def test_vqbench_aligned_routes_to_projection_patch_oracle(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``codec_quality_path="vqbench_aligned"`` calls
+        :func:`teacher_forced_chunked_nll_vqbench_aligned` (recorded
+        via spy) instead of the prefix-cache-store oracle."""
+        from silica.bench import ppl_oracle as ppl_oracle_module
+
+        recorded: dict[str, Any] = {}
+
+        def spy(
+            adapter: Any,
+            token_ids: mx.array,
+            *,
+            chunk_size: int,
+            codec_factory: Any,
+            seed: int,
+            wrap_v: bool,
+        ) -> tuple[float, int]:
+            recorded["called"] = True
+            recorded["chunk_size"] = chunk_size
+            recorded["seed"] = seed
+            recorded["wrap_v"] = wrap_v
+            recorded["codec_factory"] = codec_factory
+            # Return a fixed NLL to keep the oracle contract; values
+            # are irrelevant for this dispatch assertion.
+            return 1.0, 5
+
+        # Patch both the module attribute (for external callers) and
+        # the inline import inside _run_ppl. The inline import is what
+        # _run_ppl actually calls, so that's the load-bearing patch.
+        monkeypatch.setattr(
+            ppl_oracle_module,
+            "teacher_forced_chunked_nll_vqbench_aligned",
+            spy,
+        )
+
+        scenario = _make_scenario(
+            kv_codec="block_tq_b64_b4", chunk_size=_BLOCK_SIZE
+        )
+        scenario.oracle_config["codec_quality_path"] = "vqbench_aligned"
+        adapter = _FakePPLAdapter()
+
+        collected, context = _call_run_ppl(scenario, adapter)
+
+        assert recorded.get("called") is True, (
+            "vqbench-aligned oracle was not invoked"
+        )
+        assert recorded["chunk_size"] == _BLOCK_SIZE
+        assert recorded["seed"] == 42  # _run_ppl default seed
+        assert recorded["wrap_v"] is True
+        # The recorded factory must be the block_tq_b64_b4 factory
+        # from the registry. Identity check — not a smoke call —
+        # because block_tq_b64_b4's ``vq_block_size=64`` does not
+        # divide this fake's ``head_dim=8``, so the factory would
+        # raise on a layout-shaped invocation here. The identity
+        # assertion is the load-bearing part: dispatch routed the
+        # correct registered factory through to the oracle.
+        from silica.bench.codec_registry import get_codec_spec
+
+        expected_factory = get_codec_spec("block_tq_b64_b4").factory
+        assert recorded["codec_factory"] is expected_factory
+
+        # context carries the path label for metadata.
+        assert context["codec_quality_path"] == "vqbench_aligned"
+        # collected wrapped the spy's (nll_sum, n_tokens) → ppl.
+        assert collected["nll_sum"] == 1.0
+        assert collected["n_tokens"] == 5
+        import math
+
+        assert math.isclose(
+            collected["ppl"], math.exp(1.0 / 5.0), rel_tol=1e-9
+        )
+
+    def test_vqbench_aligned_asymmetric_codec_rejected(self) -> None:
+        """K-only codecs (``rabitq_b1``) cannot install symmetrically
+        on the projection-patch path — the wrap_v=True default would
+        force a K-only codec onto V."""
+        scenario = _make_scenario(
+            kv_codec="rabitq_b1", chunk_size=_BLOCK_SIZE
+        )
+        scenario.oracle_config["codec_quality_path"] = "vqbench_aligned"
+        adapter = _FakePPLAdapter()
+        with pytest.raises(RuntimeError, match="symmetric codec"):
+            _call_run_ppl(scenario, adapter)

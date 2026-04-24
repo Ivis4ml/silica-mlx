@@ -2124,6 +2124,7 @@ def _run_ppl(
     from silica.bench.ppl_oracle import (
         perplexity_from_nll,
         teacher_forced_chunked_nll,
+        teacher_forced_chunked_nll_vqbench_aligned,
         teacher_forced_chunked_nll_with_codec,
     )
     from silica.bench.wikitext import (
@@ -2147,6 +2148,31 @@ def _run_ppl(
             f"must be >= 1; got {chunk_size}"
         )
 
+    # P-5-D.2a: ``codec_quality_path`` selects where the codec is
+    # injected on the compressed arm:
+    #
+    # * ``"prefix_store_post_rope"`` (default) — C.2 production path.
+    #   Noise is injected in the prefix-cache store after RoPE has
+    #   been applied. This is the observable of the store path silica
+    #   actually ships, and every pre-D.2a PPL scenario hits this
+    #   branch.
+    # * ``"vqbench_aligned"`` — D.2a diagnostic path. Monkey-patches
+    #   ``attn.k_proj`` / ``attn.v_proj`` so noise is injected before
+    #   RoPE, mirroring vqbench's ``_QuantizedProj``. Exists so the
+    #   C.6 cross-check compares against vqbench's *own* semantic;
+    #   does not replace the production store path's ΔPPL.
+    #
+    # fp16 rows ignore this key — they never hit either codec branch.
+    codec_quality_path = str(cfg.get("codec_quality_path", "prefix_store_post_rope"))
+    _VALID_CODEC_QUALITY_PATHS = {"prefix_store_post_rope", "vqbench_aligned"}
+    if codec_quality_path not in _VALID_CODEC_QUALITY_PATHS:
+        raise RuntimeError(
+            f"scenario {scenario.id!r}: oracle_config["
+            f"'codec_quality_path']={codec_quality_path!r} is not a "
+            f"known path; valid: "
+            f"{sorted(_VALID_CODEC_QUALITY_PATHS)}"
+        )
+
     text = load_wikitext_text(wikitext_path)
     # ``ModelAdapter.tokenizer`` is a method, not a property (see
     # silica/models/adapter.py); bound-method-as-tokenizer would
@@ -2164,19 +2190,80 @@ def _run_ppl(
         min_tokens=chunk_size,
     )
 
-    prefix_cache = _maybe_build_prefix_cache(
-        scenario.workload, adapter, seed=seed
-    )
+    # The vqbench-aligned path does not route through the prefix
+    # cache at all — the codec fires inside the projection wrapper,
+    # not the store. Skip ``_maybe_build_prefix_cache`` on that
+    # branch so a scenario that pins ``prefix_cache=True`` on the
+    # workload shape for schema consistency does not pay the
+    # prefix-cache construction cost (and so the fp16-baseline
+    # sub-run, with its ``prefix_cache=False`` replace(), does not
+    # take a different dispatch than the codec arm — same branch,
+    # different ``codec_quality_path`` payload).
+    if (
+        codec_quality_path == "vqbench_aligned"
+        and scenario.workload.kv_codec is not None
+    ):
+        prefix_cache: Any = None
+    else:
+        prefix_cache = _maybe_build_prefix_cache(
+            scenario.workload, adapter, seed=seed
+        )
 
-    if prefix_cache is None:
-        # fp16 baseline path — kv_codec is None AND prefix_cache=False.
+    if scenario.workload.kv_codec is None:
+        # fp16 baseline path — kv_codec is None AND prefix_cache was
+        # not built (or was built but we explicitly don't use it on
+        # this branch). Cache-agnostic C.1 oracle.
         nll_sum, n_tokens = teacher_forced_chunked_nll(
             adapter, tokens, chunk_size=chunk_size
         )
+    elif codec_quality_path == "vqbench_aligned":
+        # D.2a — pre-RoPE projection patch. Fetch the codec factory
+        # via the registry so the scenario only names the codec id
+        # (same convention as the other compressed rows). No prefix
+        # cache — the wrapper fires on every projection.
+        from silica.bench.codec_registry import get_codec_spec
+
+        spec = get_codec_spec(str(scenario.workload.kv_codec))
+        if not (spec.k_supported and spec.v_supported):
+            raise RuntimeError(
+                f"scenario {scenario.id!r}: codec_quality_path="
+                f"'vqbench_aligned' requires a symmetric codec "
+                f"(k_supported and v_supported); got "
+                f"{scenario.workload.kv_codec!r} which is "
+                f"k_supported={spec.k_supported}, "
+                f"v_supported={spec.v_supported}. An asymmetric "
+                f"codec on this path would silently wrap V with a "
+                f"K-only configuration."
+            )
+        nll_sum, n_tokens = teacher_forced_chunked_nll_vqbench_aligned(
+            adapter,
+            tokens,
+            chunk_size=chunk_size,
+            codec_factory=spec.factory,
+            seed=seed,
+            wrap_v=True,
+        )
     else:
-        # Codec-backed path — build_seeded_batch_kv seeds per-chunk
-        # caches from prefix_cache; encode / decode fire on every
-        # chunk boundary.
+        # C.2 codec-backed store path — build_seeded_batch_kv seeds
+        # per-chunk caches from prefix_cache; encode / decode fire
+        # on every chunk boundary. Post-RoPE noise injection.
+        if prefix_cache is None:
+            # Workload shape contract: compressed rows on the
+            # prefix_store_post_rope path must set prefix_cache=True
+            # so ``_maybe_build_prefix_cache`` returns a store.
+            # Reaching here with no prefix cache means the scenario
+            # has a compressed kv_codec but prefix_cache=False —
+            # this would have silently fallen through to the fp16
+            # baseline before D.2a. Fail loudly now that the
+            # dispatch is explicit.
+            raise RuntimeError(
+                f"scenario {scenario.id!r}: compressed kv_codec="
+                f"{scenario.workload.kv_codec!r} on "
+                f"codec_quality_path='prefix_store_post_rope' "
+                f"requires workload.prefix_cache=True so a "
+                f"RadixPrefixCache is built; got prefix_cache="
+                f"{scenario.workload.prefix_cache!r}."
+            )
         nll_sum, n_tokens = teacher_forced_chunked_nll_with_codec(
             adapter,
             prefix_cache,
@@ -2196,6 +2283,10 @@ def _run_ppl(
         "max_tokens": max_tokens,
         "wikitext_path": str(wikitext_path),
         "kv_codec": scenario.workload.kv_codec,
+        # Surface the path explicitly so the bench report / vqbench
+        # cross-check can tell the two compressed-arm observables
+        # apart without having to re-derive it from the scenario id.
+        "codec_quality_path": codec_quality_path,
     }
     # P-5-C.6 step 2: when the caller has already computed the
     # silica fp16 baseline PPL for this scenario+seed (only

@@ -1,6 +1,6 @@
 """silica.bench.ppl_oracle — MLX-native teacher-forced streaming PPL.
 
-Two entry points, one per P-5-C sub-unit:
+Three entry points, one per P-5-C / P-5-D oracle sub-unit:
 
 - :func:`teacher_forced_chunked_nll` — P-5-C.1 landed. Cache-agnostic
   fp16 baseline oracle. One ``BatchKVCache`` allocated at sequence
@@ -12,18 +12,52 @@ Two entry points, one per P-5-C sub-unit:
   ``validation/streaming_ppl.py`` math at the fp16 baseline.
 
 - :func:`teacher_forced_chunked_nll_with_codec` — P-5-C.2 landing.
-  Codec-backed arm. Each chunk ≥ 1 seeds a **fresh** per-chunk
-  ``BatchKVCache`` from the prior prefix blocks (``prefix_cache.lookup``
-  → ``fetch_detached_blocks`` → :func:`build_seeded_batch_kv`) — the
+  Codec-backed arm (``codec_quality_path="prefix_store_post_rope"``).
+  Each chunk ≥ 1 seeds a **fresh** per-chunk ``BatchKVCache`` from
+  the prior prefix blocks (``prefix_cache.lookup`` →
+  ``fetch_detached_blocks`` → :func:`build_seeded_batch_kv`) — the
   decode-tensor hot path fires here. After each forward, the newly-
   grown aligned-prefix blocks are extracted from the post-forward
   cache and re-registered via ``prefix_cache.insert_detached`` so the
   next chunk can consume them through the codec — the encode-tensor
-  hot path fires here. A payload under a non-identity codec (BlockTQ,
-  ExtRaBitQ) loses information on the store round trip, so ΔPPL
-  against the fp16 baseline becomes an observable. Under
-  ``IdentityCodec`` the two entry points coincide (lossless round
-  trip — regression-locked in the C.2 test suite).
+  hot path fires here. Noise is injected *after* RoPE, on the
+  post-rotation K that the cache actually stores. A payload under a
+  non-identity codec (BlockTQ, ExtRaBitQ) loses information on the
+  store round trip, so ΔPPL against the fp16 baseline becomes an
+  observable of the production store path. Under ``IdentityCodec``
+  this entry point matches the C.1 baseline to fp tolerance
+  (regression-locked in the C.2 test suite).
+
+- :func:`teacher_forced_chunked_nll_vqbench_aligned` — P-5-D.2a
+  landing (``codec_quality_path="vqbench_aligned"``). Mirrors
+  vqbench's ``methods.common.monkey_patch._QuantizedProj`` semantic:
+  wraps the attention's ``k_proj`` (and optionally ``v_proj``) in a
+  quantize→dequantize pass so *all* K/V (current + past) flow through
+  the codec in pre-RoPE space on every forward. Shape unchanged —
+  the wrapped projection still returns the ``(B, L, nkv*hd)`` layout
+  the downstream RoPE + cache expect. This entry point exists because
+  the P-5-D.2 investigation (see ``docs/P5_D2_INVESTIGATION``) found
+  that post-RoPE noise injection gives a ΔPPL roughly 20× larger than
+  the pre-RoPE vqbench baseline at the same Frobenius, even though
+  the raw K Frobenius is bit-identical between the two spaces. The
+  two paths therefore answer different questions:
+
+  * ``prefix_store_post_rope`` — "how much quality does the production
+    prefix-cache store cost, in the post-RoPE space the cache lives
+    in?"
+  * ``vqbench_aligned`` — "what is vqbench's pre-RoPE-codec quality
+    claim when silica runs its own BlockTQ/ExtRaBitQ port on the same
+    real Qwen activations?"
+
+  Both numbers are valid and live in metadata under explicit
+  ``codec_quality_path`` labels; the C.6 ΔPPL vs vqbench cross-check
+  binds against ``vqbench_aligned`` because vqbench itself wraps
+  pre-RoPE projections, i.e. the two sides now inject noise in the
+  same space. Whether the residual row-level gap closes the old
+  per-row ``_compute_gap_fields`` epsilon gate (``0.01`` abs /
+  ``0.1%`` rel) or needs a mean-aggregated / noise-window rule is
+  the subject of P-5-D.3, not D.2a. The production store path is
+  not silenced — its ΔPPL is preserved as a separate observable.
 
 Chunk-invariance invariant (C.1): ``PPL(chunk=128) == PPL(chunk=256)
 == PPL(chunk=512)`` to within fp rounding. Tested in
@@ -33,24 +67,34 @@ shared-cache fp16 baseline to fp tolerance).
 
 Scope boundary:
 
-- Both entry points take ``token_ids`` as input; they do not tokenize
-  raw text. C.2's WikiText-2 loader lands as a separate helper so the
-  oracle itself stays text-free and unit-testable without a tokenizer
-  or dataset dependency.
-- Neither entry point routes through ``Engine.generate_batch`` — that
-  is a sampling API that does not return positional logits. Both go
-  straight through ``adapter._model`` (scheduler convention) using
-  :func:`silica.mlx.runner.forward_batched_full` for all-position
-  logits.
+- All three entry points take ``token_ids`` as input; they do not
+  tokenize raw text. C.2's WikiText-2 loader lands as a separate
+  helper so the oracle itself stays text-free and unit-testable
+  without a tokenizer or dataset dependency.
+- None of the entry points route through ``Engine.generate_batch`` —
+  that is a sampling API that does not return positional logits. All
+  three go straight through ``adapter._model`` (scheduler convention)
+  using :func:`silica.mlx.runner.forward_batched_full` for
+  all-position logits.
+- The vqbench-aligned path monkey-patches attention modules on
+  ``adapter._model`` for the duration of a single oracle call. The
+  wrapper is installed at function entry and restored in a
+  ``try/finally`` so an exception during the forward does not leave
+  the adapter in a partially-wrapped state. This patching is scoped
+  to the benchmark oracle — nothing on the serving hot path depends
+  on the wrapped layout, and no production code should call this
+  entry point.
 """
 
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from typing import Any, cast
 
 import mlx.core as mx
 
+from silica.kvcache.codec import VectorCodec
 from silica.mlx.runner import forward_batched_full
 from silica.scheduler.seed_kv import build_seeded_batch_kv
 
@@ -476,6 +520,271 @@ def _extract_aligned_blocks_from_seeded_cache(
         ]
     )
     return detached
+
+
+# =============================================================================
+# P-5-D.2a — vqbench-aligned PPL path (pre-RoPE projection patch).
+# =============================================================================
+
+
+CodecFactory = Callable[..., VectorCodec]
+"""Signature-compatible with :data:`silica.bench.codec_registry.CodecFactory`.
+
+Takes ``(block_size, n_kv_heads, head_dim, dtype, seed)`` by keyword and
+returns a :class:`silica.kvcache.codec.VectorCodec`. The vqbench-aligned
+oracle instantiates one codec per observed chunk length (typically the
+fixed ``chunk_size``, with at most one shorter instance for the final
+partial chunk) because :class:`silica.vq.BlockTurboQuantMSE` and its
+siblings validate the time-axis ``block_size`` against the input's
+third dimension. A Protocol-level ``VectorCodec`` that accepted a
+dynamic time axis would sidestep this, but is out of scope for
+P-5-D.2a — the oracle is not hot serving code, and a per-L codec
+instance on a 512-token run costs at most two factory calls."""
+
+
+class _WrappedProj:
+    """Quantize→dequantize wrapper around ``k_proj`` / ``v_proj``.
+
+    Installed in-place on an mlx-lm attention module by
+    :func:`teacher_forced_chunked_nll_vqbench_aligned`. On each call,
+    runs the original linear projection, reshapes the output into the
+    per-head ``(B, nkv, L, head_dim)`` layout every codec in
+    :mod:`silica.vq` consumes, pipes it through the codec's
+    ``encode_tensor`` → ``decode_tensor``, then reshapes back to the
+    flat ``(B, L, nkv*head_dim)`` layout mlx-lm's attention forward
+    expects downstream (so RoPE + cache.update_and_fetch see the
+    same shape they would have received without the wrapper).
+
+    The codec is built per-L on first use and cached in ``_codecs``:
+    a 512-token teacher-forced run chunked at 256 typically sees two
+    Ls (256 and the final partial chunk, or just 256 if the sequence
+    length is a clean multiple). A new codec instance is cheap
+    (Haar rotation + Lloyd-Max codebook — both O(head_dim²) and
+    seeded, no data dependency), and a per-call creation would trade
+    a negligible allocation cost for consistency with
+    :func:`teacher_forced_chunked_nll_with_codec`'s single-codec
+    pattern. Caching here avoids even that allocation without
+    changing behaviour — the codec state is deterministic in
+    ``(seed, vq knobs, dtype, L)``.
+
+    Not an ``mlx.nn.Module`` subclass: Module installation would
+    re-trigger the parent's parameter registration on a call chain
+    that already owns its params. The wrapper only needs to intercept
+    ``__call__``, so a plain class sidesteps the Module lifecycle.
+    Restoration is guaranteed by the installer's ``try/finally``.
+    """
+
+    __slots__ = (
+        "_orig",
+        "_n_kv_heads",
+        "_head_dim",
+        "_factory",
+        "_seed",
+        "_dtype",
+        "_codecs",
+    )
+
+    def __init__(
+        self,
+        orig: Any,
+        *,
+        n_kv_heads: int,
+        head_dim: int,
+        factory: CodecFactory,
+        seed: int,
+        dtype: mx.Dtype,
+    ) -> None:
+        self._orig = orig
+        self._n_kv_heads = n_kv_heads
+        self._head_dim = head_dim
+        self._factory = factory
+        self._seed = seed
+        self._dtype = dtype
+        self._codecs: dict[int, VectorCodec] = {}
+
+    def _get_codec(self, length: int) -> VectorCodec:
+        cached = self._codecs.get(length)
+        if cached is not None:
+            return cached
+        codec = self._factory(
+            block_size=length,
+            n_kv_heads=self._n_kv_heads,
+            head_dim=self._head_dim,
+            dtype=self._dtype,
+            seed=self._seed,
+        )
+        self._codecs[length] = codec
+        return codec
+
+    def __call__(self, x: mx.array) -> mx.array:
+        out = self._orig(x)
+        # mlx-lm Qwen3 attention applies the per-head reshape and
+        # transpose right after ``self.k_proj(x)`` / ``self.v_proj(x)``.
+        # Mirror the same reshape here so the codec sees the
+        # ``(1, n_kv_heads, L, head_dim)`` layout it validates against,
+        # then reverse the reshape so the caller sees the same flat
+        # ``(B, L, n_kv_heads * head_dim)`` output the unwrapped
+        # projection would have produced. The net effect is a pure
+        # quantize→dequantize pass on the per-head K (or V) vectors
+        # in the pre-RoPE projection space.
+        B, L, _ = out.shape
+        reshaped = out.reshape(B, L, self._n_kv_heads, self._head_dim).transpose(
+            0, 2, 1, 3
+        )
+        codec = self._get_codec(L)
+        decoded = codec.decode_tensor(codec.encode_tensor(reshaped))
+        return decoded.transpose(0, 2, 1, 3).reshape(B, L, -1)
+
+
+def _install_vqbench_wrappers(
+    model: Any,
+    *,
+    n_kv_heads: int,
+    head_dim: int,
+    factory: CodecFactory,
+    seed: int,
+    dtype: mx.Dtype,
+    wrap_v: bool,
+) -> list[tuple[Any, Any, Any]]:
+    """Replace ``attn.k_proj`` (and ``attn.v_proj`` when ``wrap_v``) on
+    every layer of ``model`` with a :class:`_WrappedProj`.
+
+    Returns a list of restoration tokens
+    ``[(attn_module, orig_k_proj, orig_v_proj_or_None), ...]`` that
+    :func:`_restore_vqbench_wrappers` consumes. The caller *must* call
+    the restorer in a ``finally`` block — the mlx-lm module the
+    adapter hands out is the same object the serving hot path uses,
+    and leaving quantized projections installed across oracle calls
+    would silently poison every subsequent forward.
+
+    Rotation sharing: one codec per ``(projection_side, L)`` pair is
+    built through ``factory(..., seed=seed)`` — the seed is the
+    oracle's execution seed, shared across all layers and all heads
+    within a layer. This mirrors silica's prefix-cache C.2 pattern
+    (one codec instance per K/V side, not per layer) and deviates
+    from vqbench's ``methods.common.monkey_patch._QuantizedProj``,
+    which runs ``quant_dequant_tensor`` with a *per-head* seed.
+    Probe 2 of the D.2 investigation
+    (``docs/P5_D2_INVESTIGATION/p5_d2_probe2.py``) found the
+    shared-vs-per-head rotation split gives a 0.977× Frobenius
+    ratio on real Qwen3-0.6B post-RoPE K — below the measurement
+    floor of the ΔPPL signal we are matching. Staying on silica's
+    shared-rotation convention keeps the oracle's codec semantics
+    identical to the production store path for the rotation axis,
+    which is what lets a future port to per-head rotation (if ever
+    warranted) be isolated to one code path rather than two.
+    """
+    restorations: list[tuple[Any, Any, Any]] = []
+    for layer in model.layers:
+        attn = layer.self_attn
+        orig_k = attn.k_proj
+        orig_v = attn.v_proj if wrap_v else None
+        attn.k_proj = _WrappedProj(
+            orig_k,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            factory=factory,
+            seed=seed,
+            dtype=dtype,
+        )
+        if wrap_v:
+            attn.v_proj = _WrappedProj(
+                orig_v,
+                n_kv_heads=n_kv_heads,
+                head_dim=head_dim,
+                factory=factory,
+                seed=seed,
+                dtype=dtype,
+            )
+        restorations.append((attn, orig_k, orig_v))
+    return restorations
+
+
+def _restore_vqbench_wrappers(
+    restorations: list[tuple[Any, Any, Any]],
+) -> None:
+    """Undo the in-place replacement performed by
+    :func:`_install_vqbench_wrappers`."""
+    for attn, orig_k, orig_v in restorations:
+        attn.k_proj = orig_k
+        if orig_v is not None:
+            attn.v_proj = orig_v
+
+
+def teacher_forced_chunked_nll_vqbench_aligned(
+    adapter: Any,
+    token_ids: mx.array,
+    *,
+    chunk_size: int = 256,
+    codec_factory: CodecFactory,
+    seed: int = 42,
+    wrap_v: bool = True,
+) -> tuple[float, int]:
+    """Teacher-forced NLL with vqbench-style pre-RoPE codec injection.
+
+    Wraps each attention layer's ``k_proj`` (and, when ``wrap_v``,
+    ``v_proj``) in a quantize→dequantize pass, then delegates the
+    chunk-boundary scoring / cache management to
+    :func:`teacher_forced_chunked_nll`. The wrapper operates in
+    pre-RoPE space, so the cache stores the lossy projection output
+    *after* RoPE has been applied to it — identical to what
+    vqbench's ``methods.common.monkey_patch._QuantizedProj`` does.
+    Projections are restored in a ``try/finally`` so an exception
+    during the forward still leaves the adapter's model in its
+    original state.
+
+    Not a re-implementation of the C.1 chunk loop — this function
+    *wraps* the C.1 oracle call so the two paths stay bit-identical
+    on their shared scoring logic. The only difference is whether a
+    codec is installed on the projections during the delegated call.
+    Under an identity codec (or a lossless round-trip) this function
+    and :func:`teacher_forced_chunked_nll` return the same result to
+    fp tolerance; under a lossy codec the returned NLL carries the
+    accumulated error of all K and V (current + past) being
+    projected through the codec on every chunk.
+
+    Args:
+        adapter: same contract as :func:`teacher_forced_chunked_nll`.
+            Additionally must expose ``kv_layout()`` (for
+            ``n_kv_heads`` / ``head_dim`` / ``dtype``) and
+            ``_model.layers`` with ``.self_attn.{k_proj, v_proj}``
+            per layer — mlx-lm's standard attention convention.
+        token_ids: ``(1, seq_len)`` ``mx.array`` of token ids.
+        chunk_size: forwarded to :func:`teacher_forced_chunked_nll`.
+        codec_factory: callable returning a
+            :class:`silica.kvcache.codec.VectorCodec`, signature
+            compatible with
+            :data:`silica.bench.codec_registry.CodecFactory`. One
+            codec is built per observed chunk length (time-axis
+            block_size), cached inside each wrapper for the duration
+            of the call. An IdentityCodec factory is a valid no-op
+            and used in the parity test.
+        seed: codec seed (Haar rotation). Forwarded into every
+            ``codec_factory`` invocation.
+        wrap_v: whether to wrap ``v_proj`` in addition to ``k_proj``.
+            Default ``True`` matches vqbench's ``--patch-v`` flag as
+            used in the REPORT §3.1 BlockTQ production recommendation.
+
+    Returns:
+        ``(nll_sum, n_tokens_scored)`` — same shape as the other two
+        entry points.
+    """
+    layout = adapter.kv_layout()
+    restorations = _install_vqbench_wrappers(
+        adapter._model,
+        n_kv_heads=layout.n_kv_heads,
+        head_dim=layout.head_dim,
+        factory=codec_factory,
+        seed=seed,
+        dtype=layout.dtype,
+        wrap_v=wrap_v,
+    )
+    try:
+        return teacher_forced_chunked_nll(
+            adapter, token_ids, chunk_size=chunk_size
+        )
+    finally:
+        _restore_vqbench_wrappers(restorations)
 
 
 def perplexity_from_nll(nll_sum: float, n_tokens: int) -> float:

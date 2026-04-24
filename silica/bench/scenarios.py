@@ -906,6 +906,76 @@ _QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4 = Scenario(
 )
 
 
+# P-5-D.2a — vqbench-aligned BlockTQ arm. Same workload knobs as the
+# post-RoPE row above, but oracle_config pins
+# ``codec_quality_path="vqbench_aligned"`` so ``_run_ppl`` dispatches to
+# the projection-patch oracle (pre-RoPE K+V compression, mirroring
+# vqbench's ``methods.common.monkey_patch._QuantizedProj``). Same
+# ``VqbenchXcheckSpec`` as the post-RoPE row so C.6 can tell the two
+# observables apart in the JSONL — this row exists to bind the
+# ``--vqbench-xcheck`` comparison against vqbench's own
+# projection-patch semantic, i.e. "inject noise in the same pre-RoPE
+# space vqbench does". The post-RoPE row's gap against vqbench is an
+# honest measurement of the production store path's cost and does NOT
+# have to close to zero. The P-5 (4-b) Acceptance rule — whether the
+# vqbench-aligned arm gap is aggregated, what noise window is
+# acceptable, whether the existing per-row epsilon gate
+# (_compute_gap_fields / _VQBENCH_PCT_EPSILON) applies as-is —
+# is owned by P-5-D.3, NOT by this scenario. D.2a's verification
+# (docs/P5_D2_INVESTIGATION) recorded per-row |gap| ≈ 0.45–0.61 PPL
+# against vqbench while mean-over-seeds agrees to ~0.15 PPL, so the
+# per-row epsilon gate as currently coded will still fire the
+# divergence warning on this row. That is expected and part of the
+# D.3 input.
+_QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4_VQBENCH_ALIGNED = Scenario(
+    id="qwen3-0.6b-wikitext-ppl-block-tq-b64-b4-vqbench-aligned",
+    repo="Qwen/Qwen3-0.6B",
+    workload=Workload(
+        name="wikitext-ppl-block-tq-b64-b4-vqbench-aligned",
+        prompts=(),
+        max_tokens=0,
+        max_batch_size=1,
+        # ``prefix_cache=True`` is set only to satisfy the Workload
+        # invariant (``kv_codec != None`` implies
+        # ``prefix_cache=True``). The vqbench-aligned oracle path
+        # does not consult ``_maybe_build_prefix_cache`` — the codec
+        # fires inside the projection wrapper, not the store.
+        prefix_cache=True,
+        temperature=0.0,
+        top_p=1.0,
+        kv_codec="block_tq_b64_b4",
+    ),
+    oracle=OracleKind.PPL,
+    oracle_config={
+        **_WIKITEXT_PPL_ORACLE_CONFIG,
+        "codec_quality_path": "vqbench_aligned",
+    },
+    gate_env_var=None,
+    description=(
+        "P-5-D.2a diagnostic PPL row. Identical workload shape to "
+        "qwen3-0.6b-wikitext-ppl-block-tq-b64-b4 but runs the codec "
+        "in vqbench's pre-RoPE projection-patch semantic instead of "
+        "the production prefix-cache store. Exists because the D.2 "
+        "investigation found the post-RoPE store path and the "
+        "pre-RoPE projection-patch path give ΔPPL numbers that "
+        "differ by ~20x at the same codec Frobenius; the C.6 "
+        "vqbench cross-check binds against this row so the "
+        "comparison is apples-to-apples with vqbench's own harness "
+        "(both sides inject noise in pre-RoPE space). The post-RoPE "
+        "store row is preserved as a separate observable of the "
+        "production path's quality cost. See "
+        "docs/P5_D2_INVESTIGATION/ for the probe scripts that "
+        "established this split."
+    ),
+    vqbench_xcheck=VqbenchXcheckSpec(
+        script_path=str(default_reproduce_script_path()),
+        method="BlockTurboQuantMSE",
+        bits=4,
+        extra_args=("--block-size", "64", "--patch-v"),
+    ),
+)
+
+
 _QWEN3_0_6B_WIKITEXT_PPL_EXT_RABITQ_B4 = Scenario(
     id="qwen3-0.6b-wikitext-ppl-ext-rabitq-b4",
     repo="Qwen/Qwen3-0.6B",
@@ -1157,6 +1227,9 @@ BUILTIN_SCENARIOS: dict[str, Scenario] = {
     _QWEN3_0_6B_WIKITEXT_PPL_FP16.id: _QWEN3_0_6B_WIKITEXT_PPL_FP16,
     _QWEN3_0_6B_WIKITEXT_PPL_TQ_MSE_B4.id: _QWEN3_0_6B_WIKITEXT_PPL_TQ_MSE_B4,
     _QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4.id: _QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4,
+    _QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4_VQBENCH_ALIGNED.id: (
+        _QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4_VQBENCH_ALIGNED
+    ),
     _QWEN3_0_6B_WIKITEXT_PPL_EXT_RABITQ_B4.id: _QWEN3_0_6B_WIKITEXT_PPL_EXT_RABITQ_B4,
     _QWEN3_0_6B_COMPRESSION_FP16.id: _QWEN3_0_6B_COMPRESSION_FP16,
     _QWEN3_0_6B_COMPRESSION_TQ_MSE_B4.id: _QWEN3_0_6B_COMPRESSION_TQ_MSE_B4,
