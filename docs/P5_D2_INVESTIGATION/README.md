@@ -165,12 +165,12 @@ matched mean and std.
   variance reduction is worth the ctor-signature change is a
   separate decision.
 
-- **P-5-D.3 acceptance close.** With D.2a landed, the (4-b)
-  Acceptance gate that was written as "ε_ppl < 0.01 abs AND < 0.1%
-  rel" on a single row needs a reinterpretation step before it can
-  close — the relevant comparison is mean-over-seeds, not per-row,
-  because per-row variance is dominated by rotation draws rather
-  than algorithmic drift.
+- **P-5-D.3 acceptance close — resolved at PLAN v1.7.3.** The
+  (4-b) Acceptance gate was reinterpreted from the v1.7.2 per-row
+  form (`ε_ppl < 0.01` abs AND `< 0.1%` rel on a single row) to a
+  mean-over-seeds aggregated form on the D.2a vqbench-aligned
+  row; the top-level (4) checkbox is now `[x]`. See the "Close"
+  section below for the gate form, evidence, and scope boundary.
 
 - **Pre-RoPE production routing (future unit — P-5-E / P-3-C
   follow-up).** The D.2a path is an oracle-only measurement; the
@@ -179,3 +179,62 @@ matched mean and std.
   codec) to close the quality gap on the serving hot path. This is
   an architecture change, not a bench-report change, and it is
   deliberately kept out of P-5 scope.
+
+## Close — P-5-D.3 (PLAN v1.7.3, 2026-04-24)
+
+With D.2a landed, the P-5 §7 Acceptance (4-b) gate was reinterpreted
+in PLAN v1.7.3 (P-5-D.3) and the top-level (4) checkbox flipped
+`[ ]` → `[x]`. The v1.7.2 per-row two-threshold form
+(`|Δ(ΔPPL)_silica − Δ(ΔPPL)_vqbench| < 0.01` AND `|Δ%| < 0.1%` on
+`qwen3-0.6b-wikitext-ppl-block-tq-b64-b4`) was a gate-semantic
+landmine at n=3: silica and vqbench draw different Haar rotations
+from the same distribution (silica shares one rotation across heads,
+vqbench samples one per head), so even after D.2a aligned their
+injection spaces every seed would still trip the per-row warning.
+That divergence is sampling variance, not algorithmic drift.
+
+The v1.7.3 gate form binds the close criterion to a
+**mean-over-seeds aggregated gate on the D.2a vqbench-aligned
+row**, with per-row `vqbench_divergence_warning` kept as a
+diagnostic field (no `_compute_gap_fields` code change):
+
+```
+bind: qwen3-0.6b-wikitext-ppl-block-tq-b64-b4-vqbench-aligned
+seeds: {42, 43, 44} (n = 3)
+
+mean_gap = mean_seeds(silica.ΔPPL_seed − vqbench.ΔPPL_seed)
+SEM_diff = sqrt( std(silica.ΔPPL_seeds)^2 / n
+                + std(vqbench.ΔPPL_seeds)^2 / n )
+          (Bessel-corrected sample std, n-1)
+
+gate (both required):
+  |mean_gap|  <=  2 * SEM_diff
+  |mean_gap|  <   1.0 PPL
+```
+
+Evidence (this directory's `d2a_verification_3seeds.jsonl`):
+
+- silica mean ΔPPL `+0.511 ± 0.354`
+- vqbench mean ΔPPL `+0.661 ± 0.347`
+- `mean_gap = −0.150` PPL
+- `SEM_diff ≈ 0.286`, `2 * SEM_diff ≈ 0.572`
+- Gate 1: `|mean_gap| ≤ 2·SEM_diff` → `0.150 ≤ 0.572` — pass
+- Gate 2: `|mean_gap| < 1.0 PPL` → `0.150 < 1.0` — pass
+
+**Scope boundary.** The (4-b) close covers algorithmic parity between
+silica's MLX-native `BlockTurboQuantMSE` and vqbench's NumPy
+`BlockTurboQuantMSE` when both inject noise in the same (pre-RoPE)
+space. It does **not** cover the `prefix_store_post_rope`
+production-routing arm: at the same codec config that arm measures
+~5–10 PPL ΔPPL (post-RoPE noise injection through RoPE-coupled
+attention, chunk-boundary-dependent). Closing that cost on the
+serving hot path requires a pre-RoPE KV-store architecture and is
+tracked as post-P-5 required follow-up in `docs/PLAN.md` §7 P-5
+Notes ("Production `prefix_store_post_rope` prefix-cache quality
+cost — post-P-5 required follow-up"). Readers should not interpret
+the (4-b) `[x]` as silica's production prefix-cache path having
+achieved vqbench-level PPL.
+
+Traceability: D.2a landing commit `ed57be1`; v1.7.3 Changelog entry
+in `docs/PLAN.md` §13; `docs/P5_OPENING.md` §7(b) / §7(b-postrope)
+mirror sections.

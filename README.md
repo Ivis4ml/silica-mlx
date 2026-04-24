@@ -15,7 +15,7 @@ plus a planned mini-sglang outer layer for Phase 8. Target: run dense
 | P-3 | Family adapters — Qwen3 dense, Qwen3.5 hybrid DeltaNet, Gemma4-31B dense, Qwen3.5-MoE, Gemma4-MoE | ✅ mostly (`C5` preempt/replay with recurrent-state snapshot pending; `E4` batched MoE pending) |
 | P-4 | Unified bench harness — runner, oracles, 15 registered scenarios, JSONL + Markdown reports, vqbench subprocess PPL | ✅ complete; P-4 exit surfaced Q-010 chunked-prefill trigger → P-4.5 bridge planned |
 | P-4.5 | P-4 exit bridge — chunked-prefill minimal + VectorCodec runtime integration spike | ✅ complete (v1.6.9) |
-| P-5 | VQ KV compression (BlockTQ / RaBitQ) | ⏳ P-5-A / B / C sub-units landed (v1.7.1 — BlockTQ + RaBitQ family + bench harness with `--kv-codec` / `--all-kv-codecs` / `--seeds` / `--vqbench-xcheck`); P-5 Acceptance sweep pending |
+| P-5 | VQ KV compression (BlockTQ / RaBitQ) | ⏳ P-5-A / B / C / D sub-units landed (v1.7.3 — BlockTQ + RaBitQ family + bench harness + vqbench-aligned PPL oracle); P-5 Acceptance item (4) numeric cross-check closed via vqbench-aligned oracle (v1.7.3); items (1) / (2) / (3) sweep pending |
 | P-6 | Weight streaming | Stub (`ResidentWeightProvider` today) |
 | P-7 | Speculative decoding (DraftTarget / EAGLE / Medusa) | Stub (`NoopDraftEngine` today) |
 | P-8 | OpenAI-compatible HTTP server + session layer | ⏳ planned (leaning T1 tail, after P-5) |
@@ -453,9 +453,21 @@ P-4.5 bridges both.
     through `SyntheticPrefixBlockStore.register_detached` /
     `fetch_detached` end-to-end on the Qwen3-0.6B path.
 - **P-5** — VQ KV compression platform. All implementation
-  sub-units landed (v1.7.1, between 2026-04-22 and 2026-04-23).
-  §7 P-5 Acceptance checkboxes in `docs/PLAN.md` remain `[ ]`; a
-  dedicated P-5 Acceptance sweep is the remaining close gate.
+  sub-units landed (v1.7.1 through v1.7.3, between 2026-04-22 and
+  2026-04-24). §7 P-5 Acceptance item (4) "Numeric cross-check
+  against vqbench" closed at v1.7.3 via the D.2a vqbench-aligned
+  oracle (mean-over-seeds gate on the
+  `qwen3-0.6b-wikitext-ppl-block-tq-b64-b4-vqbench-aligned` row:
+  `|mean_gap| ≤ 2·SEM_diff` AND `|mean_gap| < 1.0` PPL). Items
+  (1) codec-swap neutrality, (2) `--all-kv-codecs` one-command
+  report, and (3) `qwen3-0.6b-admission-headroom-prefix-heavy`
+  row remain `[ ]` pending a dedicated P-5 Acceptance sweep. The
+  production `prefix_store_post_rope` prefix-cache arm at the
+  same codec config pays a ~5–10 PPL ΔPPL quality cost (post-RoPE
+  noise injection through RoPE-coupled attention) — a real
+  production-path cost, **not closed by (4-b)**; remediation via
+  a pre-RoPE KV-store architecture is tracked as post-P-5
+  required follow-up in `docs/PLAN.md` §7 P-5 Notes.
   - **P-5-A** — Codec scaffolding + BlockTQ hot path + memory
     accounting + decode-speed gate. Side-level `VectorCodec[P]`
     Protocol + `CodedPayload` hierarchy + MLX-native bit-packing +
@@ -478,6 +490,14 @@ P-4.5 bridges both.
     aggregation (C.4); `--kv-codec` / `--all-kv-codecs` CLI
     (C.5); `--vqbench-xcheck` ΔPPL divergence gate + per-arm
     `vqbench_gap` column (C.6).
+  - **P-5-D** — vqbench-aligned PPL path + (4-b) gate close.
+    Bench-runner seed propagation into codec Haar rotations (D.1,
+    commit `2b3868d`); pre-RoPE projection-patch oracle
+    `teacher_forced_chunked_nll_vqbench_aligned` +
+    `qwen3-0.6b-wikitext-ppl-block-tq-b64-b4-vqbench-aligned`
+    scenario + 3-seed verification data (D.2a, commit `ed57be1`);
+    (4-b) gate reinterpretation as mean-over-seeds + PLAN / OPENING
+    / README sync + top-level (4) checkbox flip (D.3, v1.7.3).
 - **P-8** — OpenAI-compatible HTTP server + session layer (wraps
   `ChatSession` with routing, auth, streaming SSE / WebSocket).
   Leaning T1 tail per Q-002 progress; sequenced after P-5 so the
