@@ -168,6 +168,20 @@ def build_parser() -> argparse.ArgumentParser:
             "with --vqbench-xcheck"
         ),
     )
+    p.add_argument(
+        "--vqbench-epsilon",
+        type=float,
+        default=0.01,
+        metavar="FLOAT",
+        help=(
+            "divergence gate threshold on |silica.delta_ppl - "
+            "vqbench.delta_ppl|. Default 0.01 matches opening "
+            "doc P-5 acceptance §7(b). The companion pct "
+            "threshold (0.1 percentage points on delta_ppl_pct) "
+            "is pinned in the runner per §7(b) and not exposed "
+            "here. Only meaningful with --vqbench-xcheck"
+        ),
+    )
     return p
 
 
@@ -417,6 +431,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         codec_overrides=codec_overrides,
         vqbench_xcheck_enabled=args.vqbench_xcheck,
         vqbench_python=args.vqbench_python,
+        vqbench_epsilon=args.vqbench_epsilon,
     )
     results = runner.run(scenarios)
     _print_table(results)

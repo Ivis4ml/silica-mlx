@@ -108,6 +108,14 @@ class _ArmAggregate:
     that must sum to ``runs``. Numeric lists exclude ``None``
     values so a mix of skipped + ok rows aggregates cleanly —
     skipped rows contribute to status counts but not to mean / std.
+
+    ``vqbench_delta_ppl_gaps`` (P-5-C.6 step 2) collects the
+    non-None ``metadata["vqbench_delta_ppl_gap"]`` values across
+    seeds of this arm. The ``vqbench_gap`` table column takes the
+    max absolute value of this list — a gate column, not an
+    observation column, so a single bad seed must not be diluted
+    by averaging. Empty list → empty cell, same as other numeric
+    columns with no populated values.
     """
 
     runs: int = 0
@@ -115,6 +123,7 @@ class _ArmAggregate:
     skipped: int = 0
     failed: int = 0
     numeric: dict[str, list[float]] = field(default_factory=dict)
+    vqbench_delta_ppl_gaps: list[float] = field(default_factory=list)
 
 
 # Bucket key: ``(scenario_id, codec_id)``. ``codec_id`` may be
@@ -155,6 +164,16 @@ def _aggregate_by_scenario_codec(
             if value is None:
                 continue
             bucket.numeric.setdefault(attr, []).append(float(value))
+
+        # P-5-C.6 step 2: collect per-seed ΔPPL gaps for the
+        # arm's gate column. Only present when vqbench actually
+        # ran AND silica delta_ppl was computable; every other
+        # state (flag off, scenario not declared, silica not ok,
+        # arm mismatch) leaves the field absent or None.
+        md = r.metadata if isinstance(r.metadata, dict) else {}
+        gap = md.get("vqbench_delta_ppl_gap")
+        if gap is not None:
+            bucket.vqbench_delta_ppl_gaps.append(float(gap))
     return buckets
 
 
@@ -335,6 +354,13 @@ def _render_aggregated_table(
         "failed",
         *(col for _attr, col, _spec in _NUMERIC_COLUMNS),
         _TOKENS_COLUMN[1],
+        # P-5-C.6 step 2: ``vqbench_gap`` is the worst-case
+        # (max |ΔPPL gap|) across the arm's seeds — a gate
+        # column, not a statistical one. Empty when no seed in
+        # the arm carried a computable ``vqbench_delta_ppl_gap``
+        # (flag off, spec not declared, silica not ok, or arm
+        # mismatch).
+        "vqbench_gap",
     ]
     header = "| " + " | ".join(header_cells) + " |"
     sep = "| " + " | ".join("---" for _ in header_cells) + " |"
@@ -368,6 +394,14 @@ def _render_aggregated_table(
                     _TOKENS_COLUMN[2],
                 )
             )
+            # vqbench_gap cell: worst-case |ΔPPL gap| across
+            # seeds in this arm; empty when no seed had a
+            # computable gap.
+            if agg.vqbench_delta_ppl_gaps:
+                worst = max(abs(g) for g in agg.vqbench_delta_ppl_gaps)
+                cells.append(format(worst, ".4f"))
+            else:
+                cells.append("")
             rows.append("| " + " | ".join(cells) + " |")
     return rows
 

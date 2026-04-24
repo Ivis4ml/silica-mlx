@@ -774,6 +774,165 @@ def test_report_handles_empty_inputs() -> None:
     assert "| id | codec | runs | ok | skipped | failed |" in out
 
 
+# ---------- P-5-C.6 step 2 — vqbench_gap column ---------------------
+
+
+def test_report_table_header_includes_vqbench_gap_column() -> None:
+    """The aggregated table header grows a ``vqbench_gap`` column.
+    Existing header substring assertions that match the prefix
+    continue to pass; this one pins the new column's position (at
+    the tail, after tokens)."""
+    scenarios = [_scenario("x")]
+    results = [_result("x")]
+    out = render_markdown_report(scenarios, results, generated_at="T")
+    assert "vqbench_gap" in out
+    # Header ends with vqbench_gap — nothing inserted after it
+    # that would push it away from the table tail.
+    header_line = next(
+        ln for ln in out.splitlines() if ln.startswith("| id | codec |")
+    )
+    assert header_line.rstrip().endswith("| vqbench_gap |")
+
+
+def _split_gfm_cells(row: str) -> list[str]:
+    """Split a GFM table row ``| a | b | ... |`` into its cells,
+    preserving trailing empty cells. Python's ``str.strip`` +
+    ``split`` collapses trailing pipes, which hides the last cell
+    when it is empty; this helper uses explicit index slicing
+    instead."""
+    parts = row.split("|")
+    # Leading "| " → parts[0] == ""; trailing " |" → parts[-1] == "".
+    # Strip the two sentinel empties and whitespace on each cell.
+    return [c.strip() for c in parts[1:-1]]
+
+
+def test_report_vqbench_gap_empty_when_no_xcheck_data() -> None:
+    """Arms without any populated ``vqbench_delta_ppl_gap`` in
+    their metadata render an empty ``vqbench_gap`` cell. Covers
+    the common "flag off" JSONL feeding the report."""
+    scenarios = [_scenario("no-xcheck")]
+    results = [
+        _result("no-xcheck", seed=0, ttft_ms=5.0),
+        _result("no-xcheck", seed=1, ttft_ms=6.0),
+    ]
+    out = render_markdown_report(scenarios, results, generated_at="T")
+    data_row = next(
+        ln for ln in out.splitlines() if ln.startswith("| no-xcheck |")
+    )
+    cells = _split_gfm_cells(data_row)
+    # Last cell (vqbench_gap) is empty.
+    assert cells[-1] == ""
+    # Sanity: ttft column is populated so we know the row has
+    # substance; the emptiness is specifically vqbench_gap.
+    header_row = next(
+        ln for ln in out.splitlines() if ln.startswith("| id |")
+    )
+    header_cells = _split_gfm_cells(header_row)
+    ttft_idx = header_cells.index("ttft_ms")
+    assert cells[ttft_idx] == "5.5 ± 0.7"
+
+
+def test_report_vqbench_gap_uses_worst_case_abs_across_seeds() -> None:
+    """Gate column: ``vqbench_gap`` is ``max(abs(gap))`` across
+    seeds in the arm, not the mean. A single seed with a large
+    divergence must not be averaged-down by 4 compliant seeds —
+    that would let a broken implementation sneak past a PR-level
+    review of the table."""
+    scenarios = [_scenario("gap-arm")]
+    results = [
+        _result(
+            "gap-arm",
+            seed=0,
+            metadata={"codec_id": "fp16", "vqbench_delta_ppl_gap": 0.004},
+        ),
+        _result(
+            "gap-arm",
+            seed=1,
+            metadata={"codec_id": "fp16", "vqbench_delta_ppl_gap": 0.005},
+        ),
+        _result(
+            "gap-arm",
+            seed=2,
+            metadata={"codec_id": "fp16", "vqbench_delta_ppl_gap": -0.050},
+        ),
+        _result(
+            "gap-arm",
+            seed=3,
+            metadata={"codec_id": "fp16", "vqbench_delta_ppl_gap": 0.006},
+        ),
+    ]
+    out = render_markdown_report(scenarios, results, generated_at="T")
+    data_row = next(
+        ln for ln in out.splitlines() if ln.startswith("| gap-arm |")
+    )
+    cells = _split_gfm_cells(data_row)
+    # max(abs([0.004, 0.005, -0.050, 0.006])) == 0.050 → "0.0500"
+    assert cells[-1] == "0.0500"
+
+
+def test_report_vqbench_gap_per_arm_isolated_from_other_arms() -> None:
+    """Multi-arm scenario: each codec arm aggregates its own
+    gap independently. One arm's worst gap must not bleed into
+    another arm's cell."""
+    scenarios = [_scenario("multi-arm-gap")]
+    results = [
+        _result(
+            "multi-arm-gap",
+            seed=0,
+            metadata={"codec_id": "fp16", "vqbench_delta_ppl_gap": 0.001},
+        ),
+        _result(
+            "multi-arm-gap",
+            seed=0,
+            metadata={
+                "codec_id": "block_tq_b64_b4",
+                "vqbench_delta_ppl_gap": 0.5,
+            },
+        ),
+    ]
+    out = render_markdown_report(scenarios, results, generated_at="T")
+    arm_rows = [
+        ln
+        for ln in out.splitlines()
+        if ln.startswith("| multi-arm-gap |")
+    ]
+    assert len(arm_rows) == 2
+    # Row ordering per _codec_sort_key: None first, concrete ids
+    # alphabetical — block_tq_b64_b4 sorts before fp16.
+    block_row = next(r for r in arm_rows if "| block_tq_b64_b4 |" in r)
+    fp16_row = next(r for r in arm_rows if "| fp16 |" in r)
+    block_cells = _split_gfm_cells(block_row)
+    fp16_cells = _split_gfm_cells(fp16_row)
+    assert block_cells[-1] == "0.5000"
+    assert fp16_cells[-1] == "0.0010"
+
+
+def test_report_vqbench_gap_handles_none_gap_entries_in_mixed_arm() -> None:
+    """Within an arm, some seeds may have computable gap and
+    others may not (different per-seed xcheck outcomes). The
+    aggregation must filter None entries but still surface the
+    worst non-None gap."""
+    scenarios = [_scenario("partial-gap")]
+    results = [
+        _result(
+            "partial-gap",
+            seed=0,
+            metadata={"codec_id": "fp16", "vqbench_delta_ppl_gap": None},
+        ),
+        _result(
+            "partial-gap",
+            seed=1,
+            metadata={"codec_id": "fp16", "vqbench_delta_ppl_gap": 0.02},
+        ),
+    ]
+    out = render_markdown_report(scenarios, results, generated_at="T")
+    data_row = next(
+        ln for ln in out.splitlines() if ln.startswith("| partial-gap |")
+    )
+    cells = _split_gfm_cells(data_row)
+    assert cells[-1] == "0.0200"
+
+
 def test_report_metadata_block_is_valid_json() -> None:
     """Regression guard: metadata is dumped into a fenced code block
     as JSON, so a reader can paste it into a JSON parser without

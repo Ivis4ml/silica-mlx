@@ -2266,20 +2266,33 @@ def _ppl_scenario_with_xcheck(
 
 
 def _stub_ppl_run(
-    _scenario: Scenario, _adapter: Any
+    _scenario: Scenario,
+    _adapter: Any,
+    *,
+    fp16_baseline_ppl: float | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Stub for silica.bench.runner._run_ppl — returns a success
     payload + oracle_context matching the real shape so the runner
     can proceed through the ``ok`` branch without loading wikitext
-    or a real model. Used via monkeypatch in vqbench xcheck tests."""
+    or a real model. Used via monkeypatch in vqbench xcheck tests.
+
+    Accepts the C.6 step 2 ``fp16_baseline_ppl`` kwarg transparently:
+    when the runner threads a baseline PPL in, the stub echoes it
+    into ``oracle_context["ppl_fp16"]`` so ``ppl_oracle`` receives
+    a populated context and computes ``delta_ppl`` /
+    ``delta_ppl_pct`` metadata downstream — matching what the real
+    ``_run_ppl`` does."""
+    context: dict[str, Any] = {
+        "chunk_size": 128,
+        "max_tokens": 256,
+        "wikitext_path": "/nowhere",
+        "kv_codec": _scenario.workload.kv_codec,
+    }
+    if fp16_baseline_ppl is not None:
+        context["ppl_fp16"] = fp16_baseline_ppl
     return (
         {"nll_sum": 1.5, "n_tokens": 128, "ppl": 3.14},
-        {
-            "chunk_size": 128,
-            "max_tokens": 256,
-            "wikitext_path": "/nowhere",
-            "kv_codec": _scenario.workload.kv_codec,
-        },
+        context,
     )
 
 
@@ -2563,17 +2576,20 @@ class TestVqbenchXcheckOkPath:
         import silica.bench.runner as runner_module
 
         def ppl_with_custom_context(
-            _scenario: Scenario, _adapter: Any
+            _scenario: Scenario,
+            _adapter: Any,
+            *,
+            fp16_baseline_ppl: float | None = None,
         ) -> tuple[dict[str, Any], dict[str, Any]]:
-            return (
-                {"nll_sum": 1.0, "n_tokens": 50, "ppl": 2.0},
-                {
-                    "chunk_size": 999,  # diverges from oracle_config
-                    "max_tokens": 1111,
-                    "wikitext_path": "/nowhere",
-                    "kv_codec": "fp16",
-                },
-            )
+            ctx: dict[str, Any] = {
+                "chunk_size": 999,  # diverges from oracle_config
+                "max_tokens": 1111,
+                "wikitext_path": "/nowhere",
+                "kv_codec": "fp16",
+            }
+            if fp16_baseline_ppl is not None:
+                ctx["ppl_fp16"] = fp16_baseline_ppl
+            return ({"nll_sum": 1.0, "n_tokens": 50, "ppl": 2.0}, ctx)
 
         monkeypatch.setattr(
             runner_module, "_run_ppl", ppl_with_custom_context
@@ -2621,3 +2637,428 @@ class TestVqbenchXcheckOkPath:
                 "--max-tokens", "1111",
             ]
         ]
+
+
+# ---------- P-5-C.6 step 2 — divergence gate + gap computation -----
+
+
+from silica.bench.runner import (  # noqa: E402
+    _VQBENCH_PCT_EPSILON,
+    _compute_gap_fields,
+)
+
+
+class TestComputeGapFields:
+    """Unit tests for the pure helper. All runner-level
+    integration tests go through the BenchRunner path below; the
+    helper gets its own tests because the arithmetic is easy to
+    reason about in isolation."""
+
+    def test_computes_signed_ppl_gap_and_pct_gap(self) -> None:
+        out = _compute_gap_fields(
+            silica_delta_ppl=0.050,
+            silica_delta_pct=0.5,
+            vqbench_delta_ppl=0.045,
+            vqbench_delta_pct=0.4,
+            epsilon_ppl=0.01,
+        )
+        assert out["vqbench_delta_ppl_gap"] == pytest.approx(0.005)
+        assert out["vqbench_delta_pct_gap"] == pytest.approx(0.1)
+        # |0.005| < 0.01 AND |0.1| <= 0.1 → no warning (both
+        # under threshold; pct gap is exactly at epsilon, not
+        # above).
+        assert out["vqbench_divergence_warning"] is False
+
+    def test_negative_gap_preserved_signed(self) -> None:
+        """Silica's delta smaller than vqbench's → negative gap."""
+        out = _compute_gap_fields(
+            silica_delta_ppl=0.01,
+            silica_delta_pct=0.1,
+            vqbench_delta_ppl=0.05,
+            vqbench_delta_pct=0.5,
+            epsilon_ppl=0.01,
+        )
+        assert out["vqbench_delta_ppl_gap"] == pytest.approx(-0.04)
+        # |-0.04| > 0.01 → warning
+        assert out["vqbench_divergence_warning"] is True
+
+    def test_ppl_gap_alone_triggers_warning(self) -> None:
+        """|ΔPPL gap| over epsilon while pct gap is within
+        0.1 still trips the warning — either metric is sufficient."""
+        out = _compute_gap_fields(
+            silica_delta_ppl=0.05,
+            silica_delta_pct=0.3,
+            vqbench_delta_ppl=0.015,
+            vqbench_delta_pct=0.28,
+            epsilon_ppl=0.01,
+        )
+        # PPL gap = 0.035 > 0.01 → warning even though pct gap
+        # (0.02) is safely under the 0.1 pct epsilon.
+        assert abs(out["vqbench_delta_ppl_gap"]) > 0.01
+        assert abs(out["vqbench_delta_pct_gap"]) < _VQBENCH_PCT_EPSILON
+        assert out["vqbench_divergence_warning"] is True
+
+    def test_pct_gap_alone_triggers_warning(self) -> None:
+        """Conversely, a big pct gap with small raw ΔPPL still
+        raises a warning. Covers the case where the baselines
+        scale differently between implementations."""
+        out = _compute_gap_fields(
+            silica_delta_ppl=0.005,
+            silica_delta_pct=1.0,
+            vqbench_delta_ppl=0.003,
+            vqbench_delta_pct=0.2,
+            epsilon_ppl=0.01,
+        )
+        # PPL gap tiny, pct gap 0.8 > 0.1
+        assert abs(out["vqbench_delta_ppl_gap"]) < 0.01
+        assert abs(out["vqbench_delta_pct_gap"]) > _VQBENCH_PCT_EPSILON
+        assert out["vqbench_divergence_warning"] is True
+
+    @pytest.mark.parametrize(
+        "silica_delta_ppl,silica_delta_pct,vqbench_delta_ppl,vqbench_delta_pct",
+        [
+            (None, 0.5, 0.045, 0.4),  # silica ppl missing
+            (0.05, None, 0.045, 0.4),  # silica pct missing
+            (0.05, 0.5, None, 0.4),  # vqbench ppl missing
+            (0.05, 0.5, 0.045, None),  # vqbench pct missing
+            (None, None, None, None),  # all missing
+        ],
+    )
+    def test_none_inputs_yield_none_gaps_and_warning(
+        self,
+        silica_delta_ppl: float | None,
+        silica_delta_pct: float | None,
+        vqbench_delta_ppl: float | None,
+        vqbench_delta_pct: float | None,
+    ) -> None:
+        """Any missing delta on either side → all three fields
+        ``None``. Users filtering for warnings must not see
+        missing-data rows as False (within-threshold)."""
+        out = _compute_gap_fields(
+            silica_delta_ppl=silica_delta_ppl,
+            silica_delta_pct=silica_delta_pct,
+            vqbench_delta_ppl=vqbench_delta_ppl,
+            vqbench_delta_pct=vqbench_delta_pct,
+            epsilon_ppl=0.01,
+        )
+        assert out["vqbench_delta_ppl_gap"] is None
+        assert out["vqbench_delta_pct_gap"] is None
+        assert out["vqbench_divergence_warning"] is None
+
+    def test_custom_epsilon_overrides_default(self) -> None:
+        """Tighter epsilon flips a previously-safe gap into a
+        warning — verifies the CLI --vqbench-epsilon propagation."""
+        out_loose = _compute_gap_fields(
+            silica_delta_ppl=0.05,
+            silica_delta_pct=0.2,
+            vqbench_delta_ppl=0.04,
+            vqbench_delta_pct=0.18,
+            epsilon_ppl=0.05,
+        )
+        # |0.05 - 0.04| = 0.01 <= 0.05 → no warning; pct gap 0.02 < 0.1.
+        assert out_loose["vqbench_divergence_warning"] is False
+
+        out_tight = _compute_gap_fields(
+            silica_delta_ppl=0.05,
+            silica_delta_pct=0.2,
+            vqbench_delta_ppl=0.04,
+            vqbench_delta_pct=0.18,
+            epsilon_ppl=0.005,
+        )
+        # Same inputs, tighter epsilon → warning fires on the
+        # raw gap side.
+        assert out_tight["vqbench_divergence_warning"] is True
+
+
+class TestComputeSilicaFp16Baseline:
+    def test_baseline_replaces_workload_to_fp16_shape(
+        self, fake_home_cache: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``_compute_silica_fp16_baseline`` must invoke ``_run_ppl``
+        with a scenario whose workload has kv_codec=None AND
+        prefix_cache=False — the fp16 path signature. Captures the
+        scenario the stubbed ``_run_ppl`` receives and inspects
+        the workload shape."""
+        import silica.bench.runner as runner_module
+
+        captured_scenarios: list[Scenario] = []
+
+        def capturing_run_ppl(
+            scenario: Scenario,
+            _adapter: Any,
+            *,
+            fp16_baseline_ppl: float | None = None,
+        ) -> tuple[dict[str, Any], dict[str, Any]]:
+            captured_scenarios.append(scenario)
+            return (
+                {"nll_sum": 0.5, "n_tokens": 10, "ppl": 2.718},
+                {"chunk_size": 128, "max_tokens": 256},
+            )
+
+        monkeypatch.setattr(runner_module, "_run_ppl", capturing_run_ppl)
+
+        scenario = _ppl_scenario_with_xcheck(
+            "baseline-probe",
+            "test-owner/baseline-probe",
+            wikitext_path="/nowhere",
+            kv_codec="block_tq_b64_b4",
+        )
+        runner = BenchRunner(
+            reset_peak=lambda: None,
+            read_peak_mb=lambda: None,
+        )
+        from typing import cast
+
+        from silica.models.adapter import ModelAdapter
+
+        result_ppl = runner._compute_silica_fp16_baseline(
+            scenario, cast(ModelAdapter, _FakeAdapter(vocab_size=50))
+        )
+        assert result_ppl == pytest.approx(2.718)
+        # The captured scenario's workload must be the fp16 shape.
+        assert len(captured_scenarios) == 1
+        wl = captured_scenarios[0].workload
+        assert wl.kv_codec is None
+        assert wl.prefix_cache is False
+        # Other fields preserved (authoring invariants downstream
+        # depend on this).
+        assert wl.name == scenario.workload.name
+        assert wl.max_tokens == scenario.workload.max_tokens
+
+
+class TestVqbenchXcheckBaselineFires:
+    def test_baseline_computed_only_when_xcheck_preconditions_met(
+        self, fake_home_cache: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``_run_ppl`` should receive a non-None
+        ``fp16_baseline_ppl`` kwarg on the main pass iff the row
+        will actually cross-check (flag on + spec present + arm
+        matches). Skip cases must NOT incur the extra baseline
+        invocation."""
+        import silica.bench.runner as runner_module
+
+        main_calls: list[dict[str, Any]] = []
+
+        def tracking_run_ppl(
+            scenario: Scenario,
+            adapter: Any,
+            *,
+            fp16_baseline_ppl: float | None = None,
+        ) -> tuple[dict[str, Any], dict[str, Any]]:
+            # Distinguish baseline pass (kv_codec=None) from main
+            # pass by workload shape; only record the main pass.
+            if scenario.workload.kv_codec is not None:
+                main_calls.append({"baseline": fp16_baseline_ppl})
+            ctx: dict[str, Any] = {
+                "chunk_size": 128,
+                "max_tokens": 256,
+                "wikitext_path": "/nowhere",
+                "kv_codec": scenario.workload.kv_codec,
+            }
+            if fp16_baseline_ppl is not None:
+                ctx["ppl_fp16"] = fp16_baseline_ppl
+            return (
+                {"nll_sum": 1.5, "n_tokens": 128, "ppl": 3.14},
+                ctx,
+            )
+
+        monkeypatch.setattr(runner_module, "_run_ppl", tracking_run_ppl)
+
+        repo = "test-owner/baseline-precondition"
+        _create_cache_dir(repo)
+        wikitext = _write_fake_wikitext(fake_home_cache)
+
+        declared = _ppl_scenario_with_xcheck(
+            "declared-match",
+            repo,
+            wikitext_path=wikitext,
+            kv_codec="fp16",
+            vqbench_xcheck=VqbenchXcheckSpec(
+                script_path="/tmp/x.py", method="IdentityCodec", bits=16
+            ),
+        )
+        undeclared = _ppl_scenario_with_xcheck(
+            "undeclared",
+            repo,
+            wikitext_path=wikitext,
+            kv_codec="fp16",
+            vqbench_xcheck=None,
+        )
+
+        def fake_vqbench(*a: Any, **kw: Any) -> VqbenchBaselineResult:
+            return VqbenchBaselineResult(status="ok")
+
+        runner = BenchRunner(
+            engine_factory=_factory_returning(
+                _FakeAdapter(vocab_size=50), _FakeEngine([])
+            ),
+            reset_peak=lambda: None,
+            read_peak_mb=lambda: None,
+            vqbench_xcheck_enabled=True,
+            vqbench_runner=fake_vqbench,
+        )
+        runner.run([declared, undeclared])
+
+        assert len(main_calls) == 2
+        # declared (xcheck will fire) → baseline was threaded.
+        assert main_calls[0]["baseline"] == pytest.approx(3.14)
+        # undeclared (xcheck skipped via "scenario_not_declared")
+        # → baseline NOT threaded; saves the extra PPL pass.
+        assert main_calls[1]["baseline"] is None
+
+
+class TestVqbenchXcheckGapInMetadata:
+    def test_happy_path_populates_all_three_gap_fields(
+        self, fake_home_cache: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End-to-end: xcheck preconditions met → vqbench returns
+        a concrete ΔPPL → runner computes the 3 gap fields from
+        silica's oracle-computed delta_ppl (via ppl_fp16 threaded
+        through context) vs vqbench's delta_ppl."""
+        import silica.bench.runner as runner_module
+
+        def deterministic_run_ppl(
+            scenario: Scenario,
+            _adapter: Any,
+            *,
+            fp16_baseline_ppl: float | None = None,
+        ) -> tuple[dict[str, Any], dict[str, Any]]:
+            # Baseline scenario (kv_codec=None): fp16 PPL = 3.0.
+            # Main scenario (kv_codec=fp16): quant PPL = 3.05.
+            if scenario.workload.kv_codec is None:
+                return (
+                    {"nll_sum": 1.0, "n_tokens": 100, "ppl": 3.0},
+                    {},
+                )
+            ctx: dict[str, Any] = {
+                "chunk_size": 128,
+                "max_tokens": 256,
+                "wikitext_path": "/nowhere",
+                "kv_codec": scenario.workload.kv_codec,
+            }
+            if fp16_baseline_ppl is not None:
+                ctx["ppl_fp16"] = fp16_baseline_ppl
+            return (
+                {"nll_sum": 1.1, "n_tokens": 100, "ppl": 3.05},
+                ctx,
+            )
+
+        monkeypatch.setattr(runner_module, "_run_ppl", deterministic_run_ppl)
+
+        repo = "test-owner/gap-happy"
+        _create_cache_dir(repo)
+        scenario = _ppl_scenario_with_xcheck(
+            "gap-happy",
+            repo,
+            wikitext_path=_write_fake_wikitext(fake_home_cache),
+            kv_codec="fp16",
+            vqbench_xcheck=VqbenchXcheckSpec(
+                script_path="/tmp/x.py", method="IdentityCodec", bits=16
+            ),
+        )
+
+        def fake_vqbench(*a: Any, **kw: Any) -> VqbenchBaselineResult:
+            # vqbench reports its own ΔPPL = 0.04 (slightly lower
+            # than silica's 0.05 delta). Expected ppl gap = 0.01.
+            return VqbenchBaselineResult(
+                status="ok",
+                ppl_fp16=3.00,
+                ppl_quant=3.04,
+                delta_ppl=0.04,
+                delta_pct=1.333,
+            )
+
+        runner = BenchRunner(
+            engine_factory=_factory_returning(
+                _FakeAdapter(vocab_size=50), _FakeEngine([])
+            ),
+            reset_peak=lambda: None,
+            read_peak_mb=lambda: None,
+            vqbench_xcheck_enabled=True,
+            vqbench_runner=fake_vqbench,
+            vqbench_epsilon=0.01,
+        )
+        [result] = runner.run([scenario])
+        md = result.metadata
+        # silica delta = 3.05 - 3.0 = 0.05; vqbench delta = 0.04.
+        # Gap = 0.05 - 0.04 = 0.01. Not strictly > 0.01 epsilon
+        # → no warning from the ppl metric alone.
+        assert md["vqbench_delta_ppl_gap"] == pytest.approx(0.01)
+        # Pct check: silica pct = 0.05 / 3.0 * 100 = 1.667;
+        # vqbench pct = 1.333; gap = 0.334. |0.334| > 0.1 pct
+        # epsilon → warning fires.
+        assert md["vqbench_delta_pct_gap"] == pytest.approx(
+            (0.05 / 3.0 * 100) - 1.333, abs=1e-4
+        )
+        assert md["vqbench_divergence_warning"] is True
+
+    def test_epsilon_cli_override_shifts_warning_boundary(
+        self, fake_home_cache: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pass vqbench_epsilon=0.5 → the same gap (0.01) is now
+        safely under threshold; no warning from the ppl metric.
+        Separately verifies the epsilon plumbs through
+        BenchRunner.__init__ into _compute_gap_fields."""
+        import silica.bench.runner as runner_module
+
+        def deterministic_run_ppl(
+            scenario: Scenario,
+            _adapter: Any,
+            *,
+            fp16_baseline_ppl: float | None = None,
+        ) -> tuple[dict[str, Any], dict[str, Any]]:
+            if scenario.workload.kv_codec is None:
+                return (
+                    {"nll_sum": 1.0, "n_tokens": 100, "ppl": 3.0},
+                    {},
+                )
+            ctx: dict[str, Any] = {"kv_codec": scenario.workload.kv_codec}
+            if fp16_baseline_ppl is not None:
+                ctx["ppl_fp16"] = fp16_baseline_ppl
+            return (
+                {"nll_sum": 1.1, "n_tokens": 100, "ppl": 3.05},
+                ctx,
+            )
+
+        monkeypatch.setattr(runner_module, "_run_ppl", deterministic_run_ppl)
+
+        repo = "test-owner/epsilon-loose"
+        _create_cache_dir(repo)
+        scenario = _ppl_scenario_with_xcheck(
+            "epsilon-loose",
+            repo,
+            wikitext_path=_write_fake_wikitext(fake_home_cache),
+            kv_codec="fp16",
+            vqbench_xcheck=VqbenchXcheckSpec(
+                script_path="/tmp/x.py", method="IdentityCodec", bits=16
+            ),
+        )
+
+        # vqbench pct matching silica's pct so pct gap is zero —
+        # isolate the ppl-gap boundary for this test.
+        silica_pct = 0.05 / 3.0 * 100
+
+        def fake_vqbench(*a: Any, **kw: Any) -> VqbenchBaselineResult:
+            return VqbenchBaselineResult(
+                status="ok",
+                ppl_fp16=3.00,
+                ppl_quant=3.04,
+                delta_ppl=0.04,
+                delta_pct=silica_pct,
+            )
+
+        runner = BenchRunner(
+            engine_factory=_factory_returning(
+                _FakeAdapter(vocab_size=50), _FakeEngine([])
+            ),
+            reset_peak=lambda: None,
+            read_peak_mb=lambda: None,
+            vqbench_xcheck_enabled=True,
+            vqbench_runner=fake_vqbench,
+            vqbench_epsilon=0.5,
+        )
+        [result] = runner.run([scenario])
+        md = result.metadata
+        assert md["vqbench_delta_ppl_gap"] == pytest.approx(0.01)
+        # pct gap = 0 (matched), ppl gap 0.01 < 0.5 → no warning.
+        assert md["vqbench_divergence_warning"] is False

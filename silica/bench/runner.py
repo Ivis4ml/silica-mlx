@@ -147,6 +147,65 @@ TeacherForcedReferenceFn = Callable[
 VqbenchRunnerFn = Callable[..., VqbenchBaselineResult]
 
 
+# Fixed companion threshold on |ΔPPL%| gap. Opening doc §7(b)
+# bounds cross-implementation agreement to 0.1 percentage points
+# on the pct metric. Not exposed via CLI because the opening pins
+# it; if a downstream caller needs tuning, add a BenchRunner
+# kwarg later without extending the CLI surface.
+_VQBENCH_PCT_EPSILON: float = 0.1
+
+
+def _compute_gap_fields(
+    *,
+    silica_delta_ppl: float | None,
+    silica_delta_pct: float | None,
+    vqbench_delta_ppl: float | None,
+    vqbench_delta_pct: float | None,
+    epsilon_ppl: float,
+) -> dict[str, Any]:
+    """Compute the three ΔPPL-gap metadata fields:
+    ``vqbench_delta_ppl_gap`` / ``vqbench_delta_pct_gap`` /
+    ``vqbench_divergence_warning``.
+
+    Gaps are signed (silica − vqbench) so the sign conveys which
+    implementation measured a larger quantization loss. The
+    warning is ``True`` if EITHER the magnitude of the ΔPPL gap
+    exceeds ``epsilon_ppl`` OR the magnitude of the ΔPPL-pct gap
+    exceeds the fixed :data:`_VQBENCH_PCT_EPSILON` threshold;
+    either can point out a divergence that the other misses (the
+    pct normalisation catches disagreements that scale with
+    baseline PPL, the raw ΔPPL gap catches disagreements on small
+    deltas that pct rounds down).
+
+    Returns ``None`` for every gap field when either side lacks
+    the needed delta values — ``None`` preserves the "data not
+    computable" state rather than silently coercing to 0 (which
+    would read as "agreement" in a downstream filter).
+    """
+    if (
+        silica_delta_ppl is None
+        or vqbench_delta_ppl is None
+        or silica_delta_pct is None
+        or vqbench_delta_pct is None
+    ):
+        return {
+            "vqbench_delta_ppl_gap": None,
+            "vqbench_delta_pct_gap": None,
+            "vqbench_divergence_warning": None,
+        }
+    delta_ppl_gap = float(silica_delta_ppl) - float(vqbench_delta_ppl)
+    delta_pct_gap = float(silica_delta_pct) - float(vqbench_delta_pct)
+    warning = (
+        abs(delta_ppl_gap) > epsilon_ppl
+        or abs(delta_pct_gap) > _VQBENCH_PCT_EPSILON
+    )
+    return {
+        "vqbench_delta_ppl_gap": delta_ppl_gap,
+        "vqbench_delta_pct_gap": delta_pct_gap,
+        "vqbench_divergence_warning": warning,
+    }
+
+
 def _flatten_vqbench_result(result: VqbenchBaselineResult) -> dict[str, Any]:
     """Flatten a :class:`VqbenchBaselineResult` into ``vqbench_``-
     prefixed metadata keys.
@@ -257,6 +316,7 @@ class BenchRunner:
         vqbench_xcheck_enabled: bool = False,
         vqbench_python: str | None = None,
         vqbench_runner: VqbenchRunnerFn | None = None,
+        vqbench_epsilon: float = 0.01,
     ) -> None:
         self._engine_factory: EngineFactory = (
             engine_factory if engine_factory is not None else _default_engine_factory
@@ -364,6 +424,70 @@ class BenchRunner:
         self._vqbench_runner: VqbenchRunnerFn = (
             vqbench_runner if vqbench_runner is not None else run_vqbench_baseline
         )
+        # P-5-C.6 step 2: divergence gate threshold. Default 0.01
+        # matches opening doc §7(b): ``ε_ppl < 0.01`` is the
+        # accepted cross-implementation agreement bound. The delta-
+        # pct companion threshold (0.1%) is not exposed on the CLI
+        # because the opening pins it; if a later step needs it
+        # tunable, add a ``vqbench_pct_epsilon`` kwarg then.
+        self._vqbench_epsilon: float = vqbench_epsilon
+
+    def _will_run_vqbench(
+        self,
+        scenario: Scenario,
+        *,
+        baked_codec_id: str | None,
+        effective_codec_id: str | None,
+    ) -> bool:
+        """Predicate: will the vqbench subprocess actually fire for
+        this (scenario, codec) arm if silica's oracle succeeds?
+
+        Mirrors the 5-branch decision in
+        :meth:`_vqbench_metadata_for_silica_ok`, minus the silica-
+        oracle-ok check (which the caller hasn't run yet). Used at
+        the PPL dispatch site to decide whether the fp16 baseline
+        pass (extra silica PPL invocation, ~silica_oracle_wall_s
+        cost) is worth paying: it only produces value when the
+        downstream vqbench call will consume the resulting
+        ``delta_ppl`` for gap comparison.
+        """
+        if not self._vqbench_xcheck_enabled:
+            return False
+        if scenario.vqbench_xcheck is None:
+            return False
+        if effective_codec_id != baked_codec_id:
+            return False
+        return True
+
+    def _compute_silica_fp16_baseline(
+        self, scenario: Scenario, adapter: ModelAdapter
+    ) -> float:
+        """Run silica's PPL oracle on the fp16-baseline shape of
+        ``scenario`` and return the resulting PPL number.
+
+        The baseline scenario is built via ``dataclasses.replace``
+        from the input: workload's ``kv_codec`` is cleared to
+        ``None`` and ``prefix_cache`` is flipped to ``False`` so
+        ``_maybe_build_prefix_cache`` produces no cache and
+        ``_run_ppl`` takes the fp16 path
+        (:func:`teacher_forced_chunked_nll`). All other
+        oracle_config keys — ``wikitext_path``, ``chunk_size``,
+        ``max_tokens``, ``min_scored_tokens`` — are preserved so
+        the baseline and the arm PPL share identical tokenization,
+        chunking, and scoring rules. The two numbers are therefore
+        comparable in silica's own frame, which is the invariant
+        vqbench's ΔPPL comparison depends on (opening §7.7).
+        """
+        fp16_scenario = replace(
+            scenario,
+            workload=replace(
+                scenario.workload,
+                kv_codec=None,
+                prefix_cache=False,
+            ),
+        )
+        fp16_collected, _ = _run_ppl(fp16_scenario, adapter)
+        return float(fp16_collected["ppl"])
 
     def _vqbench_metadata_for_silica_not_ok(
         self, scenario: Scenario
@@ -395,6 +519,7 @@ class BenchRunner:
         effective_codec_id: str | None,
         seed: int,
         oracle_context: dict[str, Any] | None,
+        oracle_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Build the vqbench_* metadata slice for rows where silica
         produced an ``ok`` oracle result.
@@ -467,7 +592,35 @@ class BenchRunner:
             script_args,
             python_executable=self._vqbench_python,
         )
-        return _flatten_vqbench_result(vqbench_result)
+        flattened = _flatten_vqbench_result(vqbench_result)
+        # P-5-C.6 step 2: divergence gate. Compare silica's ΔPPL
+        # (from the PPL oracle, which received ``ppl_fp16`` via
+        # ``oracle_context`` and populated ``delta_ppl`` /
+        # ``delta_ppl_pct`` in its metadata) against vqbench's
+        # ΔPPL (parsed from the reproduce-script stdout). Both
+        # sides' ΔPPL come from their own implementation's
+        # fp16-vs-quant pair, which cancels cross-implementation
+        # baseline drift per opening §7.7.
+        silica_delta_ppl = (
+            oracle_metadata.get("delta_ppl")
+            if isinstance(oracle_metadata, dict)
+            else None
+        )
+        silica_delta_pct = (
+            oracle_metadata.get("delta_ppl_pct")
+            if isinstance(oracle_metadata, dict)
+            else None
+        )
+        vqbench_delta_ppl = vqbench_result.delta_ppl
+        vqbench_delta_pct = vqbench_result.delta_pct
+        gap_fields = _compute_gap_fields(
+            silica_delta_ppl=silica_delta_ppl,
+            silica_delta_pct=silica_delta_pct,
+            vqbench_delta_ppl=vqbench_delta_ppl,
+            vqbench_delta_pct=vqbench_delta_pct,
+            epsilon_ppl=self._vqbench_epsilon,
+        )
+        return {**flattened, **gap_fields}
 
     def run(self, scenarios: Iterable[Scenario]) -> list[ScenarioResult]:
         """Run every scenario × codec × seed in scenario-major order.
@@ -643,7 +796,29 @@ class BenchRunner:
                 # oracle is teacher-forced and needs positional logits,
                 # not sampled tokens. ``_run_ppl`` drives the adapter
                 # directly via silica.bench.ppl_oracle.
-                ppl_collected, oracle_context = _run_ppl(scenario, adapter)
+                #
+                # P-5-C.6 step 2: if this row is going to cross-check
+                # against vqbench, compute the silica fp16 baseline
+                # PPL for the same scenario first. vqbench reports
+                # PPL_fp16 and PPL_quant inside a single reproduce-
+                # script invocation, so silica's ΔPPL must also come
+                # from silica's own pair (fp16 + arm). Otherwise a
+                # cross-implementation fp16 baseline drift would
+                # dominate the gap.
+                fp16_baseline_ppl: float | None = None
+                if self._will_run_vqbench(
+                    scenario,
+                    baked_codec_id=baked_codec_id,
+                    effective_codec_id=effective_codec_id,
+                ):
+                    fp16_baseline_ppl = self._compute_silica_fp16_baseline(
+                        scenario, adapter
+                    )
+                ppl_collected, oracle_context = _run_ppl(
+                    scenario,
+                    adapter,
+                    fp16_baseline_ppl=fp16_baseline_ppl,
+                )
                 oracle_input = ppl_collected
                 total_tokens = int(ppl_collected["n_tokens"])
             elif scenario.oracle == OracleKind.STORAGE:
@@ -760,6 +935,7 @@ class BenchRunner:
                 effective_codec_id=effective_codec_id,
                 seed=seed,
                 oracle_context=oracle_context,
+                oracle_metadata=metadata,
             )
             if ok
             else self._vqbench_metadata_for_silica_not_ok(scenario)
@@ -1896,7 +2072,10 @@ def _run_storage(
 
 
 def _run_ppl(
-    scenario: Scenario, adapter: ModelAdapter
+    scenario: Scenario,
+    adapter: ModelAdapter,
+    *,
+    fp16_baseline_ppl: float | None = None,
 ) -> tuple[dict[str, float | int], dict[str, Any]]:
     """Drive the P-5-C.2 ``OracleKind.PPL`` workload.
 
@@ -2006,6 +2185,16 @@ def _run_ppl(
         "wikitext_path": str(wikitext_path),
         "kv_codec": scenario.workload.kv_codec,
     }
+    # P-5-C.6 step 2: when the caller has already computed the
+    # silica fp16 baseline PPL for this scenario+seed (only
+    # required when the row will cross-check against vqbench),
+    # inject it so ``ppl_oracle`` surfaces ``delta_ppl`` /
+    # ``delta_ppl_pct`` in metadata by the same delta formula as
+    # the rest of the codebase. Skipping this kwarg keeps the
+    # existing behaviour — ``delta_ppl`` stays ``None`` for rows
+    # that do not need a delta.
+    if fp16_baseline_ppl is not None:
+        context["ppl_fp16"] = fp16_baseline_ppl
     return collected, context
 
 
