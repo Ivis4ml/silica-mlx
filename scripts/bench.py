@@ -107,6 +107,22 @@ def build_parser() -> argparse.ArgumentParser:
             "0 <= seed < 2**32"
         ),
     )
+    p.add_argument(
+        "--kv-codec",
+        type=str,
+        default=None,
+        metavar="ID",
+        help=(
+            "override every scenario's workload.kv_codec with the "
+            "given registry id (e.g. 'fp16', 'block_tq_b64_b4'). "
+            "Scenarios that pin a specific codec (PPL / STORAGE / "
+            "prefix-hit-decode rows) get their baked value replaced; "
+            "scenarios without prefix_cache=True will fail the "
+            "Workload guard and surface as failed rows. See "
+            "`silica.bench.codec_registry.CODEC_REGISTRY` for the "
+            "full list of ids"
+        ),
+    )
     return p
 
 
@@ -282,7 +298,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    runner = BenchRunner(out_path=args.out, seeds=seeds)
+    # --kv-codec validation: look the id up in the registry at CLI
+    # parse time so an unknown codec exits 2 with the
+    # ``available: ...`` listing, matching the unknown-scenario-id
+    # error shape rather than a deep BenchRunner ValueError.
+    codec_overrides: list[str | None] = [None]
+    if args.kv_codec is not None:
+        try:
+            from silica.bench.codec_registry import get_codec_spec
+
+            get_codec_spec(args.kv_codec)
+        except KeyError as exc:
+            print(f"error: {exc.args[0]}", file=sys.stderr)
+            return 2
+        codec_overrides = [args.kv_codec]
+
+    runner = BenchRunner(
+        out_path=args.out, seeds=seeds, codec_overrides=codec_overrides
+    )
     results = runner.run(scenarios)
     _print_table(results)
 

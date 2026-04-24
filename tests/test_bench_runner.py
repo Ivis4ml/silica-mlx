@@ -1814,6 +1814,321 @@ class TestSuccessPathMetadataPrecedence:
         )
 
 
+# ---------- P-5-C.5 step 1 — --kv-codec override --------------------
+
+
+class TestCodecOverridesConstructorValidation:
+    def test_empty_codec_overrides_rejected(self) -> None:
+        """Empty list mirrors the seeds=() rejection shape."""
+        with pytest.raises(ValueError, match="at least one codec"):
+            BenchRunner(codec_overrides=())
+
+    def test_unknown_codec_id_rejected_at_init(self) -> None:
+        """Typoed codec id must fail at construction, not after N
+        scenarios have already run. Mirror of the seed range-check
+        contract — direct programmatic callers (tests, notebooks)
+        get a clean ValueError instead of a deep
+        _maybe_build_prefix_cache failure."""
+        with pytest.raises(ValueError, match="not a registered codec id"):
+            BenchRunner(codec_overrides=("not-a-real-codec",))
+
+    def test_non_str_non_none_entry_rejected(self) -> None:
+        """``int`` / ``bool`` / float etc. are caller bugs."""
+        with pytest.raises(TypeError, match="str \\| None"):
+            BenchRunner(codec_overrides=(42,))  # type: ignore[arg-type]
+
+    def test_registered_codec_ids_accepted(self) -> None:
+        """Every id in CODEC_REGISTRY constructs without complaint,
+        including mixed-None entries for fan-out over 'baked + one
+        override'."""
+        BenchRunner(codec_overrides=("fp16", "block_tq_b64_b4"))
+        BenchRunner(codec_overrides=(None, "block_tq_b64_b4"))
+        BenchRunner(codec_overrides=(None,))
+
+
+class TestCodecOverrideNoneDefault:
+    def test_none_override_preserves_baked_codec_in_metadata(
+        self, fake_home_cache: Path
+    ) -> None:
+        """``codec_override=None`` means 'use scenario's baked codec'.
+        For a scenario whose Workload does not set kv_codec, the
+        metadata carries ``codec_id=None`` — the key still exists
+        so JSONL consumers have a stable field."""
+        repo = "test-owner/default-codec"
+        _create_cache_dir(repo)
+
+        adapter = _FakeAdapter(vocab_size=50)
+        engine = _FakeEngine([7, 8])
+        scenario = _scenario(scenario_id="default-codec", repo=repo)
+
+        runner = BenchRunner(
+            engine_factory=_factory_returning(adapter, engine),
+            reset_peak=lambda: None,
+            read_peak_mb=lambda: None,
+        )
+        [result] = runner.run([scenario])
+        assert result.metadata["codec_id"] is None
+        # seed still present — execution dimensions compose cleanly
+        assert result.metadata["seed"] == 0
+
+
+class TestCodecOverrideApplied:
+    def _prefix_cache_scenario(self, scenario_id: str, repo: str) -> Scenario:
+        """Scenario shape that ACCEPTS a codec override: prefix_cache
+        enabled + workload set to the scheduler-friendly B=1,2-prompt
+        shape so the override does not hit the Workload guard."""
+        _create_cache_dir(repo)
+        return Scenario(
+            id=scenario_id,
+            repo=repo,
+            workload=Workload(
+                name="codec-override-fake",
+                prompts=("p",),
+                max_tokens=0,
+                max_batch_size=1,
+                prefix_cache=True,
+                kv_codec="fp16",  # baked baseline to be overridden
+            ),
+            oracle=OracleKind.STORAGE,
+        )
+
+    def test_override_codec_id_flows_into_workload_invalid_row(
+        self, fake_home_cache: Path
+    ) -> None:
+        """Override is applied BEFORE ``_validate_workload_for_oracle``
+        in ``_run_one``, so if workload validation subsequently
+        fails (here: STORAGE needs 2 prompts, scenario has 1),
+        ``metadata['codec_id']`` still carries the attempted
+        override — a log reader chasing a failed row sees which
+        codec was in flight when the row crashed.
+
+        Complementary to ``TestCodecOverridePreservesOtherWorkloadFields``
+        which verifies the override flows through the SUCCESS path;
+        this test pins the identity on the validation-failed path."""
+        scenario = self._prefix_cache_scenario(
+            "codec-override", "test-owner/codec-override"
+        )
+        # The oracle won't actually run (prompts=1 fails STORAGE
+        # validation); we just need the metadata to carry the
+        # codec id from the override phase of _run_one, which
+        # happens BEFORE workload validation.
+        runner = BenchRunner(
+            engine_factory=lambda _s: (_ for _ in ()).throw(
+                AssertionError("factory should not be reached")
+            ),
+            reset_peak=lambda: None,
+            read_peak_mb=lambda: None,
+            codec_overrides=("block_tq_b64_b4",),
+        )
+        [result] = runner.run([scenario])
+        assert result.status == "failed"
+        assert result.reason is not None
+        assert "requires exactly 2 prompts" in result.reason
+        # Load-bearing assertion: codec_id = override, not scenario's
+        # baked "fp16". If override were applied after validation,
+        # this would still be "fp16".
+        assert result.metadata["codec_id"] == "block_tq_b64_b4"
+
+
+class TestCodecOverrideIncompatibleScenario:
+    def test_override_on_no_prefix_cache_scenario_fails_cleanly(
+        self, fake_home_cache: Path
+    ) -> None:
+        """Applying ``--kv-codec X`` to a SMOKE scenario (no prefix
+        cache) triggers ``Workload.__post_init__`` rejecting
+        ``kv_codec != None`` without ``prefix_cache=True``. Runner
+        collapses the ValueError to a failed row; metadata still
+        carries both seed and the attempted codec_id so a log
+        reader can diagnose the mismatch."""
+        repo = "test-owner/no-prefix-cache"
+        _create_cache_dir(repo)
+        scenario = _scenario(scenario_id="no-prefix", repo=repo)  # SMOKE, prefix_cache=False
+
+        runner = BenchRunner(
+            engine_factory=lambda _s: (_ for _ in ()).throw(
+                AssertionError("factory must not run when override fails")
+            ),
+            reset_peak=lambda: None,
+            read_peak_mb=lambda: None,
+            codec_overrides=("block_tq_b64_b4",),
+        )
+        [result] = runner.run([scenario])
+        assert result.status == "failed"
+        assert result.reason is not None
+        assert "codec_override_invalid" in result.reason
+        assert "prefix_cache" in result.reason
+        assert result.metadata["codec_id"] == "block_tq_b64_b4"
+        assert result.metadata["seed"] == 0
+
+
+class TestCodecIdMetadataOnAllReturnPaths:
+    """Mirror of C.4 step 1's seed-on-every-return-path guard, for
+    the new codec_id key. JSONL stays self-describing if, for
+    example, one seed skips (missing cache) and the next seed
+    succeeds — both rows must carry codec_id."""
+
+    def test_gate_skipped_row_carries_codec_id(
+        self, fake_home_cache: Path
+    ) -> None:
+        """Cache-missing gate skip path. No override is applied
+        (codec_override=None default) and the scenario has no baked
+        codec, so metadata['codec_id'] == None. Key still present."""
+        scenario = _scenario(
+            scenario_id="gate-skip-codec",
+            repo="test-owner/never-cached-codec",
+        )
+        runner = BenchRunner(
+            engine_factory=lambda _s: (_ for _ in ()).throw(
+                AssertionError("factory must not run")
+            ),
+            reset_peak=lambda: None,
+            read_peak_mb=lambda: None,
+        )
+        [result] = runner.run([scenario])
+        assert result.status == "skipped"
+        assert "codec_id" in result.metadata
+        assert result.metadata["codec_id"] is None
+
+    def test_exception_failed_row_carries_codec_id(
+        self, fake_home_cache: Path
+    ) -> None:
+        """Factory raises mid-execution; the except-Exception
+        boundary still produces a row with codec_id in metadata."""
+        repo = "test-owner/exploding-codec"
+        _create_cache_dir(repo)
+        scenario = _scenario(scenario_id="boom-codec", repo=repo)
+
+        def exploding_factory(_s: Scenario) -> Any:
+            raise RuntimeError("synthetic factory failure for codec test")
+
+        runner = BenchRunner(
+            engine_factory=exploding_factory,
+            reset_peak=lambda: None,
+            read_peak_mb=lambda: None,
+        )
+        [result] = runner.run([scenario])
+        assert result.status == "failed"
+        assert "codec_id" in result.metadata
+
+
+class TestCodecOverridePreservesOtherWorkloadFields:
+    def test_override_does_not_alter_prompts_max_tokens_batch_size(
+        self, fake_home_cache: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The ``replace(workload, kv_codec=...)`` edit must NOT
+        clobber any other workload field. Use a stub oracle that
+        echoes the workload shape back through metadata so we can
+        inspect it after the run."""
+        from silica.bench import oracles as oracles_module
+
+        repo = "test-owner/workload-preservation"
+        _create_cache_dir(repo)
+        scenario = Scenario(
+            id="preserve-fields",
+            repo=repo,
+            workload=Workload(
+                name="preserve-workload",
+                prompts=("p0",),
+                max_tokens=7,
+                max_batch_size=1,
+                prefix_cache=True,
+                kv_codec="fp16",
+                temperature=0.3,
+                top_p=0.9,
+            ),
+            oracle=OracleKind.SMOKE,
+        )
+
+        def stub_smoke(
+            sc: Scenario, output: Any, context: Any
+        ) -> tuple[bool, str | None, dict[str, Any]]:
+            return True, None, {
+                "echoed_kv_codec": sc.workload.kv_codec,
+                "echoed_max_tokens": sc.workload.max_tokens,
+                "echoed_prompts_len": len(sc.workload.prompts),
+                "echoed_temperature": sc.workload.temperature,
+                "echoed_top_p": sc.workload.top_p,
+                "echoed_max_batch_size": sc.workload.max_batch_size,
+                "echoed_prefix_cache": sc.workload.prefix_cache,
+            }
+
+        monkeypatch.setitem(
+            oracles_module.ORACLES, OracleKind.SMOKE, stub_smoke
+        )
+
+        adapter = _FakeAdapter(vocab_size=50)
+        engine = _FakeEngine([1, 2])
+        runner = BenchRunner(
+            engine_factory=_factory_returning(adapter, engine),
+            reset_peak=lambda: None,
+            read_peak_mb=lambda: None,
+            codec_overrides=("block_tq_b64_b4",),
+        )
+        [result] = runner.run([scenario])
+
+        # The override replaced only kv_codec; everything else stayed.
+        md = result.metadata
+        assert md["echoed_kv_codec"] == "block_tq_b64_b4"
+        assert md["echoed_max_tokens"] == 7
+        assert md["echoed_prompts_len"] == 1
+        assert md["echoed_temperature"] == 0.3
+        assert md["echoed_top_p"] == 0.9
+        assert md["echoed_max_batch_size"] == 1
+        assert md["echoed_prefix_cache"] is True
+        # And the runner-injected codec_id reflects the override.
+        assert md["codec_id"] == "block_tq_b64_b4"
+
+
+class TestCodecFanOutOrdering:
+    def test_scenario_major_codec_middle_seed_innermost(
+        self, fake_home_cache: Path
+    ) -> None:
+        """Result order under mixed fan-out: for scenarios [A, B],
+        codec_overrides=[None, None], seeds=[0, 1] the order is
+        scenario-major with codec middle and seed innermost.
+
+        Step 1 only exercises cardinality 1 for codec_overrides in
+        the CLI, but the underlying order invariant must already
+        hold so step 2 (--all-kv-codecs) can lift it without
+        re-checking."""
+        repo_a = "test-owner/fan-a"
+        repo_b = "test-owner/fan-b"
+        _create_cache_dir(repo_a)
+        _create_cache_dir(repo_b)
+
+        def factory(_s: Scenario) -> Any:
+            return _FakeAdapter(vocab_size=50), _FakeEngine([1, 2])
+
+        scenarios = [
+            _scenario(scenario_id="fan-a", repo=repo_a),
+            _scenario(scenario_id="fan-b", repo=repo_b),
+        ]
+        runner = BenchRunner(
+            engine_factory=factory,
+            reset_peak=lambda: None,
+            read_peak_mb=lambda: None,
+            seeds=(0, 1),
+            codec_overrides=(None, None),
+        )
+        results = runner.run(scenarios)
+        # 2 scenarios * 2 codecs * 2 seeds = 8 rows
+        observed = [
+            (r.scenario_id, r.metadata["codec_id"], r.metadata["seed"])
+            for r in results
+        ]
+        # scenario-major, codec middle, seed inner
+        assert observed == [
+            ("fan-a", None, 0),
+            ("fan-a", None, 1),
+            ("fan-a", None, 0),
+            ("fan-a", None, 1),
+            ("fan-b", None, 0),
+            ("fan-b", None, 1),
+            ("fan-b", None, 0),
+            ("fan-b", None, 1),
+        ]
+
+
 class TestJsonlMultiSeedRoundTrip:
     def test_jsonl_one_row_per_scenario_seed(
         self, fake_home_cache: Path, tmp_path: Path

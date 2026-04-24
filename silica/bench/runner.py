@@ -93,13 +93,14 @@ import os
 import random
 import time
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
 import numpy as np
 
+from silica.bench.codec_registry import CODEC_REGISTRY
 from silica.bench.oracles import ORACLES
 from silica.bench.scenario import (
     OracleKind,
@@ -223,6 +224,7 @@ class BenchRunner:
         reset_peak: Callable[[], None] | None = None,
         read_peak_mb: Callable[[], float | None] | None = None,
         seeds: Sequence[int] = (0,),
+        codec_overrides: Sequence[str | None] = (None,),
     ) -> None:
         self._engine_factory: EngineFactory = (
             engine_factory if engine_factory is not None else _default_engine_factory
@@ -281,33 +283,77 @@ class BenchRunner:
                 )
         self._seeds: tuple[int, ...] = seeds_tuple
 
-    def run(self, scenarios: Iterable[Scenario]) -> list[ScenarioResult]:
-        """Run every scenario × seed in scenario-major order.
+        # P-5-C.5 step 1: codec override fan-out dimension. ``None``
+        # means "use scenario's baked workload.kv_codec"; a str value
+        # must be registered in CODEC_REGISTRY (validated here so a
+        # typo fails at construction rather than N scenarios * M
+        # seeds later inside ``_run_one``). Step 1 always uses
+        # cardinality 1 (either ``(None,)`` or ``(<single id>,)``);
+        # step 2 will expand this to every registry id under
+        # ``--all-kv-codecs``.
+        if not codec_overrides:
+            raise ValueError(
+                "BenchRunner requires at least one codec override "
+                "entry; pass codec_overrides=(None,) for the "
+                "default behaviour (use scenario baked codec)"
+            )
+        codec_overrides_tuple: tuple[str | None, ...] = tuple(codec_overrides)
+        for override in codec_overrides_tuple:
+            if override is None:
+                continue
+            if not isinstance(override, str):
+                raise TypeError(
+                    f"BenchRunner codec_overrides entries must be "
+                    f"str | None; got {type(override).__name__} "
+                    f"({override!r})"
+                )
+            if override not in CODEC_REGISTRY:
+                known = ", ".join(sorted(CODEC_REGISTRY))
+                raise ValueError(
+                    f"BenchRunner codec_override {override!r} is not "
+                    f"a registered codec id; known: {known}"
+                )
+        self._codec_overrides: tuple[str | None, ...] = codec_overrides_tuple
 
-        For ``seeds=(s0, s1, ..., sK)`` and scenarios ``[A, B]`` the
-        result order is ``[(A,s0), (A,s1), ..., (A,sK), (B,s0), ...]``
-        so same-scenario rows stay adjacent — both for terminal
-        readability (a watcher sees scenario A finish all seeds
-        before B starts) and for bench-report grouping (downstream
+    def run(self, scenarios: Iterable[Scenario]) -> list[ScenarioResult]:
+        """Run every scenario × codec × seed in scenario-major order.
+
+        For ``seeds=(s0, s1)``, ``codec_overrides=(c0, c1)`` and
+        scenarios ``[A, B]`` the result order is
+
+            (A, c0, s0), (A, c0, s1), (A, c1, s0), (A, c1, s1),
+            (B, c0, s0), (B, c0, s1), (B, c1, s0), (B, c1, s1)
+
+        so same-(scenario, codec) rows stay adjacent — both for
+        terminal readability (a watcher sees each arm finish
+        contiguously) and for bench-report grouping (downstream
         aggregation can consume contiguous slices).
 
         Rows are appended to ``out_path`` as they complete (one JSON
         object per line) so a long-running bench does not lose
         progress if the process is killed mid-run. Each JSONL row
-        carries ``metadata["seed"]`` so the file is self-describing
-        without reference to the CLI invocation.
+        carries ``metadata["seed"]`` and ``metadata["codec_id"]``
+        so the file is self-describing without reference to the
+        CLI invocation.
         """
         results: list[ScenarioResult] = []
         for scenario in scenarios:
-            for seed in self._seeds:
-                result = self._run_one(scenario, seed=seed)
-                results.append(result)
-                if self._out_path is not None:
-                    self._append_jsonl(result)
+            for codec_override in self._codec_overrides:
+                for seed in self._seeds:
+                    result = self._run_one(
+                        scenario, seed=seed, codec_override=codec_override
+                    )
+                    results.append(result)
+                    if self._out_path is not None:
+                        self._append_jsonl(result)
         return results
 
     def _run_one(
-        self, scenario: Scenario, *, seed: int
+        self,
+        scenario: Scenario,
+        *,
+        seed: int,
+        codec_override: str | None = None,
     ) -> ScenarioResult:
         # Seed all three RNGs BEFORE the gate check so anything
         # downstream (adapter load, factory-driven prompt selection,
@@ -320,6 +366,37 @@ class BenchRunner:
         np.random.seed(seed)
         random.seed(seed)
 
+        # Apply ``--kv-codec`` override. ``codec_override is None``
+        # means "use scenario's baked workload.kv_codec" and leaves
+        # the scenario untouched; a str value replaces the workload's
+        # ``kv_codec`` field. The replace call re-triggers
+        # ``Workload.__post_init__`` which enforces "kv_codec
+        # requires prefix_cache=True" and "kv_codec must be
+        # registered"; both are caller errors collapsing to a
+        # failed row (not authoring-time errors, because the codec
+        # override is a runtime CLI flag, not the scenario's own
+        # authoring).
+        if codec_override is not None:
+            try:
+                scenario = replace(
+                    scenario,
+                    workload=replace(
+                        scenario.workload, kv_codec=codec_override
+                    ),
+                )
+            except ValueError as exc:
+                return ScenarioResult(
+                    scenario_id=scenario.id,
+                    status="failed",
+                    reason=f"codec_override_invalid:{exc}",
+                    metadata={"seed": seed, "codec_id": codec_override},
+                )
+        # Effective codec id after override (or baked if no override).
+        # May be ``None`` for scenarios that don't install a codec
+        # (SMOKE, parity rows) — the JSONL field still appears,
+        # carrying None, so downstream consumers have a stable key.
+        effective_codec_id = scenario.workload.kv_codec
+
         # Gate check first: skipped rows never touch the engine, so
         # cache-missing scenarios do not accidentally block on a
         # download prompt or a model-factory KeyError.
@@ -329,7 +406,7 @@ class BenchRunner:
                 scenario_id=scenario.id,
                 status="skipped",
                 reason=skip_reason,
-                metadata={"seed": seed},
+                metadata={"seed": seed, "codec_id": effective_codec_id},
             )
 
         workload_error = _validate_workload_for_oracle(
@@ -340,7 +417,7 @@ class BenchRunner:
                 scenario_id=scenario.id,
                 status="failed",
                 reason=workload_error,
-                metadata={"seed": seed},
+                metadata={"seed": seed, "codec_id": effective_codec_id},
             )
 
         try:
@@ -459,7 +536,7 @@ class BenchRunner:
                 scenario_id=scenario.id,
                 status="failed",
                 reason=f"{type(exc).__name__}: {exc}",
-                metadata={"seed": seed},
+                metadata={"seed": seed, "codec_id": effective_codec_id},
             )
 
         snap = engine.metrics.snapshot()
@@ -487,13 +564,17 @@ class BenchRunner:
             if isinstance(row1_first, (int, float)):
                 ttft_ms = float(row1_first)
 
-        # Runner-injected ``seed`` wins if an oracle accidentally
-        # writes the key: seed is an execution dimension (runner
-        # fan-out), not an authoring dimension (oracle_config). The
-        # ``{**metadata, "seed": seed}`` ordering enforces that
-        # precedence without requiring every oracle to know about
-        # the seed key.
-        result_metadata: dict[str, Any] = {**metadata, "seed": seed}
+        # Runner-injected execution-dimension keys (``seed``,
+        # ``codec_id``) win if an oracle accidentally writes them:
+        # these are runner fan-out axes, not authoring data. The
+        # ``{**metadata, "seed": seed, "codec_id": ...}`` ordering
+        # enforces that precedence without requiring every oracle
+        # to know which keys are execution-scope.
+        result_metadata: dict[str, Any] = {
+            **metadata,
+            "seed": seed,
+            "codec_id": effective_codec_id,
+        }
         return ScenarioResult(
             scenario_id=scenario.id,
             status="ok" if ok else "failed",

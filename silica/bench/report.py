@@ -104,6 +104,14 @@ class _ScenarioAggregate:
     ``runs``. Numeric lists exclude ``None`` values so a mix of
     skipped + ok rows aggregates cleanly — skipped rows contribute
     to status counts but not to mean / std.
+
+    ``codec_ids`` tracks the distinct ``metadata["codec_id"]``
+    values seen within the bucket. Under C.5 step 1 this must be
+    at most a single value per scenario_id — the renderer
+    aggregates by scenario_id only, so mixing multiple codecs
+    into one bucket would produce a silently-incorrect mean/std
+    that averages across codecs. Step 2 will re-key the aggregation
+    by ``(scenario_id, codec_id)`` and drop the step 1 constraint.
     """
 
     runs: int = 0
@@ -111,6 +119,7 @@ class _ScenarioAggregate:
     skipped: int = 0
     failed: int = 0
     numeric: dict[str, list[float]] = field(default_factory=dict)
+    codec_ids: set[str | None] = field(default_factory=set)
 
 
 def _aggregate_by_scenario(
@@ -137,6 +146,14 @@ def _aggregate_by_scenario(
             bucket.skipped += 1
         elif r.status == "failed":
             bucket.failed += 1
+
+        # Track codec_id per row so the renderer can reject a
+        # bucket that mixes multiple codecs (step 1 guard; step 2
+        # re-keys by (scenario_id, codec_id) and drops it).
+        codec_id = (
+            r.metadata.get("codec_id") if r.metadata else None
+        )
+        bucket.codec_ids.add(codec_id)
 
         for attr, _col, _spec in (*_NUMERIC_COLUMNS, _TOKENS_COLUMN):
             value = getattr(r, attr, None)
@@ -199,6 +216,11 @@ def render_markdown_report(
         (unknown id — caller passed inconsistent lists)
       * a scenario in ``scenarios`` has zero results (runner
         dropped it silently — suppressing this would hide a bug)
+      * a scenario's results span multiple distinct
+        ``metadata["codec_id"]`` values — under C.5 step 1 the
+        aggregation is keyed by scenario_id only, so averaging
+        across codecs would silently conflate arms. Step 2 lifts
+        this by grouping the table by ``(scenario_id, codec_id)``
     """
     seen_ids: set[str] = set()
     duplicate_ids: list[str] = []
@@ -234,6 +256,35 @@ def render_markdown_report(
             f"zero results — the runner dropped them silently or "
             f"the caller passed an expanded scenarios list that "
             f"does not appear in results"
+        )
+    # C.5 step 1 guard: each scenario bucket must have at most one
+    # distinct codec_id. If a caller hands the renderer rows
+    # produced under multiple ``codec_overrides`` entries for the
+    # same scenario (BenchRunner's 3D fan-out can produce this
+    # cleanly; step 1's renderer cannot yet aggregate it without
+    # silently averaging across codecs), fail loudly so the data
+    # error surfaces at report time rather than in a misleading
+    # mean ± std column.
+    mixed_codec: list[tuple[str, list[str | None]]] = []
+    for scenario in scenarios:
+        agg = aggregates[scenario.id]
+        if len(agg.codec_ids) > 1:
+            mixed_codec.append(
+                (
+                    scenario.id,
+                    sorted(agg.codec_ids, key=lambda x: (x is None, x)),
+                )
+            )
+    if mixed_codec:
+        details = "; ".join(
+            f"{sid!r}: {codecs!r}" for sid, codecs in mixed_codec
+        )
+        raise ValueError(
+            f"render_markdown_report: scenario(s) span multiple "
+            f"codec_id values within one aggregation bucket — "
+            f"{details}. Step 1 aggregation is keyed by scenario_id "
+            f"only; P-5-C.5 step 2 re-keys by (scenario_id, "
+            f"codec_id) and lifts this restriction"
         )
     timestamp = (
         generated_at

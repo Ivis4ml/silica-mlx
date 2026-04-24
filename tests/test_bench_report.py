@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import re
+from typing import Any
 
 import pytest
 
@@ -67,7 +68,7 @@ def _result(
     reason: str | None = None,
     metadata: dict | None = None,
     seed: int | None = 0,
-    **metrics: float,
+    **metrics: Any,
 ) -> ScenarioResult:
     """Build a ``ScenarioResult`` with ``metadata["seed"]`` already
     set so the detail heading suffix ``(seed=<N>)`` appears naturally.
@@ -507,6 +508,79 @@ def test_report_rejects_scenario_with_zero_results() -> None:
     scenarios = [_scenario("ran"), _scenario("never_ran")]
     results = [_result("ran")]
     with pytest.raises(ValueError, match="zero results"):
+        render_markdown_report(scenarios, results)
+
+
+def test_report_rejects_mixed_codec_ids_within_scenario_bucket() -> None:
+    """C.5 step 1 guard: the aggregation is keyed by scenario_id
+    only, so a scenario whose rows span multiple codec_ids would
+    silently produce a mean ± std row that averages across codecs.
+    Fail loudly until step 2 re-keys by (scenario_id, codec_id).
+
+    BenchRunner's 3D fan-out (scenario × codec × seed) can legally
+    produce this shape when a caller passes multiple codec_overrides;
+    this renderer guard forces the step 1 behavioral commitment
+    ("single codec per scenario in the report") to surface
+    explicitly rather than as a numerical average across arms."""
+    scenarios = [_scenario("mixed")]
+    results = [
+        _result("mixed", seed=0, metadata={"codec_id": "fp16"}, ttft_ms=10.0),
+        _result("mixed", seed=1, metadata={"codec_id": "block_tq_b64_b4"}, ttft_ms=20.0),
+    ]
+    with pytest.raises(ValueError, match="multiple codec_id"):
+        render_markdown_report(scenarios, results)
+
+
+def test_report_accepts_consistent_codec_id_within_scenario_bucket() -> None:
+    """Positive case: if every row of one scenario carries the same
+    ``codec_id`` (either the single override or the baked value),
+    the renderer produces the aggregated row without complaint."""
+    scenarios = [_scenario("same-codec")]
+    results = [
+        _result(
+            "same-codec",
+            seed=0,
+            metadata={"codec_id": "fp16"},
+            ttft_ms=10.0,
+        ),
+        _result(
+            "same-codec",
+            seed=1,
+            metadata={"codec_id": "fp16"},
+            ttft_ms=14.0,
+        ),
+    ]
+    out = render_markdown_report(scenarios, results, generated_at="T")
+    assert "| same-codec |" in out
+    # mean=12, stdev of [10,14]=sqrt(8)≈2.828 → "12.0 ± 2.8"
+    assert "12.0 ± 2.8" in out
+
+
+def test_report_accepts_none_codec_id_uniform_within_bucket() -> None:
+    """The codec_id uniqueness check treats ``None`` as a legitimate
+    value (SMOKE scenarios that don't set kv_codec). Uniform
+    ``codec_id=None`` across a scenario's rows must not fire the
+    mixed-codec rejection."""
+    scenarios = [_scenario("no-codec")]
+    results = [
+        _result("no-codec", seed=0, metadata={"codec_id": None}),
+        _result("no-codec", seed=1, metadata={"codec_id": None}),
+    ]
+    # No exception
+    out = render_markdown_report(scenarios, results, generated_at="T")
+    assert "| no-codec |" in out
+
+
+def test_report_rejects_mixed_none_and_codec_id_in_bucket() -> None:
+    """``None`` vs a concrete codec id still counts as a mixed
+    bucket — semantically 'baked (None)' vs 'override (fp16)' is
+    a meaningful arm distinction that step 1 cannot aggregate."""
+    scenarios = [_scenario("partial")]
+    results = [
+        _result("partial", seed=0, metadata={"codec_id": None}),
+        _result("partial", seed=1, metadata={"codec_id": "fp16"}),
+    ]
+    with pytest.raises(ValueError, match="multiple codec_id"):
         render_markdown_report(scenarios, results)
 
 

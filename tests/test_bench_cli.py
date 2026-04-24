@@ -393,6 +393,116 @@ def test_cli_seeds_duplicate_warns_and_dedupes(tmp_path: Path) -> None:
     assert [row["metadata"]["seed"] for row in rows] == [42, 43]
 
 
+# ---------- P-5-C.5 step 1 — --kv-codec CLI surface ------------------
+
+
+def test_cli_kv_codec_default_none_preserves_baked_codec(
+    tmp_path: Path,
+) -> None:
+    """No ``--kv-codec`` flag → codec override is ``None`` → the
+    scenario's baked codec flows through verbatim. For
+    ``qwen3-0.6b-smoke`` (no kv_codec), metadata.codec_id is
+    null in JSON — the key still exists so consumers can rely on
+    a stable schema."""
+    out_path = tmp_path / "default_codec.jsonl"
+    result = _run_cli(
+        "--scenario", "qwen3-0.6b-smoke",
+        "--out", str(out_path),
+    )
+    assert result.returncode in (0, 1)
+    rows = [
+        json.loads(line)
+        for line in out_path.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    assert len(rows) == 1
+    assert "codec_id" in rows[0]["metadata"]
+    assert rows[0]["metadata"]["codec_id"] is None
+
+
+def test_cli_kv_codec_override_records_override_id(
+    tmp_path: Path,
+) -> None:
+    """``--kv-codec fp16`` applied to any scenario records the
+    override in ``metadata.codec_id``. We target
+    ``qwen3-0.6b-compression-block-tq-b64-b4`` (a STORAGE row
+    baked with ``block_tq_b64_b4``) so the override visibly
+    replaces the baked value.
+
+    Accepts any terminal status because the scenario may either
+    run (cache present) or skip (cache missing); the codec_id
+    injection happens before both branches, so the test is
+    independent of HF cache state."""
+    out_path = tmp_path / "override_codec.jsonl"
+    result = _run_cli(
+        "--scenario", "qwen3-0.6b-compression-block-tq-b64-b4",
+        "--kv-codec", "fp16",
+        "--out", str(out_path),
+    )
+    assert result.returncode in (0, 1), (
+        f"unexpected exit {result.returncode}; stderr={result.stderr!r}"
+    )
+    rows = [
+        json.loads(line)
+        for line in out_path.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    assert len(rows) == 1
+    assert rows[0]["metadata"]["codec_id"] == "fp16"
+
+
+def test_cli_kv_codec_unknown_id_exits_2(tmp_path: Path) -> None:
+    """Unknown codec id exits 2 with a CLI-friendly error message
+    that lists available ids. Mirrors the unknown-scenario-id
+    exit contract so callers can distinguish bad input from
+    runtime failure."""
+    result = _run_cli(
+        "--scenario", "qwen3-0.6b-smoke",
+        "--kv-codec", "not-a-real-codec",
+    )
+    assert result.returncode == 2, (
+        f"expected exit 2 for unknown codec id, got "
+        f"{result.returncode}; stderr={result.stderr!r}"
+    )
+    assert "error:" in result.stderr
+    assert "not-a-real-codec" in result.stderr
+    # The registry error helper lists available ids so a user with
+    # a typo sees the closest match.
+    assert "available:" in result.stderr
+    assert "fp16" in result.stderr
+    assert "block_tq_b64_b4" in result.stderr
+
+
+def test_cli_kv_codec_on_non_prefix_cache_scenario_produces_failed_row(
+    tmp_path: Path,
+) -> None:
+    """``--kv-codec X --scenario qwen3-0.6b-smoke`` applied to a
+    non-prefix-cache scenario surfaces as a failed row (not exit 2
+    or crash) — the Workload guard fires at dataclass
+    construction time inside ``_run_one``, which the exception
+    boundary collapses to a ``codec_override_invalid`` reason."""
+    out_path = tmp_path / "incompatible.jsonl"
+    result = _run_cli(
+        "--scenario", "qwen3-0.6b-smoke",
+        "--kv-codec", "block_tq_b64_b4",
+        "--out", str(out_path),
+    )
+    # Failed row → exit 1 (some scenario failed) is expected.
+    assert result.returncode == 1, (
+        f"expected exit 1 for failed row, got {result.returncode}; "
+        f"stderr={result.stderr!r}"
+    )
+    rows = [
+        json.loads(line)
+        for line in out_path.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    assert len(rows) == 1
+    assert rows[0]["status"] == "failed"
+    assert "codec_override_invalid" in rows[0]["reason"]
+    assert rows[0]["metadata"]["codec_id"] == "block_tq_b64_b4"
+
+
 def test_cli_seeds_default_produces_one_row(tmp_path: Path) -> None:
     """Omitting ``--seeds`` keeps the pre-C.4 single-row shape: one
     JSONL row per scenario, ``metadata.seed == 0``. This is the
