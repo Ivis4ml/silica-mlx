@@ -94,7 +94,7 @@ def test_qwen3_0_6b_wikitext_ppl_fp16_end_to_end() -> None:
     import math
 
     runner = BenchRunner()
-    result = runner._run_one(_SCENARIO)
+    result = runner._run_one(_SCENARIO, seed=0)
 
     assert result.status == "ok", (
         f"{_SCENARIO_ID}: status={result.status} "
@@ -173,7 +173,7 @@ def test_wikitext_missing_cache_skips_before_model_load() -> None:
         )
 
     runner = BenchRunner(engine_factory=_fail_fast_factory)
-    result = runner._run_one(scenario)
+    result = runner._run_one(scenario, seed=0)
     assert result.status == "skipped"
     assert result.reason is not None
     assert result.reason.startswith("wikitext_cache_missing:")

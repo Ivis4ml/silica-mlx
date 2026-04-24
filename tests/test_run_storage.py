@@ -366,7 +366,7 @@ def test_invalid_workload_fails_before_engine_factory(
 
     probe = _FactoryProbe()
     runner = _make_runner(probe)
-    result = runner._run_one(scenario)
+    result = runner._run_one(scenario, seed=0)
 
     assert result.status == "failed"
     assert result.reason is not None

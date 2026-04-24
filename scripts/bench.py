@@ -93,7 +93,77 @@ def build_parser() -> argparse.ArgumentParser:
             "both machine-readable JSONL and paste-ready Markdown"
         ),
     )
+    p.add_argument(
+        "--seeds",
+        type=str,
+        default="0",
+        metavar="INT[,INT...]",
+        help=(
+            "comma-separated RNG seeds to fan every scenario over "
+            "(default: 0). Each (scenario, seed) becomes one JSONL "
+            "row with metadata.seed=<seed>; aggregation across seeds "
+            "is a report-layer concern. Duplicates are dropped with "
+            "a stderr warning; each value must satisfy "
+            "0 <= seed < 2**32"
+        ),
+    )
     return p
+
+
+_SEED_MAX = 1 << 32
+
+
+def _parse_seeds(raw: str) -> list[int]:
+    """Parse ``--seeds VALUE`` into an ordered, deduplicated int list.
+
+    - Splits on ``,``; empty tokens from trailing / duplicate commas are
+      an error (surfaces a typo cleanly rather than silently dropping).
+    - Each token must parse as ``int`` and land in ``[0, 2**32)`` —
+      NumPy's ``seed()`` accepts negative values on some platforms and
+      rejects them on others, so we draw the lower bound early.
+    - Order-preserving dedup: ``"42,42,43"`` becomes ``[42, 43]``; a
+      single warning goes to stderr naming the dropped duplicates.
+    - Raises ``ValueError`` on malformed input; callers translate to
+      exit code 2 (argparse-usage class).
+    """
+    tokens = [tok.strip() for tok in raw.split(",")]
+    if any(t == "" for t in tokens):
+        raise ValueError(
+            f"--seeds value {raw!r} contains an empty token "
+            f"(leading, trailing, or consecutive ','); use "
+            f"'--seeds 42' or '--seeds 42,43', not '--seeds 42,'"
+        )
+    seeds: list[int] = []
+    for tok in tokens:
+        try:
+            value = int(tok)
+        except ValueError:
+            raise ValueError(
+                f"--seeds token {tok!r} is not an integer"
+            ) from None
+        if not (0 <= value < _SEED_MAX):
+            raise ValueError(
+                f"--seeds value {value} is out of range; must "
+                f"satisfy 0 <= seed < 2**32 ({_SEED_MAX})"
+            )
+        seeds.append(value)
+    seen: set[int] = set()
+    unique: list[int] = []
+    dropped: list[int] = []
+    for value in seeds:
+        if value in seen:
+            dropped.append(value)
+        else:
+            seen.add(value)
+            unique.append(value)
+    if dropped:
+        print(
+            f"warning: --seeds dropped duplicate seed(s) "
+            f"{sorted(set(dropped))}; running unique set "
+            f"{unique}",
+            file=sys.stderr,
+        )
+    return unique
 
 
 def _print_list() -> None:
@@ -103,17 +173,23 @@ def _print_list() -> None:
 
 
 def _print_table(results: Sequence[ScenarioResult]) -> None:
+    # ``seed`` column placed right after ``id`` because under
+    # ``--seeds 42,43`` the terminal would otherwise show two
+    # visually identical rows per scenario; the pairing (id, seed)
+    # is the actual execution identity after C.4 step 1.
     header = (
-        "| id | status | reason | ttft_ms | decode_tok_s | "
+        "| id | seed | status | reason | ttft_ms | decode_tok_s | "
         "resident_mb | peak_mb | wall_s | tokens |"
     )
     print(header)
-    print("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    print("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for r in results:
+        seed = r.metadata.get("seed", "") if r.metadata else ""
         print(
-            "| {id} | {status} | {reason} | {ttft} | {dec} | "
+            "| {id} | {seed} | {status} | {reason} | {ttft} | {dec} | "
             "{res} | {peak} | {wall} | {tok} |".format(
                 id=r.scenario_id,
+                seed=seed,
                 status=r.status,
                 reason=r.reason or "",
                 ttft=_fmt(r.ttft_ms, ".1f"),
@@ -166,12 +242,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: {exc.args[0]}", file=sys.stderr)
         return 2
 
-    runner = BenchRunner(out_path=args.out)
+    try:
+        seeds = _parse_seeds(args.seeds)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    runner = BenchRunner(out_path=args.out, seeds=seeds)
     results = runner.run(scenarios)
     _print_table(results)
 
     if args.report_md is not None:
-        _write_markdown_report(scenarios, results, args.report_md)
+        # Fan-out expansion: one (scenario, seed) pair per result so
+        # the report renderer's strict-zip invariant holds. The
+        # renderer stays a pure function; the CLI is the only layer
+        # that knows about the seed dimension.
+        scenarios_expanded = [s for s in scenarios for _ in seeds]
+        _write_markdown_report(scenarios_expanded, results, args.report_md)
 
     return 1 if any(r.status == "failed" for r in results) else 0
 

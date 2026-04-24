@@ -90,13 +90,15 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
+import numpy as np
 
 from silica.bench.oracles import ORACLES
 from silica.bench.scenario import (
@@ -220,6 +222,7 @@ class BenchRunner:
         clock: Callable[[], float] = time.perf_counter,
         reset_peak: Callable[[], None] | None = None,
         read_peak_mb: Callable[[], float | None] | None = None,
+        seeds: Sequence[int] = (0,),
     ) -> None:
         self._engine_factory: EngineFactory = (
             engine_factory if engine_factory is not None else _default_engine_factory
@@ -243,23 +246,80 @@ class BenchRunner:
         self._clock = clock
         self._reset_peak = reset_peak or _mlx_reset_peak_memory
         self._read_peak_mb = read_peak_mb or _mlx_peak_memory_mb
+        # P-5-C.4 step 1: multi-seed fan-out. Defaults to (0,) so an
+        # omitted --seeds flag produces the same single-row output
+        # shape as pre-C.4. Validate every seed here as well as at
+        # the CLI parser: the CLI is one entry, but BenchRunner is a
+        # public API called directly by tests and future programmatic
+        # callers. Catching a bad seed at construction produces a
+        # ValueError the caller sees immediately instead of a
+        # numpy / mlx crash inside _run_one, which happens before
+        # the per-scenario exception boundary and would abort the
+        # whole run rather than collapsing to a failed row.
+        if not seeds:
+            raise ValueError(
+                "BenchRunner requires at least one seed; pass "
+                "seeds=(0,) for the single-seed default behaviour"
+            )
+        seeds_tuple: tuple[int, ...] = tuple(seeds)
+        for seed in seeds_tuple:
+            # ``isinstance(seed, bool)`` catches ``True`` / ``False``
+            # being passed where an int was meant: booleans are ints
+            # in Python (``isinstance(True, int)`` is True) and
+            # NumPy would silently accept them as seed 0 / seed 1,
+            # turning a type error into a coincidence.
+            if not isinstance(seed, int) or isinstance(seed, bool):
+                raise TypeError(
+                    f"BenchRunner seeds must be int; got "
+                    f"{type(seed).__name__} ({seed!r})"
+                )
+            if not (0 <= seed < (1 << 32)):
+                raise ValueError(
+                    f"BenchRunner seed {seed} is out of range; "
+                    f"must satisfy 0 <= seed < 2**32 "
+                    f"({1 << 32})"
+                )
+        self._seeds: tuple[int, ...] = seeds_tuple
 
     def run(self, scenarios: Iterable[Scenario]) -> list[ScenarioResult]:
-        """Run every scenario in order and return the results list.
+        """Run every scenario × seed in scenario-major order.
+
+        For ``seeds=(s0, s1, ..., sK)`` and scenarios ``[A, B]`` the
+        result order is ``[(A,s0), (A,s1), ..., (A,sK), (B,s0), ...]``
+        so same-scenario rows stay adjacent — both for terminal
+        readability (a watcher sees scenario A finish all seeds
+        before B starts) and for bench-report grouping (downstream
+        aggregation can consume contiguous slices).
 
         Rows are appended to ``out_path`` as they complete (one JSON
         object per line) so a long-running bench does not lose
-        progress if the process is killed mid-run.
+        progress if the process is killed mid-run. Each JSONL row
+        carries ``metadata["seed"]`` so the file is self-describing
+        without reference to the CLI invocation.
         """
         results: list[ScenarioResult] = []
         for scenario in scenarios:
-            result = self._run_one(scenario)
-            results.append(result)
-            if self._out_path is not None:
-                self._append_jsonl(result)
+            for seed in self._seeds:
+                result = self._run_one(scenario, seed=seed)
+                results.append(result)
+                if self._out_path is not None:
+                    self._append_jsonl(result)
         return results
 
-    def _run_one(self, scenario: Scenario) -> ScenarioResult:
+    def _run_one(
+        self, scenario: Scenario, *, seed: int
+    ) -> ScenarioResult:
+        # Seed all three RNGs BEFORE the gate check so anything
+        # downstream (adapter load, factory-driven prompt selection,
+        # future stochastic oracles) runs deterministically for a
+        # given (scenario, seed) pair. Current oracle implementations
+        # are deterministic, so this is effectively a no-op + label;
+        # when an oracle eventually consumes randomness this seeding
+        # makes the result reproducible without a second commit.
+        mx.random.seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+
         # Gate check first: skipped rows never touch the engine, so
         # cache-missing scenarios do not accidentally block on a
         # download prompt or a model-factory KeyError.
@@ -269,6 +329,7 @@ class BenchRunner:
                 scenario_id=scenario.id,
                 status="skipped",
                 reason=skip_reason,
+                metadata={"seed": seed},
             )
 
         workload_error = _validate_workload_for_oracle(
@@ -279,6 +340,7 @@ class BenchRunner:
                 scenario_id=scenario.id,
                 status="failed",
                 reason=workload_error,
+                metadata={"seed": seed},
             )
 
         try:
@@ -397,6 +459,7 @@ class BenchRunner:
                 scenario_id=scenario.id,
                 status="failed",
                 reason=f"{type(exc).__name__}: {exc}",
+                metadata={"seed": seed},
             )
 
         snap = engine.metrics.snapshot()
@@ -424,6 +487,13 @@ class BenchRunner:
             if isinstance(row1_first, (int, float)):
                 ttft_ms = float(row1_first)
 
+        # Runner-injected ``seed`` wins if an oracle accidentally
+        # writes the key: seed is an execution dimension (runner
+        # fan-out), not an authoring dimension (oracle_config). The
+        # ``{**metadata, "seed": seed}`` ordering enforces that
+        # precedence without requiring every oracle to know about
+        # the seed key.
+        result_metadata: dict[str, Any] = {**metadata, "seed": seed}
         return ScenarioResult(
             scenario_id=scenario.id,
             status="ok" if ok else "failed",
@@ -435,7 +505,7 @@ class BenchRunner:
             peak_memory_mb=peak_mb,
             total_tokens=total_tokens,
             wall_s=wall_s,
-            metadata=dict(metadata),
+            metadata=result_metadata,
         )
 
     def _append_jsonl(self, result: ScenarioResult) -> None:

@@ -1460,3 +1460,386 @@ def test_scenario_result_dataclass_exposes_expected_fields() -> None:
     assert result.ttft_ms is None
     assert result.peak_memory_mb is None
     assert result.metadata == {}
+
+
+# ---------- P-5-C.4 step 1 — multi-seed fan-out -----------------------
+
+
+class TestSeedDefaultAndRangeValidation:
+    def test_empty_seeds_list_rejected_at_init(
+        self, fake_home_cache: Path
+    ) -> None:
+        """``seeds=()`` is a nonsense request — no work to do but the
+        caller still expected a result list. Fail fast at
+        construction time rather than silently producing [] later."""
+        with pytest.raises(ValueError, match="at least one seed"):
+            BenchRunner(seeds=())
+
+    def test_negative_seed_rejected_at_init(self) -> None:
+        """Direct programmatic callers (tests, future library users)
+        must not be able to smuggle a seed into ``_run_one`` that
+        NumPy / MLX would reject at ``seed()`` time. That call
+        happens BEFORE the per-scenario ``try:`` boundary, so an
+        out-of-range seed would crash the whole run rather than
+        collapsing to one ``status='failed'`` row. Mirror the CLI's
+        ``_parse_seeds`` range contract here."""
+        with pytest.raises(ValueError, match="out of range"):
+            BenchRunner(seeds=(-1,))
+
+    def test_seed_at_2_to_32_rejected_at_init(self) -> None:
+        """NumPy accepts seeds in ``[0, 2**32)``. The upper endpoint
+        itself is out of range."""
+        with pytest.raises(ValueError, match="out of range"):
+            BenchRunner(seeds=(1 << 32,))
+
+    def test_non_int_seed_rejected_at_init(self) -> None:
+        """Floats / strings would drift silently under numpy's
+        implicit conversion; reject them clearly at the API
+        boundary."""
+        with pytest.raises(TypeError, match="must be int"):
+            BenchRunner(seeds=(3.14,))  # type: ignore[arg-type]
+
+    def test_bool_seed_rejected_at_init(self) -> None:
+        """``isinstance(True, int)`` is True in Python, so booleans
+        would be silently accepted as seed 0 / seed 1 otherwise —
+        almost always a caller bug to mix bools with ints in a
+        seed list."""
+        with pytest.raises(TypeError, match="must be int"):
+            BenchRunner(seeds=(True,))  # type: ignore[list-item]
+
+    def test_upper_bound_seed_accepted_at_init(self) -> None:
+        """``2**32 - 1`` is the last legal NumPy seed and must
+        construct without complaint."""
+        BenchRunner(seeds=((1 << 32) - 1,))
+
+    def test_default_seeds_tuple_is_zero(
+        self, fake_home_cache: Path
+    ) -> None:
+        """Default ``seeds=(0,)`` keeps pre-C.4 single-row behaviour
+        for every CLI invocation that does not pass ``--seeds``."""
+        repo = "test-owner/default-seed"
+        _create_cache_dir(repo)
+        adapter = _FakeAdapter(vocab_size=50)
+        engine = _FakeEngine([7, 8])
+        scenario = _scenario(scenario_id="default-seed", repo=repo)
+
+        runner = BenchRunner(
+            engine_factory=_factory_returning(adapter, engine),
+            reset_peak=lambda: None,
+            read_peak_mb=lambda: None,
+        )
+        [result] = runner.run([scenario])
+        assert result.metadata["seed"] == 0
+
+
+class TestScenarioMajorOrdering:
+    def test_two_scenarios_two_seeds_expand_scenario_major(
+        self, fake_home_cache: Path
+    ) -> None:
+        """``run([A, B])`` with ``seeds=(42, 43)`` returns
+        ``[(A,42), (A,43), (B,42), (B,43)]``. Same-scenario rows stay
+        adjacent so downstream aggregation can consume contiguous
+        slices without a sort pass."""
+        repo_a = "test-owner/scen-a"
+        repo_b = "test-owner/scen-b"
+        _create_cache_dir(repo_a)
+        _create_cache_dir(repo_b)
+
+        # Each call to the factory returns a fresh (adapter, engine)
+        # pair so the four (scenario, seed) executions do not share
+        # token-stream state from previous invocations.
+        def factory(scenario: Scenario) -> Any:
+            return _FakeAdapter(vocab_size=50), _FakeEngine([1, 2])
+
+        scenarios = [
+            _scenario(scenario_id="scen-a", repo=repo_a),
+            _scenario(scenario_id="scen-b", repo=repo_b),
+        ]
+        runner = BenchRunner(
+            engine_factory=factory,
+            reset_peak=lambda: None,
+            read_peak_mb=lambda: None,
+            seeds=(42, 43),
+        )
+        results = runner.run(scenarios)
+
+        observed = [(r.scenario_id, r.metadata["seed"]) for r in results]
+        assert observed == [
+            ("scen-a", 42),
+            ("scen-a", 43),
+            ("scen-b", 42),
+            ("scen-b", 43),
+        ]
+        for r in results:
+            assert r.status == "ok"
+
+    def test_three_seeds_produce_three_rows_per_scenario(
+        self, fake_home_cache: Path
+    ) -> None:
+        """Fan-out cardinality: N scenarios × M seeds → N*M rows."""
+        repo = "test-owner/one-scen"
+        _create_cache_dir(repo)
+
+        def factory(scenario: Scenario) -> Any:
+            return _FakeAdapter(vocab_size=50), _FakeEngine([9])
+
+        scenario = _scenario(scenario_id="one-scen", repo=repo)
+        runner = BenchRunner(
+            engine_factory=factory,
+            reset_peak=lambda: None,
+            read_peak_mb=lambda: None,
+            seeds=(1, 2, 3),
+        )
+        results = runner.run([scenario])
+        assert len(results) == 3
+        assert [r.metadata["seed"] for r in results] == [1, 2, 3]
+
+
+class TestEarlyReturnPathsCarrySeed:
+    """C.4 step 1 Q2 guard (runner-side): every early-return path in
+    ``_run_one`` must set ``metadata["seed"]`` so the raw JSONL stays
+    strictly per-``(scenario, seed)`` self-describing, not just the
+    success path.
+    """
+
+    def test_gate_skipped_row_carries_seed(
+        self, fake_home_cache: Path
+    ) -> None:
+        """Cache-missing skip path. Factory never runs, but the
+        resulting ScenarioResult still carries the seed of the
+        (scenario, seed) pair that was attempted."""
+        scenario = _scenario(
+            scenario_id="gate-skip",
+            repo="test-owner/never-cached",
+        )
+        runner = BenchRunner(
+            engine_factory=lambda _s: (_ for _ in ()).throw(
+                AssertionError("factory must not run")
+            ),
+            reset_peak=lambda: None,
+            read_peak_mb=lambda: None,
+            seeds=(7, 11),
+        )
+        results = runner.run([scenario])
+        assert len(results) == 2
+        assert [r.status for r in results] == ["skipped", "skipped"]
+        assert [r.metadata["seed"] for r in results] == [7, 11]
+
+    def test_workload_validation_failed_row_carries_seed(
+        self, fake_home_cache: Path
+    ) -> None:
+        """Authoring-error path. B1_PARITY_VS_SINGLE with two prompts
+        fails ``_validate_workload_for_oracle`` before any factory
+        call; each per-seed row must still carry ``metadata["seed"]``."""
+        repo = "test-owner/bad-authoring"
+        _create_cache_dir(repo)
+
+        scenario = Scenario(
+            id="bad-authoring",
+            repo=repo,
+            workload=Workload(
+                name="fake",
+                prompts=("one", "two"),
+                max_tokens=1,
+                max_batch_size=1,
+            ),
+            oracle=OracleKind.B1_PARITY_VS_SINGLE,
+        )
+        runner = BenchRunner(
+            engine_factory=lambda _s: (_ for _ in ()).throw(
+                AssertionError("factory must not run on authoring error")
+            ),
+            reset_peak=lambda: None,
+            read_peak_mb=lambda: None,
+            seeds=(5, 6, 7),
+        )
+        results = runner.run([scenario])
+        assert [r.status for r in results] == ["failed", "failed", "failed"]
+        assert [r.metadata["seed"] for r in results] == [5, 6, 7]
+
+    def test_exception_failed_row_carries_seed(
+        self, fake_home_cache: Path
+    ) -> None:
+        """Exception path: factory raises mid-execution, runner's
+        outer ``except Exception`` catches and builds a failed row
+        which must still carry the seed (the exception is orthogonal
+        to which seed was in flight)."""
+        repo = "test-owner/factory-explodes"
+        _create_cache_dir(repo)
+
+        def exploding_factory(_s: Scenario) -> Any:
+            raise RuntimeError("synthetic engine-factory failure")
+
+        scenario = _scenario(scenario_id="boom", repo=repo)
+        runner = BenchRunner(
+            engine_factory=exploding_factory,
+            reset_peak=lambda: None,
+            read_peak_mb=lambda: None,
+            seeds=(100, 200),
+        )
+        results = runner.run([scenario])
+        assert [r.status for r in results] == ["failed", "failed"]
+        for r, expected_seed in zip(results, (100, 200)):
+            assert r.metadata["seed"] == expected_seed
+            assert "RuntimeError" in (r.reason or "")
+            assert "synthetic engine-factory failure" in (r.reason or "")
+
+
+class TestRngSeedingActuallyFires:
+    """C.4 step 1 Q3 guard: ``_run_one`` must seed ``mx.random``,
+    ``np.random``, AND ``random`` — not just label the row. A future
+    oracle that consumes RNG would silently non-determinise otherwise.
+    """
+
+    def test_numpy_random_seeded_per_seed(
+        self, fake_home_cache: Path
+    ) -> None:
+        """Observe ``np.random.random()`` inside the injected
+        factory: the value is deterministic for a given seed and
+        differs between seeds. If ``_run_one`` skipped
+        ``np.random.seed``, both factory calls would draw from
+        whatever NumPy state the process inherited — almost certainly
+        identical only by accident."""
+        import numpy as np
+
+        repo = "test-owner/np-rng"
+        _create_cache_dir(repo)
+
+        observed: list[float] = []
+
+        def factory(_s: Scenario) -> Any:
+            observed.append(float(np.random.random()))
+            return _FakeAdapter(vocab_size=50), _FakeEngine([0])
+
+        scenario = _scenario(scenario_id="np-rng", repo=repo)
+        runner = BenchRunner(
+            engine_factory=factory,
+            reset_peak=lambda: None,
+            read_peak_mb=lambda: None,
+            seeds=(42, 43, 42),  # seed 42 twice — deterministic
+        )
+        # Deduplication is a CLI-layer concern; BenchRunner runs
+        # whatever seed tuple it receives. Feeding (42, 43, 42)
+        # here is how we prove the RNG is actually re-seeded per
+        # (scenario, seed) pair rather than seeded once at
+        # construction.
+        runner.run([scenario])
+        assert len(observed) == 3
+        assert observed[0] == observed[2], (
+            "np.random.seed(42) must produce the same draw every "
+            "time; got different values, so the runner either "
+            "did not re-seed or consumed RNG state between calls"
+        )
+        assert observed[0] != observed[1], (
+            "np.random.seed(42) and np.random.seed(43) must "
+            "produce distinct draws; identical values indicate the "
+            "seed is not actually being applied"
+        )
+
+    def test_stdlib_random_seeded_per_seed(
+        self, fake_home_cache: Path
+    ) -> None:
+        """Mirror coverage for ``random.seed`` — the user's Q3
+        amendment explicitly called this out because future CLI-layer
+        prompt sampling is likely to reach for stdlib ``random``
+        before NumPy."""
+        import random as stdlib_random
+
+        repo = "test-owner/stdlib-rng"
+        _create_cache_dir(repo)
+
+        observed: list[float] = []
+
+        def factory(_s: Scenario) -> Any:
+            observed.append(stdlib_random.random())
+            return _FakeAdapter(vocab_size=50), _FakeEngine([0])
+
+        scenario = _scenario(scenario_id="stdlib-rng", repo=repo)
+        runner = BenchRunner(
+            engine_factory=factory,
+            reset_peak=lambda: None,
+            read_peak_mb=lambda: None,
+            seeds=(1, 2, 1),
+        )
+        runner.run([scenario])
+        assert len(observed) == 3
+        assert observed[0] == observed[2]
+        assert observed[0] != observed[1]
+
+
+class TestSuccessPathMetadataPrecedence:
+    """Runner-injected seed wins if an oracle accidentally writes the
+    same key into its metadata. Prevents authoring-dimension leakage
+    via an oracle that reads ``oracle_config`` and echoes it back."""
+
+    def test_runner_seed_overrides_oracle_metadata(
+        self, fake_home_cache: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Patch the SMOKE oracle to inject a bogus ``seed`` key;
+        the runner's ``{**metadata, "seed": seed}`` merge must
+        overwrite it. If the merge order inverts, the bogus value
+        would leak into the JSONL."""
+        from silica.bench import oracles as oracles_module
+
+        real_smoke_oracle = oracles_module.ORACLES[OracleKind.SMOKE]
+
+        def tainted_smoke(
+            scenario: Scenario, output: Any, context: Any
+        ) -> tuple[bool, str | None, dict[str, Any]]:
+            ok, reason, metadata = real_smoke_oracle(
+                scenario, output, context
+            )
+            return ok, reason, {**metadata, "seed": -999}
+
+        monkeypatch.setitem(
+            oracles_module.ORACLES, OracleKind.SMOKE, tainted_smoke
+        )
+
+        repo = "test-owner/precedence"
+        _create_cache_dir(repo)
+        scenario = _scenario(scenario_id="precedence", repo=repo)
+        runner = BenchRunner(
+            engine_factory=_factory_returning(
+                _FakeAdapter(vocab_size=50), _FakeEngine([1])
+            ),
+            reset_peak=lambda: None,
+            read_peak_mb=lambda: None,
+            seeds=(77,),
+        )
+        [result] = runner.run([scenario])
+        assert result.status == "ok"
+        assert result.metadata["seed"] == 77, (
+            f"runner seed 77 must win over oracle-written seed -999; "
+            f"got {result.metadata['seed']}"
+        )
+
+
+class TestJsonlMultiSeedRoundTrip:
+    def test_jsonl_one_row_per_scenario_seed(
+        self, fake_home_cache: Path, tmp_path: Path
+    ) -> None:
+        """Every row appended to the JSONL carries its seed. Reading
+        the file back yields ``N * M`` rows with the same
+        scenario-major ordering the runner produces in memory."""
+        repo = "test-owner/jsonl-seed"
+        _create_cache_dir(repo)
+
+        def factory(_s: Scenario) -> Any:
+            return _FakeAdapter(vocab_size=50), _FakeEngine([1, 2])
+
+        scenario = _scenario(scenario_id="jsonl-seed", repo=repo)
+        out_path = tmp_path / "results.jsonl"
+        runner = BenchRunner(
+            engine_factory=factory,
+            reset_peak=lambda: None,
+            read_peak_mb=lambda: None,
+            seeds=(10, 11, 12),
+            out_path=out_path,
+        )
+        runner.run([scenario])
+
+        raw = out_path.read_text(encoding="utf-8").splitlines()
+        assert len(raw) == 3
+        rows = [json.loads(line) for line in raw]
+        assert [row["metadata"]["seed"] for row in rows] == [10, 11, 12]
+        assert all(row["scenario_id"] == "jsonl-seed" for row in rows)

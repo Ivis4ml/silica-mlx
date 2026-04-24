@@ -87,12 +87,18 @@ def render_markdown_report(
 
 
 def _render_summary_line(results: Sequence[ScenarioResult]) -> str:
+    # Label is "Runs" rather than "Scenarios" because after
+    # P-5-C.4 step 1 each ScenarioResult is one ``(scenario, seed)``
+    # execution, so ``len(results)`` is the number of executions —
+    # not the number of distinct scenarios selected on the CLI.
+    # Step 2 adds cross-seed aggregation; until then, the summary
+    # counts executions, not scenarios.
     total = len(results)
     counts = {"ok": 0, "skipped": 0, "failed": 0}
     for r in results:
         counts[r.status] = counts.get(r.status, 0) + 1
     return (
-        f"Scenarios: total={total} "
+        f"Runs: total={total} "
         f"ok={counts['ok']} "
         f"skipped={counts['skipped']} "
         f"failed={counts['failed']}"

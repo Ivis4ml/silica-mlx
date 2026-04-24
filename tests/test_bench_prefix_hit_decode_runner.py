@@ -251,7 +251,7 @@ def test_invalid_workload_fails_before_engine_factory(
 
     probe = _FactoryProbe()
     runner = _make_runner(probe)
-    result = runner._run_one(scenario)
+    result = runner._run_one(scenario, seed=0)
 
     assert result.status == "failed"
     assert result.reason is not None
@@ -284,7 +284,7 @@ def test_decode_tok_s_field_populated_from_oracle_metadata() -> None:
     scenario = _prefix_hit_scenario()
     probe = _FactoryProbe()
     runner = _make_runner(probe)
-    result = runner._run_one(scenario)
+    result = runner._run_one(scenario, seed=0)
 
     # Sanity: the fake engine / event stream should pass every gate
     # in the oracle. If this fails, the runner plumbing or the fake
@@ -308,7 +308,7 @@ def test_ttft_ms_field_populated_from_oracle_metadata() -> None:
     gets ``metadata['row1_first_token_ms']`` for this oracle so the
     JSONL column reflects the seeded-admission first-token latency."""
     scenario = _prefix_hit_scenario()
-    result = _make_runner(_FactoryProbe())._run_one(scenario)
+    result = _make_runner(_FactoryProbe())._run_one(scenario, seed=0)
 
     assert result.status == "ok"
     assert result.ttft_ms is not None

@@ -107,7 +107,7 @@ _RATIO_THRESHOLD = 0.85  # codec median / fp16 median >= this
 
 def _run_scenario(runner: BenchRunner, scenario_id: str) -> ScenarioResult:
     scenario = get_scenario(scenario_id)
-    return runner._run_one(scenario)
+    return runner._run_one(scenario, seed=0)
 
 
 def _assert_decode_tok_s(
