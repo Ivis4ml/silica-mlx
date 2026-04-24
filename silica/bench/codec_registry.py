@@ -99,8 +99,13 @@ class CodecSpec:
             ``block_tq_b64_b4`` qualifies in P-5-A.1 / P-5-B.
         factory: callable producing a ``VectorCodec`` instance given
             per-side shape params. Signature:
-            ``factory(*, block_size, n_kv_heads, head_dim, dtype=fp16)
-            -> VectorCodec``.
+            ``factory(*, block_size, n_kv_heads, head_dim,
+            dtype=fp16, seed: int = 42) -> VectorCodec``. The
+            ``seed`` parameter is threaded from the bench runner's
+            per-execution seed into the codec ctor's Haar-rotation
+            seed (P-5-D.1); factories for codecs that do not consume
+            randomness (e.g. ``IdentityCodec``) accept ``seed`` for
+            signature uniformity and ignore it.
     """
 
     id: str

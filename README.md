@@ -15,7 +15,7 @@ plus a planned mini-sglang outer layer for Phase 8. Target: run dense
 | P-3 | Family adapters — Qwen3 dense, Qwen3.5 hybrid DeltaNet, Gemma4-31B dense, Qwen3.5-MoE, Gemma4-MoE | ✅ mostly (`C5` preempt/replay with recurrent-state snapshot pending; `E4` batched MoE pending) |
 | P-4 | Unified bench harness — runner, oracles, 15 registered scenarios, JSONL + Markdown reports, vqbench subprocess PPL | ✅ complete; P-4 exit surfaced Q-010 chunked-prefill trigger → P-4.5 bridge planned |
 | P-4.5 | P-4 exit bridge — chunked-prefill minimal + VectorCodec runtime integration spike | ✅ complete (v1.6.9) |
-| P-5 | VQ KV compression (BlockTQ / RaBitQ) | ⏳ P-5-A / B / C / D sub-units landed (v1.7.3 — BlockTQ + RaBitQ family + bench harness + vqbench-aligned PPL oracle); P-5 Acceptance item (4) numeric cross-check closed via vqbench-aligned oracle (v1.7.3); items (1) / (2) / (3) sweep pending |
+| P-5 | VQ KV compression (BlockTQ / RaBitQ) | ✅ complete (v1.7.4 — P-5-A / B / C / D sub-units + P-5 Acceptance (1)–(4) all closed: codec-swap neutrality by inspection, `--all-kv-codecs` one-command report, `n_block > n_fp16` admission-headroom gate, vqbench-aligned mean-over-seeds PPL cross-check; `PagedPrefixBlockStore` codec injection intentionally deferred under D-003) |
 | P-6 | Weight streaming | Stub (`ResidentWeightProvider` today) |
 | P-7 | Speculative decoding (DraftTarget / EAGLE / Medusa) | Stub (`NoopDraftEngine` today) |
 | P-8 | OpenAI-compatible HTTP server + session layer | ⏳ planned (leaning T1 tail, after P-5) |
@@ -453,21 +453,36 @@ P-4.5 bridges both.
     through `SyntheticPrefixBlockStore.register_detached` /
     `fetch_detached` end-to-end on the Qwen3-0.6B path.
 - **P-5** — VQ KV compression platform. All implementation
-  sub-units landed (v1.7.1 through v1.7.3, between 2026-04-22 and
-  2026-04-24). §7 P-5 Acceptance item (4) "Numeric cross-check
-  against vqbench" closed at v1.7.3 via the D.2a vqbench-aligned
-  oracle (mean-over-seeds gate on the
+  sub-units landed (v1.7.0 through v1.7.4, between 2026-04-22 and
+  2026-04-24); **§7 P-5 Acceptance items (1) / (2) / (3) / (4)
+  all closed at v1.7.4**. (1) codec-swap neutrality by inspection
+  (zero concrete-codec dispatch across scheduler / model adapters;
+  evidence in `docs/P5_ACCEPTANCE_SWEEP/codec_swap_neutrality.md`).
+  (2) `scripts/bench.py --all --all-kv-codecs --seeds 42,43,44`
+  produces a coherent 924-row report covering 28 scenarios × 11
+  codecs × 3 seeds; all 564 failed rows classified into three
+  expected compatibility classes (`codec_override_invalid`,
+  K-only `rabitq_b1`, vqbench-aligned symmetric-codec guard);
+  evidence in `docs/P5_ACCEPTANCE_SWEEP/all_kv_codecs.{jsonl,md}`.
+  (3) `qwen3-0.6b-admission-headroom-prefix-heavy` passes
+  `n_block > n_fp16` (`7 > 4`, `admit_ratio ≈ 1.75`,
+  `residency_ratio ≈ 0.266`, ≈ 1 / 3.76 per vqbench §3.1);
+  evidence in `docs/P5_ACCEPTANCE_SWEEP/admission_headroom.{jsonl,md}`.
+  (4) vqbench cross-check closed at v1.7.3 via the D.2a
+  vqbench-aligned oracle (mean-over-seeds gate on the
   `qwen3-0.6b-wikitext-ppl-block-tq-b64-b4-vqbench-aligned` row:
-  `|mean_gap| ≤ 2·SEM_diff` AND `|mean_gap| < 1.0` PPL). Items
-  (1) codec-swap neutrality, (2) `--all-kv-codecs` one-command
-  report, and (3) `qwen3-0.6b-admission-headroom-prefix-heavy`
-  row remain `[ ]` pending a dedicated P-5 Acceptance sweep. The
+  `|mean_gap| ≤ 2·SEM_diff` AND `|mean_gap| < 1.0` PPL).
+  **Post-P-5 follow-up in backlog (not blocking close):** the
   production `prefix_store_post_rope` prefix-cache arm at the
   same codec config pays a ~5–10 PPL ΔPPL quality cost (post-RoPE
   noise injection through RoPE-coupled attention) — a real
   production-path cost, **not closed by (4-b)**; remediation via
   a pre-RoPE KV-store architecture is tracked as post-P-5
-  required follow-up in `docs/PLAN.md` §7 P-5 Notes.
+  required follow-up in `docs/PLAN.md` §7 P-5 Notes. The single
+  intentionally-deferred Deliverable is `PagedPrefixBlockStore`
+  codec injection (`NotImplementedError` stub per D-003 no-
+  compressed-domain-attention scope; lands when the paged-attention
+  kernel track advances).
   - **P-5-A** — Codec scaffolding + BlockTQ hot path + memory
     accounting + decode-speed gate. Side-level `VectorCodec[P]`
     Protocol + `CodedPayload` hierarchy + MLX-native bit-packing +
