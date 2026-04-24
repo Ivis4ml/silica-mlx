@@ -125,7 +125,10 @@ def test_cli_report_md_writes_file(tmp_path: Path) -> None:
     assert text.startswith("# silica-mlx bench report")
     assert "Generated:" in text
     assert "Runs: total=1" in text
-    assert "| id | status |" in text
+    # Post-C.4 step 2 Markdown header is the aggregated shape; the
+    # terminal-only ``| id | seed | status |`` header belongs to
+    # scripts/bench.py:_print_table, not the report renderer.
+    assert "| id | runs | ok | skipped | failed |" in text
     assert "| qwen3-0.6b-smoke |" in text
     assert "### `qwen3-0.6b-smoke`" in text
 
@@ -247,6 +250,72 @@ class TestParseSeedsRejectsInvalid:
         bench = _load_bench_cli_module()
         with pytest.raises(ValueError, match="empty token"):
             bench._parse_seeds("")
+
+
+# ---------- P-5-C.4 step 2 — --scenario duplicate handling -----------
+
+
+class TestDedupeScenarioIds:
+    """Direct unit tests on ``_dedupe_scenario_ids`` — parallel to the
+    ``_parse_seeds`` coverage below. ``--scenario`` is marked
+    repeatable in ``build_parser``, so a pasted shell variable or a
+    typo can produce duplicates; the helper collapses them with a
+    stderr warning rather than running the same scenario twice."""
+
+    def test_no_duplicates_is_a_noop(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        bench = _load_bench_cli_module()
+        assert bench._dedupe_scenario_ids(["a", "b", "c"]) == ["a", "b", "c"]
+        captured = capsys.readouterr()
+        assert captured.err == ""
+
+    def test_duplicate_ids_dropped_with_stderr_warning(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        bench = _load_bench_cli_module()
+        result = bench._dedupe_scenario_ids(["foo", "foo", "bar"])
+        assert result == ["foo", "bar"]
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "warning" in captured.err
+        assert "foo" in captured.err
+
+    def test_dedup_preserves_first_occurrence_order(self) -> None:
+        """Order-preserving dedup: output order matches first-seen
+        order, not sorted order. Matches ``_parse_seeds`` semantic."""
+        bench = _load_bench_cli_module()
+        assert bench._dedupe_scenario_ids(
+            ["c", "a", "b", "a", "c"]
+        ) == ["c", "a", "b"]
+
+
+def test_cli_duplicate_scenario_dedupes_with_warning(
+    tmp_path: Path,
+) -> None:
+    """``--scenario qwen3-0.6b-smoke --scenario qwen3-0.6b-smoke``
+    dedupes to a single run with a stderr warning. Without this the
+    aggregated report would show two identical rows pointing at the
+    same bucket (if the renderer did not also reject it as it now
+    does — the CLI dedup is the friendly upstream layer)."""
+    out_path = tmp_path / "dedup.jsonl"
+    result = _run_cli(
+        "--scenario", "qwen3-0.6b-smoke",
+        "--scenario", "qwen3-0.6b-smoke",
+        "--out", str(out_path),
+    )
+    assert result.returncode in (0, 1), (
+        f"unexpected exit {result.returncode}; stderr={result.stderr!r}"
+    )
+    assert "warning" in result.stderr.lower()
+    # Single (scenario, seed) with default seeds=(0,) → one row
+    rows = [
+        json.loads(line)
+        for line in out_path.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    assert len(rows) == 1
+    assert rows[0]["scenario_id"] == "qwen3-0.6b-smoke"
 
 
 # ---------- P-5-C.4 step 1 — --seeds integration via subprocess -------
@@ -425,11 +494,11 @@ def test_cli_report_md_detail_order_is_scenario_major(
         ("qwen3-0.6b-long-in-short-out", 43),
     ]
 
-    # Markdown: the ``### `<scenario_id>`` headings must appear in
-    # the same scenario-major order. Extract the sequence of heading
-    # ids and the seed values embedded in each following metadata
-    # block; together these prove scenarios_expanded aligned with
-    # results index-by-index.
+    # Markdown: the ``### `<scenario_id>` (seed=<N>)`` detail headings
+    # must appear in scenario-major order. Post-C.4 step 2 the
+    # renderer looks scenarios up by id and expands detail from the
+    # raw results list, so the heading sequence is the direct
+    # signal of result ordering.
     md_text = out_path.read_text(encoding="utf-8")
     heading_ids: list[str] = [
         line.strip()
@@ -437,18 +506,8 @@ def test_cli_report_md_detail_order_is_scenario_major(
         if line.startswith("### `")
     ]
     assert heading_ids == [
-        "### `qwen3-0.6b-smoke`",
-        "### `qwen3-0.6b-smoke`",
-        "### `qwen3-0.6b-long-in-short-out`",
-        "### `qwen3-0.6b-long-in-short-out`",
+        "### `qwen3-0.6b-smoke` (seed=42)",
+        "### `qwen3-0.6b-smoke` (seed=43)",
+        "### `qwen3-0.6b-long-in-short-out` (seed=42)",
+        "### `qwen3-0.6b-long-in-short-out` (seed=43)",
     ]
-
-    # Parse seeds in the order they appear in the metadata JSON
-    # blocks; should match the scenario-major sequence.
-    import re
-
-    seed_values = [
-        int(m.group(1))
-        for m in re.finditer(r'"seed":\s*(\d+)', md_text)
-    ]
-    assert seed_values == [42, 43, 42, 43]

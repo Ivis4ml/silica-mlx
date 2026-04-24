@@ -2,12 +2,22 @@
 
 The report is a pure rendering function — no I/O, no clock unless
 ``generated_at`` is omitted — so every test constructs a small
-scenarios/results pair and inspects the returned string. Structural
-assertions only (header present, table rows count correctly,
-counts line reflects statuses); full rendering fidelity is not
-pinned character-for-character because the format will evolve as
-later phases land (TEACHER_FORCED_ARGMAX metadata, vqbench PPL
-reference column) and character pins would be pure friction.
+scenarios/results pair and inspects the returned string.
+
+P-5-C.4 step 2 changed the renderer's shape:
+
+  * Table aggregates per-scenario (one row regardless of seed count).
+  * Numeric columns show ``mean ± std`` across a scenario's seeds;
+    single-value / deterministic rows collapse to just the value.
+  * Reason column moved to the per-execution detail section.
+  * ``(scenario, seed)`` detail headings include the seed suffix.
+  * Length-equality invariant replaced with id-based invariants.
+
+Structural assertions only: header present, table rows count
+correctly, counts line reflects statuses, aggregation math matches.
+Full rendering fidelity is not pinned character-for-character
+because the format will keep evolving (aggregation policies,
+vqbench PPL reference column, oracle-specific metadata tables).
 """
 
 from __future__ import annotations
@@ -56,15 +66,31 @@ def _result(
     status: str = "ok",
     reason: str | None = None,
     metadata: dict | None = None,
+    seed: int | None = 0,
     **metrics: float,
 ) -> ScenarioResult:
+    """Build a ``ScenarioResult`` with ``metadata["seed"]`` already
+    set so the detail heading suffix ``(seed=<N>)`` appears naturally.
+
+    Pre-C.4 test vectors that omitted seed now implicitly get
+    ``seed=0`` which matches the runner's default behaviour. Tests
+    exercising seed=None behaviour pass ``seed=None`` explicitly;
+    the merge below keeps any caller-provided metadata dict intact
+    while injecting the seed under the expected key.
+    """
+    md = dict(metadata or {})
+    if seed is not None and "seed" not in md:
+        md["seed"] = seed
     return ScenarioResult(
         scenario_id=scenario_id,
         status=status,
         reason=reason,
-        metadata=metadata or {},
+        metadata=md,
         **metrics,
     )
+
+
+# ----- Header / timestamp --------------------------------------------
 
 
 def test_report_has_header_and_fixed_timestamp() -> None:
@@ -77,7 +103,16 @@ def test_report_has_header_and_fixed_timestamp() -> None:
     assert "Generated: 2026-04-20T12:34:56" in out
 
 
+# ----- Summary line --------------------------------------------------
+
+
 def test_report_summary_counts_statuses() -> None:
+    """Status counts sum per-execution (post-C.4 step 2 semantic).
+
+    With 4 scenarios × 1 seed each, ``Runs: total=4`` equals
+    ``Scenarios: total=4`` — the fan-out is degenerate at N=1.
+    Multi-seed tests below exercise the divergence explicitly.
+    """
     scenarios = [_scenario(sid) for sid in ("a", "b", "c", "d")]
     results = [
         _result("a", status="ok"),
@@ -86,18 +121,64 @@ def test_report_summary_counts_statuses() -> None:
         _result("d", status="failed", reason="RuntimeError: boom"),
     ]
     out = render_markdown_report(scenarios, results, generated_at="T")
-    assert "total=4" in out
+    assert "Scenarios: total=4" in out
+    assert "Runs: total=4" in out
     assert "ok=2" in out
     assert "skipped=1" in out
     assert "failed=1" in out
 
 
-def test_report_table_has_row_per_result() -> None:
+def test_report_summary_counts_scenarios_vs_runs_separately() -> None:
+    """Two scenarios × three seeds = 2 Scenarios, 6 Runs. The
+    summary line must surface both counts; collapsing them would
+    hide fan-out from a PR reviewer."""
+    scenarios = [_scenario("a"), _scenario("b")]
+    results = [
+        _result("a", seed=0),
+        _result("a", seed=1),
+        _result("a", seed=2),
+        _result("b", seed=0),
+        _result("b", seed=1),
+        _result("b", seed=2),
+    ]
+    out = render_markdown_report(scenarios, results, generated_at="T")
+    assert "Scenarios: total=2" in out
+    assert "Runs: total=6" in out
+    assert "ok=6" in out
+
+
+def test_report_summary_status_counts_sum_per_execution() -> None:
+    """Within a single scenario, mixed-status seeds surface as
+    per-execution counts that sum to the run count. A naive
+    per-scenario rollup ("1 failed scenario") would lose the
+    information that 2 out of 3 seeds passed."""
+    scenarios = [_scenario("mixed")]
+    results = [
+        _result("mixed", seed=0, status="ok"),
+        _result("mixed", seed=1, status="ok"),
+        _result("mixed", seed=2, status="failed", reason="RuntimeError"),
+    ]
+    out = render_markdown_report(scenarios, results, generated_at="T")
+    assert "Runs: total=3" in out
+    assert "ok=2" in out
+    assert "failed=1" in out
+
+
+# ----- Aggregated table ---------------------------------------------
+
+
+def test_report_table_has_row_per_scenario() -> None:
+    """Post-C.4 step 2: table aggregates per-scenario. Two scenarios
+    → two data rows regardless of how many seeds ran."""
     scenarios = [_scenario("one"), _scenario("two")]
     results = [
-        _result("one", ttft_ms=11.1, decode_tok_s=222.2, total_tokens=4),
+        _result("one", seed=0, ttft_ms=11.1, decode_tok_s=222.2, total_tokens=4),
+        _result("one", seed=1, ttft_ms=12.3, decode_tok_s=220.0, total_tokens=4),
         _result(
-            "two", status="skipped", reason="env_var_not_set:DEMO_GATE"
+            "two",
+            seed=0,
+            status="skipped",
+            reason="env_var_not_set:DEMO_GATE",
         ),
     ]
     out = render_markdown_report(scenarios, results, generated_at="T")
@@ -109,51 +190,181 @@ def test_report_table_has_row_per_result() -> None:
     assert len(lines) == 4
     assert "| one |" in table_block
     assert "| two |" in table_block
-    assert "env_var_not_set:DEMO_GATE" in table_block
 
 
-def test_report_renders_numeric_columns_with_fixed_precision() -> None:
-    scenarios = [_scenario("m")]
+def test_report_table_row_preserves_scenarios_input_order() -> None:
+    """Row order follows the ``scenarios`` argument order, not
+    whatever order scenarios first appeared in the results list.
+    The CLI passes scenarios in user-selection order (repeatable
+    ``--scenario`` flags), which the report must preserve."""
+    scenarios = [_scenario("second"), _scenario("first")]
     results = [
-        _result(
-            "m",
-            ttft_ms=12.345,
-            decode_tok_s=111.987,
-            resident_mb=29.36,
-            peak_memory_mb=1234.5,
-            wall_s=0.6123,
-            total_tokens=8,
-        )
+        _result("first", seed=0),  # appears first in results
+        _result("second", seed=0),
     ]
     out = render_markdown_report(scenarios, results, generated_at="T")
-    # ttft .1f, decode .1f, resident .1f, peak .1f, wall .3f
-    assert "| 12.3 |" in out  # ttft
-    assert "| 112.0 |" in out  # decode_tok_s rounded
-    assert "| 29.4 |" in out  # resident_mb
-    assert "| 1234.5 |" in out  # peak_mb
-    assert "| 0.612 |" in out  # wall_s
+    table_start = out.index("## Results")
+    detail_start = out.index("## Scenario details")
+    table_block = out[table_start:detail_start]
+    # The data rows start with the scenario id in the first cell;
+    # "second" must appear before "first" because that is the
+    # scenarios-argument order.
+    second_idx = table_block.index("| second |")
+    first_idx = table_block.index("| first |")
+    assert second_idx < first_idx
 
 
-def test_report_renders_none_metrics_as_empty_cells() -> None:
-    scenarios = [_scenario("m")]
-    results = [_result("m", status="skipped", reason="cache_missing:/x")]
+def test_report_table_header_has_aggregate_columns() -> None:
+    """New column set: id + runs + ok/skipped/failed + numeric
+    metrics + tokens. Reason column is gone (moved to detail)."""
+    scenarios = [_scenario("one")]
+    results = [_result("one")]
     out = render_markdown_report(scenarios, results, generated_at="T")
-    # skipped rows have all metrics None — cells should be blank (|  |)
-    assert "|  |" in out
-    # total_tokens is None -> blank
-    lines = [ln for ln in out.splitlines() if ln.startswith("| m |")]
-    assert lines, "expected data row for scenario 'm'"
-    row = lines[0]
-    # count pipes; data row must have the same column count as the
-    # header regardless of Nones (guards against accidental column
-    # loss on all-None scenarios)
-    header_line = next(
+    assert "| id | runs | ok | skipped | failed |" in out
+    # reason column must NOT be in the aggregated table
+    assert "| id | runs | ok | skipped | failed | reason |" not in out
+
+
+def test_report_table_runs_column_reports_count() -> None:
+    """The ``runs`` column on each row equals how many ScenarioResults
+    had that scenario id. A drift here would mean the aggregation
+    lost or double-counted executions."""
+    scenarios = [_scenario("x")]
+    results = [_result("x", seed=i) for i in range(5)]
+    out = render_markdown_report(scenarios, results, generated_at="T")
+    # Data row looks like "| x | 5 | 5 | 0 | 0 | ..."
+    data_row = next(
+        ln for ln in out.splitlines() if ln.startswith("| x |")
+    )
+    cells = [c.strip() for c in data_row.strip("| ").split("|")]
+    assert cells[0] == "x"
+    assert cells[1] == "5"  # runs
+    assert cells[2] == "5"  # ok
+    assert cells[3] == "0"  # skipped
+    assert cells[4] == "0"  # failed
+
+
+# ----- mean ± std rendering ------------------------------------------
+
+
+def test_report_single_seed_renders_without_std_suffix() -> None:
+    """Default ``seeds=(0,)`` path: N=1 per scenario. Numeric cells
+    must show just the value, not ``value ± 0``."""
+    scenarios = [_scenario("m")]
+    results = [
+        _result("m", ttft_ms=12.345, wall_s=0.6123, total_tokens=8)
+    ]
+    out = render_markdown_report(scenarios, results, generated_at="T")
+    assert "| 12.3 |" in out  # ttft_ms
+    assert "| 0.612 |" in out  # wall_s
+    assert "| 8 |" in out  # tokens with .0f
+    assert " ± " not in out
+
+
+def test_report_multi_seed_renders_mean_std() -> None:
+    """N=2 with distinct values: cell becomes ``mean ± std``
+    where ``std`` is sample std (``stdev`` divides by N-1)."""
+    scenarios = [_scenario("m")]
+    results = [
+        _result("m", seed=0, ttft_ms=10.0, wall_s=0.500),
+        _result("m", seed=1, ttft_ms=14.0, wall_s=0.700),
+    ]
+    out = render_markdown_report(scenarios, results, generated_at="T")
+    # ttft: mean=12.0, stdev of [10, 14] = sqrt(8) ≈ 2.828 → "12.0 ± 2.8"
+    # with .1f precision.
+    assert "12.0 ± 2.8" in out
+    # wall_s: mean=0.600, stdev = sqrt(0.02) ≈ 0.1414 → "0.600 ± 0.141"
+    # with .3f precision.
+    assert "0.600 ± 0.141" in out
+
+
+def test_report_multi_seed_std_zero_collapses_to_mean() -> None:
+    """Deterministic quantities (tokens, scheduler-driven timings
+    on CPU-bound fakes) produce identical values across seeds.
+    std == 0 must render as a single value, not ``4.0 ± 0.0``."""
+    scenarios = [_scenario("det")]
+    results = [
+        _result("det", seed=0, total_tokens=4, ttft_ms=10.0),
+        _result("det", seed=1, total_tokens=4, ttft_ms=10.0),
+        _result("det", seed=2, total_tokens=4, ttft_ms=10.0),
+    ]
+    out = render_markdown_report(scenarios, results, generated_at="T")
+    # tokens deterministic: ".0f" → "4" (not "4.0")
+    assert "| 4 |" in out
+    # ttft deterministic: ".1f" → "10.0"
+    assert "| 10.0 |" in out
+    # No ± anywhere on the deterministic row
+    data_row = next(
+        ln for ln in out.splitlines() if ln.startswith("| det |")
+    )
+    assert " ± " not in data_row
+
+
+def test_report_tokens_column_uses_integer_formatting() -> None:
+    """total_tokens is conceptually integer; ``.0f`` prevents the
+    mean from rendering as ``4.0`` in the common deterministic case
+    and keeps mixed-seed rendering sensible (``5 ± 1`` not ``5.0 ± 1.0``)."""
+    scenarios = [_scenario("t")]
+    results = [
+        _result("t", seed=0, total_tokens=4),
+        _result("t", seed=1, total_tokens=6),
+    ]
+    out = render_markdown_report(scenarios, results, generated_at="T")
+    # mean = 5, stdev of [4, 6] = sqrt(2) ≈ 1.414 → rounded to "5 ± 1"
+    # with .0f precision.
+    data_row = next(
+        ln for ln in out.splitlines() if ln.startswith("| t |")
+    )
+    assert "5 ± 1" in data_row
+
+
+def test_report_mean_std_ignores_none_values() -> None:
+    """A mix of skipped (all-None) and ok (populated) rows
+    aggregates cleanly: numeric lists contain only non-None
+    entries, so mean / std reflect the actual measurements without
+    a skipped row counting as zero."""
+    scenarios = [_scenario("mix")]
+    results = [
+        _result("mix", seed=0, status="skipped", reason="cache_missing:/x"),
+        _result("mix", seed=1, ttft_ms=10.0),
+        _result("mix", seed=2, ttft_ms=14.0),
+    ]
+    out = render_markdown_report(scenarios, results, generated_at="T")
+    # ttft: only the two populated values contribute; mean=12,
+    # stdev of [10, 14] ≈ 2.828 → "12.0 ± 2.8" with .1f.
+    assert "12.0 ± 2.8" in out
+
+
+def test_report_renders_all_none_numeric_columns_as_empty_cells() -> None:
+    """If every seed was skipped the numeric columns stay blank,
+    matching pre-C.4 behaviour. Guards against accidental column
+    loss on all-None scenarios (pipe count must match the header)."""
+    scenarios = [_scenario("skip")]
+    results = [
+        _result("skip", seed=0, status="skipped", reason="cache_missing:/x"),
+        _result("skip", seed=1, status="skipped", reason="cache_missing:/x"),
+    ]
+    out = render_markdown_report(scenarios, results, generated_at="T")
+    data_row = next(
+        ln for ln in out.splitlines() if ln.startswith("| skip |")
+    )
+    header_row = next(
         ln for ln in out.splitlines() if ln.startswith("| id |")
     )
-    assert row.count("|") == header_line.count("|")
+    # Same pipe count as header, even when numeric cells are blank
+    assert _count_unescaped_pipes(data_row) == _count_unescaped_pipes(
+        header_row
+    )
+    # At least one ``|  |`` (an empty cell between pipes) must exist
+    assert "|  |" in data_row
+
+
+# ----- Detail section -----------------------------------------------
 
 
 def test_report_scenario_detail_block_lists_repo_oracle_and_gate() -> None:
+    """Detail block carries everything it did pre-C.4 — the only
+    shape change is the ``(seed=<N>)`` heading suffix."""
     scenarios = [
         _scenario(
             "one",
@@ -167,7 +378,11 @@ def test_report_scenario_detail_block_lists_repo_oracle_and_gate() -> None:
         _result(
             "one",
             status="ok",
-            metadata={"reference_len": 4, "batch_len": 4, "first_mismatch_index": -1},
+            metadata={
+                "reference_len": 4,
+                "batch_len": 4,
+                "first_mismatch_index": -1,
+            },
         )
     ]
     out = render_markdown_report(scenarios, results, generated_at="T")
@@ -182,6 +397,61 @@ def test_report_scenario_detail_block_lists_repo_oracle_and_gate() -> None:
     assert '"first_mismatch_index": -1' in out
 
 
+def test_report_detail_heading_includes_seed_suffix() -> None:
+    """Multi-seed scenarios get one detail section per execution,
+    each heading suffixed ``(seed=<N>)`` so a reader can locate
+    the seed that failed without counting position."""
+    scenarios = [_scenario("multi")]
+    results = [
+        _result("multi", seed=42),
+        _result("multi", seed=43),
+    ]
+    out = render_markdown_report(scenarios, results, generated_at="T")
+    assert "### `multi` (seed=42)" in out
+    assert "### `multi` (seed=43)" in out
+
+
+def test_report_detail_heading_omits_suffix_when_seed_metadata_missing() -> None:
+    """Robustness guard: a ScenarioResult built without going
+    through BenchRunner (e.g. in a bench-adjacent test fixture
+    that constructs results manually) will lack ``metadata['seed']``.
+    The detail heading must fall back to the plain id rather than
+    rendering ``(seed=None)``."""
+    scenarios = [_scenario("no-seed")]
+    results = [_result("no-seed", seed=None)]
+    out = render_markdown_report(scenarios, results, generated_at="T")
+    assert "### `no-seed`" in out
+    assert "(seed=None)" not in out
+    assert "(seed=" not in out  # defensive — no suffix at all
+
+
+def test_report_detail_preserves_raw_result_order() -> None:
+    """Detail sections follow the ``results`` argument order (which
+    under scenario-major fan-out places all of scenario A's seeds
+    before scenario B's). A reader skimming the file sees related
+    rows contiguously."""
+    scenarios = [_scenario("a"), _scenario("b")]
+    results = [
+        _result("a", seed=0),
+        _result("a", seed=1),
+        _result("b", seed=0),
+        _result("b", seed=1),
+    ]
+    out = render_markdown_report(scenarios, results, generated_at="T")
+    # Extract the sequence of scenario-detail headings
+    heading_ids = [
+        ln
+        for ln in out.splitlines()
+        if ln.startswith("### `")
+    ]
+    assert heading_ids == [
+        "### `a` (seed=0)",
+        "### `a` (seed=1)",
+        "### `b` (seed=0)",
+        "### `b` (seed=1)",
+    ]
+
+
 def test_report_cache_only_gate_renders_placeholder() -> None:
     scenarios = [_scenario("plain", gate_env_var=None)]
     results = [_result("plain")]
@@ -189,9 +459,12 @@ def test_report_cache_only_gate_renders_placeholder() -> None:
     assert "gate: `(cache-only)`" in out
 
 
-def test_report_escapes_pipe_in_reasons() -> None:
-    """A failure reason containing a literal pipe must not break the
-    GFM table (the renderer should backslash-escape it)."""
+def test_report_escapes_pipe_in_detail_reason() -> None:
+    """A failure reason containing a literal pipe must not break
+    the GFM detail section's reason line (the renderer should
+    backslash-escape it). Post-C.4 step 2 the reason column moved
+    from the aggregated table to the per-execution detail; this
+    test follows it there."""
     scenarios = [_scenario("x")]
     results = [
         _result(
@@ -201,35 +474,85 @@ def test_report_escapes_pipe_in_reasons() -> None:
         )
     ]
     out = render_markdown_report(scenarios, results, generated_at="T")
-    # Escaped pipe appears in the reason cell; unescaped (column-
-    # delimiter) pipe count must still match the header row, otherwise
-    # the GFM table shape collapses on the downstream Markdown render.
-    data_row = next(
-        ln for ln in out.splitlines() if ln.startswith("| x |")
+    # Detail reason line has form: "- reason: `...`" with backslash
+    # escaping on the inner pipe.
+    reason_lines = [
+        ln for ln in out.splitlines() if ln.startswith("- reason:")
+    ]
+    assert reason_lines, "expected a reason line in the detail block"
+    assert "\\|" in reason_lines[0], (
+        f"reason line did not escape the pipe: {reason_lines[0]!r}"
     )
-    header_row = next(
-        ln for ln in out.splitlines() if ln.startswith("| id |")
-    )
-    assert _count_unescaped_pipes(data_row) == _count_unescaped_pipes(
-        header_row
-    )
-    assert "\\|" in data_row
 
 
-def test_report_rejects_misaligned_input_lengths() -> None:
-    scenarios = [_scenario("a"), _scenario("b")]
-    results = [_result("a")]
-    with pytest.raises(ValueError, match="same length"):
+# ----- Id-based invariants (replaces length-equality) ---------------
+
+
+def test_report_rejects_result_with_unknown_scenario_id() -> None:
+    """A result whose ``scenario_id`` is not in the ``scenarios``
+    list is a caller-bug: either the runner produced a spurious row
+    or the CLI passed an out-of-sync scenarios list. Fail loudly
+    rather than silently dropping the result from the table."""
+    scenarios = [_scenario("known")]
+    results = [_result("unknown")]
+    with pytest.raises(ValueError, match="unknown"):
         render_markdown_report(scenarios, results)
+
+
+def test_report_rejects_scenario_with_zero_results() -> None:
+    """A scenario listed but never executed would render as an
+    empty / NaN row. That masks a runner bug (dropped the row
+    silently) and is just as bad as an unknown-id result — fail
+    fast on both sides of the id contract."""
+    scenarios = [_scenario("ran"), _scenario("never_ran")]
+    results = [_result("ran")]
+    with pytest.raises(ValueError, match="zero results"):
+        render_markdown_report(scenarios, results)
+
+
+def test_report_rejects_duplicate_scenario_ids() -> None:
+    """The aggregated table is keyed by scenario_id; if scenarios
+    contains the same id twice, the iteration order in
+    ``_render_aggregated_table`` would render two identical rows
+    pointing at the same aggregate bucket, and the summary line's
+    ``Scenarios: total=`` would double-count. Callers must dedupe
+    upstream — the CLI's ``_dedupe_scenario_ids`` helper handles
+    the common repeatable-flag case; this check is defense-in-depth
+    for direct programmatic callers (tests, notebooks)."""
+    scenarios = [_scenario("foo"), _scenario("foo")]
+    results = [_result("foo", seed=0), _result("foo", seed=1)]
+    with pytest.raises(ValueError, match="duplicate id"):
+        render_markdown_report(scenarios, results)
+
+
+def test_report_accepts_fan_out_results_with_matching_ids() -> None:
+    """The replacement invariant for the pre-C.4 length-equality
+    check: differing lengths are fine as long as every result id is
+    in scenarios and every scenario is represented."""
+    scenarios = [_scenario("a"), _scenario("b")]
+    results = [
+        _result("a", seed=0),
+        _result("a", seed=1),
+        _result("b", seed=0),
+    ]
+    # No exception raised
+    out = render_markdown_report(scenarios, results, generated_at="T")
+    assert "| a |" in out
+    assert "| b |" in out
+
+
+# ----- Empty + metadata JSON ----------------------------------------
 
 
 def test_report_handles_empty_inputs() -> None:
     out = render_markdown_report([], [], generated_at="T")
     assert out.startswith("# silica-mlx bench report")
-    assert "total=0 ok=0 skipped=0 failed=0" in out
+    assert "Scenarios: total=0" in out
+    assert "Runs: total=0" in out
+    assert "ok=0 skipped=0 failed=0" in out
     # Table still renders header + separator even with zero rows so
     # downstream renderers do not need to special-case empty runs.
-    assert "| id | status |" in out
+    assert "| id | runs | ok | skipped | failed |" in out
 
 
 def test_report_metadata_block_is_valid_json() -> None:
@@ -256,3 +579,6 @@ def test_report_metadata_block_is_valid_json() -> None:
     assert parsed["flag"] is True
     assert parsed["first_failure"] is None
     assert parsed["rows"][0]["first_mismatch_index"] == -1
+    # seed=0 was injected by _result; it is part of the metadata
+    # block alongside the caller-provided keys.
+    assert parsed["seed"] == 0

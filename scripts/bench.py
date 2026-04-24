@@ -217,6 +217,38 @@ def _resolve_selection(
     return list(args.scenario)
 
 
+def _dedupe_scenario_ids(selected: list[str]) -> list[str]:
+    """Collapse repeated ``--scenario foo`` entries into a single run.
+
+    Parallel to :func:`_parse_seeds`: ``--scenario`` is marked
+    repeatable in ``build_parser``, so a pasted shell variable or a
+    command-line typo can legitimately produce duplicates. Running
+    ``foo`` twice from the same invocation is almost certainly not
+    what the user meant — the aggregated report would already
+    collapse the duplicate into one table row, and executing it
+    twice just burns cycles. Dedupe with a stderr warning so the
+    user notices the drop, matching ``_parse_seeds``'s shape
+    (never a hard error for a likely typo).
+    """
+    seen: set[str] = set()
+    unique: list[str] = []
+    dropped: list[str] = []
+    for sid in selected:
+        if sid in seen:
+            dropped.append(sid)
+        else:
+            seen.add(sid)
+            unique.append(sid)
+    if dropped:
+        print(
+            f"warning: --scenario dropped duplicate id(s) "
+            f"{sorted(set(dropped))}; running unique set "
+            f"{unique}",
+            file=sys.stderr,
+        )
+    return unique
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -231,6 +263,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+
+    selected = _dedupe_scenario_ids(selected)
 
     try:
         scenarios = [get_scenario(sid) for sid in selected]
@@ -253,12 +287,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     _print_table(results)
 
     if args.report_md is not None:
-        # Fan-out expansion: one (scenario, seed) pair per result so
-        # the report renderer's strict-zip invariant holds. The
-        # renderer stays a pure function; the CLI is the only layer
-        # that knows about the seed dimension.
-        scenarios_expanded = [s for s in scenarios for _ in seeds]
-        _write_markdown_report(scenarios_expanded, results, args.report_md)
+        # C.4 step 2: renderer now looks scenarios up by id and
+        # aggregates results per scenario, so the CLI no longer
+        # needs to expand scenarios to match results length.
+        _write_markdown_report(scenarios, results, args.report_md)
 
     return 1 if any(r.status == "failed" for r in results) else 0
 
