@@ -2270,6 +2270,7 @@ def _stub_ppl_run(
     _adapter: Any,
     *,
     fp16_baseline_ppl: float | None = None,
+    seed: int = 42,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Stub for silica.bench.runner._run_ppl — returns a success
     payload + oracle_context matching the real shape so the runner
@@ -2281,7 +2282,10 @@ def _stub_ppl_run(
     into ``oracle_context["ppl_fp16"]`` so ``ppl_oracle`` receives
     a populated context and computes ``delta_ppl`` /
     ``delta_ppl_pct`` metadata downstream — matching what the real
-    ``_run_ppl`` does."""
+    ``_run_ppl`` does. Accepts the P-5-D.1 ``seed`` kwarg as well —
+    the stub does not consume randomness, so the value is accepted
+    for signature parity and discarded."""
+    del seed
     context: dict[str, Any] = {
         "chunk_size": 128,
         "max_tokens": 256,
@@ -2580,7 +2584,9 @@ class TestVqbenchXcheckOkPath:
             _adapter: Any,
             *,
             fp16_baseline_ppl: float | None = None,
+            seed: int = 42,
         ) -> tuple[dict[str, Any], dict[str, Any]]:
+            del seed
             ctx: dict[str, Any] = {
                 "chunk_size": 999,  # diverges from oracle_config
                 "max_tokens": 1111,
@@ -2788,7 +2794,9 @@ class TestComputeSilicaFp16Baseline:
             _adapter: Any,
             *,
             fp16_baseline_ppl: float | None = None,
+            seed: int = 42,
         ) -> tuple[dict[str, Any], dict[str, Any]]:
+            del seed
             captured_scenarios.append(scenario)
             return (
                 {"nll_sum": 0.5, "n_tokens": 10, "ppl": 2.718},
@@ -2844,7 +2852,9 @@ class TestVqbenchXcheckBaselineFires:
             adapter: Any,
             *,
             fp16_baseline_ppl: float | None = None,
+            seed: int = 42,
         ) -> tuple[dict[str, Any], dict[str, Any]]:
+            del seed
             # Distinguish baseline pass (kv_codec=None) from main
             # pass by workload shape; only record the main pass.
             if scenario.workload.kv_codec is not None:
@@ -2922,7 +2932,9 @@ class TestVqbenchXcheckGapInMetadata:
             _adapter: Any,
             *,
             fp16_baseline_ppl: float | None = None,
+            seed: int = 42,
         ) -> tuple[dict[str, Any], dict[str, Any]]:
+            del seed
             # Baseline scenario (kv_codec=None): fp16 PPL = 3.0.
             # Main scenario (kv_codec=fp16): quant PPL = 3.05.
             if scenario.workload.kv_codec is None:
@@ -3006,7 +3018,9 @@ class TestVqbenchXcheckGapInMetadata:
             _adapter: Any,
             *,
             fp16_baseline_ppl: float | None = None,
+            seed: int = 42,
         ) -> tuple[dict[str, Any], dict[str, Any]]:
+            del seed
             if scenario.workload.kv_codec is None:
                 return (
                     {"nll_sum": 1.0, "n_tokens": 100, "ppl": 3.0},

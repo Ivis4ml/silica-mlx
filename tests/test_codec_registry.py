@@ -574,3 +574,111 @@ def test_repeated_factory_calls_produce_equivalent_codecs() -> None:
     out1 = c1.decode_tensor(c1.encode_tensor(x))
     out2 = c2.decode_tensor(c2.encode_tensor(x))
     assert bool(mx.array_equal(out1, out2).item())
+
+
+# ---------------------------------------------------------------------------
+# P-5-D.1 — seed propagation through the factory layer
+# ---------------------------------------------------------------------------
+#
+# Before P-5-D.1, every factory ignored a ``seed`` kwarg and the codec
+# ctor defaulted to ``seed=42``, so the bench runner's ``--seeds
+# 42,43,44`` fan-out hit the same Haar rotation every time and
+# ``ppl_quant`` was deterministic across seeds. The tests below pin
+# the contract that the factory now threads ``seed`` through to the
+# codec ctor, so distinct seeds produce distinct rotations (visible
+# as distinct round-trip outputs on the same input).
+#
+# IdentityCodec is excluded — it has no PRNG dependency; the factory
+# accepts ``seed`` only for signature parity with the rest of the
+# registry (the runner threads seed uniformly without branching on
+# codec family). The remaining codec families (tq_mse, block_tq,
+# rabitq, ext_rabitq) all consume seed for their Haar rotation.
+
+
+_SEED_AWARE_CODEC_IDS: tuple[str, ...] = tuple(
+    codec_id
+    for codec_id in list_codec_ids()
+    if CODEC_REGISTRY[codec_id].family != "fp16"
+)
+
+
+@pytest.mark.parametrize("codec_id", _SEED_AWARE_CODEC_IDS)
+def test_factory_threads_seed_to_codec(codec_id: str) -> None:
+    """Same factory, same shape kwargs, different ``seed`` → different
+    Haar rotation → different round-trip output on the same input.
+
+    Regression-locks P-5-D.1: before the fix, the registry's factory
+    closures dropped ``seed`` on the floor and every codec instance
+    used the ctor default (42), so ``--seeds 42,43,44`` produced a
+    deterministic ``ppl_quant`` across seeds.
+    """
+    spec = get_codec_spec(codec_id)
+    c_a = spec.factory(
+        block_size=BLOCK_SIZE,
+        n_kv_heads=N_KV_HEADS,
+        head_dim=HEAD_DIM,
+        seed=42,
+    )
+    c_b = spec.factory(
+        block_size=BLOCK_SIZE,
+        n_kv_heads=N_KV_HEADS,
+        head_dim=HEAD_DIM,
+        seed=43,
+    )
+    x = _canonical_input()
+    out_a = c_a.decode_tensor(c_a.encode_tensor(x))
+    out_b = c_b.decode_tensor(c_b.encode_tensor(x))
+    # Two independent Haar rotations on a non-degenerate input tensor
+    # produce distinct decoded outputs with probability 1. A
+    # bit-identical match across distinct seeds means seed was
+    # silently dropped somewhere between the factory call site and
+    # the codec's Haar-rotation init.
+    assert not bool(mx.array_equal(out_a, out_b).item())
+
+
+def test_factory_same_seed_reproduces_output() -> None:
+    """Same factory, same shape kwargs, same ``seed`` → bit-identical
+    round-trip output. Pairs with the distinct-seed test above so the
+    gate is "seed changes → output changes; seed stable → output
+    stable" rather than a flaky "different-by-chance" check."""
+    spec = get_codec_spec("block_tq_b64_b4")
+    c_a = spec.factory(
+        block_size=BLOCK_SIZE,
+        n_kv_heads=N_KV_HEADS,
+        head_dim=HEAD_DIM,
+        seed=42,
+    )
+    c_b = spec.factory(
+        block_size=BLOCK_SIZE,
+        n_kv_heads=N_KV_HEADS,
+        head_dim=HEAD_DIM,
+        seed=42,
+    )
+    x = _canonical_input()
+    out_a = c_a.decode_tensor(c_a.encode_tensor(x))
+    out_b = c_b.decode_tensor(c_b.encode_tensor(x))
+    assert bool(mx.array_equal(out_a, out_b).item())
+
+
+def test_identity_factory_accepts_seed_for_signature_parity() -> None:
+    """``fp16`` (IdentityCodec) factory must accept ``seed`` so the
+    runner can thread it uniformly; the value is ignored because
+    IdentityCodec is a pass-through with no PRNG dependency."""
+    spec = get_codec_spec("fp16")
+    c_42 = spec.factory(
+        block_size=BLOCK_SIZE,
+        n_kv_heads=N_KV_HEADS,
+        head_dim=HEAD_DIM,
+        seed=42,
+    )
+    c_43 = spec.factory(
+        block_size=BLOCK_SIZE,
+        n_kv_heads=N_KV_HEADS,
+        head_dim=HEAD_DIM,
+        seed=43,
+    )
+    x = _canonical_input()
+    out_42 = c_42.decode_tensor(c_42.encode_tensor(x))
+    out_43 = c_43.decode_tensor(c_43.encode_tensor(x))
+    # IdentityCodec is pass-through; seed does not influence output.
+    assert bool(mx.array_equal(out_42, out_43).item())

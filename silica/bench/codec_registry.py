@@ -50,8 +50,11 @@ from silica.vq import BlockTurboQuantMSE, ExtRaBitQ, RaBitQ1Bit, TurboQuantMSE
 
 # Every factory takes the per-side shape via kwargs and returns a
 # ready-to-use VectorCodec. The registry binds codec-specific knobs
-# (num_bits, vq_block_size, seed, norm_correction) so the caller only
-# supplies ``(block_size, n_kv_heads, head_dim, dtype)``.
+# (num_bits, vq_block_size, norm_correction) so the caller only
+# supplies ``(block_size, n_kv_heads, head_dim, dtype, seed)``.
+# ``seed`` flows from the bench runner's per-execution seed all the
+# way through the codec ctor's Haar-rotation seed; see P-5-D.1 for
+# the infrastructure fix that established this propagation.
 CodecFactory = Callable[..., VectorCodec]
 
 
@@ -164,7 +167,13 @@ def _identity_factory(
     n_kv_heads: int,
     head_dim: int,
     dtype: mx.Dtype = mx.float16,
+    seed: int = 42,
 ) -> VectorCodec:
+    # IdentityCodec has no PRNG dependency (pass-through); ``seed`` is
+    # accepted for signature parity with the rest of the registry so
+    # the runner can thread the execution seed uniformly without
+    # branching on codec family.
+    del seed
     return IdentityCodec(
         block_size=block_size,
         n_kv_heads=n_kv_heads,
@@ -183,12 +192,14 @@ def _make_scalar_tq_factory(num_bits: int) -> CodecFactory:
         n_kv_heads: int,
         head_dim: int,
         dtype: mx.Dtype = mx.float16,
+        seed: int = 42,
     ) -> VectorCodec:
         return TurboQuantMSE(
             block_size=block_size,
             n_kv_heads=n_kv_heads,
             head_dim=head_dim,
             num_bits=num_bits,
+            seed=seed,
             dtype=dtype,
         )
 
@@ -205,6 +216,7 @@ def _make_block_tq_factory(vq_block_size: int, num_bits: int) -> CodecFactory:
         n_kv_heads: int,
         head_dim: int,
         dtype: mx.Dtype = mx.float16,
+        seed: int = 42,
     ) -> VectorCodec:
         return BlockTurboQuantMSE(
             block_size=block_size,
@@ -212,6 +224,7 @@ def _make_block_tq_factory(vq_block_size: int, num_bits: int) -> CodecFactory:
             head_dim=head_dim,
             vq_block_size=vq_block_size,
             num_bits=num_bits,
+            seed=seed,
             dtype=dtype,
         )
 
@@ -224,6 +237,7 @@ def _rabitq_b1_factory(
     n_kv_heads: int,
     head_dim: int,
     dtype: mx.Dtype = mx.float16,
+    seed: int = 42,
 ) -> VectorCodec:
     """Produce a ``RaBitQ1Bit`` codec. Only one 1-bit variant exists in
     the catalog, so no maker closure is needed — a plain module-level
@@ -234,6 +248,7 @@ def _rabitq_b1_factory(
         n_kv_heads=n_kv_heads,
         head_dim=head_dim,
         num_bits=1,
+        seed=seed,
         dtype=dtype,
     )
 
@@ -250,12 +265,14 @@ def _make_ext_rabitq_factory(num_bits: int) -> CodecFactory:
         n_kv_heads: int,
         head_dim: int,
         dtype: mx.Dtype = mx.float16,
+        seed: int = 42,
     ) -> VectorCodec:
         return ExtRaBitQ(
             block_size=block_size,
             n_kv_heads=n_kv_heads,
             head_dim=head_dim,
             num_bits=num_bits,
+            seed=seed,
             dtype=dtype,
         )
 

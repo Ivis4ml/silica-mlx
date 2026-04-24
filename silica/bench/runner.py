@@ -460,7 +460,7 @@ class BenchRunner:
         return True
 
     def _compute_silica_fp16_baseline(
-        self, scenario: Scenario, adapter: ModelAdapter
+        self, scenario: Scenario, adapter: ModelAdapter, *, seed: int = 42
     ) -> float:
         """Run silica's PPL oracle on the fp16-baseline shape of
         ``scenario`` and return the resulting PPL number.
@@ -486,7 +486,7 @@ class BenchRunner:
                 prefix_cache=False,
             ),
         )
-        fp16_collected, _ = _run_ppl(fp16_scenario, adapter)
+        fp16_collected, _ = _run_ppl(fp16_scenario, adapter, seed=seed)
         return float(fp16_collected["ppl"])
 
     def _vqbench_metadata_for_silica_not_ok(
@@ -786,7 +786,7 @@ class BenchRunner:
                 total_tokens = len(tf_predictions)
             elif scenario.oracle == OracleKind.DECODE_TOK_S_WITH_PREFIX_HIT:
                 prefix_hit_collected, oracle_context = _run_prefix_hit_decode(
-                    scenario, engine, adapter
+                    scenario, engine, adapter, seed=seed
                 )
                 oracle_input = prefix_hit_collected
                 tokens_dict, _ = prefix_hit_collected
@@ -812,12 +812,13 @@ class BenchRunner:
                     effective_codec_id=effective_codec_id,
                 ):
                     fp16_baseline_ppl = self._compute_silica_fp16_baseline(
-                        scenario, adapter
+                        scenario, adapter, seed=seed
                     )
                 ppl_collected, oracle_context = _run_ppl(
                     scenario,
                     adapter,
                     fp16_baseline_ppl=fp16_baseline_ppl,
+                    seed=seed,
                 )
                 oracle_input = ppl_collected
                 total_tokens = int(ppl_collected["n_tokens"])
@@ -830,7 +831,7 @@ class BenchRunner:
                 # detached blocks registered so the JSONL row still
                 # carries a useful counter.
                 storage_collected, oracle_context = _run_storage(
-                    scenario, engine, adapter
+                    scenario, engine, adapter, seed=seed
                 )
                 oracle_input = storage_collected
                 total_tokens = int(storage_collected["live_blocks"])
@@ -842,7 +843,7 @@ class BenchRunner:
                 # fp16 + compressed admission counts so the JSONL
                 # row has a non-trivial counter.
                 ah_collected, oracle_context = _run_admission_headroom(
-                    scenario, adapter
+                    scenario, adapter, seed=seed
                 )
                 oracle_input = ah_collected
                 total_tokens = int(
@@ -864,7 +865,7 @@ class BenchRunner:
                     total_tokens = len(single_tokens)
                 else:
                     batched_tokens, first_token_ms = _run_smoke_batched(
-                        scenario, engine, params, adapter
+                        scenario, engine, params, adapter, seed=seed
                     )
                     oracle_input = batched_tokens
                     total_tokens = sum(
@@ -1396,6 +1397,8 @@ def _run_smoke_batched(
     engine: Engine,
     params: SamplingParams,
     adapter: ModelAdapter,
+    *,
+    seed: int = 42,
 ) -> tuple[dict[int, list[int]], dict[int, float]]:
     """Drive SMOKE through ``generate_batch`` for multi-prompt B>1.
 
@@ -1404,7 +1407,8 @@ def _run_smoke_batched(
     gets its own cache instance so shared-prefix metrics reflect
     that run alone. When ``workload.kv_codec`` is set, the cache's
     store is constructed with the named codec so subsequent encode /
-    decode path actually exercises it (P-5-A.3a). Returns
+    decode path actually exercises it (P-5-A.3a). ``seed`` (P-5-D.1)
+    flows into the codec's Haar-rotation seed. Returns
     ``(tokens, first_token_ms)`` — per-row token streams plus
     per-row first-token wall offsets in ms (measured from the
     moment the batched generation started, so the TTFT-under-
@@ -1412,7 +1416,9 @@ def _run_smoke_batched(
     short-prompt rows' first-token latency).
     """
     prompts = list(scenario.workload.prompts)
-    prefix_cache = _maybe_build_prefix_cache(scenario.workload, adapter)
+    prefix_cache = _maybe_build_prefix_cache(
+        scenario.workload, adapter, seed=seed
+    )
     return _collect_smoke_batched_tokens(
         engine,
         prompts,
@@ -1426,6 +1432,8 @@ def _run_prefix_hit_decode(
     scenario: Scenario,
     engine: Engine,
     adapter: ModelAdapter,
+    *,
+    seed: int = 42,
 ) -> tuple[
     tuple[dict[int, list[int]], dict[int, list[float]]],
     dict[str, Any],
@@ -1468,7 +1476,7 @@ def _run_prefix_hit_decode(
         )
 
     params = _build_sampling_params(wl, adapter, include_eos=False)
-    prefix_cache = _maybe_build_prefix_cache(wl, adapter)
+    prefix_cache = _maybe_build_prefix_cache(wl, adapter, seed=seed)
     assert prefix_cache is not None  # wl.prefix_cache=True guarantees this
 
     collected = _collect_prefix_hit_decode(
@@ -1694,7 +1702,7 @@ def _default_teacher_forced_reference(
 
 
 def _run_admission_headroom(
-    scenario: Scenario, adapter: ModelAdapter
+    scenario: Scenario, adapter: ModelAdapter, *, seed: int = 42
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Drive the P-5-C.3 step 2 ``OracleKind.ADMISSION_HEADROOM``
     row (§4.7 mode (B) vs mode (C) admission comparison).
@@ -1837,6 +1845,7 @@ def _run_admission_headroom(
             n_kv_heads=layout.n_kv_heads,
             head_dim=layout.head_dim,
             dtype=layout.dtype,
+            seed=seed,
         )
         store = SyntheticPrefixBlockStore(
             block_size=block_size, codec=codec
@@ -1954,7 +1963,7 @@ _ADMISSION_HEADROOM_ADMIT_CAP: int = 4096
 
 
 def _run_storage(
-    scenario: Scenario, engine: Engine, adapter: ModelAdapter
+    scenario: Scenario, engine: Engine, adapter: ModelAdapter, *, seed: int = 42
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Drive the P-5-C.3 ``OracleKind.STORAGE`` workload.
 
@@ -1991,7 +2000,7 @@ def _run_storage(
     """
     wl = scenario.workload
     params = _build_sampling_params(wl, adapter, include_eos=False)
-    prefix_cache = _maybe_build_prefix_cache(wl, adapter)
+    prefix_cache = _maybe_build_prefix_cache(wl, adapter, seed=seed)
     assert prefix_cache is not None  # wl.prefix_cache=True guarantees this
 
     # Drain the batched event stream with the same strictness the
@@ -2076,6 +2085,7 @@ def _run_ppl(
     adapter: ModelAdapter,
     *,
     fp16_baseline_ppl: float | None = None,
+    seed: int = 42,
 ) -> tuple[dict[str, float | int], dict[str, Any]]:
     """Drive the P-5-C.2 ``OracleKind.PPL`` workload.
 
@@ -2154,7 +2164,9 @@ def _run_ppl(
         min_tokens=chunk_size,
     )
 
-    prefix_cache = _maybe_build_prefix_cache(scenario.workload, adapter)
+    prefix_cache = _maybe_build_prefix_cache(
+        scenario.workload, adapter, seed=seed
+    )
 
     if prefix_cache is None:
         # fp16 baseline path — kv_codec is None AND prefix_cache=False.
@@ -2199,7 +2211,10 @@ def _run_ppl(
 
 
 def _maybe_build_prefix_cache(
-    workload: Workload, adapter: ModelAdapter | None = None
+    workload: Workload,
+    adapter: ModelAdapter | None = None,
+    *,
+    seed: int = 42,
 ) -> Any | None:
     """Build a fresh :class:`RadixPrefixCache` if the workload asks
     for it, else ``None``.
@@ -2208,10 +2223,18 @@ def _maybe_build_prefix_cache(
     named codec via ``silica.bench.codec_registry`` and installs it
     on the synthetic store as the shorthand (both K and V sides use
     the same codec). Codec factories take ``(block_size, n_kv_heads,
-    head_dim, dtype)`` — the last three come from
-    ``adapter.kv_layout()``, which is why this helper now takes an
-    ``adapter`` kwarg. Callers that pass a workload with
-    ``kv_codec=None`` (all pre-P-5-A.3 callers) can omit the adapter.
+    head_dim, dtype, seed)`` — the last four come from
+    ``adapter.kv_layout()`` plus the caller-supplied ``seed``, which
+    is why this helper now takes an ``adapter`` kwarg. Callers that
+    pass a workload with ``kv_codec=None`` (all pre-P-5-A.3 callers)
+    can omit the adapter; they can also omit ``seed`` since it only
+    affects the codec's Haar rotation when a codec actually installs.
+
+    ``seed`` (P-5-D.1) flows from the bench runner's per-execution
+    seed into the codec's ``seed`` ctor kwarg so ``--seeds
+    42,43,44`` produces genuinely distinct Haar rotations. Default
+    ``42`` matches the codec ctor defaults and preserves pre-P-5-D
+    behaviour for callers that don't thread a seed.
 
     Block size is hard-coded to 16 — the same constant the README's
     Quickstart example uses, and the default value every pytest-
@@ -2264,6 +2287,7 @@ def _maybe_build_prefix_cache(
             n_kv_heads=layout.n_kv_heads,
             head_dim=layout.head_dim,
             dtype=layout.dtype,
+            seed=seed,
         )
 
     store = SyntheticPrefixBlockStore(
