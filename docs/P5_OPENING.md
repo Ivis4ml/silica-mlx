@@ -96,7 +96,7 @@ The three intents above combine into a stronger framing: P-5 is not "ship BlockT
 
 - **Runtime / inference hot path — MLX only.** Every `silica.vq.*` module outside the `_calibration` quarantine: `silica.vq.block_tq.BlockTurboQuantMSE.encode_tensor` / `decode_tensor`, `silica.vq.core.packing.pack_sub_byte` / `unpack_sub_byte`, `silica.vq.turboquant.TurboQuantMSE` (an alias — no separate code path), the forthcoming `silica.vq.rabitq.RaBitQ1Bit` / `ExtRaBitQ`, and `silica.kvcache.store.SyntheticPrefixBlockStore`'s per-side codec dispatch. K/V enters a codec as `mx.array` from mlx-lm attention and leaves as `mx.array` fp16/bf16 back into mlx-lm SDPA — no torch round trip, no NumPy round trip. The `silica.vq.*` NumPy-import grep test (`tests/test_calibration.py::test_calibration_module_is_the_numpy_quarantine_exception`) enforces this by walking every module under the package.
 - **Offline calibration — NumPy permitted.** Only `silica.vq._calibration` may import NumPy. `haar_rotation` + `lloyd_max_codebook` run once at codec `__init__`; their outputs become fp32 `mx.array` constants stored on the codec instance. Runtime never re-consults NumPy.
-- **Tests / reference — NumPy / vqbench / scipy permitted.** `tests/test_block_tq_vqbench_xcheck.py::_numpy_block_tq_round_trip` is the algorithmic-parity judge; `silica.bench.vqbench_baseline` is the future PPL cross-check subprocess (P-5-C (a-real), §7(a)). Neither is on the inference path; both exist to prove the MLX translation is faithful.
+- **Tests / reference — NumPy / vqbench / scipy permitted.** `tests/test_block_tq_vqbench_xcheck.py::_numpy_block_tq_round_trip` is the algorithmic-parity judge used by both (a-algo) and the v1.7.5 (a-real) real-activation xcheck; `silica.bench.vqbench_baseline` is the independent PPL cross-check subprocess for Acceptance (4-b). Neither is on the inference path; both exist to prove the MLX translation is faithful.
 
 Performance escalation inside the MLX boundary, in order: plain MLX Python (current P-5-A.1a shape) → `@mx.compile` on decode / unpack hot paths → `mx.fast.metal_kernel` for SIMD-friendly hotspots like `unpack_sub_byte`. Obj-C / C++ extensions stay v0.2-only, gated on genuine MLX primitive gaps (Q-009 / R-7 variable-length SDPA is the named case). See §2.8 for the full ladder. **vqbench / NumPy / scipy / torch are reference and cross-validation; `silica.vq.*` runtime is MLX-native. That separation does not shift.**
 
@@ -135,7 +135,7 @@ Carried forward from P-4.5-C. Relevant to the bench harness design — a single-
 
 ### 2.5 vqbench as algorithmic + numeric reference, not runtime
 
-`vqbench/` is gitignored and carries its own NumPy / PyTorch / HF transformers environment. `vqbench/REPORT.md` + `vqbench/BlockTQ.md` are the algorithm walkthroughs; `vqbench/vqbench/methods/turboquant/block_mse.py`, `rabitq/rabitq_1bit.py`, `rabitq/rabitq_ext.py` are the reference implementations to translate. P-5 does **not** `pip install vqbench`; it rewrites each method's encode / decode loop on `mx.array` and cross-checks the output numerically against a vqbench subprocess run on the same calibration vectors (P-4.4's `silica/bench/vqbench_baseline.py` is the delegate channel).
+`vqbench/` is gitignored and carries its own NumPy / PyTorch / HF transformers environment. `vqbench/REPORT.md` + `vqbench/BlockTQ.md` are the algorithm walkthroughs; `vqbench/vqbench/methods/turboquant/block_mse.py`, `rabitq/rabitq_1bit.py`, `rabitq/rabitq_ext.py` are the reference implementations to translate. P-5 does **not** `pip install vqbench`; it rewrites each method's encode / decode loop on `mx.array`, cross-checks reconstruction numerics against in-test transcribed references, and cross-checks PPL numerics through the separate P-4.4 `silica.bench.vqbench_baseline` subprocess channel.
 
 ### 2.6 MoE-compatible interface
 
@@ -728,14 +728,28 @@ Six clauses. (a)–(c) carry forward from PLAN §7 P-5 Acceptance (with (b) and 
 
 ### (a) Per-block reconstruction error vs vqbench — split in two (2026-04-22)
 
-Acceptance (a) splits into an **algorithmic parity** half that lands
-with the MLX codec itself (P-5-A.1c) and a **real-activation + vqbench
-subprocess** half that lands when the bench harness has the subprocess
-plumbing in place (P-5-C). The split reflects scope: the MLX hot path
-is a self-contained unit that deserves its own parity gate on every
-developer machine; the real-activation comparison against vqbench's
-own codec requires vqbench's venv (scipy / torch / transformers) and a
-loaded model, which are bench-harness-adjacent.
+Acceptance (a) splits into two halves that landed independently:
+
+- **(a-algo) algorithmic parity half** — landed at P-5-A.1c in
+  `tests/test_block_tq_vqbench_xcheck.py`. The MLX hot path
+  is a self-contained unit that deserves its own parity gate on
+  every developer machine, and the gate runs on synthetic
+  Gaussian inputs against a vqbench-transcribed NumPy reference
+  (`_numpy_block_tq_round_trip`).
+- **(a-real) real-activation half** — closed at v1.7.5 via
+  `tests/test_block_tq_real_activation_xcheck.py`, which reuses
+  the (a-algo) NumPy reference on real Qwen3.5-0.8B pre-RoPE K /
+  V tensors extracted from a prefill pass. The v1.5.1-era
+  "vqbench venv subprocess + recon-specific driver script" design
+  was superseded by the inline-NumPy idiom (memory: "vqbench is
+  reference-only — transcribe inline"); the transcription's
+  faithfulness was already pinned at (a-algo), so real-activation
+  reuses the same reference without new subprocess infrastructure
+  or a second skip gate. Full design contract and per-decision
+  rationale: `docs/P5_A_REAL_OPENING.md`. References to a
+  "P-5-C subprocess landing" or a "vqbench venv" below this
+  paragraph describe the superseded design only — the current
+  landed design is inline NumPy, single HF-cache gate.
 
 **(a-algo) — P-5-A.1c — algorithmic parity vs in-test NumPy reference.**
 
@@ -764,30 +778,61 @@ Runs on every developer machine; no vqbench, scipy, HF cache, or
 model-load dependency. This is the primary guardrail that the MLX
 translation of vqbench's BlockTQ algorithm is numerically faithful.
 
-**(a-real) — post-P-5 required follow-up — real Qwen activations vs vqbench subprocess.**
+**(a-real) — closed at v1.7.5 — real Qwen3.5-0.8B K / V activations vs inline NumPy reference.**
 
-Post-P-5 required follow-up (PLAN v1.7.2 moved this out of the P-5 close gate into §7 P-5 Notes); **no runtime capability blocker**; pending a dedicated real-activation cross-check test on Qwen3.5-0.8B (or larger).
+Closed by P-5 (a-real) at v1.7.5 via
+`tests/test_block_tq_real_activation_xcheck.py`. Evidence:
+`docs/P5_ACCEPTANCE_SWEEP/real_activation_xcheck.md` + `.jsonl`.
+Design contract: `docs/P5_A_REAL_OPENING.md`.
 
-Metric: same per-block relative Frobenius error, but inputs are real
-K/V activations extracted from a loaded Qwen3.5-0.8B (or larger)
-forward pass, and the reference side runs vqbench's
-`BlockTurboQuantMSE` **in a vqbench venv subprocess** (scipy / torch /
-transformers unavailable in silica's venv; D-009 forbids importing
-them here). Builds on the existing `silica.bench.vqbench_baseline`
-subprocess driver + a new recon-specific driver script that takes
-a tensor blob + codec config, emits recon MSE to stdout.
+Metric: per-block relative Frobenius error on real K / V
+activations extracted from a Qwen3.5-0.8B prefill pass (GLOBAL
+layers only — `layer.is_linear == False` — pre-RoPE
+`k_proj` / `v_proj` output, the same vqbench-aligned space that
+Acceptance (4-b) and D.2a inject noise into). The reference
+side runs the vqbench-transcribed NumPy implementation landed
+at P-5-A.1c (`tests/test_block_tq_vqbench_xcheck.py::_numpy_block_tq_round_trip`),
+called with the same shared calibration helpers silica's codec
+uses (`silica.vq._calibration.{haar_rotation, lloyd_max_codebook}`).
+No vqbench subprocess: the reference is inline NumPy per the
+established xcheck idiom (memory: "vqbench is reference-only —
+transcribe inline"), and the transcription's faithfulness was
+pinned at (a-algo) to `5e-3` / `1e-3` on synthetic Gaussian. The
+v1.5.1-era "vqbench venv subprocess + new recon-specific driver
+script" design has been superseded — see `docs/P5_A_REAL_OPENING.md`
+§2.3 for the rationale.
 
-Gate: `ε_recon < 2 × fp16 round-trip baseline noise`, where the
-baseline is established by vqbench's own fp16 encode→decode round
-trip on the same calibration set (matches the original P-5 opening
-Acceptance (a) wording). Tightened at implementation time based
-on measured baseline noise (likely 1e-3 to 1e-4 range).
+Gate: silica-vs-NumPy absolute Frobenius-ratio gap must satisfy
+`|silica_frob - numpy_frob| < 1e-3` on the production-recommended
+`(B=64, num_bits=4)` cell and `< 5e-3` on the other
+`(B, bits) ∈ {32, 64} × {3, 4}` cells — the same envelope
+(a-algo) pinned for synthetic Gaussian, reused here without
+tightening because the transcription is identical. The v1.7.2
+"`ε_recon < 2 × fp16 round-trip baseline`" ratio is kept as a
+secondary gate; the `IdentityCodec` `encode_tensor`→`decode_tensor`
+round-trip baseline is dtype-preserving (`RawFp16Payload` stores
+the `mx.array` directly), so the ratio degenerates on every row
+and the absolute-gap gate above carries the close weight. The
+test asserts baseline degeneracy on every row so a future
+`IdentityCodec` change that breaks dtype preservation surfaces
+loudly.
 
-Gating: dual — HF cache has Qwen3.5-0.8B AND
-`VQBENCH_PYTHON_EXECUTABLE` is set to a vqbench-aware Python. Both
-gates miss → test skips. Matches the dual-gate pattern of
-`test_engine_admission_reorder.py::test_q010_*` (HF cache) +
-`silica/bench/vqbench_baseline.py` (`VQBENCH_PYTHON_EXECUTABLE`).
+Evidence (144 rows — 6 GLOBAL layers × 2 sides × 4 (B, bits) × 3 seeds):
+
+- Worst-case `|silica - numpy|`: `1.15e-4` (layer 15, K, B=64 b=3)
+  — ~43× headroom under `5e-3`.
+- Worst-case production cell `(B=64, b=4)`: `5.21e-5` (V side) —
+  ~19× headroom under `1e-3`.
+- K / V symmetric (worst K `1.15e-4`, worst V `9.78e-5`); all 6
+  GLOBAL layers land in the same `9e-5 … 1.2e-4` band.
+- Baseline degenerate on 144 / 144 rows as predicted.
+
+Gating: **single gate** — HF cache has Qwen3.5-0.8B. No
+`VQBENCH_PYTHON_EXECUTABLE` gate (the reference is inline NumPy).
+The prompt is a checked-in deterministic English passage inside
+`tests/test_block_tq_real_activation_xcheck.py` (~138 tokens under
+the Qwen3.5 tokenizer, envelope-guarded at 96..160 for
+tokenizer-drift catch).
 
 ### (b) End-to-end PPL agreement on the vqbench-aligned oracle — mean-over-seeds cross-check
 
@@ -916,7 +961,7 @@ Scope:
 
 Acceptance:
 
-- (a-algo) algorithmic parity vs in-test NumPy reference — closed by `tests/test_block_tq_vqbench_xcheck.py` in P-5-A.1c, per §7(a) split. (a-real) — real Qwen activations + vqbench subprocess — **post-P-5 required follow-up** (not a P-5 close gate); the bench-harness infrastructure it depends on (`silica.bench.vqbench_baseline` subprocess driver + HF-cache plumbing) is already in place at P-5-C close. See PLAN §7 P-5 Notes and §7(a-real) above for current ownership.
+- (a-algo) algorithmic parity vs in-test NumPy reference — closed by `tests/test_block_tq_vqbench_xcheck.py` in P-5-A.1c, per §7(a) split. (a-real) real-activation Frobenius on Qwen3.5-0.8B pre-RoPE K / V — closed at v1.7.5 by `tests/test_block_tq_real_activation_xcheck.py` using the same in-test NumPy reference (inline, not a vqbench subprocess — the v1.5.1 subprocess design was superseded, see `docs/P5_A_REAL_OPENING.md` §2.3). Single HF-cache skip gate; 144 rows across 6 GLOBAL layers × K/V × 4 `(B, bits)` cells × 3 seeds. Worst `|silica_frob - numpy_frob| = 1.15e-4` (~43× headroom under `5e-3`). Evidence: `docs/P5_ACCEPTANCE_SWEEP/real_activation_xcheck.{md,jsonl}`.
 - New: `tests/test_block_tq.py::test_block_equals_scalar_when_B_equals_d` — shipping the Block invariant vqbench already pins.
 
 Blocked by: P-5-A.0.

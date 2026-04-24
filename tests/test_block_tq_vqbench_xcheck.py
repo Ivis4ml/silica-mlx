@@ -1,9 +1,12 @@
 """P-5-A.1c — algorithmic-parity gate: MLX BlockTQ vs NumPy reference.
 
-Closes P-5-A.1 Acceptance (a-algo), the first half of opening §7(a).
-The second half — (a-real): real Qwen3.5-0.8B activations vs vqbench
-subprocess — defers to P-5-C where the bench harness already owns the
-subprocess + HF-cache + model-load plumbing.
+Closes P-5 §7(a-algo), the synthetic-Gaussian half of opening §7(a).
+The real-activation half — (a-real) — closed separately at v1.7.5
+in ``tests/test_block_tq_real_activation_xcheck.py``, which reuses
+this file's ``_numpy_block_tq_round_trip`` reference and runs it on
+pre-RoPE K / V activations extracted from a Qwen3.5-0.8B prefill
+pass (the v1.5.1 "vqbench venv subprocess" design was superseded
+by the inline-NumPy idiom — see ``docs/P5_A_REAL_OPENING.md`` §2.3).
 
 What this test does:
 
@@ -39,8 +42,16 @@ What this test does:
 What this test does NOT do:
 
 - Run the full vqbench NumPy codec in-process. That would need scipy.
-- Load a real model. Real-activation recon testing is P-5-C.
-- Compare PPL. That's Acceptance (b), also P-5-C.
+- Load a real model. Real-activation Frobenius xcheck lives in
+  ``tests/test_block_tq_real_activation_xcheck.py`` (v1.7.5 close of
+  §7(a-real)); it reuses this file's ``_numpy_block_tq_round_trip``
+  reference on real Qwen3.5-0.8B K / V activations.
+- Compare PPL. That's Acceptance (4-b) — closed at v1.7.3 via the
+  D.2a vqbench-aligned oracle (mean-over-seeds gate on
+  ``qwen3-0.6b-wikitext-ppl-block-tq-b64-b4-vqbench-aligned``).
+  The (b-static) static Qwen3.5-4B PPL vs ``vqbench/REPORT.md``
+  baseline remains post-P-5 backlog (blocked on P-3-C5 recurrent-
+  state snapshot or the monkey-patch route; see PLAN §7 P-5 Notes).
 """
 
 from __future__ import annotations
