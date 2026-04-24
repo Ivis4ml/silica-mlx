@@ -99,6 +99,40 @@ class OracleKind(str, Enum):
     # ``{"resident_bytes": int, "resident_bytes_per_block":
     # int | None, "live_blocks": int, "prefix_cache_hits": int}``.
     STORAGE = "storage"
+    # P-5-C.3 step 2. Admission-headroom observable demonstrating
+    # §4.7 mode (B) vs mode (C): a compressed codec's smaller
+    # ``store.resident_bytes()`` translates into more headroom and
+    # therefore more admitted requests under the same ``cap_bytes``.
+    #
+    # Runner bypasses ``engine.generate_batch`` entirely. Workload
+    # is abstract (``prompts=()``, ``max_tokens=0``); all numeric
+    # knobs live in ``oracle_config``:
+    #   cap_bytes, weights_bytes, warmup_ratio,
+    #   n_prompt, max_tokens, fp16_codec, compressed_codec
+    #
+    # Procedure (mirrors opening §7(c) verbatim):
+    # 1. Build prefix_cache(fp16_codec), synthesize blocks of
+    #    zero-filled K/V one at a time until
+    #    ``store.resident_bytes() >= cap_bytes * warmup_ratio``.
+    #    Record the recipe ``[(tokens, per_layer_kv), ...]``.
+    # 2. Build prefix_cache(compressed_codec), replay the SAME
+    #    recipe verbatim. The compressed codec stores the same
+    #    logical content at smaller ``resident_bytes``.
+    # 3. For each prefix_cache, build a MemoryBudgeter with
+    #    ``account_prefix_residency=True``, then call
+    #    ``budgeter.admit("trial-N", n_prompt, max_tokens)`` in a
+    #    loop. Count *consecutive* ``AdmitDecision`` returns; stop
+    #    at the first non-``AdmitDecision`` (Reject /
+    #    AdmitAfterEvict / AdmitAfterPreempt) — those mix
+    #    eviction / preemption policy into the signal that should
+    #    be pure-headroom.
+    #
+    # Oracle enforces the hard gate ``n_block > n_fp16`` (§7(c)
+    # acceptance) on top of the usual structural checks.
+    # ``collected`` shape: ``{"n_fp16": int, "n_block": int,
+    # "n_delta": int, "resident_bytes_fp16": int,
+    # "resident_bytes_block": int, "warmup_blocks": int}``.
+    ADMISSION_HEADROOM = "admission_headroom"
 
 
 @dataclass(frozen=True)

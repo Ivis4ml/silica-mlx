@@ -96,6 +96,8 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+import mlx.core as mx
+
 from silica.bench.oracles import ORACLES
 from silica.bench.scenario import (
     OracleKind,
@@ -346,6 +348,20 @@ class BenchRunner:
                 )
                 oracle_input = storage_collected
                 total_tokens = int(storage_collected["live_blocks"])
+            elif scenario.oracle == OracleKind.ADMISSION_HEADROOM:
+                # ADMISSION_HEADROOM bypasses engine.generate_batch.
+                # The runner still loaded adapter via factory (v1
+                # accepts the engine-construction cost); the engine
+                # itself is unused. total_tokens reports the sum of
+                # fp16 + compressed admission counts so the JSONL
+                # row has a non-trivial counter.
+                ah_collected, oracle_context = _run_admission_headroom(
+                    scenario, adapter
+                )
+                oracle_input = ah_collected
+                total_tokens = int(
+                    ah_collected["n_fp16"] + ah_collected["n_block"]
+                )
             else:
                 # SMOKE (and any future single/batched-flexible
                 # oracle). B=1 takes the single-request path,
@@ -1153,6 +1169,266 @@ def _default_teacher_forced_reference(
     mx.eval(logits)
     positional = logits[0, prompt_len - 1 : prompt_len - 1 + target_len, :]
     return [int(mx.argmax(positional[i]).item()) for i in range(target_len)]
+
+
+def _run_admission_headroom(
+    scenario: Scenario, adapter: ModelAdapter
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Drive the P-5-C.3 step 2 ``OracleKind.ADMISSION_HEADROOM``
+    row (§4.7 mode (B) vs mode (C) admission comparison).
+
+    Bypasses ``engine.generate_batch`` entirely — the signal is
+    about ``MemoryBudgeter.headroom_bytes()`` arithmetic under
+    different store residencies, not about token generation.
+    ``_run_one`` still calls ``engine_factory`` to materialize
+    the adapter; the returned engine is discarded. v1 accepts
+    that weight load cost (~600 MB for Qwen3-0.6B) rather than
+    inventing a metadata-only adapter loader in this commit.
+
+    Procedure mirrors opening §7(c) verbatim:
+
+    1. Build a prefix cache with the fp16 codec (default
+       ``"fp16"`` = IdentityCodec). Synthesize zero-filled K/V
+       blocks with unique token sequences and register them via
+       ``prefix_cache.insert_detached`` one at a time until
+       ``store.resident_bytes() >= cap_bytes * warmup_ratio``.
+       Record the ordered recipe
+       ``[(tokens_tuple, per_layer_kv), ...]``.
+    2. Build a parallel prefix cache with the compressed codec
+       (default ``"block_tq_b64_b4"``). **Replay the same
+       recipe** — identical token sequences, identical K/V
+       tensors. Under the compressed codec each block lands at
+       smaller ``resident_bytes`` than the fp16 equivalent, so
+       mode (C) ends up with more headroom at the same bound.
+    3. For each prefix cache, construct a
+       ``MemoryBudgeter.for_adapter`` with
+       ``account_prefix_residency=True`` and call ``admit(...)``
+       in a loop using ``(n_prompt, max_tokens)`` from
+       ``oracle_config``. Count **consecutive**
+       ``AdmitDecision`` returns and stop at the first non-
+       ``AdmitDecision``. Eviction- and preemption-assisted
+       admits are NOT counted — they mix admission-policy signal
+       into what should be a pure-headroom comparison.
+
+    ``oracle_config`` keys:
+
+    - ``cap_bytes`` (int, required): headroom cap for the
+      budgeter.
+    - ``weights_bytes`` (int, required): weights subtracted from
+      ``cap_bytes`` in ``headroom_bytes()``. ``0`` is legal and
+      useful for isolating pure prefix-residency signal.
+    - ``warmup_ratio`` (float, default ``0.5``): fraction of
+      ``cap_bytes`` the fp16 store must reach before admissions
+      start. ``0 < ratio < 1``.
+    - ``n_prompt`` (int, required): synthetic prompt length per
+      trial admission.
+    - ``max_tokens`` (int, required): synthetic max_tokens per
+      trial admission.
+    - ``fp16_codec`` (str, default ``"fp16"``): registry id for
+      the mode-(B) codec. IdentityCodec is the reference baseline
+      §7(c) names; this knob exists so a future "double-codec
+      regression" row can pin a specific fp16-pass-through
+      variant without redefining the oracle.
+    - ``compressed_codec`` (str, default ``"block_tq_b64_b4"``):
+      registry id for the mode-(C) codec.
+
+    Safety rails:
+
+    - A warmup loop that would run indefinitely (per-block
+      residency too small relative to the cap target) aborts at
+      ``_ADMISSION_HEADROOM_WARMUP_BLOCK_CAP`` blocks and raises
+      ``RuntimeError``.
+    - If fp16-codec warmup never reaches the target, raises.
+    - If an admission loop would run indefinitely (every call
+      returns ``AdmitDecision``), bound at
+      ``_ADMISSION_HEADROOM_ADMIT_CAP`` iterations and raise.
+    """
+    from silica.kvcache.prefix import RadixPrefixCache
+    from silica.kvcache.store import SyntheticPrefixBlockStore
+    from silica.scheduler.budget import (
+        AdmitDecision,
+        MemoryBudgeter,
+    )
+
+    cfg = scenario.oracle_config
+    for required in ("cap_bytes", "weights_bytes", "n_prompt", "max_tokens"):
+        if required not in cfg:
+            raise RuntimeError(
+                f"admission_headroom oracle_config missing required "
+                f"key {required!r}"
+            )
+    cap_bytes = int(cfg["cap_bytes"])
+    weights_bytes = int(cfg["weights_bytes"])
+    warmup_ratio = float(cfg.get("warmup_ratio", 0.5))
+    n_prompt = int(cfg["n_prompt"])
+    max_tokens = int(cfg["max_tokens"])
+    fp16_codec_id = str(cfg.get("fp16_codec", "fp16"))
+    compressed_codec_id = str(
+        cfg.get("compressed_codec", "block_tq_b64_b4")
+    )
+
+    if cap_bytes <= 0:
+        raise RuntimeError(
+            f"admission_headroom oracle_config cap_bytes must be > 0, "
+            f"got {cap_bytes}"
+        )
+    if weights_bytes < 0:
+        raise RuntimeError(
+            f"admission_headroom oracle_config weights_bytes must be "
+            f">= 0, got {weights_bytes}"
+        )
+    if not (0.0 < warmup_ratio < 1.0):
+        raise RuntimeError(
+            f"admission_headroom oracle_config warmup_ratio must be "
+            f"in (0, 1); got {warmup_ratio}"
+        )
+    if n_prompt <= 0 or max_tokens <= 0:
+        raise RuntimeError(
+            f"admission_headroom oracle_config requires n_prompt>0 and "
+            f"max_tokens>0; got n_prompt={n_prompt}, max_tokens="
+            f"{max_tokens}"
+        )
+
+    block_size = 16  # matches _maybe_build_prefix_cache
+    warmup_target = int(cap_bytes * warmup_ratio)
+    if warmup_target <= 0:
+        raise RuntimeError(
+            f"admission_headroom warmup_target computed as "
+            f"{warmup_target}; increase cap_bytes or warmup_ratio"
+        )
+
+    layout = adapter.kv_layout()
+
+    def _build_prefix_cache(codec_id: str) -> Any:
+        from silica.bench.codec_registry import get_codec_spec
+
+        spec = get_codec_spec(codec_id)
+        if not (spec.k_supported and spec.v_supported):
+            raise RuntimeError(
+                f"admission_headroom requires a symmetric codec for "
+                f"shorthand install; codec {codec_id!r} has "
+                f"k_supported={spec.k_supported}, "
+                f"v_supported={spec.v_supported}"
+            )
+        codec = spec.factory(
+            block_size=block_size,
+            n_kv_heads=layout.n_kv_heads,
+            head_dim=layout.head_dim,
+            dtype=layout.dtype,
+        )
+        store = SyntheticPrefixBlockStore(
+            block_size=block_size, codec=codec
+        )
+        return RadixPrefixCache(block_size=block_size, store=store)
+
+    def _synth_block(block_idx: int) -> list[tuple[Any, Any]]:
+        # Zero-filled K/V. The admission-headroom signal is about
+        # budgeter arithmetic over store residency; quantization
+        # quality is irrelevant here.
+        per_layer: list[tuple[Any, Any]] = []
+        for _ in range(layout.num_layers):
+            k = mx.zeros(
+                (1, layout.n_kv_heads, block_size, layout.head_dim),
+                dtype=layout.dtype,
+            )
+            v = mx.zeros(
+                (1, layout.n_kv_heads, block_size, layout.head_dim),
+                dtype=layout.dtype,
+            )
+            per_layer.append((k, v))
+        return per_layer
+
+    # Step 1 — warm fp16 cache to the target, record recipe.
+    fp16_pc = _build_prefix_cache(fp16_codec_id)
+    recipe: list[tuple[tuple[int, ...], list[tuple[Any, Any]]]] = []
+    fp16_store = fp16_pc.store
+    while fp16_store.resident_bytes() < warmup_target:
+        block_idx = len(recipe)
+        if block_idx >= _ADMISSION_HEADROOM_WARMUP_BLOCK_CAP:
+            raise RuntimeError(
+                f"admission_headroom warmup exceeded "
+                f"{_ADMISSION_HEADROOM_WARMUP_BLOCK_CAP} blocks without "
+                f"reaching target={warmup_target} bytes "
+                f"(current={fp16_store.resident_bytes()}). Codec "
+                f"{fp16_codec_id!r} per-block residency may be too "
+                f"small for the configured cap_bytes × warmup_ratio; "
+                f"increase cap_bytes or reduce warmup_ratio."
+            )
+        # Unique token sequence per block so insert_detached actually
+        # creates a new radix node (identical tokens would
+        # deduplicate).
+        tokens = tuple(
+            block_idx * block_size + i for i in range(block_size)
+        )
+        per_layer = _synth_block(block_idx)
+        fp16_pc.insert_detached(list(tokens), [per_layer])
+        recipe.append((tokens, per_layer))
+
+    warmup_blocks = len(recipe)
+    if warmup_blocks < 1:
+        raise RuntimeError(
+            "admission_headroom warmup produced zero blocks; "
+            "warmup_target already satisfied by empty store"
+        )
+
+    # Step 2 — replay identical recipe into the compressed prefix cache.
+    block_pc = _build_prefix_cache(compressed_codec_id)
+    for tokens, per_layer in recipe:
+        block_pc.insert_detached(list(tokens), [per_layer])
+
+    # Step 3 — admission loops on each.
+    def _count_admissions(prefix_cache: Any) -> int:
+        budgeter = MemoryBudgeter.for_adapter(
+            adapter,
+            prefix_cache=prefix_cache,
+            weights_bytes=weights_bytes,
+            cap_bytes=cap_bytes,
+            account_prefix_residency=True,
+        )
+        count = 0
+        while count < _ADMISSION_HEADROOM_ADMIT_CAP:
+            req_id = f"admission-headroom-trial-{count}"
+            decision = budgeter.admit(req_id, n_prompt, max_tokens)
+            if not isinstance(decision, AdmitDecision):
+                return count
+            budgeter.apply_admit(req_id, decision.reserved_delta)
+            count += 1
+        raise RuntimeError(
+            f"admission_headroom admit loop exceeded "
+            f"{_ADMISSION_HEADROOM_ADMIT_CAP} consecutive admits "
+            f"without a non-AdmitDecision; cap_bytes may be too large "
+            f"relative to per-admit worst_case_bytes"
+        )
+
+    n_fp16 = _count_admissions(fp16_pc)
+    n_block = _count_admissions(block_pc)
+
+    resident_fp16 = int(fp16_pc.store.resident_bytes())
+    resident_block = int(block_pc.store.resident_bytes())
+
+    collected: dict[str, Any] = {
+        "n_fp16": n_fp16,
+        "n_block": n_block,
+        "resident_bytes_fp16": resident_fp16,
+        "resident_bytes_block": resident_block,
+        "warmup_blocks": warmup_blocks,
+    }
+    context: dict[str, Any] = {
+        "cap_bytes": cap_bytes,
+        "weights_bytes": weights_bytes,
+        "warmup_ratio": warmup_ratio,
+        "n_prompt": n_prompt,
+        "max_tokens": max_tokens,
+        "fp16_codec": fp16_codec_id,
+        "compressed_codec": compressed_codec_id,
+    }
+    return collected, context
+
+
+# Safety rails for the admission-headroom loops. Chosen generously;
+# real rows stay well under both.
+_ADMISSION_HEADROOM_WARMUP_BLOCK_CAP: int = 4096
+_ADMISSION_HEADROOM_ADMIT_CAP: int = 4096
 
 
 def _run_storage(

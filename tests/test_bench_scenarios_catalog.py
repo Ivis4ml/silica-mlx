@@ -85,7 +85,14 @@ def test_catalog_entry_shape_invariants(
     # workload at max_batch_size=1 (``DECODE_TOK_S_WITH_PREFIX_HIT``
     # and ``STORAGE``). Every other oracle follows the single-
     # prompt single-request or multi-prompt batched default.
-    _PROMPTLESS_ORACLES = {OracleKind.PPL}
+    _PROMPTLESS_ORACLES = {
+        OracleKind.PPL,
+        # ADMISSION_HEADROOM bypasses engine.generate_batch entirely
+        # — all numeric knobs live in oracle_config; workload
+        # carries prompts=() / max_tokens=0 to document "no
+        # sampling path runs".
+        OracleKind.ADMISSION_HEADROOM,
+    }
     _SHARED_PREFIX_ORACLES = {
         OracleKind.DECODE_TOK_S_WITH_PREFIX_HIT,
         OracleKind.STORAGE,

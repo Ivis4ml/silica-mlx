@@ -1054,6 +1054,75 @@ _QWEN3_0_6B_COMPRESSION_EXT_RABITQ_B4 = Scenario(
 )
 
 
+# =============================================================================
+# P-5-C.3 step 2 — admission-headroom row on Qwen3-0.6B.
+#
+# Demonstrates opening §7(c): under ``account_prefix_residency=True``
+# the compressed codec (mode C) frees enough prefix residency to
+# strictly admit more concurrent trial requests than the IdentityCodec
+# baseline (mode B). Workload is abstract — prompts=(), max_tokens=0
+# at the workload level; all numeric knobs live in oracle_config.
+#
+# cap_bytes / n_prompt / max_tokens chosen so the fp16 baseline
+# admits a small but non-zero number (~3-6) and the compressed
+# arm admits strictly more. Leaving weights_bytes=0 isolates the
+# signal on pure prefix residency (per user guidance: simplest
+# first-version shape).
+# =============================================================================
+
+
+_QWEN3_0_6B_ADMISSION_HEADROOM_PREFIX_HEAVY = Scenario(
+    id="qwen3-0.6b-admission-headroom-prefix-heavy",
+    repo="Qwen/Qwen3-0.6B",
+    workload=Workload(
+        name="admission-headroom-prefix-heavy",
+        # Oracle bypasses engine.generate_batch entirely; the
+        # numeric workload knobs live in oracle_config below.
+        prompts=(),
+        max_tokens=0,
+        max_batch_size=1,
+        prefix_cache=False,
+        temperature=0.0,
+        top_p=1.0,
+        kv_codec=None,
+    ),
+    oracle=OracleKind.ADMISSION_HEADROOM,
+    oracle_config={
+        # Synthetic cap; small enough that Qwen3-0.6B's per-block
+        # IdentityCodec residency (~1.8 MB under its layout) hits
+        # the warmup target in a reasonable block count, but large
+        # enough that subsequent trial admissions (per-request
+        # worst_case_bytes ~= 115 KB × (n_prompt + max_tokens))
+        # fit more than once.
+        "cap_bytes": 128 * 1024 * 1024,  # 128 MB
+        "weights_bytes": 0,
+        "warmup_ratio": 0.5,
+        "n_prompt": 128,
+        "max_tokens": 16,
+        "fp16_codec": "fp16",
+        "compressed_codec": "block_tq_b64_b4",
+    },
+    gate_env_var=None,
+    description=(
+        "P-5-C.3 step 2 admission-headroom row demonstrating §4.7 "
+        "mode (B) vs mode (C) and pinning §7(c) acceptance "
+        "n_block > n_fp16. Runner warms a prefix cache under "
+        "IdentityCodec until store.resident_bytes() >= cap_bytes * "
+        "warmup_ratio, replays the identical block recipe under "
+        "block_tq_b64_b4, then runs a consecutive-AdmitDecision "
+        "count against each. Compressed residency frees more "
+        "headroom, so the compressed arm strictly admits more "
+        "trial requests than the fp16 baseline. Hard gate on the "
+        "inequality is the oracle's acceptance check; metadata "
+        "surfaces the admission delta and the residency ratio "
+        "for the bench report. Cache-only gate (weight load via "
+        "engine_factory is paid but the engine itself is "
+        "discarded — v1 accepts this cost rather than inventing "
+        "a metadata-only adapter loader)."
+    ),
+)
+
+
 BUILTIN_SCENARIOS: dict[str, Scenario] = {
     _QWEN3_0_6B_SMOKE.id: _QWEN3_0_6B_SMOKE,
     _QWEN3_0_6B_B1_PARITY.id: _QWEN3_0_6B_B1_PARITY,
@@ -1075,6 +1144,7 @@ BUILTIN_SCENARIOS: dict[str, Scenario] = {
     _QWEN3_0_6B_COMPRESSION_TQ_MSE_B4.id: _QWEN3_0_6B_COMPRESSION_TQ_MSE_B4,
     _QWEN3_0_6B_COMPRESSION_BLOCK_TQ_B64_B4.id: _QWEN3_0_6B_COMPRESSION_BLOCK_TQ_B64_B4,
     _QWEN3_0_6B_COMPRESSION_EXT_RABITQ_B4.id: _QWEN3_0_6B_COMPRESSION_EXT_RABITQ_B4,
+    _QWEN3_0_6B_ADMISSION_HEADROOM_PREFIX_HEAVY.id: _QWEN3_0_6B_ADMISSION_HEADROOM_PREFIX_HEAVY,
     _QWEN3_5_27B_SMOKE.id: _QWEN3_5_27B_SMOKE,
     _QWEN3_5_MOE_SMOKE.id: _QWEN3_5_MOE_SMOKE,
     _GEMMA4_31B_SMOKE.id: _GEMMA4_31B_SMOKE,

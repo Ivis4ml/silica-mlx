@@ -912,6 +912,130 @@ def storage_oracle(
     return (True, None, metadata)
 
 
+def admission_headroom_oracle(
+    scenario: Scenario, collected: Any, context: Any
+) -> tuple[bool, str | None, dict[str, Any]]:
+    """P-5-C.3 step 2 oracle: pinning the §7(c) acceptance gate
+    ``n_block > n_fp16``.
+
+    The runner's ``_run_admission_headroom`` warms one prefix cache
+    under a fp16 codec until ``store.resident_bytes() >=
+    cap_bytes * warmup_ratio``, replays the identical warmup recipe
+    under a compressed codec, then runs a budgeter admission loop
+    against each cache and records consecutive ``AdmitDecision``
+    counts (``n_fp16`` / ``n_block``). The compressed codec's
+    smaller per-block residency frees more headroom; more headroom
+    translates to more consecutive admits.
+
+    This oracle enforces **two** gates:
+
+    1. **Structural** — required fields present, correctly typed,
+       ``n_fp16 >= 0``, ``n_block >= 0``, residency bytes
+       non-negative, warmup block count >= 1.
+    2. **Hard comparison** — ``n_block > n_fp16``. Strict inequality
+       is the floor; the opening §7(c) says the theoretical upper
+       bound is ``n_fp16 × (1 + compression_factor × prefix_fraction)``
+       but the "strictly greater" gate is the load-bearing signal
+       that the §4.7 mode (C) residency accounting actually flows
+       through to admission decisions. Equality would indicate
+       either zero compression (pass-through under IdentityCodec on
+       both sides by mistake) or a budgeter regression where
+       ``headroom_bytes()`` ignores ``store.resident_bytes()``.
+
+    Metadata surfaces the delta and ratio so the bench report layer
+    can render the compression-induced admission gain without
+    reaching into context.
+    """
+    if not isinstance(collected, dict):
+        return (False, "admission_headroom_collected_shape_mismatch", {})
+    for field in (
+        "n_fp16",
+        "n_block",
+        "resident_bytes_fp16",
+        "resident_bytes_block",
+        "warmup_blocks",
+    ):
+        if field not in collected:
+            return (
+                False,
+                f"admission_headroom_missing_field:{field}",
+                {"fields_present": sorted(collected)},
+            )
+
+    try:
+        n_fp16 = int(collected["n_fp16"])
+        n_block = int(collected["n_block"])
+        resident_bytes_fp16 = int(collected["resident_bytes_fp16"])
+        resident_bytes_block = int(collected["resident_bytes_block"])
+        warmup_blocks = int(collected["warmup_blocks"])
+    except (TypeError, ValueError) as exc:
+        return (
+            False,
+            f"admission_headroom_field_not_castable:{exc!s}",
+            {},
+        )
+
+    if n_fp16 < 0 or n_block < 0:
+        return (
+            False,
+            "admission_headroom_admission_count_negative",
+            {"n_fp16": n_fp16, "n_block": n_block},
+        )
+    if resident_bytes_fp16 < 0 or resident_bytes_block < 0:
+        return (
+            False,
+            "admission_headroom_resident_bytes_negative",
+            {
+                "resident_bytes_fp16": resident_bytes_fp16,
+                "resident_bytes_block": resident_bytes_block,
+            },
+        )
+    if warmup_blocks < 1:
+        return (
+            False,
+            "admission_headroom_warmup_blocks_below_one",
+            {"warmup_blocks": warmup_blocks},
+        )
+
+    # §7(c) hard gate. Strict inequality: the compressed codec must
+    # actually free enough headroom for at least one additional
+    # admission relative to the fp16 baseline.
+    if n_block <= n_fp16:
+        return (
+            False,
+            "admission_headroom_n_block_not_greater_than_n_fp16",
+            {
+                "n_fp16": n_fp16,
+                "n_block": n_block,
+                "resident_bytes_fp16": resident_bytes_fp16,
+                "resident_bytes_block": resident_bytes_block,
+            },
+        )
+
+    n_delta = n_block - n_fp16
+    ratio = (n_block / n_fp16) if n_fp16 > 0 else math.inf
+    residency_ratio = (
+        resident_bytes_block / resident_bytes_fp16
+        if resident_bytes_fp16 > 0
+        else math.inf
+    )
+
+    metadata: dict[str, Any] = {
+        "n_fp16": n_fp16,
+        "n_block": n_block,
+        "n_delta": n_delta,
+        "admit_ratio": ratio,
+        "resident_bytes_fp16": resident_bytes_fp16,
+        "resident_bytes_block": resident_bytes_block,
+        "residency_ratio": residency_ratio,
+        "warmup_blocks": warmup_blocks,
+    }
+    if isinstance(context, dict):
+        for key, value in context.items():
+            metadata.setdefault(key, value)
+    return (True, None, metadata)
+
+
 ORACLES: dict[OracleKind, OracleFn] = {
     OracleKind.SMOKE: smoke_oracle,
     OracleKind.B1_PARITY_VS_SINGLE: b1_parity_oracle,
@@ -920,6 +1044,7 @@ ORACLES: dict[OracleKind, OracleFn] = {
     OracleKind.DECODE_TOK_S_WITH_PREFIX_HIT: decode_tok_s_with_prefix_hit_oracle,
     OracleKind.PPL: ppl_oracle,
     OracleKind.STORAGE: storage_oracle,
+    OracleKind.ADMISSION_HEADROOM: admission_headroom_oracle,
 }
 
 
@@ -931,5 +1056,6 @@ __all__ = [
     "decode_tok_s_with_prefix_hit_oracle",
     "ppl_oracle",
     "storage_oracle",
+    "admission_headroom_oracle",
     "ORACLES",
 ]
