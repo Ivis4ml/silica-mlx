@@ -764,21 +764,23 @@ Runs on every developer machine; no vqbench, scipy, HF cache, or
 model-load dependency. This is the primary guardrail that the MLX
 translation of vqbench's BlockTQ algorithm is numerically faithful.
 
-**(a-real) — P-5-C — real Qwen activations vs vqbench subprocess.**
+**(a-real) — post-P-5 required follow-up — real Qwen activations vs vqbench subprocess.**
+
+Post-P-5 required follow-up (PLAN v1.7.2 moved this out of the P-5 close gate into §7 P-5 Notes); **no runtime capability blocker**; pending a dedicated real-activation cross-check test on Qwen3.5-0.8B (or larger).
 
 Metric: same per-block relative Frobenius error, but inputs are real
 K/V activations extracted from a loaded Qwen3.5-0.8B (or larger)
 forward pass, and the reference side runs vqbench's
 `BlockTurboQuantMSE` **in a vqbench venv subprocess** (scipy / torch /
 transformers unavailable in silica's venv; D-009 forbids importing
-them here). Builds on P-5-C's existing `silica.bench.vqbench_baseline`
+them here). Builds on the existing `silica.bench.vqbench_baseline`
 subprocess driver + a new recon-specific driver script that takes
 a tensor blob + codec config, emits recon MSE to stdout.
 
 Gate: `ε_recon < 2 × fp16 round-trip baseline noise`, where the
 baseline is established by vqbench's own fp16 encode→decode round
 trip on the same calibration set (matches the original P-5 opening
-Acceptance (a) wording). Tightened at P-5-C implementation time based
+Acceptance (a) wording). Tightened at implementation time based
 on measured baseline noise (likely 1e-3 to 1e-4 range).
 
 Gating: dual — HF cache has Qwen3.5-0.8B AND
@@ -791,12 +793,18 @@ gates miss → test skips. Matches the dual-gate pattern of
 
 Compare **deltas**, not absolute PPL. silica's MLX fp16 path and vqbench's NumPy/PyTorch fp16 path produce slightly different baseline PPL numbers (fp16 roundoff, different accumulation order, MPS vs MLX kernels); that baseline drift can exceed `0.01` absolute PPL even with IdentityCodec. Comparing `(silica.PPL_quant - silica.PPL_fp16)` against `(vqbench.PPL_quant - vqbench.PPL_fp16)` cancels the cross-implementation baseline term and leaves only the codec-induced signal. Same pattern vqbench REPORT §3.3 uses to compare against `turboquant_plus`.
 
-Gate: under Qwen3.5-4B `BlockTurboQuantMSE B=64` 4-bit K+V,
+Gate: under Qwen3-0.6B `BlockTurboQuantMSE B=64` 4-bit K+V (the `qwen3-0.6b-wikitext-ppl-block-tq-b64-b4` bench row),
 
   `|silica.ΔPPL - vqbench.ΔPPL| < 0.01` absolute
   and `|silica.Δpct - vqbench.Δpct| < 0.1%` relative
 
-where each `ΔPPL = PPL_quant - PPL_fp16` is measured inside its own oracle on the same calibration set (same three seeds, same WikiText-2 prefix, same chunk size, same K/V routing). Verified via `scripts/bench.py --kv-codec block_tq_b64_b4 --scenario qwen3.5-4b-wikitext-ppl --vqbench-xcheck --seeds 42,43,44`; the delta-compare arithmetic lives in the `--vqbench-xcheck` post-processing. This amends PLAN §7 P-5 Acceptance (b)'s original "absolute" wording, which did not account for cross-implementation baseline drift.
+where each `ΔPPL = PPL_quant - PPL_fp16` is measured inside its own oracle on the same calibration set (same three seeds, same WikiText-2 prefix, same chunk size, same K/V routing). Verified via `scripts/bench.py --scenario qwen3-0.6b-wikitext-ppl-block-tq-b64-b4 --seeds 42,43,44 --vqbench-xcheck`; the delta-compare arithmetic lives in `silica/bench/runner.py::_compute_gap_fields` with thresholds sourced from `vqbench_epsilon` (default `0.01`) and `_VQBENCH_PCT_EPSILON = 0.1`. PLAN v1.7.2 ratified two independent amendments to the original v1.5.1 "absolute" wording: (i) the cross-implementation baseline-drift finding that motivates comparing **deltas** rather than absolute PPL; (ii) the P5_OPENING §6.5 migration of all P-5 codec-backed PPL bench rows from Qwen3.5-4B to Qwen3-0.6B.
+
+### (b-static) End-to-end PPL vs `vqbench/REPORT.md` static baseline — post-P-5 required follow-up
+
+The literal v1.5.1 form of Acceptance (b) — silica BlockTQ end-to-end PPL on **Qwen3.5-4B**, compared against the static `PPL_fp16 ≈ 10.3866` baseline in `vqbench/REPORT.md` §3.1 — is **not reachable on the current tree**. Qwen3.5-4B is hybrid-DeltaNet (8 full-attention + 24 linear-attention layers, `has_recurrent_state=True` — `vqbench/REPORT.md` §2.1) and `ContinuousBatcher` refuses to pair `RadixPrefixCache` with recurrent adapters (`docs/P3_DELTANET_SURVEY.md` C-open-3), which the C.2 codec-backed oracle requires.
+
+This item is **post-P-5 required follow-up**, blocked on **the remaining P-3-C recurrent / prefix-cache cooperation work** (`docs/P3_DELTANET_SURVEY.md` C-open-3; may land through P-3-C5 preempt/replay-with-recurrent-snapshot, or through a narrower targeted fix if prefix-reuse support arrives without the full snapshot machinery), **or on an alternate monkey-patch measurement path** wrapping `k_proj` / `v_proj` on the 8 full-attention layers to inject quantize→dequantize inside the forward pass, bypassing `RadixPrefixCache` (mirrors `vqbench/scripts/reproduce_qwen35_4b_headline.py`'s own fallback — `vqbench/REPORT.md` §2.2 documents the monkey-patch as "pessimistic" but valid). The dependency is intentionally written at the P-3-C work-area granularity; pinning it to P-3-C5 specifically would re-introduce the same drift if prefix-reuse support lands via a different P-3-C sub-unit. Qwen3.5-4B remains a required v0.1 cross-validation target; v1.7.2 moves it from the P-5 close gate to the correct workstream, does not drop it.
 
 ### (c) Prefix residency enters `headroom_bytes()`, admission benefits follow
 
@@ -871,7 +879,7 @@ Scope:
 
 Acceptance:
 
-- (a-algo) algorithmic parity vs in-test NumPy reference — closed by `tests/test_block_tq_vqbench_xcheck.py` in P-5-A.1c, per §7(a) split. (a-real) — real Qwen activations + vqbench subprocess — defers to P-5-C where the bench harness already owns the subprocess + HF-cache plumbing.
+- (a-algo) algorithmic parity vs in-test NumPy reference — closed by `tests/test_block_tq_vqbench_xcheck.py` in P-5-A.1c, per §7(a) split. (a-real) — real Qwen activations + vqbench subprocess — **post-P-5 required follow-up** (not a P-5 close gate); the bench-harness infrastructure it depends on (`silica.bench.vqbench_baseline` subprocess driver + HF-cache plumbing) is already in place at P-5-C close. See PLAN §7 P-5 Notes and §7(a-real) above for current ownership.
 - New: `tests/test_block_tq.py::test_block_equals_scalar_when_B_equals_d` — shipping the Block invariant vqbench already pins.
 
 Blocked by: P-5-A.0.
