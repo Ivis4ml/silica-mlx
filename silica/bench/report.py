@@ -6,20 +6,24 @@ human-readable half. The output is designed to be pasted directly
 into a PR description or a docs/ note — GitHub-flavoured Markdown,
 wide but fixed-column GFM table, no ANSI escapes, no emoji.
 
-P-5-C.4 step 2 shape:
+P-5-C.5 step 2 shape:
 
-Under multi-seed fan-out (P-5-C.4 step 1 added ``--seeds 42,43,44``
-to the CLI) the runner produces one :class:`ScenarioResult` per
-``(scenario, seed)`` execution, so a ``--scenario A --scenario B
---seeds 42,43`` invocation yields four results. The renderer splits
-that into two audiences:
+Under the 3D fan-out ``--seeds 42,43 --all-kv-codecs`` (or
+``--kv-codec X``) the runner produces one :class:`ScenarioResult`
+per ``(scenario, codec, seed)`` execution, so a
+``--scenario A --scenario B --all-kv-codecs --seeds 42,43``
+invocation yields ``2 * K * 2`` results where ``K = len(CODEC_REGISTRY)``.
+The renderer splits that into two audiences:
 
-  * **Aggregated table** — one row per *scenario* (not per
-    execution). Numeric columns show ``mean ± std`` across the
-    scenario's seeds; deterministic quantities (std == 0) collapse
-    to a single value. Status counts (ok / skipped / failed) sum
-    per-execution so ``ok + skipped + failed`` equals ``runs`` on
-    that row.
+  * **Aggregated table** — one row per ``(scenario, codec)`` arm.
+    Numeric columns show ``mean ± std`` across the arm's seeds;
+    deterministic quantities (std == 0) collapse to a single
+    value. Status counts (ok / skipped / failed) sum per-execution
+    so ``ok + skipped + failed`` equals ``runs`` on that row.
+    Rows are ordered scenario-major (preserving caller's scenario
+    order) with codec sorted alphabetically within each scenario
+    (``None`` first so the "baked / no override" arm, if any,
+    stays at the head of the scenario's row block).
   * **Per-execution detail** — one subsection per raw result,
     heading suffixed ``(seed=<N>)``. Preserves everything a reader
     needed from the old one-row-per-result shape (repo, oracle,
@@ -30,12 +34,12 @@ Input shape:
 
   * ``scenarios`` — the unique scenario list the CLI resolved from
     ``--scenario`` / ``--all``. Each scenario appears once
-    regardless of how many seeds ran against it. The renderer looks
-    up scenario metadata (repo, oracle, description) by id, so
-    caller order is preserved in the table.
+    regardless of how many seeds or codecs ran against it. The
+    renderer looks up scenario metadata (repo, oracle, description)
+    by id, so caller order is preserved in the table.
   * ``results`` — every ``ScenarioResult`` the runner produced, in
-    scenario-major order (``A-seed0, A-seed1, ..., B-seed0, ...``).
-    One row becomes one detail subsection.
+    scenario-major order (``A-c0-s0, A-c0-s1, A-c1-s0, A-c1-s1,
+    B-c0-s0, ...``). One row becomes one detail subsection.
 
 Input invariants (caller bugs, not user errors):
 
@@ -94,24 +98,16 @@ _TOKENS_COLUMN = ("total_tokens", "tokens", ".0f")
 
 
 @dataclass
-class _ScenarioAggregate:
-    """Per-scenario aggregation buffer.
+class _ArmAggregate:
+    """Per-``(scenario, codec)`` aggregation buffer.
 
     Built in a single pass over ``results``; consumed once by the
     table renderer. ``runs`` is the number of ``ScenarioResult``
-    rows seen (including skipped / failed); ``ok``/``skipped``/
-    ``failed`` are per-execution status counts that must sum to
-    ``runs``. Numeric lists exclude ``None`` values so a mix of
-    skipped + ok rows aggregates cleanly — skipped rows contribute
-    to status counts but not to mean / std.
-
-    ``codec_ids`` tracks the distinct ``metadata["codec_id"]``
-    values seen within the bucket. Under C.5 step 1 this must be
-    at most a single value per scenario_id — the renderer
-    aggregates by scenario_id only, so mixing multiple codecs
-    into one bucket would produce a silently-incorrect mean/std
-    that averages across codecs. Step 2 will re-key the aggregation
-    by ``(scenario_id, codec_id)`` and drop the step 1 constraint.
+    rows seen for this arm (including skipped / failed);
+    ``ok``/``skipped``/``failed`` are per-execution status counts
+    that must sum to ``runs``. Numeric lists exclude ``None``
+    values so a mix of skipped + ok rows aggregates cleanly —
+    skipped rows contribute to status counts but not to mean / std.
     """
 
     runs: int = 0
@@ -119,26 +115,33 @@ class _ScenarioAggregate:
     skipped: int = 0
     failed: int = 0
     numeric: dict[str, list[float]] = field(default_factory=dict)
-    codec_ids: set[str | None] = field(default_factory=set)
 
 
-def _aggregate_by_scenario(
+# Bucket key: ``(scenario_id, codec_id)``. ``codec_id`` may be
+# ``None`` for scenarios whose workload does not install a codec
+# (SMOKE / parity rows) and where no override was applied.
+_ArmKey = tuple[str, str | None]
+
+
+def _aggregate_by_scenario_codec(
     results: Sequence[ScenarioResult],
-) -> dict[str, _ScenarioAggregate]:
-    """Bucket ``results`` by ``scenario_id`` for table rendering.
+) -> dict[_ArmKey, _ArmAggregate]:
+    """Bucket ``results`` by ``(scenario_id, codec_id)`` for table rendering.
 
-    Preserves first-seen order of scenario ids via ``dict`` insertion
-    order — callers that iterate the returned mapping in insertion
-    order walk scenarios in the same sequence the results came in,
-    which under scenario-major runner output equals the CLI selection
-    order.
+    Preserves first-seen order of keys via ``dict`` insertion order
+    — callers iterating the returned mapping walk arms in the same
+    sequence the results came in. Under the runner's scenario-major
+    / codec-middle / seed-inner fan-out, this matches the CLI
+    invocation's natural reading order.
     """
-    buckets: dict[str, _ScenarioAggregate] = {}
+    buckets: dict[_ArmKey, _ArmAggregate] = {}
     for r in results:
-        bucket = buckets.get(r.scenario_id)
+        codec_id = r.metadata.get("codec_id") if r.metadata else None
+        key: _ArmKey = (r.scenario_id, codec_id)
+        bucket = buckets.get(key)
         if bucket is None:
-            bucket = _ScenarioAggregate()
-            buckets[r.scenario_id] = bucket
+            bucket = _ArmAggregate()
+            buckets[key] = bucket
         bucket.runs += 1
         if r.status == "ok":
             bucket.ok += 1
@@ -146,14 +149,6 @@ def _aggregate_by_scenario(
             bucket.skipped += 1
         elif r.status == "failed":
             bucket.failed += 1
-
-        # Track codec_id per row so the renderer can reject a
-        # bucket that mixes multiple codecs (step 1 guard; step 2
-        # re-keys by (scenario_id, codec_id) and drops it).
-        codec_id = (
-            r.metadata.get("codec_id") if r.metadata else None
-        )
-        bucket.codec_ids.add(codec_id)
 
         for attr, _col, _spec in (*_NUMERIC_COLUMNS, _TOKENS_COLUMN):
             value = getattr(r, attr, None)
@@ -198,8 +193,8 @@ def render_markdown_report(
     """Return a Markdown report covering ``results``.
 
     ``scenarios`` is the unique scenario list; ``results`` is the
-    full per-execution list (one row per ``(scenario, seed)``
-    under multi-seed fan-out). ``generated_at`` defaults to
+    full per-execution list (one row per ``(scenario, codec, seed)``
+    under 3D fan-out). ``generated_at`` defaults to
     ``datetime.now().isoformat(...)`` when ``None``; tests inject a
     fixed string for determinism.
 
@@ -207,20 +202,15 @@ def render_markdown_report(
 
       * ``scenarios`` contains duplicate ids — the aggregated table
         iterates ``scenarios`` in order, so a duplicate would
-        produce two identical rows pointing at the same aggregate
-        bucket, and the summary's ``Scenarios: total=`` would be
-        inflated by the duplicate selection. Callers (including
-        the CLI) must dedupe upstream; this renderer check is
-        defense-in-depth for direct programmatic callers
+        produce two identical blocks of rows for the same scenario.
+        Callers (including the CLI) must dedupe upstream; this
+        renderer check is defense-in-depth for direct programmatic
+        callers
       * a result references a scenario id not in ``scenarios``
         (unknown id — caller passed inconsistent lists)
-      * a scenario in ``scenarios`` has zero results (runner
-        dropped it silently — suppressing this would hide a bug)
-      * a scenario's results span multiple distinct
-        ``metadata["codec_id"]`` values — under C.5 step 1 the
-        aggregation is keyed by scenario_id only, so averaging
-        across codecs would silently conflate arms. Step 2 lifts
-        this by grouping the table by ``(scenario_id, codec_id)``
+      * a scenario in ``scenarios`` has zero results across all
+        codecs (runner dropped it silently — suppressing this would
+        hide a bug)
     """
     seen_ids: set[str] = set()
     duplicate_ids: list[str] = []
@@ -233,10 +223,10 @@ def render_markdown_report(
         raise ValueError(
             f"render_markdown_report: scenarios list contains "
             f"duplicate id(s) {sorted(set(duplicate_ids))!r}; the "
-            f"aggregated table is keyed by scenario_id, so "
-            f"duplicates would render as identical rows pointing "
-            f"at the same bucket. CLI callers should dedupe "
-            f"upstream (see scripts/bench.py:_dedupe_scenario_ids)"
+            f"aggregated table iterates scenarios in order, so "
+            f"duplicates would render as two identical blocks of "
+            f"rows. CLI callers should dedupe upstream (see "
+            f"scripts/bench.py:_dedupe_scenario_ids)"
         )
     scenario_by_id = {s.id: s for s in scenarios}
     unknown_ids = [
@@ -248,43 +238,18 @@ def render_markdown_report(
             f"scenario id(s) {sorted(set(unknown_ids))!r}; every "
             f"result.scenario_id must appear in the scenarios list"
         )
-    aggregates = _aggregate_by_scenario(results)
-    missing = [s.id for s in scenarios if s.id not in aggregates]
+    aggregates = _aggregate_by_scenario_codec(results)
+    # Zero-results invariant: every scenario must have at least one
+    # arm (one ``codec_id`` value) in the aggregates map. Check by
+    # id alone — any codec_id counts as "scenario did run".
+    scenarios_with_results = {sid for (sid, _codec) in aggregates}
+    missing = [s.id for s in scenarios if s.id not in scenarios_with_results]
     if missing:
         raise ValueError(
             f"render_markdown_report: scenarios {missing!r} have "
             f"zero results — the runner dropped them silently or "
-            f"the caller passed an expanded scenarios list that "
-            f"does not appear in results"
-        )
-    # C.5 step 1 guard: each scenario bucket must have at most one
-    # distinct codec_id. If a caller hands the renderer rows
-    # produced under multiple ``codec_overrides`` entries for the
-    # same scenario (BenchRunner's 3D fan-out can produce this
-    # cleanly; step 1's renderer cannot yet aggregate it without
-    # silently averaging across codecs), fail loudly so the data
-    # error surfaces at report time rather than in a misleading
-    # mean ± std column.
-    mixed_codec: list[tuple[str, list[str | None]]] = []
-    for scenario in scenarios:
-        agg = aggregates[scenario.id]
-        if len(agg.codec_ids) > 1:
-            mixed_codec.append(
-                (
-                    scenario.id,
-                    sorted(agg.codec_ids, key=lambda x: (x is None, x)),
-                )
-            )
-    if mixed_codec:
-        details = "; ".join(
-            f"{sid!r}: {codecs!r}" for sid, codecs in mixed_codec
-        )
-        raise ValueError(
-            f"render_markdown_report: scenario(s) span multiple "
-            f"codec_id values within one aggregation bucket — "
-            f"{details}. Step 1 aggregation is keyed by scenario_id "
-            f"only; P-5-C.5 step 2 re-keys by (scenario_id, "
-            f"codec_id) and lifts this restriction"
+            f"the caller passed a scenarios list with ids that do "
+            f"not appear in any result"
         )
     timestamp = (
         generated_at
@@ -315,13 +280,13 @@ def render_markdown_report(
 def _render_summary_line(
     scenarios: Sequence[Scenario], results: Sequence[ScenarioResult]
 ) -> str:
-    # Status counts sum per-execution, not per-scenario: under
-    # fan-out a single scenario may have mixed-status seeds, and
-    # collapsing that to one status bucket per scenario would
+    # Status counts sum per-execution, not per-arm: under 3D fan-out
+    # a single (scenario, codec) arm may have mixed-status seeds,
+    # and collapsing that to one status bucket per arm would
     # require inventing a "mixed" bucket or picking strictest-
     # wins. Summing executions keeps the arithmetic clean —
-    # ``ok + skipped + failed == runs`` — and the aggregated
-    # table shows per-scenario breakdowns so the information
+    # ``ok + skipped + failed == Runs: total=`` — and the
+    # aggregated table shows per-arm breakdowns so the information
     # is not lost.
     total_runs = len(results)
     total_scenarios = len(scenarios)
@@ -337,18 +302,33 @@ def _render_summary_line(
     )
 
 
+def _codec_sort_key(codec_id: str | None) -> tuple[int, str]:
+    """Sort key for codec ids within a scenario's row block.
+
+    ``None`` sorts before any concrete id (first element of tuple
+    is 0 for ``None``, 1 otherwise), so the "baked arm" (no
+    override applied) shows as the first row of the scenario's
+    block when it appears. Concrete ids sort alphabetically among
+    themselves.
+    """
+    if codec_id is None:
+        return (0, "")
+    return (1, codec_id)
+
+
 def _render_aggregated_table(
     scenarios: Sequence[Scenario],
-    aggregates: dict[str, _ScenarioAggregate],
+    aggregates: dict[_ArmKey, _ArmAggregate],
 ) -> list[str]:
-    # Column set: id + per-run status breakdown + numeric columns
-    # aggregated with mean ± std. Reason column is deliberately not
-    # included — under fan-out different seeds can fail with
-    # different reasons, and either "varied" or a pick-one policy
-    # would be a lossy aggregation. Reasons live in the per-
-    # execution detail section instead.
+    # Column set: id + codec + per-run status breakdown + numeric
+    # columns aggregated with mean ± std. Reason column is
+    # deliberately not included — under fan-out different seeds
+    # can fail with different reasons, and either "varied" or a
+    # pick-one policy would be a lossy aggregation. Reasons live
+    # in the per-execution detail section instead.
     header_cells = [
         "id",
+        "codec",
         "runs",
         "ok",
         "skipped",
@@ -360,38 +340,61 @@ def _render_aggregated_table(
     sep = "| " + " | ".join("---" for _ in header_cells) + " |"
     rows: list[str] = [header, sep]
     for scenario in scenarios:
-        agg = aggregates[scenario.id]
-        cells = [
-            _md_cell(scenario.id),
-            str(agg.runs),
-            str(agg.ok),
-            str(agg.skipped),
-            str(agg.failed),
-        ]
-        for attr, _col, spec in _NUMERIC_COLUMNS:
-            cells.append(
-                _format_mean_std(agg.numeric.get(attr, []), spec)
-            )
-        cells.append(
-            _format_mean_std(
-                agg.numeric.get(_TOKENS_COLUMN[0], []), _TOKENS_COLUMN[2]
-            )
+        # Collect every codec_id that appeared for this scenario,
+        # ordered by ``_codec_sort_key`` (None first, then
+        # alphabetical). One row per (scenario, codec) arm.
+        scenario_codec_ids = sorted(
+            (codec_id for (sid, codec_id) in aggregates if sid == scenario.id),
+            key=_codec_sort_key,
         )
-        rows.append("| " + " | ".join(cells) + " |")
+        for codec_id in scenario_codec_ids:
+            agg = aggregates[(scenario.id, codec_id)]
+            codec_cell = _md_cell(codec_id) if codec_id is not None else ""
+            cells = [
+                _md_cell(scenario.id),
+                codec_cell,
+                str(agg.runs),
+                str(agg.ok),
+                str(agg.skipped),
+                str(agg.failed),
+            ]
+            for attr, _col, spec in _NUMERIC_COLUMNS:
+                cells.append(
+                    _format_mean_std(agg.numeric.get(attr, []), spec)
+                )
+            cells.append(
+                _format_mean_std(
+                    agg.numeric.get(_TOKENS_COLUMN[0], []),
+                    _TOKENS_COLUMN[2],
+                )
+            )
+            rows.append("| " + " | ".join(cells) + " |")
     return rows
 
 
 def _render_scenario_detail(
     scenario: Scenario, result: ScenarioResult
 ) -> list[str]:
-    # Detail heading suffixed with (seed=<N>) so under multi-seed
-    # fan-out each execution has a unique section. Missing seed
-    # (metadata lacks the key) falls back to the plain id — keeps
-    # the renderer robust against pre-C.4 callers / manual test
-    # fixtures that construct ScenarioResult without going through
-    # BenchRunner.
+    # Detail heading parameters identify an execution uniquely
+    # under the 3D fan-out (scenario × codec × seed) that C.5 step
+    # 2 exposed. ``codec`` appears only when the run actually
+    # carried a codec id — pure SMOKE / parity scenarios whose
+    # workload has ``kv_codec=None`` keep the simpler
+    # ``(seed=<N>)`` heading they had in C.4 step 2. Missing keys
+    # (no metadata at all, or only codec_id set) fall back cleanly
+    # so the renderer stays robust against manual fixtures.
     seed = result.metadata.get("seed") if result.metadata else None
-    heading_suffix = f" (seed={seed})" if seed is not None else ""
+    codec_id = (
+        result.metadata.get("codec_id") if result.metadata else None
+    )
+    heading_params: list[str] = []
+    if codec_id is not None:
+        heading_params.append(f"codec={codec_id}")
+    if seed is not None:
+        heading_params.append(f"seed={seed}")
+    heading_suffix = (
+        f" ({', '.join(heading_params)})" if heading_params else ""
+    )
     lines: list[str] = [
         f"### `{scenario.id}`{heading_suffix}",
         "",

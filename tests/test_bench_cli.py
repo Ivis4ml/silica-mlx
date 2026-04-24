@@ -125,10 +125,11 @@ def test_cli_report_md_writes_file(tmp_path: Path) -> None:
     assert text.startswith("# silica-mlx bench report")
     assert "Generated:" in text
     assert "Runs: total=1" in text
-    # Post-C.4 step 2 Markdown header is the aggregated shape; the
-    # terminal-only ``| id | seed | status |`` header belongs to
-    # scripts/bench.py:_print_table, not the report renderer.
-    assert "| id | runs | ok | skipped | failed |" in text
+    # Post-C.5 step 2 Markdown header is the aggregated shape with
+    # codec column; the terminal-only ``| id | codec | seed | status |``
+    # header belongs to scripts/bench.py:_print_table, not the
+    # report renderer.
+    assert "| id | codec | runs | ok | skipped | failed |" in text
     assert "| qwen3-0.6b-smoke |" in text
     assert "### `qwen3-0.6b-smoke`" in text
 
@@ -473,6 +474,151 @@ def test_cli_kv_codec_unknown_id_exits_2(tmp_path: Path) -> None:
     assert "block_tq_b64_b4" in result.stderr
 
 
+def test_cli_kv_codec_and_all_kv_codecs_are_mutually_exclusive(
+    tmp_path: Path,
+) -> None:
+    """argparse's ``mutually_exclusive_group`` rejects
+    ``--kv-codec X --all-kv-codecs`` at parse time with exit 2.
+    CLI-friendly: the user gets a specific 'not allowed with'
+    message rather than a runtime error after loading weights."""
+    result = _run_cli(
+        "--scenario", "qwen3-0.6b-smoke",
+        "--kv-codec", "fp16",
+        "--all-kv-codecs",
+    )
+    assert result.returncode == 2, (
+        f"expected exit 2 for mutex violation, got "
+        f"{result.returncode}; stderr={result.stderr!r}"
+    )
+    # argparse's exact phrasing for mutex violations
+    assert "not allowed with" in result.stderr
+
+
+def test_cli_all_kv_codecs_fans_over_every_registered_codec(
+    tmp_path: Path,
+) -> None:
+    """``--all-kv-codecs`` on a SMOKE scenario (prefix_cache=False)
+    produces K failed rows — one per codec in
+    ``CODEC_REGISTRY`` — each with the attempted codec_id in
+    metadata and a ``codec_override_invalid`` reason.
+
+    Why this particular scenario: SMOKE is deterministically
+    incompatible with any codec (no prefix cache), so all K
+    overrides fail at ``Workload.__post_init__``. That gives a
+    stable test assertion: len(rows) == len(registry). A
+    compatible scenario (e.g. compression-*) would depend on
+    weights being cached and turn into an env-gated test."""
+    from silica.bench.codec_registry import list_codec_ids
+
+    out_path = tmp_path / "all_codecs.jsonl"
+    result = _run_cli(
+        "--scenario", "qwen3-0.6b-smoke",
+        "--all-kv-codecs",
+        "--out", str(out_path),
+    )
+    # Every row failed → exit 1
+    assert result.returncode == 1
+    rows = [
+        json.loads(line)
+        for line in out_path.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    expected_codecs = list_codec_ids()
+    assert len(rows) == len(expected_codecs), (
+        f"expected one row per codec, got {len(rows)} vs "
+        f"{len(expected_codecs)}"
+    )
+    observed_codecs = [row["metadata"]["codec_id"] for row in rows]
+    # Scenario-major / codec middle / seed inner; within the
+    # single scenario the codec order matches the runner's
+    # codec_overrides, which the CLI built from list_codec_ids()
+    # (already sorted). So observed order == expected_codecs.
+    assert observed_codecs == list(expected_codecs)
+    # Every row should be a codec_override_invalid failure.
+    assert all(row["status"] == "failed" for row in rows)
+    assert all(
+        "codec_override_invalid" in row["reason"] for row in rows
+    )
+
+
+def test_cli_all_kv_codecs_combined_with_seeds_is_3d_fan_out(
+    tmp_path: Path,
+) -> None:
+    """Headline step 2 invariant: scenario × codec × seed fan-out
+    produces ``1 * K * M`` JSONL rows. End-to-end coverage that
+    the unit tests on ``_aggregate_by_scenario_codec`` + the
+    subprocess CLI paths actually compose. A regression here
+    would mean either BenchRunner.run drops an axis or the CLI
+    fails to stitch seeds + codecs into codec_overrides × seeds
+    correctly."""
+    from silica.bench.codec_registry import list_codec_ids
+
+    out_path = tmp_path / "all_3d.jsonl"
+    result = _run_cli(
+        "--scenario", "qwen3-0.6b-smoke",
+        "--all-kv-codecs",
+        "--seeds", "42,43",
+        "--out", str(out_path),
+    )
+    assert result.returncode in (0, 1)
+    rows = [
+        json.loads(line)
+        for line in out_path.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    k = len(list_codec_ids())
+    assert len(rows) == k * 2, (
+        f"expected {k * 2} rows (K codecs * 2 seeds), got {len(rows)}"
+    )
+    # Every (codec, seed) pair must appear exactly once.
+    observed_pairs = {
+        (row["metadata"]["codec_id"], row["metadata"]["seed"])
+        for row in rows
+    }
+    expected_pairs = {
+        (codec, seed) for codec in list_codec_ids() for seed in (42, 43)
+    }
+    assert observed_pairs == expected_pairs
+
+
+def test_cli_all_kv_codecs_report_renders_per_codec_rows(
+    tmp_path: Path,
+) -> None:
+    """``--all-kv-codecs --report-md`` produces one aggregated row
+    per ``(scenario, codec)`` arm. For a SMOKE scenario that
+    fails every codec override, we get K failed arms, each with
+    runs=1 failed=1 in the table."""
+    from silica.bench.codec_registry import list_codec_ids
+
+    md_path = tmp_path / "all_codecs.md"
+    result = _run_cli(
+        "--scenario", "qwen3-0.6b-smoke",
+        "--all-kv-codecs",
+        "--report-md", str(md_path),
+    )
+    assert result.returncode in (0, 1)
+    md = md_path.read_text(encoding="utf-8")
+
+    # Summary line reflects K runs (one per codec).
+    k = len(list_codec_ids())
+    assert f"Runs: total={k}" in md
+    assert "Scenarios: total=1" in md
+
+    # One data row per codec in the aggregated table. Count rows
+    # whose first non-separator cell starts with the scenario id.
+    table_start = md.index("## Results")
+    detail_start = md.index("## Scenario details")
+    table_block = md[table_start:detail_start]
+    data_rows = [
+        ln
+        for ln in table_block.splitlines()
+        if ln.startswith("| qwen3-0.6b-smoke |")
+    ]
+    assert len(data_rows) == k, (
+        f"expected {k} per-codec arm rows, got {len(data_rows)}"
+    )
+
+
 def test_cli_kv_codec_on_non_prefix_cache_scenario_produces_failed_row(
     tmp_path: Path,
 ) -> None:
@@ -522,17 +668,19 @@ def test_cli_seeds_default_produces_one_row(tmp_path: Path) -> None:
     assert rows[0]["metadata"]["seed"] == 0
 
 
-def test_cli_terminal_table_includes_seed_column(
+def test_cli_terminal_table_includes_seed_and_codec_columns(
     tmp_path: Path,
 ) -> None:
-    """Under ``--seeds 42,43`` the terminal table prints one row per
-    ``(scenario, seed)`` execution, and each row must be
-    disambiguated by a ``seed`` cell — otherwise a two-seed run
-    renders as two visually-identical rows and the operator
-    cannot tell which seed failed from stdout alone.
+    """Under ``--seeds 42,43`` (and post-C.5 step 2 also
+    ``--all-kv-codecs``) the terminal table prints one row per
+    ``(scenario, codec, seed)`` execution, and each row must be
+    disambiguated by ``codec`` and ``seed`` cells — otherwise a
+    multi-arm run renders as visually-identical rows and the
+    operator cannot tell which arm failed from stdout alone.
 
-    The expected header order is ``| id | seed | status | ...``,
-    and each row carries its seed cell in the second column.
+    Expected header order is ``| id | codec | seed | status | ...``,
+    with codec bound tighter to scenario identity than seed
+    (matches the report's row grouping by (scenario_id, codec_id)).
     """
     result = _run_cli(
         "--scenario", "qwen3-0.6b-smoke",
@@ -541,8 +689,8 @@ def test_cli_terminal_table_includes_seed_column(
     assert result.returncode in (0, 1), (
         f"unexpected exit {result.returncode}; stderr={result.stderr!r}"
     )
-    assert "| id | seed | status |" in result.stdout, (
-        f"expected seed column in header; got:\n{result.stdout}"
+    assert "| id | codec | seed | status |" in result.stdout, (
+        f"expected codec+seed columns in header; got:\n{result.stdout}"
     )
     # Both seed values must appear in their own cell. The full
     # ``| 42 |`` / ``| 43 |`` pattern (with surrounding spaces and

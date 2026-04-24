@@ -107,7 +107,8 @@ def build_parser() -> argparse.ArgumentParser:
             "0 <= seed < 2**32"
         ),
     )
-    p.add_argument(
+    kv_codec_group = p.add_mutually_exclusive_group()
+    kv_codec_group.add_argument(
         "--kv-codec",
         type=str,
         default=None,
@@ -121,6 +122,21 @@ def build_parser() -> argparse.ArgumentParser:
             "Workload guard and surface as failed rows. See "
             "`silica.bench.codec_registry.CODEC_REGISTRY` for the "
             "full list of ids"
+        ),
+    )
+    kv_codec_group.add_argument(
+        "--all-kv-codecs",
+        action="store_true",
+        help=(
+            "fan every scenario over every codec in "
+            "`CODEC_REGISTRY` in sorted order. Equivalent to "
+            "iterating --kv-codec over the full registry in one "
+            "invocation. Mutually exclusive with --kv-codec "
+            "(argparse rejects the combination at parse time). "
+            "Each (scenario, codec, seed) becomes one JSONL row; "
+            "the report groups rows by (scenario_id, codec_id) so "
+            "per-codec mean ± std across seeds is the natural "
+            "aggregation"
         ),
     )
     return p
@@ -189,22 +205,39 @@ def _print_list() -> None:
 
 
 def _print_table(results: Sequence[ScenarioResult]) -> None:
-    # ``seed`` column placed right after ``id`` because under
-    # ``--seeds 42,43`` the terminal would otherwise show two
-    # visually identical rows per scenario; the pairing (id, seed)
-    # is the actual execution identity after C.4 step 1.
+    # Columns pin the (id, codec, seed) triple as the execution
+    # identity post-C.5 step 2. Without the ``codec`` cell,
+    # ``--all-kv-codecs`` would render K seed-adjacent rows per
+    # scenario that only differed in a runner-injected metadata
+    # value and were otherwise visually indistinguishable; the
+    # terminal stream would force a JSONL cross-reference to
+    # disambiguate. ``codec`` goes immediately after ``id`` (and
+    # before ``seed``) because codec binds tighter to scenario
+    # identity — "this scenario under block_tq_b64_b4" reads
+    # naturally, while interleaving codec between seeds would
+    # split a natural mental grouping.
     header = (
-        "| id | seed | status | reason | ttft_ms | decode_tok_s | "
+        "| id | codec | seed | status | reason | ttft_ms | decode_tok_s | "
         "resident_mb | peak_mb | wall_s | tokens |"
     )
     print(header)
-    print("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    print(
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+    )
     for r in results:
-        seed = r.metadata.get("seed", "") if r.metadata else ""
+        metadata = r.metadata or {}
+        seed = metadata.get("seed", "")
+        # ``codec_id`` may be ``None`` (scenarios without
+        # workload.kv_codec, no override applied); render the empty
+        # string to keep the cell visually consistent with missing
+        # numeric values.
+        codec_id = metadata.get("codec_id")
+        codec_cell = codec_id if codec_id is not None else ""
         print(
-            "| {id} | {seed} | {status} | {reason} | {ttft} | {dec} | "
-            "{res} | {peak} | {wall} | {tok} |".format(
+            "| {id} | {codec} | {seed} | {status} | {reason} | "
+            "{ttft} | {dec} | {res} | {peak} | {wall} | {tok} |".format(
                 id=r.scenario_id,
+                codec=codec_cell,
                 seed=seed,
                 status=r.status,
                 reason=r.reason or "",
@@ -298,10 +331,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    # --kv-codec validation: look the id up in the registry at CLI
-    # parse time so an unknown codec exits 2 with the
-    # ``available: ...`` listing, matching the unknown-scenario-id
-    # error shape rather than a deep BenchRunner ValueError.
+    # --kv-codec / --all-kv-codecs validation + expansion. The two
+    # flags are declared mutually exclusive at argparse level, so at
+    # most one is set; main() only decides how to build
+    # codec_overrides from the winner.
+    #
+    # Default (neither flag) → (None,): runner uses each scenario's
+    # baked workload.kv_codec verbatim, no override applied.
+    # --kv-codec X → (X,): single override, validated against
+    # CODEC_REGISTRY at CLI time for a CLI-friendly error shape.
+    # --all-kv-codecs → list_codec_ids(): iterate every registered
+    # codec in alphabetical order. Deliberately excludes the None
+    # "baked arm" — --all-kv-codecs represents "run every codec",
+    # not "run baked + every codec"; users who want the baked arm
+    # plus an override use separate invocations.
     codec_overrides: list[str | None] = [None]
     if args.kv_codec is not None:
         try:
@@ -312,6 +355,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"error: {exc.args[0]}", file=sys.stderr)
             return 2
         codec_overrides = [args.kv_codec]
+    elif args.all_kv_codecs:
+        from silica.bench.codec_registry import list_codec_ids
+
+        codec_overrides = list(list_codec_ids())
 
     runner = BenchRunner(
         out_path=args.out, seeds=seeds, codec_overrides=codec_overrides

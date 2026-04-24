@@ -216,33 +216,39 @@ def test_report_table_row_preserves_scenarios_input_order() -> None:
 
 
 def test_report_table_header_has_aggregate_columns() -> None:
-    """New column set: id + runs + ok/skipped/failed + numeric
-    metrics + tokens. Reason column is gone (moved to detail)."""
+    """Post-C.5 step 2 column set: id + codec + runs +
+    ok/skipped/failed + numeric metrics + tokens. Reason column
+    is gone (moved to detail)."""
     scenarios = [_scenario("one")]
     results = [_result("one")]
     out = render_markdown_report(scenarios, results, generated_at="T")
-    assert "| id | runs | ok | skipped | failed |" in out
+    assert "| id | codec | runs | ok | skipped | failed |" in out
     # reason column must NOT be in the aggregated table
-    assert "| id | runs | ok | skipped | failed | reason |" not in out
+    assert (
+        "| id | codec | runs | ok | skipped | failed | reason |"
+        not in out
+    )
 
 
 def test_report_table_runs_column_reports_count() -> None:
     """The ``runs`` column on each row equals how many ScenarioResults
-    had that scenario id. A drift here would mean the aggregation
-    lost or double-counted executions."""
+    had that (scenario, codec) key. A drift here would mean the
+    aggregation lost or double-counted executions."""
     scenarios = [_scenario("x")]
     results = [_result("x", seed=i) for i in range(5)]
     out = render_markdown_report(scenarios, results, generated_at="T")
-    # Data row looks like "| x | 5 | 5 | 0 | 0 | ..."
+    # Data row looks like "| x |  | 5 | 5 | 0 | 0 | ..." — codec
+    # cell is empty because _result does not set metadata.codec_id.
     data_row = next(
         ln for ln in out.splitlines() if ln.startswith("| x |")
     )
     cells = [c.strip() for c in data_row.strip("| ").split("|")]
     assert cells[0] == "x"
-    assert cells[1] == "5"  # runs
-    assert cells[2] == "5"  # ok
-    assert cells[3] == "0"  # skipped
-    assert cells[4] == "0"  # failed
+    assert cells[1] == ""  # codec (None → empty cell)
+    assert cells[2] == "5"  # runs
+    assert cells[3] == "5"  # ok
+    assert cells[4] == "0"  # skipped
+    assert cells[5] == "0"  # failed
 
 
 # ----- mean ± std rendering ------------------------------------------
@@ -412,6 +418,61 @@ def test_report_detail_heading_includes_seed_suffix() -> None:
     assert "### `multi` (seed=43)" in out
 
 
+def test_report_detail_heading_includes_codec_under_multi_codec_fanout() -> None:
+    """Post-C.5 step 2: when a scenario spans multiple codec arms,
+    the detail heading must disambiguate by codec too. A heading
+    that only said ``(seed=42)`` would duplicate across
+    ``--all-kv-codecs --seeds 42,43`` — once per codec at the
+    same seed — and anchor navigation would collapse onto the
+    first match. Appending ``codec=<id>`` restores uniqueness."""
+    scenarios = [_scenario("multi-arm")]
+    results = [
+        _result(
+            "multi-arm",
+            seed=42,
+            metadata={"codec_id": "fp16"},
+        ),
+        _result(
+            "multi-arm",
+            seed=42,
+            metadata={"codec_id": "block_tq_b64_b4"},
+        ),
+    ]
+    out = render_markdown_report(scenarios, results, generated_at="T")
+    # Both (seed=42) rows must produce distinct headings.
+    assert "### `multi-arm` (codec=fp16, seed=42)" in out
+    assert "### `multi-arm` (codec=block_tq_b64_b4, seed=42)" in out
+    # The plain ``(seed=42)`` form (without codec prefix) must NOT
+    # leak through — that would indicate the heading still mostly
+    # keyed on seed alone.
+    heading_lines = [
+        ln for ln in out.splitlines() if ln.startswith("### `multi-arm`")
+    ]
+    for ln in heading_lines:
+        assert "codec=" in ln, (
+            f"heading missing codec disambiguator: {ln!r}"
+        )
+
+
+def test_report_detail_heading_keeps_seed_only_when_codec_id_is_none() -> None:
+    """Pure SMOKE / parity scenarios have ``codec_id=None`` in
+    metadata and must keep the simpler ``(seed=<N>)`` heading —
+    adding ``codec=None`` would be visual noise for the common
+    non-codec case."""
+    scenarios = [_scenario("no-codec-arm")]
+    results = [
+        _result(
+            "no-codec-arm",
+            seed=42,
+            metadata={"codec_id": None},
+        )
+    ]
+    out = render_markdown_report(scenarios, results, generated_at="T")
+    assert "### `no-codec-arm` (seed=42)" in out
+    # No codec= fragment creeps in under None
+    assert "codec=" not in out
+
+
 def test_report_detail_heading_omits_suffix_when_seed_metadata_missing() -> None:
     """Robustness guard: a ScenarioResult built without going
     through BenchRunner (e.g. in a bench-adjacent test fixture
@@ -511,77 +572,161 @@ def test_report_rejects_scenario_with_zero_results() -> None:
         render_markdown_report(scenarios, results)
 
 
-def test_report_rejects_mixed_codec_ids_within_scenario_bucket() -> None:
-    """C.5 step 1 guard: the aggregation is keyed by scenario_id
-    only, so a scenario whose rows span multiple codec_ids would
-    silently produce a mean ± std row that averages across codecs.
-    Fail loudly until step 2 re-keys by (scenario_id, codec_id).
-
-    BenchRunner's 3D fan-out (scenario × codec × seed) can legally
-    produce this shape when a caller passes multiple codec_overrides;
-    this renderer guard forces the step 1 behavioral commitment
-    ("single codec per scenario in the report") to surface
-    explicitly rather than as a numerical average across arms."""
-    scenarios = [_scenario("mixed")]
-    results = [
-        _result("mixed", seed=0, metadata={"codec_id": "fp16"}, ttft_ms=10.0),
-        _result("mixed", seed=1, metadata={"codec_id": "block_tq_b64_b4"}, ttft_ms=20.0),
-    ]
-    with pytest.raises(ValueError, match="multiple codec_id"):
-        render_markdown_report(scenarios, results)
-
-
-def test_report_accepts_consistent_codec_id_within_scenario_bucket() -> None:
-    """Positive case: if every row of one scenario carries the same
-    ``codec_id`` (either the single override or the baked value),
-    the renderer produces the aggregated row without complaint."""
-    scenarios = [_scenario("same-codec")]
+def test_report_multi_codec_scenario_produces_one_row_per_codec() -> None:
+    """Post-C.5 step 2 positive: a scenario with rows across
+    multiple codec_ids aggregates into K arm rows, one per codec.
+    The step 1 rejection guard is gone because the aggregation
+    key is now ``(scenario_id, codec_id)``, not just ``scenario_id``."""
+    scenarios = [_scenario("multi")]
     results = [
         _result(
-            "same-codec",
+            "multi", seed=0, metadata={"codec_id": "fp16"}, ttft_ms=10.0
+        ),
+        _result(
+            "multi",
+            seed=0,
+            metadata={"codec_id": "block_tq_b64_b4"},
+            ttft_ms=20.0,
+        ),
+    ]
+    out = render_markdown_report(scenarios, results, generated_at="T")
+    # Two data rows, each carrying a distinct codec cell.
+    data_rows = [
+        ln for ln in out.splitlines() if ln.startswith("| multi |")
+    ]
+    assert len(data_rows) == 2
+    # Same scenario_id appears twice; the second cell disambiguates.
+    codecs_seen = [ln.split("|")[2].strip() for ln in data_rows]
+    assert codecs_seen == ["block_tq_b64_b4", "fp16"]  # alpha sort
+    # Each arm's ttft cell reflects only its own codec's row.
+    assert "| 10.0 |" in out  # fp16 single-seed value
+    assert "| 20.0 |" in out  # block_tq single-seed value
+
+
+def test_report_none_and_concrete_codec_produce_separate_rows() -> None:
+    """C.5 step 1 rejected ``None`` + concrete id in the same
+    bucket; step 2 accepts them as two distinct arms (the baked /
+    no-override arm vs the explicit codec arm). ``None`` sorts
+    before concrete ids per ``_codec_sort_key``."""
+    scenarios = [_scenario("mixed-none")]
+    results = [
+        _result(
+            "mixed-none", seed=0, metadata={"codec_id": None}, ttft_ms=5.0
+        ),
+        _result(
+            "mixed-none",
             seed=0,
             metadata={"codec_id": "fp16"},
-            ttft_ms=10.0,
+            ttft_ms=15.0,
+        ),
+    ]
+    out = render_markdown_report(scenarios, results, generated_at="T")
+    data_rows = [
+        ln for ln in out.splitlines() if ln.startswith("| mixed-none |")
+    ]
+    assert len(data_rows) == 2
+    codec_cells = [ln.split("|")[2].strip() for ln in data_rows]
+    # None first, concrete id second (sort key: (0, "") < (1, "fp16"))
+    assert codec_cells == ["", "fp16"]
+
+
+def test_report_uniform_none_codec_aggregates_to_single_arm() -> None:
+    """The SMOKE / parity row baseline case: every row carries
+    ``codec_id=None`` (no override, scenario has no baked kv_codec).
+    Aggregates to one ``codec=None`` arm, not N separate rows."""
+    scenarios = [_scenario("plain")]
+    results = [
+        _result("plain", seed=0, metadata={"codec_id": None}),
+        _result("plain", seed=1, metadata={"codec_id": None}),
+    ]
+    out = render_markdown_report(scenarios, results, generated_at="T")
+    data_rows = [
+        ln for ln in out.splitlines() if ln.startswith("| plain |")
+    ]
+    assert len(data_rows) == 1
+    # codec cell renders as empty string for None
+    assert data_rows[0].split("|")[2].strip() == ""
+
+
+def test_report_multi_codec_multi_seed_aggregates_per_arm() -> None:
+    """Seed fan-out within each ``(scenario, codec)`` arm collapses
+    to ``mean ± std`` per arm. Cross-codec averaging would
+    conflate arms; this test pins that each arm aggregates
+    independently."""
+    scenarios = [_scenario("arm-agg")]
+    results = [
+        _result(
+            "arm-agg", seed=0, metadata={"codec_id": "fp16"}, ttft_ms=10.0
         ),
         _result(
-            "same-codec",
+            "arm-agg", seed=1, metadata={"codec_id": "fp16"}, ttft_ms=14.0
+        ),
+        _result(
+            "arm-agg",
+            seed=0,
+            metadata={"codec_id": "block_tq_b64_b4"},
+            ttft_ms=20.0,
+        ),
+        _result(
+            "arm-agg",
             seed=1,
-            metadata={"codec_id": "fp16"},
-            ttft_ms=14.0,
+            metadata={"codec_id": "block_tq_b64_b4"},
+            ttft_ms=28.0,
         ),
     ]
     out = render_markdown_report(scenarios, results, generated_at="T")
-    assert "| same-codec |" in out
-    # mean=12, stdev of [10,14]=sqrt(8)≈2.828 → "12.0 ± 2.8"
+    # fp16 arm: mean=12, stdev of [10, 14] = sqrt(8) ≈ 2.828
+    # → "12.0 ± 2.8" with .1f
     assert "12.0 ± 2.8" in out
+    # block_tq arm: mean=24, stdev of [20, 28] = sqrt(32) ≈ 5.657
+    # → "24.0 ± 5.7" with .1f
+    assert "24.0 ± 5.7" in out
 
 
-def test_report_accepts_none_codec_id_uniform_within_bucket() -> None:
-    """The codec_id uniqueness check treats ``None`` as a legitimate
-    value (SMOKE scenarios that don't set kv_codec). Uniform
-    ``codec_id=None`` across a scenario's rows must not fire the
-    mixed-codec rejection."""
-    scenarios = [_scenario("no-codec")]
+def test_report_codec_rows_sorted_none_first_then_alpha() -> None:
+    """Within a scenario's block of arm rows, ordering is:
+    ``None`` (if present) first, then concrete codec ids in
+    alphabetical order. Stable ordering matters for PR review
+    diffs — two runs with the same codec set must produce the
+    same row order."""
+    scenarios = [_scenario("ordering")]
     results = [
-        _result("no-codec", seed=0, metadata={"codec_id": None}),
-        _result("no-codec", seed=1, metadata={"codec_id": None}),
+        _result(
+            "ordering",
+            seed=0,
+            metadata={"codec_id": "fp16"},
+            ttft_ms=1.0,
+        ),
+        _result(
+            "ordering",
+            seed=0,
+            metadata={"codec_id": "block_tq_b64_b4"},
+            ttft_ms=2.0,
+        ),
+        _result(
+            "ordering",
+            seed=0,
+            metadata={"codec_id": None},
+            ttft_ms=3.0,
+        ),
+        _result(
+            "ordering",
+            seed=0,
+            metadata={"codec_id": "ext_rabitq_b4"},
+            ttft_ms=4.0,
+        ),
     ]
-    # No exception
     out = render_markdown_report(scenarios, results, generated_at="T")
-    assert "| no-codec |" in out
-
-
-def test_report_rejects_mixed_none_and_codec_id_in_bucket() -> None:
-    """``None`` vs a concrete codec id still counts as a mixed
-    bucket — semantically 'baked (None)' vs 'override (fp16)' is
-    a meaningful arm distinction that step 1 cannot aggregate."""
-    scenarios = [_scenario("partial")]
-    results = [
-        _result("partial", seed=0, metadata={"codec_id": None}),
-        _result("partial", seed=1, metadata={"codec_id": "fp16"}),
+    data_rows = [
+        ln for ln in out.splitlines() if ln.startswith("| ordering |")
     ]
-    with pytest.raises(ValueError, match="multiple codec_id"):
-        render_markdown_report(scenarios, results)
+    codec_cells = [ln.split("|")[2].strip() for ln in data_rows]
+    assert codec_cells == [
+        "",  # None first
+        "block_tq_b64_b4",
+        "ext_rabitq_b4",
+        "fp16",
+    ]
 
 
 def test_report_rejects_duplicate_scenario_ids() -> None:
@@ -626,7 +771,7 @@ def test_report_handles_empty_inputs() -> None:
     assert "ok=0 skipped=0 failed=0" in out
     # Table still renders header + separator even with zero rows so
     # downstream renderers do not need to special-case empty runs.
-    assert "| id | runs | ok | skipped | failed |" in out
+    assert "| id | codec | runs | ok | skipped | failed |" in out
 
 
 def test_report_metadata_block_is_valid_json() -> None:
