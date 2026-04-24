@@ -139,6 +139,35 @@ def build_parser() -> argparse.ArgumentParser:
             "aggregation"
         ),
     )
+    p.add_argument(
+        "--vqbench-xcheck",
+        action="store_true",
+        help=(
+            "for every PPL scenario that declares vqbench_xcheck "
+            "metadata, invoke the configured vqbench reproduce "
+            "script in a subprocess after silica's own oracle "
+            "succeeds. Results are flattened into metadata with "
+            "``vqbench_`` prefix (ppl_fp16, ppl_quant, delta_ppl, "
+            "wall_s, stdout_tail, ...). Step 1 observability "
+            "only; divergence gate (|silica - vqbench| / silica "
+            "< 0.01) is C.6 step 2"
+        ),
+    )
+    p.add_argument(
+        "--vqbench-python",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Python interpreter for the vqbench subprocess. "
+            "Defaults to sys.executable, but silica-mlx's venv "
+            "does not carry vqbench's torch / transformers deps; "
+            "typical usage points this at a dedicated vqbench "
+            "venv's python (e.g. "
+            "/path/to/vqbench-venv/bin/python). Only meaningful "
+            "with --vqbench-xcheck"
+        ),
+    )
     return p
 
 
@@ -360,8 +389,34 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         codec_overrides = list(list_codec_ids())
 
+    # P-5-C.6 step 1: --vqbench-xcheck warn-once. When the flag is
+    # set AND the user did not supply --vqbench-python AND at least
+    # one selected scenario declares vqbench_xcheck, emit a single
+    # stderr warning: sys.executable is almost certainly NOT a
+    # vqbench venv (silica-mlx's venv doesn't carry torch /
+    # transformers), so the subprocess will fail the reproduce
+    # script's imports. Loud-fail behavior stays downstream; this
+    # warning is UX nudge, not blocker.
+    if (
+        args.vqbench_xcheck
+        and args.vqbench_python is None
+        and any(s.vqbench_xcheck is not None for s in scenarios)
+    ):
+        print(
+            f"warning: --vqbench-xcheck active but --vqbench-python "
+            f"not set; falling back to {sys.executable} which "
+            f"likely does not carry vqbench's torch / transformers "
+            f"deps. Pass --vqbench-python /path/to/vqbench-venv/bin/"
+            f"python to silence",
+            file=sys.stderr,
+        )
+
     runner = BenchRunner(
-        out_path=args.out, seeds=seeds, codec_overrides=codec_overrides
+        out_path=args.out,
+        seeds=seeds,
+        codec_overrides=codec_overrides,
+        vqbench_xcheck_enabled=args.vqbench_xcheck,
+        vqbench_python=args.vqbench_python,
     )
     results = runner.run(scenarios)
     _print_table(results)

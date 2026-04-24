@@ -133,7 +133,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from silica.bench.scenario import OracleKind, Scenario, Workload
+from silica.bench.scenario import (
+    OracleKind,
+    Scenario,
+    VqbenchXcheckSpec,
+    Workload,
+)
+from silica.bench.vqbench_baseline import default_reproduce_script_path
 
 _QWEN3_0_6B_SMOKE = Scenario(
     id="qwen3-0.6b-smoke",
@@ -883,7 +889,19 @@ _QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4 = Scenario(
         "the configuration on Qwen3-0.6B; the row emits a raw PPL "
         "number at step 3a. ΔPPL against the fp16 baseline is a "
         "downstream computation (bench report / C.6 vqbench "
-        "cross-check), not wired into the per-row runner in 3a."
+        "cross-check), not wired into the per-row runner in 3a. "
+        "C.6 step 1 wires this row through --vqbench-xcheck so a "
+        "side-by-side vqbench PPL lands in metadata.vqbench_*."
+    ),
+    # P-5-C.6 step 1 live demo. Runner auto-appends --model /
+    # --seed / --chunk / --max-tokens from execution context; the
+    # spec only carries the fixed bits (method name, bit width,
+    # BlockTQ-specific --block-size + --patch-v flags).
+    vqbench_xcheck=VqbenchXcheckSpec(
+        script_path=str(default_reproduce_script_path()),
+        method="BlockTurboQuantMSE",
+        bits=4,
+        extra_args=("--block-size", "64", "--patch-v"),
     ),
 )
 

@@ -2158,3 +2158,466 @@ class TestJsonlMultiSeedRoundTrip:
         rows = [json.loads(line) for line in raw]
         assert [row["metadata"]["seed"] for row in rows] == [10, 11, 12]
         assert all(row["scenario_id"] == "jsonl-seed" for row in rows)
+
+
+# ---------- P-5-C.6 step 1 — vqbench xcheck plumbing ----------------
+
+
+from silica.bench.scenario import VqbenchXcheckSpec  # noqa: E402
+from silica.bench.vqbench_baseline import VqbenchBaselineResult  # noqa: E402
+
+
+class TestScenarioVqbenchXcheckPPLGuard:
+    """Scenario.__post_init__ enforces vqbench_xcheck only on PPL
+    scenarios. This is authoring-time validation: mismatched oracle
+    surfaces as ValueError at Scenario construction rather than a
+    silent skip during a bench run."""
+
+    def test_vqbench_xcheck_on_ppl_scenario_accepted(self) -> None:
+        # The PPL oracle expects oracle_config["wikitext_path"]; not
+        # required to exist for this __post_init__ test — we're
+        # probing the oracle-kind guard, not running the oracle.
+        Scenario(
+            id="ppl-ok",
+            repo="demo/repo",
+            workload=Workload(
+                name="w",
+                prompts=(),
+                max_tokens=0,
+                max_batch_size=1,
+                prefix_cache=True,
+                kv_codec="fp16",
+            ),
+            oracle=OracleKind.PPL,
+            vqbench_xcheck=VqbenchXcheckSpec(
+                script_path="/tmp/whatever.py",
+                method="BlockTurboQuantMSE",
+                bits=4,
+            ),
+        )
+
+    @pytest.mark.parametrize(
+        "oracle",
+        [
+            OracleKind.SMOKE,
+            OracleKind.B1_PARITY_VS_SINGLE,
+            OracleKind.BGT1_DIRECT_BATCHED_REFERENCE,
+            OracleKind.TEACHER_FORCED_ARGMAX,
+            OracleKind.DECODE_TOK_S_WITH_PREFIX_HIT,
+            OracleKind.STORAGE,
+            OracleKind.ADMISSION_HEADROOM,
+        ],
+    )
+    def test_vqbench_xcheck_on_non_ppl_scenario_rejected(
+        self, oracle: OracleKind
+    ) -> None:
+        """Every non-PPL oracle kind must loud-fail at Scenario
+        construction when vqbench_xcheck is set."""
+        with pytest.raises(ValueError, match="only meaningful on OracleKind.PPL"):
+            Scenario(
+                id=f"bad-{oracle.value}",
+                repo="demo/repo",
+                workload=Workload(
+                    name="w",
+                    prompts=("p",),
+                    max_tokens=1,
+                    max_batch_size=1,
+                ),
+                oracle=oracle,
+                vqbench_xcheck=VqbenchXcheckSpec(
+                    script_path="/tmp/whatever.py",
+                    method="Foo",
+                    bits=4,
+                ),
+            )
+
+
+def _ppl_scenario_with_xcheck(
+    scenario_id: str,
+    repo: str,
+    *,
+    wikitext_path: str,
+    kv_codec: str = "fp16",
+    vqbench_xcheck: VqbenchXcheckSpec | None = None,
+) -> Scenario:
+    """Build a minimal PPL scenario used by vqbench-xcheck runner
+    tests. oracle_config carries wikitext_path / chunk_size /
+    max_tokens so the real ``_run_ppl`` would find them — but the
+    tests inject a stubbed oracle so the real path never runs."""
+    return Scenario(
+        id=scenario_id,
+        repo=repo,
+        workload=Workload(
+            name=f"{scenario_id}-wl",
+            prompts=(),
+            max_tokens=0,
+            max_batch_size=1,
+            prefix_cache=True,
+            kv_codec=kv_codec,
+        ),
+        oracle=OracleKind.PPL,
+        oracle_config={
+            "wikitext_path": wikitext_path,
+            "chunk_size": 128,
+            "max_tokens": 256,
+        },
+        vqbench_xcheck=vqbench_xcheck,
+    )
+
+
+def _stub_ppl_run(
+    _scenario: Scenario, _adapter: Any
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Stub for silica.bench.runner._run_ppl — returns a success
+    payload + oracle_context matching the real shape so the runner
+    can proceed through the ``ok`` branch without loading wikitext
+    or a real model. Used via monkeypatch in vqbench xcheck tests."""
+    return (
+        {"nll_sum": 1.5, "n_tokens": 128, "ppl": 3.14},
+        {
+            "chunk_size": 128,
+            "max_tokens": 256,
+            "wikitext_path": "/nowhere",
+            "kv_codec": _scenario.workload.kv_codec,
+        },
+    )
+
+
+def _write_fake_wikitext(tmp_path: Path) -> str:
+    """Create a tiny WikiText file under ``tmp_path`` so the PPL
+    scenario's ``_check_gates`` passes its ``is_file()`` check.
+    Returns the absolute path string the scenario authors would
+    pass in ``oracle_config['wikitext_path']``."""
+    p = tmp_path / "fake_wikitext.txt"
+    p.write_text("hello world " * 200, encoding="utf-8")
+    return str(p)
+
+
+class TestVqbenchXcheckFlagOff:
+    def test_no_vqbench_keys_in_metadata_when_flag_off(
+        self, fake_home_cache: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Default ``vqbench_xcheck_enabled=False`` — no vqbench_*
+        keys appear in metadata regardless of scenario spec."""
+        import silica.bench.runner as runner_module
+
+        monkeypatch.setattr(runner_module, "_run_ppl", _stub_ppl_run)
+        repo = "test-owner/xcheck-off"
+        _create_cache_dir(repo)
+        scenario = _ppl_scenario_with_xcheck(
+            "xcheck-off",
+            repo,
+            wikitext_path=_write_fake_wikitext(fake_home_cache),
+            vqbench_xcheck=VqbenchXcheckSpec(
+                script_path="/tmp/x.py", method="Foo", bits=4
+            ),
+        )
+
+        adapter = _FakeAdapter(vocab_size=50)
+        engine = _FakeEngine([])
+        runner = BenchRunner(
+            engine_factory=_factory_returning(adapter, engine),
+            reset_peak=lambda: None,
+            read_peak_mb=lambda: None,
+        )
+        [result] = runner.run([scenario])
+        assert result.status == "ok"
+        # No vqbench_* keys should be present anywhere in metadata.
+        assert not any(
+            k.startswith("vqbench_") for k in result.metadata
+        )
+
+
+class TestVqbenchXcheckScenarioNotDeclared:
+    def test_flag_on_no_spec_marks_scenario_not_declared(
+        self, fake_home_cache: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Flag-on + scenario without ``vqbench_xcheck`` → status
+        recorded as ``scenario_not_declared``. Distinguishes "no
+        opt-in at scenario-author level" from "declared but silica
+        failed"."""
+        import silica.bench.runner as runner_module
+
+        monkeypatch.setattr(runner_module, "_run_ppl", _stub_ppl_run)
+        repo = "test-owner/xcheck-no-spec"
+        _create_cache_dir(repo)
+        scenario = _ppl_scenario_with_xcheck(
+            "xcheck-no-spec",
+            repo,
+            wikitext_path=_write_fake_wikitext(fake_home_cache),
+            vqbench_xcheck=None,
+        )
+
+        called: list[Any] = []
+
+        def fake_vqbench(*args: Any, **kwargs: Any) -> VqbenchBaselineResult:
+            called.append((args, kwargs))
+            raise AssertionError("vqbench must not run when spec absent")
+
+        runner = BenchRunner(
+            engine_factory=_factory_returning(
+                _FakeAdapter(vocab_size=50), _FakeEngine([])
+            ),
+            reset_peak=lambda: None,
+            read_peak_mb=lambda: None,
+            vqbench_xcheck_enabled=True,
+            vqbench_runner=fake_vqbench,
+        )
+        [result] = runner.run([scenario])
+        assert result.status == "ok"
+        assert result.metadata["vqbench_status"] == "scenario_not_declared"
+        assert called == []
+
+
+class TestVqbenchXcheckSilicaOracleNotOk:
+    def test_silica_gate_skipped_row_records_silica_oracle_not_ok(
+        self, fake_home_cache: Path
+    ) -> None:
+        """Scenario with xcheck declared but gate-skipped (cache
+        missing) → ``silica_oracle_not_ok``. Silica never ran, so
+        vqbench comparison would be meaningless."""
+        # Cache missing for this repo; gate skip fires.
+        scenario = _ppl_scenario_with_xcheck(
+            "xcheck-cache-missing",
+            "test-owner/never-cached-xcheck",
+            wikitext_path="/nowhere",
+            vqbench_xcheck=VqbenchXcheckSpec(
+                script_path="/tmp/x.py", method="Foo", bits=4
+            ),
+        )
+        runner = BenchRunner(
+            engine_factory=lambda _s: (_ for _ in ()).throw(
+                AssertionError("factory must not run")
+            ),
+            reset_peak=lambda: None,
+            read_peak_mb=lambda: None,
+            vqbench_xcheck_enabled=True,
+            vqbench_runner=lambda *a, **kw: (_ for _ in ()).throw(
+                AssertionError("vqbench must not run on silica-not-ok")
+            ),
+        )
+        [result] = runner.run([scenario])
+        assert result.status == "skipped"
+        assert result.metadata["vqbench_status"] == "silica_oracle_not_ok"
+
+
+class TestVqbenchXcheckOverrideDiffers:
+    def test_codec_override_differs_from_baked_skips_with_diagnostic(
+        self, fake_home_cache: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Scenario baked with ``kv_codec='fp16'`` and vqbench_xcheck
+        declared for that arm; user overrides with ``kv_codec='block_tq_b64_b4'``.
+        Spec was authored for fp16's method/bits — running vqbench
+        against block_tq would compare different codecs' PPL. Skip
+        with ``override_differs_from_declared_arm`` + diagnostic
+        fields naming both arms."""
+        import silica.bench.runner as runner_module
+
+        monkeypatch.setattr(runner_module, "_run_ppl", _stub_ppl_run)
+        repo = "test-owner/xcheck-arm-mismatch"
+        _create_cache_dir(repo)
+        scenario = _ppl_scenario_with_xcheck(
+            "xcheck-arm-mismatch",
+            repo,
+            wikitext_path=_write_fake_wikitext(fake_home_cache),
+            kv_codec="fp16",
+            vqbench_xcheck=VqbenchXcheckSpec(
+                script_path="/tmp/x.py",
+                method="IdentityCodec",
+                bits=16,
+            ),
+        )
+
+        runner = BenchRunner(
+            engine_factory=_factory_returning(
+                _FakeAdapter(vocab_size=50), _FakeEngine([])
+            ),
+            reset_peak=lambda: None,
+            read_peak_mb=lambda: None,
+            codec_overrides=("block_tq_b64_b4",),
+            vqbench_xcheck_enabled=True,
+            vqbench_runner=lambda *a, **kw: (_ for _ in ()).throw(
+                AssertionError("vqbench must not run on arm mismatch")
+            ),
+        )
+        [result] = runner.run([scenario])
+        assert result.status == "ok"
+        assert (
+            result.metadata["vqbench_status"]
+            == "override_differs_from_declared_arm"
+        )
+        assert result.metadata["vqbench_declared_arm"] == "fp16"
+        assert result.metadata["vqbench_effective_arm"] == "block_tq_b64_b4"
+
+
+class TestVqbenchXcheckOkPath:
+    def test_all_conditions_met_invokes_vqbench_and_flattens_result(
+        self, fake_home_cache: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Happy path: flag on + spec present + silica ok + arm
+        matches. Runner invokes vqbench with auto-appended args and
+        flattens the entire VqbenchBaselineResult into
+        vqbench_-prefixed metadata."""
+        import silica.bench.runner as runner_module
+
+        monkeypatch.setattr(runner_module, "_run_ppl", _stub_ppl_run)
+        repo = "test-owner/xcheck-happy"
+        _create_cache_dir(repo)
+        scenario = _ppl_scenario_with_xcheck(
+            "xcheck-happy",
+            repo,
+            wikitext_path=_write_fake_wikitext(fake_home_cache),
+            kv_codec="block_tq_b64_b4",
+            vqbench_xcheck=VqbenchXcheckSpec(
+                script_path="/tmp/reproduce.py",
+                method="BlockTurboQuantMSE",
+                bits=4,
+                extra_args=("--block-size", "64", "--patch-v"),
+            ),
+        )
+
+        captured_args: list[Any] = []
+
+        def fake_vqbench(
+            script: Any,
+            script_args: Any = None,
+            **kwargs: Any,
+        ) -> VqbenchBaselineResult:
+            captured_args.append((script, list(script_args or []), kwargs))
+            return VqbenchBaselineResult(
+                status="ok",
+                script=str(script),
+                python_executable="/fake/python",
+                script_args=tuple(script_args or ()),
+                model="Qwen/Qwen3-0.6B",
+                method="BlockTurboQuantMSE",
+                bits=4,
+                ppl_fp16=3.10,
+                ppl_quant=3.15,
+                delta_ppl=0.05,
+                delta_pct=1.61,
+                wall_s=42.0,
+                returncode=0,
+                stdout_tail="tail lines here",
+            )
+
+        runner = BenchRunner(
+            engine_factory=_factory_returning(
+                _FakeAdapter(vocab_size=50), _FakeEngine([])
+            ),
+            reset_peak=lambda: None,
+            read_peak_mb=lambda: None,
+            seeds=(42,),
+            vqbench_xcheck_enabled=True,
+            vqbench_python="/fake/python",
+            vqbench_runner=fake_vqbench,
+        )
+        [result] = runner.run([scenario])
+        assert result.status == "ok"
+
+        # Vqbench was invoked exactly once with the right shape.
+        assert len(captured_args) == 1
+        script, args, kwargs = captured_args[0]
+        assert script == "/tmp/reproduce.py"
+        # python_executable is the CLI-passed value, threaded via
+        # BenchRunner's vqbench_python.
+        assert kwargs.get("python_executable") == "/fake/python"
+        # Auto-appended args in fixed order: model, seed, method,
+        # bits, chunk, max-tokens, then extra_args.
+        assert args == [
+            "--model", repo,
+            "--seed", "42",
+            "--method", "BlockTurboQuantMSE",
+            "--bits", "4",
+            "--chunk", "128",
+            "--max-tokens", "256",
+            "--block-size", "64",
+            "--patch-v",
+        ]
+
+        # All 15 VqbenchBaselineResult fields flattened with prefix.
+        md = result.metadata
+        assert md["vqbench_status"] == "ok"
+        assert md["vqbench_script"] == "/tmp/reproduce.py"
+        assert md["vqbench_python_executable"] == "/fake/python"
+        assert md["vqbench_model"] == "Qwen/Qwen3-0.6B"
+        assert md["vqbench_method"] == "BlockTurboQuantMSE"
+        assert md["vqbench_bits"] == 4
+        assert md["vqbench_ppl_fp16"] == 3.10
+        assert md["vqbench_ppl_quant"] == 3.15
+        assert md["vqbench_delta_ppl"] == 0.05
+        assert md["vqbench_delta_pct"] == 1.61
+        assert md["vqbench_wall_s"] == 42.0
+        assert md["vqbench_returncode"] == 0
+        assert md["vqbench_stdout_tail"] == "tail lines here"
+        # reason was None on success; flattened as None, not absent.
+        assert md["vqbench_reason"] is None
+
+    def test_vqbench_auto_append_uses_oracle_context_chunk_values(
+        self, fake_home_cache: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """--chunk and --max-tokens must come from the PPL oracle's
+        returned context, not re-read from oracle_config. This
+        catches a regression where chunk drifted between
+        silica oracle and vqbench subprocess."""
+        import silica.bench.runner as runner_module
+
+        def ppl_with_custom_context(
+            _scenario: Scenario, _adapter: Any
+        ) -> tuple[dict[str, Any], dict[str, Any]]:
+            return (
+                {"nll_sum": 1.0, "n_tokens": 50, "ppl": 2.0},
+                {
+                    "chunk_size": 999,  # diverges from oracle_config
+                    "max_tokens": 1111,
+                    "wikitext_path": "/nowhere",
+                    "kv_codec": "fp16",
+                },
+            )
+
+        monkeypatch.setattr(
+            runner_module, "_run_ppl", ppl_with_custom_context
+        )
+
+        repo = "test-owner/xcheck-context-chunk"
+        _create_cache_dir(repo)
+        scenario = _ppl_scenario_with_xcheck(
+            "xcheck-context-chunk",
+            repo,
+            wikitext_path=_write_fake_wikitext(fake_home_cache),
+            kv_codec="fp16",
+            vqbench_xcheck=VqbenchXcheckSpec(
+                script_path="/tmp/reproduce.py",
+                method="IdentityCodec",
+                bits=16,
+            ),
+        )
+
+        captured_args: list[Any] = []
+
+        def fake_vqbench(
+            script: Any, script_args: Any = None, **kwargs: Any
+        ) -> VqbenchBaselineResult:
+            captured_args.append(list(script_args or []))
+            return VqbenchBaselineResult(status="ok")
+
+        runner = BenchRunner(
+            engine_factory=_factory_returning(
+                _FakeAdapter(vocab_size=50), _FakeEngine([])
+            ),
+            reset_peak=lambda: None,
+            read_peak_mb=lambda: None,
+            vqbench_xcheck_enabled=True,
+            vqbench_runner=fake_vqbench,
+        )
+        runner.run([scenario])
+        assert captured_args == [
+            [
+                "--model", repo,
+                "--seed", "0",
+                "--method", "IdentityCodec",
+                "--bits", "16",
+                "--chunk", "999",
+                "--max-tokens", "1111",
+            ]
+        ]

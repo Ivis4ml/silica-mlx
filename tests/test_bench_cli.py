@@ -474,6 +474,79 @@ def test_cli_kv_codec_unknown_id_exits_2(tmp_path: Path) -> None:
     assert "block_tq_b64_b4" in result.stderr
 
 
+def test_cli_vqbench_xcheck_flag_is_parseable(tmp_path: Path) -> None:
+    """``--vqbench-xcheck`` is a store_true flag; the parser must
+    accept it alongside other flags without requiring a value.
+    Smoke test that the flag propagates without breaking the
+    default CLI path."""
+    result = _run_cli(
+        "--scenario", "qwen3-0.6b-smoke",
+        "--vqbench-xcheck",
+    )
+    # qwen3-0.6b-smoke is SMOKE (not PPL) so vqbench_xcheck cannot
+    # be declared on it (Scenario.__post_init__ enforced). The
+    # runner sees flag-on + no spec → vqbench_status="scenario_not_declared".
+    # Row still runs silica successfully (or skips on cache miss);
+    # exit code is 0 or 1 either way.
+    assert result.returncode in (0, 1), (
+        f"unexpected exit {result.returncode}; stderr={result.stderr!r}"
+    )
+
+
+def test_cli_vqbench_python_flag_requires_a_value(
+    tmp_path: Path,
+) -> None:
+    """``--vqbench-python`` takes a string value; passing it bare
+    must trigger argparse's "expected one argument" error."""
+    result = _run_cli(
+        "--scenario", "qwen3-0.6b-smoke",
+        "--vqbench-python",
+    )
+    assert result.returncode == 2
+    assert "expected one argument" in result.stderr
+
+
+def test_cli_vqbench_xcheck_warns_on_sys_executable_with_declared_scenario(
+    tmp_path: Path,
+) -> None:
+    """Warn-once: --vqbench-xcheck + declared scenario + no
+    --vqbench-python → single stderr warning naming
+    sys.executable. On ``qwen3-0.6b-wikitext-ppl-block-tq-b64-b4``
+    (the live demo with vqbench_xcheck populated) we expect the
+    warning to fire.
+
+    The actual vqbench subprocess will fail because silica-mlx's
+    venv doesn't carry torch — but the warning happens BEFORE the
+    subprocess, so it fires regardless of whether the scenario
+    gate-passes or not. We assert the warning text alone; exit
+    code is not pinned."""
+    result = _run_cli(
+        "--scenario", "qwen3-0.6b-wikitext-ppl-block-tq-b64-b4",
+        "--vqbench-xcheck",
+    )
+    # Warning appears on stderr; regardless of whether scenario
+    # skipped (wikitext missing on CI) or reached the silica oracle.
+    assert "warning:" in result.stderr
+    assert "--vqbench-python" in result.stderr
+
+
+def test_cli_vqbench_xcheck_no_warning_when_no_declared_scenario(
+    tmp_path: Path,
+) -> None:
+    """If every selected scenario lacks vqbench_xcheck (e.g. a
+    SMOKE row), the warn-once should NOT fire — the warning is
+    for a real scenario+flag combination that needs a vqbench
+    python, not a CLI flag misfire."""
+    result = _run_cli(
+        "--scenario", "qwen3-0.6b-smoke",
+        "--vqbench-xcheck",
+    )
+    # qwen3-0.6b-smoke has no vqbench_xcheck spec, so the warning
+    # block gated on "any scenario declares vqbench_xcheck" must
+    # short-circuit.
+    assert "--vqbench-python not set" not in result.stderr
+
+
 def test_cli_kv_codec_and_all_kv_codecs_are_mutually_exclusive(
     tmp_path: Path,
 ) -> None:

@@ -196,6 +196,46 @@ class Workload:
 
 
 @dataclass(frozen=True)
+class VqbenchXcheckSpec:
+    """Declarative spec for a ``--vqbench-xcheck`` cross-check arm.
+
+    Present on ``Scenario.vqbench_xcheck`` when the scenario's
+    baked codec arm has a corresponding vqbench reproduce-script
+    configuration. Scenario authors fill the fixed/rare bits
+    (``script_path``, ``method``, ``bits``, ``extra_args``); the
+    BenchRunner auto-appends the common ones (``--model``,
+    ``--seed``, ``--chunk``, ``--max-tokens``) from the live
+    execution context so they cannot drift vs what silica
+    actually ran.
+
+    Attributes:
+        script_path: Path (absolute or cwd-relative) to the vqbench
+            reproduce script. ``run_vqbench_baseline`` resolves
+            relative paths against ``cwd``; authors typically pass
+            ``str(default_reproduce_script_path())`` so the spec
+            carries the absolute location explicitly.
+        method: Value for vqbench's ``--method`` flag, e.g.
+            ``"BlockTurboQuantMSE"``. Must match the vqbench class
+            name the reproduce script dispatches to; silica-side
+            ``codec_id`` is deliberately NOT auto-mapped to this
+            (silica naming diverges from vqbench naming, and
+            silent mapping hides drift).
+        bits: Value for vqbench's ``--bits`` flag, e.g. 4.
+        extra_args: Tuple of additional argv passed verbatim after
+            the auto-appended common flags. Use for
+            scenario-specific switches like ``("--block-size",
+            "64", "--patch-v")``; do not duplicate the auto-append
+            flags here (runner does not deduplicate — vqbench may
+            reject or take the last value unpredictably).
+    """
+
+    script_path: str
+    method: str
+    bits: int
+    extra_args: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class Scenario:
     """One bench row.
 
@@ -212,6 +252,12 @@ class Scenario:
     :class:`OracleKind`; ``oracle_config`` carries oracle-specific
     parameters without growing the top-level dataclass.
 
+    ``vqbench_xcheck`` (P-5-C.6 step 1) declares a vqbench
+    cross-check arm. Only valid on ``OracleKind.PPL`` scenarios —
+    vqbench's reproduce scripts produce PPL numbers, so pairing
+    with any other oracle would be a category error. The
+    ``__post_init__`` guard enforces this at authoring time.
+
     Deliberately not carrying ``expected_adapter_class`` — bench is
     throughput/latency, not correctness verification; factory
     dispatch is pinned in ``tests/test_models_factory.py``. Adapter
@@ -225,6 +271,26 @@ class Scenario:
     oracle_config: dict[str, Any] = field(default_factory=dict)
     gate_env_var: str | None = None
     description: str = ""
+    vqbench_xcheck: VqbenchXcheckSpec | None = None
+
+    def __post_init__(self) -> None:
+        # vqbench_xcheck requires OracleKind.PPL: the cross-check
+        # compares silica's PPL oracle against vqbench's reproduce
+        # script (which itself reports PPL). Pairing it with a
+        # parity / smoke / storage oracle would have nothing
+        # meaningful to cross-check — silence would bury the
+        # authoring error under a silent skip, so raise loudly.
+        if (
+            self.vqbench_xcheck is not None
+            and self.oracle != OracleKind.PPL
+        ):
+            raise ValueError(
+                f"Scenario {self.id!r}: vqbench_xcheck is only "
+                f"meaningful on OracleKind.PPL scenarios; got "
+                f"oracle={self.oracle.value!r}. vqbench reproduce "
+                f"scripts report PPL, so other oracles have "
+                f"nothing to cross-check against"
+            )
 
 
 @dataclass
@@ -287,6 +353,7 @@ __all__ = [
     "Workload",
     "Scenario",
     "ScenarioResult",
+    "VqbenchXcheckSpec",
     "hf_cache_path_for_repo",
     "OracleFn",
 ]

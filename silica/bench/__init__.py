@@ -19,6 +19,7 @@ from silica.bench.scenario import (
     OracleKind,
     Scenario,
     ScenarioResult,
+    VqbenchXcheckSpec,
     Workload,
     hf_cache_path_for_repo,
 )
@@ -46,6 +47,7 @@ __all__ = [
     "TeacherForcedReferenceFn",
     "TeacherForcedSilicaFn",
     "VqbenchBaselineResult",
+    "VqbenchXcheckSpec",
     "Workload",
     "default_reproduce_script_path",
     "get_scenario",

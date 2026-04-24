@@ -109,6 +109,10 @@ from silica.bench.scenario import (
     Workload,
     hf_cache_path_for_repo,
 )
+from silica.bench.vqbench_baseline import (
+    VqbenchBaselineResult,
+    run_vqbench_baseline,
+)
 from silica.core.sampling import SamplingParams
 from silica.engine import Engine
 from silica.models.adapter import ModelAdapter
@@ -132,6 +136,31 @@ TeacherForcedSilicaFn = Callable[
 TeacherForcedReferenceFn = Callable[
     [ModelAdapter, list[int], list[int]], list[int]
 ]
+# P-5-C.6 step 1: injectable vqbench subprocess runner. Default
+# implementation is :func:`silica.bench.vqbench_baseline.run_vqbench_baseline`
+# which spawns an actual subprocess; tests inject a fake returning
+# a pre-built :class:`VqbenchBaselineResult`. The signature is
+# permissive (``**kwargs`` via ellipsis) because
+# ``run_vqbench_baseline`` accepts multiple keyword args (script,
+# script_args, cwd, python_executable, timeout_s, stdout_tail_lines,
+# subprocess_runner) and the runner binds them by keyword.
+VqbenchRunnerFn = Callable[..., VqbenchBaselineResult]
+
+
+def _flatten_vqbench_result(result: VqbenchBaselineResult) -> dict[str, Any]:
+    """Flatten a :class:`VqbenchBaselineResult` into ``vqbench_``-
+    prefixed metadata keys.
+
+    Every dataclass field becomes ``vqbench_<field>`` so a JSONL
+    consumer (``jq``, pandas) can pick columns without walking a
+    nested dict. Keys are stable across status values (``ok`` /
+    ``skipped`` / ``failed``) — missing fields render as ``None``
+    rather than absent, so downstream tooling can ``SELECT
+    vqbench_ppl_quant`` without an existence check. Tuples
+    (``script_args``) pass through; ``json.dumps`` converts them
+    to lists at emit time.
+    """
+    return {f"vqbench_{k}": v for k, v in asdict(result).items()}
 
 
 def _default_engine_factory(
@@ -225,6 +254,9 @@ class BenchRunner:
         read_peak_mb: Callable[[], float | None] | None = None,
         seeds: Sequence[int] = (0,),
         codec_overrides: Sequence[str | None] = (None,),
+        vqbench_xcheck_enabled: bool = False,
+        vqbench_python: str | None = None,
+        vqbench_runner: VqbenchRunnerFn | None = None,
     ) -> None:
         self._engine_factory: EngineFactory = (
             engine_factory if engine_factory is not None else _default_engine_factory
@@ -315,6 +347,128 @@ class BenchRunner:
                 )
         self._codec_overrides: tuple[str | None, ...] = codec_overrides_tuple
 
+        # P-5-C.6 step 1: vqbench cross-check plumbing. The
+        # ``enabled`` flag gates the whole path — when False, no
+        # vqbench_* keys appear in metadata. ``python`` is the
+        # interpreter path passed to the reproduce subprocess
+        # (typically a dedicated vqbench venv's python since
+        # silica's venv does not carry torch/transformers);
+        # ``None`` falls back to ``sys.executable`` via
+        # ``run_vqbench_baseline``. ``runner`` is the injection
+        # seam for tests — default binds the real subprocess
+        # helper, tests inject a fake returning a
+        # :class:`VqbenchBaselineResult` without spawning a
+        # process.
+        self._vqbench_xcheck_enabled: bool = vqbench_xcheck_enabled
+        self._vqbench_python: str | None = vqbench_python
+        self._vqbench_runner: VqbenchRunnerFn = (
+            vqbench_runner if vqbench_runner is not None else run_vqbench_baseline
+        )
+
+    def _vqbench_metadata_for_silica_not_ok(
+        self, scenario: Scenario
+    ) -> dict[str, Any]:
+        """Build the vqbench_* metadata slice for rows where silica
+        did not produce an ``ok`` oracle result (gate-skipped,
+        workload-invalid, exception-failed).
+
+        Returns the empty dict when the ``--vqbench-xcheck`` flag
+        is off — consumers should not see vqbench_* keys on rows
+        that never opted into the cross-check. When the flag is on
+        but the scenario lacks a ``vqbench_xcheck`` spec, returns
+        ``{"vqbench_status": "scenario_not_declared"}`` so the
+        "flag on but this arm has no cross-check" case is
+        distinguishable from "scenario had one but silica's oracle
+        did not succeed".
+        """
+        if not self._vqbench_xcheck_enabled:
+            return {}
+        if scenario.vqbench_xcheck is None:
+            return {"vqbench_status": "scenario_not_declared"}
+        return {"vqbench_status": "silica_oracle_not_ok"}
+
+    def _vqbench_metadata_for_silica_ok(
+        self,
+        scenario: Scenario,
+        *,
+        baked_codec_id: str | None,
+        effective_codec_id: str | None,
+        seed: int,
+        oracle_context: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Build the vqbench_* metadata slice for rows where silica
+        produced an ``ok`` oracle result.
+
+        Five branches, mirroring the design gate pins:
+
+        1. flag off → ``{}`` (no vqbench_* keys in metadata).
+        2. spec not declared → ``{"vqbench_status": "scenario_not_declared"}``.
+        3. spec declared but ``effective_codec_id != baked_codec_id``
+           → ``{"vqbench_status": "override_differs_from_declared_arm"}``
+           plus ``vqbench_declared_arm`` / ``vqbench_effective_arm``
+           diagnostics. The declared spec (``method`` / ``bits``)
+           describes only the baked arm; running vqbench against
+           a different arm would compare different codecs' PPL.
+        4. all branches satisfied → invoke ``self._vqbench_runner``
+           with auto-appended flags: ``--model`` / ``--seed`` from
+           execution context, ``--method`` / ``--bits`` from the
+           spec, ``--chunk`` / ``--max-tokens`` from the PPL
+           oracle's returned context, and the spec's
+           ``extra_args`` verbatim at the tail. Flatten the
+           entire :class:`VqbenchBaselineResult` via
+           :func:`_flatten_vqbench_result`.
+
+        The ``--chunk`` / ``--max-tokens`` values come from the PPL
+        oracle's returned ``oracle_context`` rather than re-reading
+        ``scenario.oracle_config`` — this guarantees the vqbench
+        subprocess sees exactly the same values silica just used
+        (no second-default drift).
+        """
+        if not self._vqbench_xcheck_enabled:
+            return {}
+        spec = scenario.vqbench_xcheck
+        if spec is None:
+            return {"vqbench_status": "scenario_not_declared"}
+        if effective_codec_id != baked_codec_id:
+            return {
+                "vqbench_status": "override_differs_from_declared_arm",
+                "vqbench_declared_arm": baked_codec_id,
+                "vqbench_effective_arm": effective_codec_id,
+            }
+        # Run vqbench with auto-appended common args + spec's
+        # extra_args. ``oracle_context`` is from ``_run_ppl``; the
+        # PPL oracle is the only path that produces a ``spec`` AND
+        # an ``ok`` status (Scenario.__post_init__ enforces the
+        # "vqbench_xcheck only on PPL" invariant at authoring
+        # time), so the context keys are guaranteed populated when
+        # we reach here. Defensive ``.get`` is still used in case
+        # a future oracle declares spec support without
+        # propagating chunk_size / max_tokens.
+        ctx = oracle_context or {}
+        script_args: list[str] = [
+            "--model",
+            scenario.repo,
+            "--seed",
+            str(seed),
+            "--method",
+            spec.method,
+            "--bits",
+            str(spec.bits),
+        ]
+        chunk_size = ctx.get("chunk_size")
+        if chunk_size is not None:
+            script_args += ["--chunk", str(chunk_size)]
+        max_tokens = ctx.get("max_tokens")
+        if max_tokens is not None:
+            script_args += ["--max-tokens", str(max_tokens)]
+        script_args.extend(spec.extra_args)
+        vqbench_result = self._vqbench_runner(
+            spec.script_path,
+            script_args,
+            python_executable=self._vqbench_python,
+        )
+        return _flatten_vqbench_result(vqbench_result)
+
     def run(self, scenarios: Iterable[Scenario]) -> list[ScenarioResult]:
         """Run every scenario × codec × seed in scenario-major order.
 
@@ -366,6 +520,16 @@ class BenchRunner:
         np.random.seed(seed)
         random.seed(seed)
 
+        # P-5-C.6 step 1: capture the authored codec id BEFORE any
+        # override replace. vqbench_xcheck's declared ``method`` /
+        # ``bits`` describe only the baked arm; if the user passed
+        # a ``--kv-codec`` / ``--all-kv-codecs`` override that
+        # shifted the effective arm to something else, running
+        # vqbench against the declared method would compare two
+        # different codecs' PPL. We skip xcheck in that case and
+        # surface ``vqbench_status='override_differs_from_declared_arm'``.
+        baked_codec_id: str | None = scenario.workload.kv_codec
+
         # Apply ``--kv-codec`` override. ``codec_override is None``
         # means "use scenario's baked workload.kv_codec" and leaves
         # the scenario untouched; a str value replaces the workload's
@@ -406,7 +570,11 @@ class BenchRunner:
                 scenario_id=scenario.id,
                 status="skipped",
                 reason=skip_reason,
-                metadata={"seed": seed, "codec_id": effective_codec_id},
+                metadata={
+                    "seed": seed,
+                    "codec_id": effective_codec_id,
+                    **self._vqbench_metadata_for_silica_not_ok(scenario),
+                },
             )
 
         workload_error = _validate_workload_for_oracle(
@@ -417,7 +585,11 @@ class BenchRunner:
                 scenario_id=scenario.id,
                 status="failed",
                 reason=workload_error,
-                metadata={"seed": seed, "codec_id": effective_codec_id},
+                metadata={
+                    "seed": seed,
+                    "codec_id": effective_codec_id,
+                    **self._vqbench_metadata_for_silica_not_ok(scenario),
+                },
             )
 
         try:
@@ -536,7 +708,11 @@ class BenchRunner:
                 scenario_id=scenario.id,
                 status="failed",
                 reason=f"{type(exc).__name__}: {exc}",
-                metadata={"seed": seed, "codec_id": effective_codec_id},
+                metadata={
+                    "seed": seed,
+                    "codec_id": effective_codec_id,
+                    **self._vqbench_metadata_for_silica_not_ok(scenario),
+                },
             )
 
         snap = engine.metrics.snapshot()
@@ -570,10 +746,29 @@ class BenchRunner:
         # ``{**metadata, "seed": seed, "codec_id": ...}`` ordering
         # enforces that precedence without requiring every oracle
         # to know which keys are execution-scope.
+        #
+        # vqbench_* keys (P-5-C.6 step 1) are appended last so
+        # they also override any oracle-written vqbench_* — same
+        # "execution dimension wins over authoring" invariant.
+        # Only populated when the user passed ``--vqbench-xcheck``
+        # AND silica's oracle returned ``ok``; the helper encodes
+        # the full 5-branch decision (see _vqbench_metadata_for_silica_ok).
+        vqbench_metadata = (
+            self._vqbench_metadata_for_silica_ok(
+                scenario,
+                baked_codec_id=baked_codec_id,
+                effective_codec_id=effective_codec_id,
+                seed=seed,
+                oracle_context=oracle_context,
+            )
+            if ok
+            else self._vqbench_metadata_for_silica_not_ok(scenario)
+        )
         result_metadata: dict[str, Any] = {
             **metadata,
             "seed": seed,
             "codec_id": effective_codec_id,
+            **vqbench_metadata,
         }
         return ScenarioResult(
             scenario_id=scenario.id,
