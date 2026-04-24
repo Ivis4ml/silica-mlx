@@ -2,9 +2,9 @@
 
 | Field        | Value                                                                      |
 | ------------ | -------------------------------------------------------------------------- |
-| Version      | v1.7.0                                                                     |
+| Version      | v1.7.1                                                                     |
 | Last updated | 2026-04-23                                                                 |
-| Status       | P-0..P-4.5 complete; P-5-A / P-5-B landed; P-5-C.1 landed; P-5-C.2 next    |
+| Status       | P-0..P-4.5 complete; P-5 sub-units landed; P-5 Acceptance sweep pending    |
 | Maintainer   | Xin Zhou                                                                   |
 | Source       | `docs/PLAN.md` (single source of truth)                                    |
 
@@ -561,7 +561,7 @@ Each Phase uses the same structure: `ID / Goal / Scope / Strategy / Deliverables
     - **(b) End-to-end PPL drift.** Under the Qwen3.5-4B `BlockTurboQuantMSE B=64` 4-bit K+V configuration, Silica `BlockTQCodec`'s end-to-end perplexity deviates from the `vqbench/REPORT.md` baseline by `ε_ppl < 0.01` absolute.
     - Both must pass; passing only one is insufficient.
 - **Dependencies:** P-4.5.
-- **Status:** in-progress. Sub-units P-5-A.0 / A.1 / A.3 and P-5-B.1 / B.2 / B.3 landed; P-5-C.1 landed (teacher-forced streaming PPL oracle + `forward_batched_full`, fp16 baseline only — the codec-backed oracle arm lives in P-5-C.2). P-5-C.2 is next. Deliverables above are the PLAN-freeze coarse list; the working sub-unit decomposition is maintained in `docs/P5_OPENING.md` §8.
+- **Status:** in-progress. All sub-units per `docs/P5_OPENING.md` §8 landed: P-5-A.0 / A.1 / A.2 / A.3, P-5-B.1 / B.2 / B.3, P-5-C.1 / C.2 / C.3 / C.4 / C.5 / C.6 (between 2026-04-22 and 2026-04-23). §7 P-5 Deliverables and Acceptance checkboxes above remain `[ ]`: the bench harness now exposes `--kv-codec` / `--all-kv-codecs` / `--seeds` / `--vqbench-xcheck`, but a dedicated P-5 Acceptance sweep has not yet been run — the four Acceptance gates will flip in a later revision, mirroring the P-4.5-B.1 (v1.6.6) implementation + P-4.5 close (v1.6.9) pattern. Deliverables above are the PLAN-freeze coarse list; the working sub-unit decomposition is maintained in `docs/P5_OPENING.md` §8.
 - **Notes:** concrete implementation details for BlockTQ / RaBitQ reference `turboquant_plus/` (gitignored reference impl).
 
 ### P-6 Phase 6 — Weight Streaming
@@ -1075,6 +1075,14 @@ Local reference implementations sit at the repo root. **Algorithm / architecture
 ---
 
 ## 13. Changelog
+
+- **v1.7.1** (2026-04-23): **P-5 implementation sub-units all landed — doc sync.** No code or test diffs. Updates PLAN header, §7 P-5 Status, `docs/P5_OPENING.md` §8, and `README.md` to reflect the post-P-5-C.6 reality — P-5-A / B / C sub-units per `docs/P5_OPENING.md` §8 all landed between 2026-04-22 and 2026-04-23. §7 P-5 Acceptance checkboxes (lines 555-562) deliberately kept at `[ ]`; the four Acceptance gates — (1) codec-swap neutrality, (2) one-command fp16 vs codec side-by-side, (3) BlockTQ admits more under the same budget, (4) vqbench numeric cross-check (a) / (b) — will flip in a later revision after a dedicated sweep, mirroring the P-4.5-B.1 (v1.6.6) implementation landing + P-4.5 close (v1.6.9) acceptance sweep pattern.
+  - **Header:** Version v1.7.0 → v1.7.1; Status updated from "P-5-A / P-5-B landed; P-5-C.1 landed; P-5-C.2 next" to "P-5-A / P-5-B / P-5-C sub-units all landed; P-5 Acceptance sweep pending". Line 564 §7 P-5 Status rewritten to enumerate all sub-units (previously omitted A.2 and described C.2 as "next").
+  - **`docs/P5_OPENING.md` §8.** C.2 heading "(next)" → "(landed 2026-04-23)"; C.3 / C.4 / C.5 / C.6 headings gain "(landed 2026-04-23)" annotations matching the C.1 precedent already present at the C.1 heading (landed 2026-04-23). Scope prose and blocked-by lines unchanged.
+  - **`README.md`:** Status table P-5 row updated from "P-5-A.0 scaffolding shipped ... P-5-A.1 BlockTQ hot path next" to "P-5-A / B / C sub-units landed (v1.7.1 — BlockTQ + RaBitQ family + bench harness); P-5 Acceptance sweep pending". Roadmap §P-5 bullet rewritten as a three-bullet A / B / C sub-unit summary explicitly calling out the `[ ]` §7 P-5 Acceptance gate.
+  - **Landing commits referenced for traceability:** `dc7c751` (C.6), `2094518` (C.5), `81bca8b` (C.4), `66897d9` (C.3), `08233e2` (C.2), `bf9dafc` (C.1), `deb5749` (B.3), `abb19b4` / `f85f1e7` / `4171984` (B.2), `64ee750` / `e2148b2` / `cfdec12` (B.1), `9579b0c` / `7c5b37d` / `9a538fe` (A.3), `35bbd2e` (A.2), `c431ad6` / `1213756` / `dd32d17` (A.1), v1.7.0 (A.0).
+  - **What is NOT changed:** any `[ ]` Deliverables / Acceptance checkboxes in §7 P-5; I-1..I-5 Protocol signatures; §10 Q / §11 R / §9 D IDs; sub-unit scope prose in P5_OPENING §8. Zero code, test, or interface diffs.
+  - **Next step:** the P-5 Acceptance sweep — run the full `python -m scripts.bench --all --all-kv-codecs --seeds 42,43,44 --vqbench-xcheck` on the post-C.6 tree, compare against `vqbench/REPORT.md` headline numbers, and flip the four §7 P-5 Acceptance checkboxes in a separate close revision (the P-4.5-B.1 → P-4.5 close sequence between v1.6.6 and v1.6.9 is the reference pattern).
 
 - **v1.7.0** (2026-04-22): **P-5-A.0 scaffolding — side-level VectorCodec[P] + packing + calibration + store migration.** Opens P-5 proper with the four P-5-A.0 sub-unit commits plus doc sync. No functional change to the active codec path — `IdentityCodec` continues to be the only shipping codec, byte-identity against the pre-P-5 token stream is preserved by the P-4.5-C.1 integration test suite. The scaffolding unblocks P-5-A.1 (BlockTurboQuantMSE hot path + Q-008 resolved on the store seam).
   - **`silica/kvcache/codec.py`** (rewrite) — retires the pre-P-5 pair-level `KVCodec` Protocol, `CodedBlock` dataclass, and pair-level `IdentityCodec`. New side-level `VectorCodec[P]` Protocol (one tensor in, one `CodedPayload` subclass out); new `CodedPayload` hierarchy (`RawFp16Payload`, `BlockTQPayload`, `RaBitQPayload`) with D-012 honesty enforced at `__post_init__`; new side-level `IdentityCodec(block_size, n_kv_heads, head_dim, dtype=fp16)` implementing `VectorCodec[RawFp16Payload]`. Signatures drop `k_dtype` / `v_dtype` in favour of a single per-side `dtype`. `resident_bytes` / `logical_bytes` are per-side.

@@ -15,7 +15,7 @@ plus a planned mini-sglang outer layer for Phase 8. Target: run dense
 | P-3 | Family adapters — Qwen3 dense, Qwen3.5 hybrid DeltaNet, Gemma4-31B dense, Qwen3.5-MoE, Gemma4-MoE | ✅ mostly (`C5` preempt/replay with recurrent-state snapshot pending; `E4` batched MoE pending) |
 | P-4 | Unified bench harness — runner, oracles, 15 registered scenarios, JSONL + Markdown reports, vqbench subprocess PPL | ✅ complete; P-4 exit surfaced Q-010 chunked-prefill trigger → P-4.5 bridge planned |
 | P-4.5 | P-4 exit bridge — chunked-prefill minimal + VectorCodec runtime integration spike | ✅ complete (v1.6.9) |
-| P-5 | VQ KV compression (BlockTQ / RaBitQ) | ⏳ P-5-A.0 scaffolding shipped (v1.7.0 — side-level `VectorCodec[P]`, bit-packing, Lloyd-Max calibration, K/V split store); P-5-A.1 BlockTQ hot path next |
+| P-5 | VQ KV compression (BlockTQ / RaBitQ) | ⏳ P-5-A / B / C sub-units landed (v1.7.1 — BlockTQ + RaBitQ family + bench harness with `--kv-codec` / `--all-kv-codecs` / `--seeds` / `--vqbench-xcheck`); P-5 Acceptance sweep pending |
 | P-6 | Weight streaming | Stub (`ResidentWeightProvider` today) |
 | P-7 | Speculative decoding (DraftTarget / EAGLE / Medusa) | Stub (`NoopDraftEngine` today) |
 | P-8 | OpenAI-compatible HTTP server + session layer | ⏳ planned (leaning T1 tail, after P-5) |
@@ -452,20 +452,32 @@ P-4.5 bridges both.
     / cache wrapper) and landed Option (B); `IdentityCodec` is wired
     through `SyntheticPrefixBlockStore.register_detached` /
     `fetch_detached` end-to-end on the Qwen3-0.6B path.
-- **P-5** — VQ KV compression platform:
-  - **P-5-A.0** (complete, v1.7.0) — scaffolding: side-level
-    `VectorCodec[P]` Protocol + `CodedPayload` hierarchy
-    (`RawFp16Payload` / `BlockTQPayload` / `RaBitQPayload`),
-    MLX-native bit-packing (`silica.vq.core.packing`), NumPy-
-    quarantined offline helpers (`silica.vq._calibration` — Haar
-    rotation + Lloyd-Max codebook), K/V split store dispatch
-    (`SyntheticPrefixBlockStore(k_codec=, v_codec=)`), `RadixPrefixCache.store`
-    property. Q-008 resolved to side-level Protocol + store-level split.
-  - **P-5-A.1** (next) — BlockTurboQuantMSE hot path on the shipped
-    scaffold, MLX-native rewrite of the vqbench numeric reference;
-    cross-check via `silica/bench/vqbench_baseline.py`.
-  - **P-5-B / P-5-C** — RaBitQ family, bench harness extensions,
-    vqbench parity table; see `docs/PLAN.md` §7 P-5.
+- **P-5** — VQ KV compression platform. All implementation
+  sub-units landed (v1.7.1, between 2026-04-22 and 2026-04-23).
+  §7 P-5 Acceptance checkboxes in `docs/PLAN.md` remain `[ ]`; a
+  dedicated P-5 Acceptance sweep is the remaining close gate.
+  - **P-5-A** — Codec scaffolding + BlockTQ hot path + memory
+    accounting + decode-speed gate. Side-level `VectorCodec[P]`
+    Protocol + `CodedPayload` hierarchy + MLX-native bit-packing +
+    Lloyd-Max / Haar calibration quarantine + K/V split store (A.0,
+    v1.7.0); `BlockTurboQuantMSE` on the `mx.array` hot path + codec
+    registry + vqbench algorithmic parity (A.1);
+    `MemoryBudgeter` three-mode residency accounting (A.2);
+    decode-speed acceptance gate on
+    `qwen3-0.6b-prefix-hit-decode-{fp16,block-tq-b64-b4}` (A.3).
+  - **P-5-B** — RaBitQ family. `RaBitQ1Bit` K-only codec + registry +
+    vqbench parity (B.1); `ExtRaBitQ` at bits ∈ {2, 3, 4} + registry +
+    vqbench parity (B.2); `ext_rabitq_b4` decode-speed gate on the
+    `qwen3-0.6b-prefix-hit-decode-ext-rabitq-b4` row (B.3).
+  - **P-5-C** — Bench harness extensions. Teacher-forced streaming
+    PPL oracle + `forward_batched_full` runner entry point (C.1);
+    codec-backed PPL oracle + WikiText loader + four
+    `qwen3-0.6b-wikitext-ppl-*` rows (C.2); `STORAGE` +
+    `ADMISSION_HEADROOM` `OracleKind` + compression / prefix-heavy
+    rows (C.3); `--seeds` fan-out + per-scenario mean ± std
+    aggregation (C.4); `--kv-codec` / `--all-kv-codecs` CLI
+    (C.5); `--vqbench-xcheck` ΔPPL divergence gate + per-arm
+    `vqbench_gap` column (C.6).
 - **P-8** — OpenAI-compatible HTTP server + session layer (wraps
   `ChatSession` with routing, auth, streaming SSE / WebSocket).
   Leaning T1 tail per Q-002 progress; sequenced after P-5 so the

@@ -945,7 +945,7 @@ Scope deferrals (out of C.1, in C.2):
 
 Blocked by: P-5-A.1 (landed).
 
-#### P-5-C.2 — Codec-backed PPL + WikiText bench rows (next)
+#### P-5-C.2 — Codec-backed PPL + WikiText bench rows (landed 2026-04-23)
 
 Scope:
 
@@ -956,26 +956,26 @@ Scope:
 
 Blocked by: P-5-C.1 (landed), P-5-A.1 (landed).
 
-#### P-5-C.3 — STORAGE oracle + compression / admission-headroom rows
+#### P-5-C.3 — STORAGE oracle + compression / admission-headroom rows (landed 2026-04-23)
 
 Scope:
 
 - `silica.bench.oracles` gains `STORAGE` `OracleKind` reading `prefix_cache.store.resident_bytes()`.
 - Bench rows: `qwen3-0.6b-compression` (per-codec resident-bytes column) and `qwen3-0.6b-admission-headroom-prefix-heavy` (§4.7 admission-signal row demonstrating the `resident_bytes`-aware budgeter).
 
-#### P-5-C.4 — Variance / multi-seed plumbing
+#### P-5-C.4 — Variance / multi-seed plumbing (landed 2026-04-23)
 
 Scope:
 
 - `BenchRunner` — per-(scenario, codec, seed) JSONL rows; `--seeds 42,43,44` CLI flag; markdown table `mean ± std` aggregation column.
 
-#### P-5-C.5 — `--kv-codec` / `--all-kv-codecs` CLI
+#### P-5-C.5 — `--kv-codec` / `--all-kv-codecs` CLI (landed 2026-04-23)
 
 Scope:
 
 - `scripts/bench.py` — `--kv-codec <id>` (registry dispatch through `BenchRunner.engine_factory`), `--all-kv-codecs` (iterate every `CodecSpec`), `--k-only` selection. The registry layer already exists (P-5-A.1b); C.5 is the CLI surface only.
 
-#### P-5-C.6 — vqbench subprocess cross-check
+#### P-5-C.6 — vqbench subprocess cross-check (landed 2026-04-23)
 
 Scope:
 
