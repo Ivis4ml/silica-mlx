@@ -58,6 +58,10 @@ from silica.models.capabilities import (
     ModelCapabilities,
     capabilities_from_attention_pattern,
 )
+from silica.models.recurrent import (
+    RecurrentSnapshot,
+    _RecurrentLayerEntry,
+)
 from silica.weights.provider import WeightProvider
 
 
@@ -265,6 +269,138 @@ class Qwen3_5Adapter:
         """
         del req_id
 
+    # --- P-3-C5.1: adapter-owned recurrent state snapshot / restore ---
+
+    def snapshot_recurrent_state(
+        self, cache_list: list[Any], row_idx: int
+    ) -> RecurrentSnapshot:
+        """Implements ``RecurrentStateAdapter.snapshot_recurrent_state``.
+
+        Walks every DeltaNet layer (``layer.is_linear == True``) in
+        ``cache_list``, slices each ``ArraysCache`` slot to leading
+        ``(1, ...)`` at ``row_idx``, materialises a detached copy
+        (R-C5-2: ``mx.eval`` then ``mx.array`` so subsequent in-place
+        rebinds at ``mlx_lm/models/qwen3_5.py:164/166/197`` cannot
+        mutate the snapshot), and packs the per-layer ``(conv_state,
+        recurrent_state)`` pairs into a frozen ``RecurrentSnapshot``.
+
+        GLOBAL (full-attention) layers are skipped — their K/V is
+        owned by ``SyntheticPrefixBlockStore`` and is not part of the
+        recurrent snapshot surface (per ``docs/P3_C5_OPENING.md`` §3.1).
+
+        Lazy-allocation case (``cache.cache[i] is None`` because no
+        forward has populated this slot yet on this row) is preserved
+        by storing ``None`` in the entry; ``restore_recurrent_state``
+        leaves the slot ``None`` so the next forward lazy-allocates
+        normally rather than seeing a fp32-zero injection.
+        """
+        if row_idx < 0:
+            raise ValueError(f"row_idx must be non-negative, got {row_idx}")
+        if len(cache_list) != len(self._model.layers):
+            raise ValueError(
+                f"cache_list length {len(cache_list)} does not match "
+                f"model layers {len(self._model.layers)}"
+            )
+
+        entries: list[_RecurrentLayerEntry] = []
+        total_nbytes = 0
+        for layer_idx, (layer, layer_cache) in enumerate(
+            zip(self._model.layers, cache_list, strict=True)
+        ):
+            if not getattr(layer, "is_linear", False):
+                continue
+            inner = getattr(layer_cache, "cache", None)
+            if inner is None:
+                # Defensive — every DeltaNet layer's cache should be an
+                # ArraysCache(size=2). If a future change uses a
+                # different container, fail loudly rather than silently
+                # producing an empty snapshot.
+                raise TypeError(
+                    f"layer {layer_idx} (DeltaNet) has no .cache attribute "
+                    f"on its layer_cache; expected ArraysCache(size=2). "
+                    f"Got {type(layer_cache).__name__}."
+                )
+            slot0 = inner[0]
+            slot1 = inner[1]
+
+            snap_conv = _detach_row(slot0, row_idx) if slot0 is not None else None
+            snap_recur = (
+                _detach_row(slot1, row_idx) if slot1 is not None else None
+            )
+            entries.append(
+                _RecurrentLayerEntry(
+                    layer_idx=layer_idx,
+                    conv_state=snap_conv,
+                    recurrent_state=snap_recur,
+                )
+            )
+            if snap_conv is not None:
+                total_nbytes += int(snap_conv.nbytes)
+            if snap_recur is not None:
+                total_nbytes += int(snap_recur.nbytes)
+
+        return RecurrentSnapshot(entries=tuple(entries), nbytes=total_nbytes)
+
+    def restore_recurrent_state(
+        self,
+        cache_list: list[Any],
+        row_idx: int,
+        snapshot: RecurrentSnapshot,
+    ) -> None:
+        """Implements ``RecurrentStateAdapter.restore_recurrent_state``.
+
+        For each ``_RecurrentLayerEntry`` in ``snapshot.entries``,
+        splice the captured per-row tensors back into the
+        corresponding layer's ``ArraysCache`` slots at ``row_idx``.
+        Other rows in the same batched cache are not modified.
+
+        Restore is value-object semantics: the post-restore state at
+        ``row_idx`` reflects what the snapshot captured. Cases per
+        slot (delegated to :func:`_splice_row`):
+
+        1. Snapshot entry is ``None`` and live slot is ``None``:
+           remains ``None`` (both lazy). Next forward lazy-allocates
+           as today.
+        2. Snapshot entry is ``None`` and live slot is populated at
+           ``B = 1``: live slot is wiped to ``None`` so the next
+           forward lazy-allocates fresh state (the snapshot's
+           "unallocated" capture is reproduced).
+        3. Snapshot entry is ``None`` and live slot is populated at
+           ``B > 1``: ``ValueError``. The lazy state is per-slot,
+           not per-row; wiping one row of a populated multi-row slot
+           is not expressible. C5.2 / C5.3 only take snapshots on
+           caches that have already participated in a forward, so
+           this case should not arise in production.
+        4. Snapshot entry has data and live slot is ``None``:
+           snapshot's ``(1, ...)`` tensor is assigned directly. Only
+           ``row_idx = 0`` is valid here (no batch dim to index).
+        5. Snapshot entry has data and live slot is populated:
+           splice — replace exactly ``row_idx`` without touching
+           other rows.
+
+        ``row_idx`` is validated up front against the relevant range
+        for each case; out-of-range values raise ``IndexError``.
+        """
+        if row_idx < 0:
+            raise ValueError(f"row_idx must be non-negative, got {row_idx}")
+        if len(cache_list) != len(self._model.layers):
+            raise ValueError(
+                f"cache_list length {len(cache_list)} does not match "
+                f"model layers {len(self._model.layers)}"
+            )
+
+        for entry in snapshot.entries:
+            layer_cache = cache_list[entry.layer_idx]
+            inner = getattr(layer_cache, "cache", None)
+            if inner is None:
+                raise TypeError(
+                    f"layer {entry.layer_idx} (DeltaNet) cache_list entry has "
+                    f"no .cache attribute; expected ArraysCache(size=2). "
+                    f"Got {type(layer_cache).__name__}."
+                )
+            inner[0] = _splice_row(inner[0], entry.conv_state, row_idx)
+            inner[1] = _splice_row(inner[1], entry.recurrent_state, row_idx)
+
     # --- family-specific metadata extraction ---
 
     @staticmethod
@@ -325,3 +461,111 @@ class Qwen3_5Adapter:
         if isinstance(raw, dict):
             return raw
         return {}
+
+
+# --- P-3-C5.1 row-slicing helpers (module-level so the methods stay readable) ---
+
+
+def _detach_row(tensor: mx.array, row_idx: int) -> mx.array:
+    """Slice a single row out of a batched tensor and detach it from
+    the live cache.
+
+    R-C5-2 requirement: subsequent in-place rebinds at
+    ``mlx_lm/models/qwen3_5.py:164/166/197`` must not be observable
+    through the snapshot. ``mx.array(slice)`` constructs a new array
+    distinct from the slice's underlying view; ``mx.eval`` forces
+    materialisation so the snapshot does not hold a deferred-graph
+    reference into the live cache.
+    """
+    if row_idx < 0 or row_idx >= int(tensor.shape[0]):
+        raise IndexError(
+            f"row_idx {row_idx} out of range for tensor with leading "
+            f"dim {int(tensor.shape[0])}"
+        )
+    sliced = tensor[row_idx : row_idx + 1]
+    detached = mx.array(sliced)
+    mx.eval(detached)
+    return detached
+
+
+def _splice_row(
+    live: mx.array | None, snap: mx.array | None, row_idx: int
+) -> mx.array | None:
+    """Splice ``snap`` (a ``(1, ...)`` snapshot tensor) into ``live``
+    at ``row_idx``, restoring the value-object contract: the
+    post-restore live state at ``row_idx`` reflects what the snapshot
+    captured at its construction time.
+
+    Cases:
+
+    1. ``snap is None, live is None`` — both empty / lazy. Stays
+       ``None``; next forward lazy-allocates as usual.
+    2. ``snap is None, live is not None``:
+       - ``B == 1`` — the snapshot recorded an unallocated slot for
+         the only row. Restore that by wiping the live slot back to
+         ``None``. The next forward lazy-allocates fresh state.
+       - ``B > 1`` — raises ``ValueError``. The "lazy / unallocated"
+         state is per-slot, not per-row, so wiping a single row of a
+         populated multi-row slot is not expressible. C5.2 / C5.3
+         take snapshots only after a forward has populated the cache,
+         so an empty snapshot into a populated multi-row cache is a
+         contract violation.
+    3. ``snap is not None, live is None`` — only valid for
+       ``row_idx == 0`` (no batch dim to index). The snapshot's
+       ``(1, ...)`` tensor is assigned directly; the next forward
+       sees a populated slot at B=1.
+    4. ``snap is not None, live is not None`` — splice the snapshot
+       at ``row_idx`` without touching other rows.
+
+    All cases validate ``row_idx`` against the relevant range up
+    front (``0`` for live-None / B=1; ``[0, B)`` for B>1).
+    """
+    if row_idx < 0:
+        raise IndexError(f"row_idx must be non-negative, got {row_idx}")
+
+    if snap is None:
+        if live is None:
+            return None
+        B = int(live.shape[0])
+        if B == 1:
+            if row_idx != 0:
+                raise IndexError(
+                    f"row_idx {row_idx} invalid for live B=1 tensor "
+                    f"(only row_idx=0 is meaningful)"
+                )
+            return None
+        raise ValueError(
+            f"cannot restore an empty (None) snapshot slot into a "
+            f"populated multi-row cache (B={B}); the lazy / "
+            f"unallocated state is per-slot, not per-row, so wiping "
+            f"row {row_idx} alone is not expressible. Take and "
+            f"restore snapshots on caches that have all participated "
+            f"in at least one forward."
+        )
+
+    # snap is not None below.
+    if live is None:
+        if row_idx != 0:
+            raise IndexError(
+                f"row_idx {row_idx} invalid for live-None target "
+                f"(only row_idx=0 is meaningful before lazy allocation)"
+            )
+        return snap
+
+    B = int(live.shape[0])
+    if row_idx >= B:
+        raise IndexError(
+            f"row_idx {row_idx} out of range for live tensor with "
+            f"leading dim {B}"
+        )
+    if B == 1:
+        return snap
+    pieces: list[mx.array] = []
+    if row_idx > 0:
+        pieces.append(live[:row_idx])
+    pieces.append(snap)
+    if row_idx + 1 < B:
+        pieces.append(live[row_idx + 1 :])
+    spliced = mx.concatenate(pieces, axis=0)
+    mx.eval(spliced)
+    return spliced
