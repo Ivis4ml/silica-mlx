@@ -158,6 +158,7 @@ class _ScriptedTokenizer:
 @dataclass
 class _SpyLog:
     snapshot_calls: list[dict[str, Any]] = field(default_factory=list)
+    restore_calls: list[dict[str, Any]] = field(default_factory=list)
     next_marker: int = 0
 
 
@@ -257,7 +258,23 @@ class _ScriptedHybridAdapter:
         row_idx: int,
         snapshot: RecurrentSnapshot,
     ) -> None:
-        del cache_list, row_idx, snapshot  # spy ignores restore inputs
+        # Record the layer types AT THE TIME OF THE CALL so admit-side
+        # tests (P-3-C5.3.3-het.2) can pin the heterogeneity invariant:
+        # the cache_list passed into restore must mirror the adapter's
+        # ``make_batch_cache`` shape, never the homogeneous all-
+        # ``BatchKVCache`` shape that the pre-het.2 seed assembly would
+        # produce. Snapshot is unused here (the spy doesn't actually
+        # splice state); recording its identity is enough for tests
+        # that want to verify which snapshot was restored.
+        self._log.restore_calls.append(
+            {
+                "row_idx": row_idx,
+                "layer_types": [
+                    type(layer).__name__ for layer in cache_list
+                ],
+                "snapshot": snapshot,
+            }
+        )
 
     # ModelAdapter Protocol stubs — never reached (the batcher uses
     # ``self._model`` directly via ``forward_batched``), but mypy

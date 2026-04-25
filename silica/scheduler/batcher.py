@@ -600,10 +600,11 @@ class ContinuousBatcher:
         self._rows = [self._rows[i] for i in kept]
         self._rebuild_slot_table()
 
-    def _token_kv_layer_indices(self) -> list[int]:
-        """Return source-transformer-layer indices in ``self._batch_cache``
-        whose layer cache is a token-granular K/V store
-        (``BatchKVCache``).
+    def _token_kv_layer_indices(
+        self, cache_list: list[Any] | None = None
+    ) -> list[int]:
+        """Return source-transformer-layer indices whose layer cache is
+        a token-granular K/V store (``BatchKVCache``).
 
         For pure-attention adapters (Qwen3, etc.), every layer is a
         ``BatchKVCache`` so this returns ``list(range(num_layers))``.
@@ -612,20 +613,34 @@ class ContinuousBatcher:
         ``ArraysCache`` whose state is captured via the recurrent
         snapshot path, NOT the token-K/V slice path.
 
+        ``cache_list`` argument (P-3-C5.3.3-het.2): when provided, the
+        helper introspects that list instead of ``self._batch_cache``.
+        The admit-side seed-assembly path uses this to derive attention
+        positions from a freshly-built empty heterogeneous row cache
+        before any forward has populated layers; passing it explicitly
+        avoids depending on the main batch cache (which may be ``None``
+        when the hit row arrives in an empty batcher). When omitted, the
+        helper preserves the original extract-side behaviour and asserts
+        ``self._batch_cache`` is set.
+
         Centralizes the cache-shape introspection so callers
-        (``_extract_and_insert_prefix``, future seed-assembly path)
+        (``_extract_and_insert_prefix``, ``_admit_single_hit_row``)
         don't sprinkle ``isinstance`` / ``hasattr`` checks across the
         prefix-cache plumbing. Loud-fail on a pure-recurrent stack
         (zero ``BatchKVCache`` layers) — the C5.3 prefix-cache extract
         path has no work to do without token-K/V layers, and silently
         skipping would mask a misconfiguration.
 
-        P-3-C5.3.3-het.1.
+        P-3-C5.3.3-het.1 (introduced); P-3-C5.3.3-het.2 (cache_list arg).
         """
-        assert self._batch_cache is not None
+        if cache_list is None:
+            assert self._batch_cache is not None
+            target = self._batch_cache
+        else:
+            target = cache_list
         indices = [
             i
-            for i, layer in enumerate(self._batch_cache)
+            for i, layer in enumerate(target)
             if isinstance(layer, BatchKVCache)
         ]
         if not indices:
@@ -1543,10 +1558,36 @@ class ContinuousBatcher:
             detached = self._prefix_cache.fetch_detached_blocks(
                 list(hit.block_ids)
             )
-            num_layers = self._adapter.config.num_layers
-            row_cache = build_seeded_batch_kv(
-                detached, num_layers=num_layers
+
+            # P-3-C5.3.3-het.2: row_cache assembly for hybrid adapters.
+            # ``detached_blocks[b]`` is indexed by **attention-layer
+            # position** (the het.1 extract path stores only token-K/V
+            # layers — DeltaNet positions carry no token K/V to slice).
+            # For hybrid Qwen3.5 the row_cache must mirror the
+            # heterogeneous shape from ``adapter.make_batch_cache``:
+            # ``ArraysCache`` for DeltaNet positions, seeded
+            # ``BatchKVCache`` for attention positions. The pre-het.2
+            # code passed ``num_layers=adapter.config.num_layers`` to
+            # ``build_seeded_batch_kv`` which (a) trips the helper's
+            # ``len(detached[0]) == num_layers`` validator on hybrid
+            # and (b) would yield an all-``BatchKVCache`` list that
+            # ``restore_recurrent_state`` cannot splice DeltaNet state
+            # into. For pure-attention adapters the assembly degenerates
+            # to today's behaviour: every transformer layer is an
+            # attention layer, ``empty_row_cache`` is an all-empty
+            # ``BatchKVCache`` list, and seeded entries replace every
+            # slot 1:1.
+            empty_row_cache = _make_batch_cache(self._adapter, [0])
+            attn_layer_indices = self._token_kv_layer_indices(
+                empty_row_cache
             )
+            seeded_attn = build_seeded_batch_kv(
+                detached, num_layers=len(attn_layer_indices)
+            )
+            row_cache: list[Any] = list(empty_row_cache)
+            for pos, src_layer_idx in enumerate(attn_layer_indices):
+                row_cache[src_layer_idx] = seeded_attn[pos]
+            num_layers = len(row_cache)
 
             # P-3-C5.3.3 Insertion A — seed row metadata for slice
             # regime: walk the ancestor chain of ``deepest_usable``
