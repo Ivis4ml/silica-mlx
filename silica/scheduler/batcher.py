@@ -609,8 +609,9 @@ class ContinuousBatcher:
 
         tokens_prefix = computed_ids[:aligned_tokens]
         num_layers = len(self._batch_cache)
+        n_aligned_blocks = aligned_tokens // block_size
         detached_blocks: list[list[tuple[mx.array, mx.array]]] = []
-        for b_idx in range(aligned_tokens // block_size):
+        for b_idx in range(n_aligned_blocks):
             start = b_idx * block_size
             end = start + block_size
             per_layer: list[tuple[mx.array, mx.array]] = []
@@ -636,12 +637,30 @@ class ContinuousBatcher:
                 per_layer.append((k, v))
             detached_blocks.append(per_layer)
 
+        # P-3-C5.3.2: forward per-block recurrent snapshots that the
+        # slice-prefill regime captured into ``row.recurrent_snapshots_per_block``.
+        # ``b_idx`` is the absolute block index (block 0 covers tokens
+        # ``[0, block_size)``, etc.) — same key space the capture path
+        # writes into. ``.get`` graceful-defaults missing keys to None,
+        # which covers (a) non-slice-regime rows whose dict stays empty
+        # and (b) slice-regime rows whose decode-era counter never
+        # crossed a particular block boundary. ``insert_detached``'s
+        # C5.3.0 contract handles None entries: new nodes get
+        # ``recurrent_snapshot=None``; duplicate-prefix branch's
+        # backfill only fires on a non-None caller-provided snapshot.
+        recurrent_snapshots = [
+            row.recurrent_snapshots_per_block.get(b_idx)
+            for b_idx in range(n_aligned_blocks)
+        ]
+
         # S-3b eager materialisation: force each slice to its own
         # backing memory BEFORE the source cache's filter / drop.
         mx.eval(
             *[arr for pl in detached_blocks for (k, v) in pl for arr in (k, v)]
         )
-        self._prefix_cache.insert_detached(tokens_prefix, detached_blocks)
+        self._prefix_cache.insert_detached(
+            tokens_prefix, detached_blocks, recurrent_snapshots
+        )
 
     def _rebuild_slot_table(self) -> None:
         """Re-derive ``slot_table`` from the current ``self._rows``.
