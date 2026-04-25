@@ -108,17 +108,20 @@ def _slice_prefill_regime_active(self) -> bool:
         return False
     if self._prefix_cache is not None:
         return True
-    # Test-only escape: see _force_recurrent_slice_prefill_for_c5_3_oracle
-    # in §3.6. Production paths never set this flag.
-    return self._force_recurrent_slice_prefill_for_c5_3_oracle
+    # Test-only opt-in branch: see
+    # _force_recurrent_slice_prefill_for_c5_3_oracle in §3.6. The flag
+    # is int | None — non-None activates the oracle slice path, and
+    # the int value carries the block_size. Production paths leave it
+    # at None.
+    return self._force_recurrent_slice_prefill_for_c5_3_oracle is not None
 ```
 
-The second clause is a test-only opt-in; in production the predicate is exactly `RecurrentStateAdapter and prefix_cache is not None`.
+The third clause is a test-only opt-in branch; in production the predicate reduces to exactly `RecurrentStateAdapter and prefix_cache is not None`.
 
 **Acceptance oracle redefinition (per §2.2).** Tests assert byte-equality **within the slice-prefill regime**. Both subject and oracle use hybrid adapters and both run slice-prefill, so the trajectory regime is held constant; only the prefix-cache cooperation differs.
 
 - **Subject**: `prefix_cache=RadixPrefixCache(...)` + slice-regime active by the production predicate (clause `prefix_cache is not None`). Sees the hit, restores the snapshot.
-- **Oracle**: `prefix_cache=None` + slice-regime forced via the test-only flag `_force_recurrent_slice_prefill_for_c5_3_oracle=True` (per §3.6). Production never trips this flag. The oracle never sees a hit because there is no prefix cache; it slice-prefills the full prompt from scratch. This isolates the cooperation effect (snapshot-restore vs full re-prefill) from the regime effect (slice vs contiguous).
+- **Oracle**: `prefix_cache=None` + slice-regime forced via the test-only flag `_force_recurrent_slice_prefill_for_c5_3_oracle=<block_size>` (per §3.6). The flag is `int | None`; when set, its int value is the slice block_size and must match the subject's `RadixPrefixCache.block_size` so both batchers run the identical trajectory regime. Production never trips this flag. The oracle never sees a hit because there is no prefix cache; it slice-prefills the full prompt from scratch. This isolates the cooperation effect (snapshot-restore vs full re-prefill) from the regime effect (slice vs contiguous).
 
 Subject's post-restore state byte-equals oracle's slice-trajectory state at every DeltaNet layer. The contiguous-prefill regime's tokens are NOT a C5.3 oracle; they remain a sub-rounding-drift sanity check (drift experiment showed greedy bf16 tokens match across regimes, so token-stream parity remains testable even though it is not the gate).
 
@@ -278,9 +281,9 @@ The ctor guard at `silica/scheduler/batcher.py:152-166` still raises `NotImpleme
 C5.3 introduces two private constructor flags, both intended for tests only and both planned to be removed alongside the guard at C5.4:
 
 - `_allow_recurrent_prefix_cache_for_c5_3_testing: bool = False` — bypasses the ctor guard so a `RadixPrefixCache` may be wired alongside a hybrid adapter for the prefix-hit-admission test path. Production paths still hit `NotImplementedError`.
-- `_force_recurrent_slice_prefill_for_c5_3_oracle: bool = False` — flips the slice-regime predicate for hybrid + `prefix_cache=None`. Used ONLY by the §4.4 / §4.5 oracle batchers so they run slice-regime alongside no prefix cache, isolating the cooperation effect from the regime effect. Production paths never set this flag; production hybrid + `prefix_cache=None` stays contiguous (§3.2).
+- `_force_recurrent_slice_prefill_for_c5_3_oracle: int | None = None` — when an int is provided, flips the slice-regime predicate for hybrid + `prefix_cache=None` and uses the int value as the slice block_size. Required to be `> 0`; the value must match the subject's `RadixPrefixCache.block_size` so the oracle and subject share the identical trajectory regime. Used ONLY by the §4.4 / §4.5 oracle batchers; production paths leave it at `None` and hybrid + `prefix_cache=None` stays contiguous (§3.2).
 
-The two flags are independent: subject batchers in oracle tests set `_allow_recurrent_prefix_cache_for_c5_3_testing=True` only; oracle batchers set `_force_recurrent_slice_prefill_for_c5_3_oracle=True` only. Their existence is a test-only signal that C5.3 isn't fully landed; both are removed at C5.4.
+The two flags are independent: subject batchers in oracle tests set `_allow_recurrent_prefix_cache_for_c5_3_testing=True` only; oracle batchers set `_force_recurrent_slice_prefill_for_c5_3_oracle=<block_size>` only. Their existence is a test-only signal that C5.3 isn't fully landed; both are removed at C5.4.
 
 ## 4. Sub-unit breakdown
 
@@ -364,7 +367,7 @@ C5.3 is the integrative payoff for P-3-C5; the work is sliced for incremental re
 - Suffix prefill itself runs through the slice-prefill regime helper from §4.2 when slice-regime is active; otherwise unchanged. Decode-step counter for the admitted row continues from absolute block index `K` (set by the seeding bullet above).
 - Add the two test-only flags from §3.6 to `ContinuousBatcher.__init__` so the real-model byte-exact gate below can run in this same commit:
   - `_allow_recurrent_prefix_cache_for_c5_3_testing: bool = False` — bypasses the `caps.has_recurrent_state + prefix_cache != None` ctor guard at line 152-166.
-  - `_force_recurrent_slice_prefill_for_c5_3_oracle: bool = False` — flips the slice-regime predicate for hybrid + `prefix_cache=None`, used only by the oracle batcher in the byte-exact gate below.
+  - `_force_recurrent_slice_prefill_for_c5_3_oracle: int | None = None` — when an int is provided, flips the slice-regime predicate for hybrid + `prefix_cache=None` and uses the int as the oracle's slice block_size. Used only by the oracle batcher in the byte-exact gate below; the value must match the subject's `RadixPrefixCache.block_size`.
   Both flags default to False; production paths leave them at the default. Their existence is gated for removal at C5.4 alongside the underlying guard.
 
 **Acceptance — within slice-prefill regime, byte-exact-vs-oracle gate**:
@@ -372,7 +375,7 @@ C5.3 is the integrative payoff for P-3-C5; the work is sliced for incremental re
 Real-model test on Qwen3.5-0.8B using the two test-only flags from §3.6 / §4.4. Both batchers run **slice-prefill regime** for hybrid adapters (same regime, only the prefix-cache cooperation differs):
 
 - **Subject**: `prefix_cache=RadixPrefixCache(...)` + `_allow_recurrent_prefix_cache_for_c5_3_testing=True` (bypass guard). Slice-regime active by the production predicate's `prefix_cache is not None` clause. Two requests share a long prompt; the second hits the radix tree's snapshot, admits via `_admit_single_hit_row`, restores recurrent state, runs suffix slice-prefill.
-- **Oracle**: `prefix_cache=None` + `_force_recurrent_slice_prefill_for_c5_3_oracle=True` (test-only flip). Slice-regime active via the test-only predicate clause. Same prompts, same seeds; the second request prefills via the slice-regime miss path (no hit available because no prefix cache). The flag is the only deviation from production; in production, hybrid + `prefix_cache=None` stays contiguous.
+- **Oracle**: `prefix_cache=None` + `_force_recurrent_slice_prefill_for_c5_3_oracle=<subject_block_size>` (test-only flip; flag is `int | None`, the int value is the oracle's slice block_size and must match the subject's prefix-cache block_size). Slice-regime active via the test-only predicate clause. Same prompts, same seeds; the second request prefills via the slice-regime miss path (no hit available because no prefix cache). The flag is the only deviation from production; in production, hybrid + `prefix_cache=None` stays contiguous.
 - **Comparison**: after both batchers process request 2, snapshot the row's DeltaNet recurrent slots from each `_batch_cache` and assert `mx.array_equal` per layer. **This is byte-exact within slice-prefill regime.**
 
 A token-stream sanity row sits alongside the byte-exact gate: subject's emitted tokens (prefix_cache=True) and oracle's emitted tokens (prefix_cache=None, slice-regime) match bit-by-bit. Drift experiment context applies — both regimes are slice-prefill, so this is the SAME regime; drift across regimes (slice vs contiguous) is a separate question and is NOT a C5.3 gate. Token-stream-vs-contiguous-regime is a separate diagnostic test that may report differences within the sub-rounding band the drift experiment characterised; it is informational only.
@@ -411,7 +414,7 @@ Synthetic-adapter test, `block_size=4`. Insert a 2-block (8-token) prefix manual
 - Smoke tests green on Qwen3.5-0.8B; HF-cache-gated.
 - No regression in `prefix_cache=None` non-recurrent paths (existing `tests/test_qwen3_5_preempt_replay.py`, `tests/test_qwen3_5_recurrent_snapshot.py`, `tests/test_batcher.py` all still pass).
 - Production `prefix_cache=None` hybrid path stays on contiguous prefill (no slice-regime activation, no snapshot capture). Verified by a synthetic-adapter test that constructs the batcher without either C5.3 test-only flag and confirms the row's `recurrent_snapshots_per_block` stays empty after a hybrid-adapter prefill. Tokens match the pre-C5.3 baseline bit-for-bit because no path changed.
-- `_force_recurrent_slice_prefill_for_c5_3_oracle=True` hybrid path (test-only — the oracle batcher in §4.4) produces tokens that match the production `prefix_cache=None` contiguous-regime tokens within bf16 greedy. This is a sanity check on the cross-regime drift band the experiment characterised, not a C5.3 acceptance gate.
+- `_force_recurrent_slice_prefill_for_c5_3_oracle=<block_size>` hybrid path (test-only — the oracle batcher in §4.4) produces tokens that match the production `prefix_cache=None` contiguous-regime tokens within bf16 greedy. This is a sanity check on the cross-regime drift band the experiment characterised, not a C5.3 acceptance gate.
 
 ## 5. Risks + open questions
 
@@ -458,7 +461,7 @@ A radix tree with deep prefixes accumulates one snapshot per node. On Qwen3.5-0.
 
 - `TestSliceCaptureSynthetic`: spy adapter records snapshot calls during a prefill; assert one call per `block_size` boundary; assert snapshots attached to `_BatchRow.recurrent_snapshots_per_block`.
 - `TestExtractInsertPropagatesSnapshots`: drive prefill + preempt; assert the deepest tree node has `recurrent_snapshot is not None`.
-- `TestHitAdmissionRestoresSnapshot` (real Qwen3.5-0.8B; HF-cache-gated): drive a prefix-hit admission and assert subject's row_cache after admission byte-equals the **slice-regime** oracle's cache at every DeltaNet layer. Subject batcher: `prefix_cache=RadixPrefixCache(...)` + `_allow_recurrent_prefix_cache_for_c5_3_testing=True`. Oracle batcher: `prefix_cache=None` + `_force_recurrent_slice_prefill_for_c5_3_oracle=True` so it runs the SAME slice-prefill regime as the subject (per §4.4). Do NOT compare against a `prefix_cache=None` contiguous-regime oracle — that gate was deliberately demoted in §2.2 / §3.2 because slice-vs-contiguous trajectories diverge at fp32 by construction.
+- `TestHitAdmissionRestoresSnapshot` (real Qwen3.5-0.8B; HF-cache-gated): drive a prefix-hit admission and assert subject's row_cache after admission byte-equals the **slice-regime** oracle's cache at every DeltaNet layer. Subject batcher: `prefix_cache=RadixPrefixCache(block_size=B)` + `_allow_recurrent_prefix_cache_for_c5_3_testing=True`. Oracle batcher: `prefix_cache=None` + `_force_recurrent_slice_prefill_for_c5_3_oracle=B` (same block_size B) so it runs the SAME slice-prefill regime as the subject (per §4.4). Do NOT compare against a `prefix_cache=None` contiguous-regime oracle — that gate was deliberately demoted in §2.2 / §3.2 because slice-vs-contiguous trajectories diverge at fp32 by construction.
 - `TestFallbackOnMissingSnapshot`: deepest-usable node has `recurrent_snapshot=None`; admission falls back to miss path (Phase-B classifier route per §3.5); sanity tokens still match.
 
 ### 6.3 Smoke test additions

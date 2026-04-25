@@ -40,6 +40,7 @@ reshuffling indices) is 16d's filter+re-index path.
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -204,10 +205,26 @@ class ContinuousBatcher:
         max_batch_size: int = 1,
         prefix_cache: RadixPrefixCache | None = None,
         budgeter: MemoryBudgeter | None = None,
+        _allow_recurrent_prefix_cache_for_c5_3_testing: bool = False,
+        _force_recurrent_slice_prefill_for_c5_3_oracle: int | None = None,
     ) -> None:
         if max_batch_size < 1:
             raise ValueError(
                 f"max_batch_size must be >= 1, got {max_batch_size}"
+            )
+        # P-3-C5.3.3 oracle flag: when non-None, the value is the
+        # slice block_size. Mirror RadixPrefixCache.__init__'s
+        # validation so a misconfigured oracle batcher fails fast at
+        # construction rather than mid-step on a divide-by-zero in
+        # the block-index math.
+        if (
+            _force_recurrent_slice_prefill_for_c5_3_oracle is not None
+            and _force_recurrent_slice_prefill_for_c5_3_oracle <= 0
+        ):
+            raise ValueError(
+                "_force_recurrent_slice_prefill_for_c5_3_oracle must "
+                "be > 0 when set (it carries the oracle block_size); "
+                f"got {_force_recurrent_slice_prefill_for_c5_3_oracle}"
             )
         # P-3-C3b: the prefix-cache extract path (``_extract_and_insert_prefix``
         # + the seeded-admission path through the radix trie) assumes
@@ -222,9 +239,18 @@ class ContinuousBatcher:
         # specific error surfaces first and the placement stays stable
         # once C3c lifts the capability gate for hybrid adapters running
         # without a prefix cache.
+        #
+        # P-3-C5.3.3 test-only escape: ``_allow_recurrent_prefix_cache_for_c5_3_testing``
+        # bypasses this guard so the C5.3.3 byte-exact oracle test can
+        # construct a hybrid + RadixPrefixCache batcher. The flag is
+        # private, defaults False, and is removed at C5.4 alongside
+        # the guard itself. Production paths never set it.
         if prefix_cache is not None:
             caps = adapter.capabilities()
-            if caps.has_recurrent_state:
+            if (
+                caps.has_recurrent_state
+                and not _allow_recurrent_prefix_cache_for_c5_3_testing
+            ):
                 raise NotImplementedError(
                     "ContinuousBatcher does not support a RadixPrefixCache "
                     "on adapters with has_recurrent_state=True "
@@ -290,6 +316,29 @@ class ContinuousBatcher:
         # the cache's lifetime so it can span multiple Engine.generate_batch
         # invocations (that is the whole point of prefix reuse).
         self._prefix_cache: RadixPrefixCache | None = prefix_cache
+        # P-3-C5.3.3 test-only flags. Both default False and are removed
+        # at C5.4 alongside the ctor guard. Production paths never set
+        # either.
+        # ``_allow_recurrent_prefix_cache_for_c5_3_testing``: stored for
+        # symmetry only — actually consumed by the ctor guard above
+        # before the assignment runs. Kept as an attribute so test
+        # introspection / future audits can read which flags are
+        # active on a constructed batcher.
+        self._allow_recurrent_prefix_cache_for_c5_3_testing: bool = (
+            _allow_recurrent_prefix_cache_for_c5_3_testing
+        )
+        # ``_force_recurrent_slice_prefill_for_c5_3_oracle``: flips the
+        # slice-regime predicate to fire on hybrid + ``prefix_cache=None``,
+        # used only by the §4.4 byte-exact oracle batcher so it runs
+        # the same trajectory regime as the subject. The flag's value
+        # (an ``int`` when active, ``None`` when off) is the block_size
+        # the oracle slices at — must match the subject's
+        # ``RadixPrefixCache.block_size`` for regime parity. Production
+        # hybrid + ``prefix_cache=None`` stays contiguous because the
+        # default is ``None``.
+        self._force_recurrent_slice_prefill_for_c5_3_oracle: int | None = (
+            _force_recurrent_slice_prefill_for_c5_3_oracle
+        )
         # 16c.2 observability counters. ``forward_prompt_tokens`` tracks
         # tokens fed through prefill forwards (excludes decode steps).
         # ``prefix_hits`` counts admissions that used the hit path. Step
@@ -892,7 +941,7 @@ class ContinuousBatcher:
 
         Slice-prefill is the canonical regime for hybrid adapters
         running with a ``RadixPrefixCache`` so the producer (whose
-        snapshots get stored) and the consumer (the C5.3.3 prefix-hit
+        snapshots get stored) and the consumer (C5.3.3 prefix-hit
         admission) operate in the same trajectory regime — see
         ``docs/P3_C5_3_DESIGN.md`` §2.2 / §3.2 for why same-regime
         is required for byte-exact-vs-oracle.
@@ -900,48 +949,98 @@ class ContinuousBatcher:
         Production predicate: ``RecurrentStateAdapter`` mixin AND
         ``prefix_cache is not None``. Non-recurrent adapters and
         ``prefix_cache=None`` paths preserve today's contiguous
-        prefill bit-for-bit. The test-only oracle clause
-        (``_force_recurrent_slice_prefill_for_c5_3_oracle``) lands at
-        C5.3.3 alongside the byte-exact gate it serves.
+        prefill bit-for-bit.
 
-        Returns ``True`` to enable slice-prefill in the prefill paths
-        and decode-step capture in ``_decode_phase``; the prefill
-        callers add their own ``len(rows) == 1`` clamp because B>1
-        cohort slicing is post-C5.3 backlog (§5.2).
+        P-3-C5.3.3 test-only oracle clause: when
+        ``_force_recurrent_slice_prefill_for_c5_3_oracle`` is set,
+        the predicate also fires for hybrid + ``prefix_cache=None``
+        so the §4.4 byte-exact oracle batcher runs the same
+        trajectory regime as the subject. Production paths never
+        set the flag.
+
+        Returns ``True`` to enable slice-prefill in the prefill paths,
+        the suffix prefill in ``_admit_single_hit_row``, and decode-
+        step capture in ``_decode_phase``; the prefill callers add
+        their own ``len(rows) == 1`` clamp because B>1 cohort
+        slicing is post-C5.3 backlog (§5.2).
         """
-        return (
-            isinstance(self._adapter, RecurrentStateAdapter)
-            and self._prefix_cache is not None
+        if not isinstance(self._adapter, RecurrentStateAdapter):
+            return False
+        if self._prefix_cache is not None:
+            return True
+        return self._force_recurrent_slice_prefill_for_c5_3_oracle is not None
+
+    def _effective_slice_block_size(self) -> int:
+        """The block_size the slice helper / decode capture uses.
+
+        Reads from ``self._prefix_cache.block_size`` in the production
+        path; falls back to the test-only oracle flag's int value when
+        the oracle path is active. Caller must guarantee
+        ``_slice_prefill_active()`` is True — otherwise the helper has
+        no business asking for a block_size.
+        """
+        if self._prefix_cache is not None:
+            return self._prefix_cache.block_size
+        oracle_block_size = self._force_recurrent_slice_prefill_for_c5_3_oracle
+        assert oracle_block_size is not None, (
+            "_effective_slice_block_size called without prefix_cache "
+            "and without the oracle flag — _slice_prefill_active() bug"
         )
+        return oracle_block_size
 
     def _slice_prefill_with_capture(
-        self, row: _BatchRow, cache: list[Any]
+        self,
+        row: _BatchRow,
+        cache: list[Any],
+        tokens: Sequence[int],
     ) -> mx.array:
-        """B=1 slice-prefill helper — issues ``ceil(T / block_size)``
+        """B=1 slice-prefill helper — issues ``ceil(len(tokens) / block_size)``
         forwards of up to ``block_size`` tokens each.
 
         Captures the per-DeltaNet-layer recurrent state at every full-
         block boundary into ``row.recurrent_snapshots_per_block`` keyed
         by absolute block index. The final chunk may be shorter than
-        ``block_size`` (for non-aligned prompt lengths) and produces
-        no snapshot — the decode-step capture path picks up snapshots
-        at later block boundaries crossed by single-step decoding.
+        ``block_size`` (for non-aligned input lengths) and produces no
+        snapshot — the decode-step capture path picks up snapshots at
+        later block boundaries crossed by single-step decoding.
+
+        ``tokens`` is the explicit sequence to slice-prefill. Two call
+        shapes today:
+
+        - **Initial / miss-cohort prefill** (P-3-C5.3.1):
+          ``tokens = row.prompt_ids``. Counter starts at 0; absolute
+          block indices align with row-relative indices.
+        - **Hit-admission suffix prefill** (P-3-C5.3.3):
+          ``tokens = pending.prompt_ids[usable_hit_tokens:]``. Counter
+          is pre-seeded to ``K * block_size`` at admission, so this
+          helper's first chunk advances to ``(K+1) * block_size`` and
+          captures at absolute index ``K``.
+
+        Block-index math: ``block_idx = absolute_consumed_tokens //
+        block_size - 1`` after the per-chunk increment. Works for both
+        call shapes because the seeded counter shifts the math by ``K``
+        without the helper needing to know.
 
         Caller invariant: ``self._slice_prefill_active()`` is True and
-        the row is the sole occupant of its cohort (B=1). Returns the
-        final chunk's ``(1, V)`` logits for the sampler.
+        ``len(tokens) >= 1``. Returns the final chunk's ``(1, V)``
+        logits for the sampler.
         """
         assert isinstance(self._adapter, RecurrentStateAdapter)
-        assert self._prefix_cache is not None
-        block_size = self._prefix_cache.block_size
-        n = len(row.prompt_ids)
+        # Block size comes from prefix_cache when present, or from the
+        # oracle flag's int value when the test-only oracle path is
+        # active (the oracle runs slice-regime with prefix_cache=None
+        # and therefore has no RadixPrefixCache to read block_size
+        # from; the flag's int value carries the block_size for
+        # regime parity with the subject).
+        block_size = self._effective_slice_block_size()
+        n = len(tokens)
 
         last_logits: mx.array | None = None
         start = 0
         while start < n:
             end = min(start + block_size, n)
             chunk_arr = mx.array(
-                [row.prompt_ids[start:end]], dtype=mx.int32
+                [list(tokens[start:end])], dtype=mx.int32
             )
             last_logits = forward_batched(self._model, chunk_arr, cache)
             consumed = end - start
@@ -971,7 +1070,9 @@ class ContinuousBatcher:
         assert self._batch_cache is not None
         if self._slice_prefill_active() and len(self._rows) == 1:
             logits = self._slice_prefill_with_capture(
-                self._rows[0], list(self._batch_cache)
+                self._rows[0],
+                list(self._batch_cache),
+                self._rows[0].prompt_ids,
             )
         else:
             tokens = self._build_prefill_tokens()  # (B, T_max)
@@ -1010,10 +1111,12 @@ class ContinuousBatcher:
             self._model, tokens, list(self._batch_cache)
         )  # (B, V)
         if self._slice_prefill_active():
-            # mypy narrowing: _slice_prefill_active guarantees both.
+            # mypy narrowing: _slice_prefill_active guarantees the
+            # adapter mixin. block_size resolves through
+            # _effective_slice_block_size so the oracle path (no
+            # prefix_cache) reads the flag's int value instead.
             assert isinstance(self._adapter, RecurrentStateAdapter)
-            assert self._prefix_cache is not None
-            block_size = self._prefix_cache.block_size
+            block_size = self._effective_slice_block_size()
             for row_idx, row in enumerate(self._rows):
                 if row.state.is_terminal:
                     continue
@@ -1258,6 +1361,9 @@ class ContinuousBatcher:
             miss_rows = list(accepted)
         else:
             block_size = self._prefix_cache.block_size
+            needs_recurrent_snapshot = isinstance(
+                self._adapter, RecurrentStateAdapter
+            )
             for pending in accepted:
                 raw = self._prefix_cache.peek(pending.prompt_ids)
                 # S-5 edge 1: reserve at least one token for suffix
@@ -1271,8 +1377,30 @@ class ContinuousBatcher:
                 usable = min(raw.num_hit_tokens, max_aligned)
                 if usable == 0:
                     miss_rows.append(pending)
-                else:
-                    hit_rows.append((pending, usable))
+                    continue
+                # P-3-C5.3.3: hybrid adapters require a recurrent
+                # snapshot at the deepest USABLE node — i.e., the
+                # node ``_admit_single_hit_row`` will actually
+                # restore from. The raw deepest node may be deeper
+                # than ``usable`` when the prompt is fully cached
+                # (``raw.num_hit_tokens=8`` vs ``max_aligned=4`` for
+                # an 8-token block_size=4 prompt). Re-walk via
+                # ``peek_with_node(prompt[:usable])`` so the node
+                # whose snapshot we inspect matches the node the
+                # atomic phase will consume. ``peek_with_node`` is
+                # side-effect-free; no ``retain_hit`` fires before
+                # the routing decision (design §3.5).
+                if needs_recurrent_snapshot:
+                    _, deepest_usable = self._prefix_cache.peek_with_node(
+                        pending.prompt_ids[:usable]
+                    )
+                    if (
+                        deepest_usable is None
+                        or deepest_usable.recurrent_snapshot is None
+                    ):
+                        miss_rows.append(pending)
+                        continue
+                hit_rows.append((pending, usable))
 
         # Phase B.1 — hit rows, per-row seeded admission.
         for pending, usable in hit_rows:
@@ -1348,7 +1476,7 @@ class ContinuousBatcher:
             state=state,
         )
 
-        hit = self._prefix_cache.lookup(
+        hit, deepest_usable = self._prefix_cache.lookup_with_node(
             pending.prompt_ids[:usable_hit_tokens]
         )
         try:
@@ -1369,13 +1497,74 @@ class ContinuousBatcher:
                 detached, num_layers=num_layers
             )
 
+            # P-3-C5.3.3 Insertion A — seed row metadata for slice
+            # regime: walk the ancestor chain of ``deepest_usable``
+            # and copy each ancestor's ``recurrent_snapshot`` into
+            # ``row.recurrent_snapshots_per_block`` keyed by its
+            # absolute block index. Set ``absolute_consumed_tokens``
+            # to ``usable_hit_tokens`` so the suffix slice helper's
+            # block-index math starts at absolute index ``K``. Per
+            # design §4.4 (relocated from §4.2). ``_Node.parent``
+            # walks deepest → root; reverse to assign indices 0..K-1.
+            # Ancestors with ``recurrent_snapshot is None`` (legacy
+            # nodes) leave the dict key absent — the design's
+            # ``dict.get`` graceful default in extract / decode-step
+            # capture handles missing keys.
+            if isinstance(self._adapter, RecurrentStateAdapter):
+                assert deepest_usable is not None  # non-empty hit
+                chain: list[Any] = []
+                cursor = deepest_usable
+                while cursor is not None and cursor.parent is not None:
+                    chain.append(cursor)
+                    cursor = cursor.parent
+                chain.reverse()
+                for abs_idx, node in enumerate(chain):
+                    if node.recurrent_snapshot is not None:
+                        row.recurrent_snapshots_per_block[abs_idx] = (
+                            node.recurrent_snapshot
+                        )
+                row.absolute_consumed_tokens = usable_hit_tokens
+
+            # P-3-C5.3.3 Insertion B — restore the deepest-usable
+            # node's recurrent snapshot into the freshly-seeded
+            # ``row_cache``. Phase-B classifier guarantees the
+            # snapshot exists (route-to-miss happens upstream when
+            # it's None), so the assert below is a tripwire for a
+            # classifier bug, not a fallback. Restore must precede
+            # the suffix prefill (Insertion C) — the suffix forward
+            # advances the recurrent state from the restored
+            # boundary.
+            if isinstance(self._adapter, RecurrentStateAdapter):
+                assert hit.block_ids, (
+                    "hit path entered with empty block_ids"
+                )
+                assert deepest_usable is not None
+                snapshot = deepest_usable.recurrent_snapshot
+                assert snapshot is not None, (
+                    "hit path entered with snapshotless deepest-usable "
+                    "node — Phase-B classifier should have routed to miss"
+                )
+                self._adapter.restore_recurrent_state(
+                    row_cache, 0, snapshot
+                )
+
+            # P-3-C5.3.3 Insertion C — suffix prefill routes through
+            # the slice helper when slice-regime is active so capture
+            # at absolute indices ``K, K+1, ...`` matches the
+            # producer-side regime; otherwise stays on today's
+            # contiguous suffix forward.
             suffix_tokens = list(pending.prompt_ids[usable_hit_tokens:])
             # S-5 edge 1 guarantees suffix_tokens is non-empty — the
             # max_aligned formula above reserves at least one token.
-            suffix_arr = mx.array([suffix_tokens], dtype=mx.int32)
-            logits = forward_batched(
-                self._model, suffix_arr, list(row_cache)
-            )  # (1, V)
+            if self._slice_prefill_active():
+                logits = self._slice_prefill_with_capture(
+                    row, list(row_cache), suffix_tokens
+                )
+            else:
+                suffix_arr = mx.array([suffix_tokens], dtype=mx.int32)
+                logits = forward_batched(
+                    self._model, suffix_arr, list(row_cache)
+                )  # (1, V)
             events = self._sample_and_emit_rows(
                 [row], logits, is_prefill=True
             )
@@ -1451,7 +1640,9 @@ class ContinuousBatcher:
         # tight.
         if self._slice_prefill_active() and len(admitted) == 1:
             logits = self._slice_prefill_with_capture(
-                admitted[0], list(k_batch_cache)
+                admitted[0],
+                list(k_batch_cache),
+                admitted[0].prompt_ids,
             )
         else:
             pad = self._pad_token_id()

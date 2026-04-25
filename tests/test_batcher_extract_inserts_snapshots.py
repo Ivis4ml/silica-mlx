@@ -279,31 +279,36 @@ class TestPreemptExtractForwardsSnapshots:
 
 
 class TestDuplicateExtractDoesNotOverwriteExisting:
-    def test_second_row_extract_with_empty_dict_preserves_tree_snapshots(
+    def test_second_row_extract_preserves_tree_snapshots_via_duplicate_keep(
         self,
     ) -> None:
-        # Two sequential B=1 requests with the same prompt:
-        #   - Request 0: slice-regime prefill captures markers 0, 1;
-        #     reclaim's extract inserts (snap_0, snap_1) into the tree.
-        #   - Request 1: same prompt → Phase-B classifier (today's
-        #     pre-C5.3.3 form, no recurrent-snapshot routing) routes
-        #     it through ``_admit_single_hit_row``. Hit admission's
-        #     suffix prefill stays contiguous at C5.3.2 (slice helper
-        #     for the suffix lands at C5.3.3 alongside the restore
-        #     wiring), so request 1's row has an empty
-        #     ``recurrent_snapshots_per_block``. When max_tokens=1
-        #     terminates request 1 and reclaim's extract runs, it
-        #     forwards a list of ``None``-entries to ``insert_detached``.
-        #
-        # The C5.3.0 ``insert_detached`` contract: duplicate-prefix
-        # branch with ``new_snap is None`` keeps the existing node's
-        # snapshot (no overwrite, no backfill). This test pins that
-        # contract end-to-end through the batcher's extract path —
-        # complementing the unit-level test in
+        # Two sequential B=1 slice-regime requests with the same
+        # prompt. Pinning the duplicate-prefix-branch "both non-None
+        # → keep existing" contract end-to-end through the batcher,
+        # alongside the unit-level test in
         # ``test_radix_prefix_cache_recurrent_snapshot.py``.
+        #
+        #   - Request 0: slice-regime prefill captures markers 0, 1;
+        #     reclaim's extract inserts (marker 0, marker 1) into
+        #     the tree.
+        #   - Request 1: same prompt; the (post-C5.3.3) Phase-B
+        #     classifier routes it to hit admission. With
+        #     ``block_size=4`` and prompt length 8, the
+        #     ``max_aligned=(8-1)//4*4=4`` clamp gives ``usable=4``,
+        #     so only the first block is consumed via hit; the
+        #     second block becomes the suffix. Hit admission seeds
+        #     ``row.recurrent_snapshots_per_block[0]`` from Node A's
+        #     marker 0 ancestor (Insertion A) and slice-prefills the
+        #     4-token suffix, capturing one fresh marker at abs idx
+        #     1 (Insertion C). Reclaim's extract walks both absolute
+        #     blocks; both insert_detached calls hit the
+        #     duplicate-prefix branch with both existing and new
+        #     non-None → keep existing. Tree markers stay at 0, 1.
         prompt = list(range(1, 2 * BLOCK_SIZE + 1))
         log = _SliceCaptureLog()
-        adapter = _make_slice_spy_adapter(log, script=(0, 0, 0, 0))
+        # Script: 2 prefill slices (request 0) + 1 suffix slice
+        # (request 1) = 3 forwards minimum.
+        adapter = _make_slice_spy_adapter(log, script=(0, 0, 0))
         pc = _prefix_cache()
         batcher = ContinuousBatcher(adapter, prefix_cache=pc)
         batcher.add_request(0, prompt, _params(max_tokens=1))
@@ -317,13 +322,16 @@ class TestDuplicateExtractDoesNotOverwriteExisting:
         assert captures_after_first == 2
 
         batcher.add_request(1, prompt, _params(max_tokens=1))
-        batcher.step()  # admit → hit admission, contiguous suffix
-        batcher.step()  # reclaim → extract with all-None list
+        batcher.step()  # admit → hit admission, slice-regime suffix
+        batcher.step()  # reclaim → extract; duplicate-keep both blocks
 
-        # Request 1 went through hit admission (today's path); no
-        # additional snapshot captures happened.
-        assert len(log.snapshot_calls) == captures_after_first
-        # Tree's markers stay at the originals.
+        # Request 1's slice-regime suffix added one capture for the
+        # second absolute block (marker 2); request 0 contributed 2
+        # captures. Total is 3.
+        assert len(log.snapshot_calls) == captures_after_first + 1
+        # Tree's markers stay at the originals — duplicate-prefix
+        # branch keeps existing snapshots even though the new ones
+        # (seeded marker 0 + captured marker 2) are non-None.
         chain_second = _walk_chain(pc, prompt)
         assert len(chain_second) == 2
         assert _read_marker(chain_second[0].recurrent_snapshot) == 0
