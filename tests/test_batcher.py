@@ -2115,9 +2115,10 @@ def test_preempt_active_row_returns_victim_row_on_success() -> None:
     b.step()  # prefill → row in DECODE, batch_cache allocated
 
     assert len(b._rows) == 1  # type: ignore[attr-defined]
-    victim = b._preempt_active_row("req-0")  # type: ignore[attr-defined]
+    result = b._preempt_active_row("req-0")  # type: ignore[attr-defined]
 
-    assert victim is not None
+    assert result is not None
+    victim = result.detached
     assert victim.req_id == "req-0"
     assert list(victim.prompt_ids) == [1, 2, 3, 4]
     assert len(b._rows) == 0  # type: ignore[attr-defined]
@@ -2156,9 +2157,10 @@ def test_preempt_active_row_removes_row_from_rows_via_filter() -> None:
     b.step()
     assert len(b._rows) == 2  # type: ignore[attr-defined]
 
-    victim = b._preempt_active_row("req-0")  # type: ignore[attr-defined]
+    result = b._preempt_active_row("req-0")  # type: ignore[attr-defined]
 
-    assert victim is not None
+    assert result is not None
+    victim = result.detached
     assert victim.req_index == 0
     assert len(b._rows) == 1  # type: ignore[attr-defined]
     assert b._rows[0].req_index == 1  # type: ignore[attr-defined]
@@ -2174,9 +2176,10 @@ def test_preempt_active_row_transitions_victim_PREEMPTED_then_WAITING() -> None:
     b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=5))
     b.step()  # prefill → DECODE
 
-    victim = b._preempt_active_row("req-0")  # type: ignore[attr-defined]
+    result = b._preempt_active_row("req-0")  # type: ignore[attr-defined]
 
-    assert victim is not None
+    assert result is not None
+    victim = result.detached
     assert victim.state.status == RequestStatus.WAITING
     history = victim.state.history
     # Last two entries are the preempt pair.
@@ -2194,9 +2197,10 @@ def test_preempt_active_row_handles_prefill_state_uniformly() -> None:
     b._prepare_cohort()  # type: ignore[attr-defined]
     assert b._rows[0].state.status == RequestStatus.PREFILL  # type: ignore[attr-defined]
 
-    victim = b._preempt_active_row("req-0")  # type: ignore[attr-defined]
+    result = b._preempt_active_row("req-0")  # type: ignore[attr-defined]
 
-    assert victim is not None
+    assert result is not None
+    victim = result.detached
     assert victim.state.status == RequestStatus.WAITING
     assert victim.state.history[-2] == (
         RequestStatus.PREEMPTED,
@@ -2225,9 +2229,9 @@ def test_preempt_active_row_releases_budgeter_reservation() -> None:
     budgeter.apply_admit("req-0", 200)
     assert budgeter.reserved_bytes() == 200
 
-    victim = b._preempt_active_row("req-0")  # type: ignore[attr-defined]
+    result = b._preempt_active_row("req-0")  # type: ignore[attr-defined]
 
-    assert victim is not None
+    assert result is not None
     assert budgeter.reserved_bytes() == 0
     assert budgeter.active_requests() == []
 
@@ -2243,9 +2247,9 @@ def test_preempt_active_row_extracts_prefix_before_filter() -> None:
     b.step()  # prefill → 4-token K/V in batch_cache
     assert pc.node_count() == 0
 
-    victim = b._preempt_active_row("req-0")  # type: ignore[attr-defined]
+    result = b._preempt_active_row("req-0")  # type: ignore[attr-defined]
 
-    assert victim is not None
+    assert result is not None
     # Prefix extracted → one radix block available to future admissions.
     assert pc.node_count() == 1
     assert pc.peek([1, 2, 3, 4]).num_hit_tokens == 4
@@ -2260,9 +2264,10 @@ def test_preempt_active_row_no_prefix_cache_still_works() -> None:
     b.add_request(0, [1, 2, 3, 4], _greedy(max_tokens=5))
     b.step()
 
-    victim = b._preempt_active_row("req-0")  # type: ignore[attr-defined]
+    result = b._preempt_active_row("req-0")  # type: ignore[attr-defined]
 
-    assert victim is not None
+    assert result is not None
+    victim = result.detached
     assert victim.req_id == "req-0"
     assert len(b._rows) == 0  # type: ignore[attr-defined]
 
@@ -2280,9 +2285,10 @@ def test_preempt_active_row_rebuilds_slot_table() -> None:
     b.step()
     assert b._slot_table == {0: 0, 5: 1, 7: 2}  # type: ignore[attr-defined]
 
-    victim = b._preempt_active_row("req-5")  # type: ignore[attr-defined]
+    result = b._preempt_active_row("req-5")  # type: ignore[attr-defined]
 
-    assert victim is not None
+    assert result is not None
+    victim = result.detached
     assert victim.req_index == 5
     assert b._slot_table == {0: 0, 7: 1}  # type: ignore[attr-defined]
     assert len(b._rows) == 2  # type: ignore[attr-defined]

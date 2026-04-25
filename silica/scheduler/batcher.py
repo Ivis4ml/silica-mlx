@@ -53,6 +53,7 @@ from silica.core.sampling import SamplingParams
 from silica.kvcache.prefix import RadixPrefixCache
 from silica.mlx.runner import forward_batched
 from silica.models.adapter import AttentionKind, ModelAdapter
+from silica.models.recurrent import RecurrentSnapshot, RecurrentStateAdapter
 from silica.scheduler.budget import (
     AdmitAfterEvictDecision,
     AdmitAfterPreemptDecision,
@@ -91,12 +92,63 @@ class _PendingAdmit:
     anti-ping-pong rule (16d-4c/d) keys off this flag. Default
     ``False`` keeps every existing ``add_request`` / ``_admit_*``
     construction site unchanged.
+
+    ``recurrent_snapshot`` (P-3-C5.2): the adapter-captured
+    ``RecurrentSnapshot`` for this row at preempt time, or ``None``
+    when (a) the adapter does not implement ``RecurrentStateAdapter``
+    (no recurrent state to capture, e.g. plain Qwen3 / Gemma4), or
+    (b) this pending was created by ``add_request`` rather than by
+    preempt (no preempt history to snapshot from).
+
+    **Boundary semantics**: when set, the snapshot describes the
+    recurrent state at ``T + len(generated) - 1`` tokens consumed,
+    where ``T = len(prompt_ids)`` of the original (pre-preempt)
+    request and ``len(generated)`` is the number of tokens emitted
+    before preempt. This is the cache's natural state at preempt:
+    ``T`` prompt tokens plus the first ``len(generated) - 1``
+    decode-step inputs have been fed back; the latest sample (which
+    became ``generated[-1]``) is observed but not yet consumed.
+
+    **C5.2 stashes; C5.3 restores.** ``_admit_miss_cohort`` does
+    NOT call ``adapter.restore_recurrent_state`` on the full-replay
+    path because ``composite_prompt`` is ``prompt + generated`` (i.e.
+    ``T + len(generated)`` tokens) and the post-prefill cache lands
+    at ``T + len(generated)`` consumed — one token past the snapshot
+    boundary. See ``docs/P3_C5_DRIFT_EXPERIMENT/README.md``
+    "C5.2 acceptance" for the boundary derivation. C5.3 will enable
+    restore only on admission paths whose post-prefill boundary
+    matches the snapshot boundary (e.g. prefix-hit replay where the
+    prefill ends at a block-aligned edge the snapshot was captured
+    against). Until then, ``recurrent_snapshot`` is a captured
+    record carried for future use, not actively consumed.
     """
 
     req_index: int
     prompt_ids: tuple[int, ...]
     params: SamplingParams
     is_replay: bool = False
+    recurrent_snapshot: RecurrentSnapshot | None = None
+
+
+@dataclass(frozen=True)
+class _PreemptedRow:
+    """Result of ``_preempt_active_row`` (P-3-C5.2).
+
+    Carries the detached ``_BatchRow`` alongside the optional
+    recurrent snapshot captured **before** the cache-filter pass. The
+    snapshot is set when ``isinstance(adapter, RecurrentStateAdapter)``
+    holds; otherwise ``None`` and the replay proceeds via batched
+    re-prefill (today's behaviour for non-recurrent adapters).
+
+    Returning a small dataclass instead of stuffing a side-channel
+    into ``_BatchRow`` keeps the snapshot capture point inside
+    ``_preempt_active_row`` (where the live ``victim_row_idx`` is
+    valid against ``self._batch_cache``) and lets ``_apply_preempt``
+    pass the snapshot into ``_PendingAdmit`` cleanly.
+    """
+
+    detached: _BatchRow
+    recurrent_snapshot: RecurrentSnapshot | None = None
 
 
 @dataclass
@@ -604,11 +656,22 @@ class ContinuousBatcher:
 
     def _preempt_active_row(
         self, victim_req_id: str
-    ) -> _BatchRow | None:
+    ) -> _PreemptedRow | None:
         """Strip one active row out of the batch and return it (16d-4b).
 
-        Does steps 1-4 of prep doc ``P2_UNIT_16D_PREP.md`` §4.4:
+        Does steps 1-4 of prep doc ``P2_UNIT_16D_PREP.md`` §4.4 plus
+        the P-3-C5.2 recurrent-state snapshot:
 
+          0. **(P-3-C5.2)** Capture the victim row's recurrent
+             state via ``adapter.snapshot_recurrent_state(
+             self._batch_cache, victim_row_idx)`` when the adapter
+             implements ``RecurrentStateAdapter``. Captured **before**
+             any cache mutation (prefix extract / filter) so the
+             snapshot reflects exactly the state the victim row had
+             at the moment preempt was decided. The snapshot is
+             returned alongside the detached row so
+             ``_apply_preempt`` can stash it on the replay's
+             ``_PendingAdmit``.
           1. Extract victim's aligned prefix K/V into
              ``self._prefix_cache`` (if present). Safe no-op when the
              cache is absent — the row's prompt work is lost, but
@@ -631,10 +694,11 @@ class ContinuousBatcher:
         composite prompt + ``appendleft`` the replay ``_PendingAdmit``.
 
         Returns:
-            The victim ``_BatchRow`` on success (caller reads its
-            ``prompt_ids`` / ``generated`` / ``params`` to construct the
-            re-admission). ``None`` when the request is no longer
-            active (not in ``self._rows``) — that is B-7's race path.
+            ``_PreemptedRow`` carrying the detached ``_BatchRow`` and
+            an optional ``RecurrentSnapshot`` (set when the adapter
+            implements ``RecurrentStateAdapter``; ``None`` otherwise).
+            Returns ``None`` when the request is no longer active
+            (not in ``self._rows``) — that is B-7's race path.
         """
         if self._batch_cache is None:
             # No active batched cache → no row to preempt. Distinct
@@ -644,6 +708,16 @@ class ContinuousBatcher:
         if victim_row_idx is None:
             return None
         victim_row = self._rows[victim_row_idx]
+
+        # 0. P-3-C5.2 — capture recurrent snapshot before any cache
+        # mutation. The victim_row_idx is valid against
+        # self._batch_cache here; once the filter at step 3 runs,
+        # that index would point at a different (or missing) row.
+        recurrent_snapshot: RecurrentSnapshot | None = None
+        if isinstance(self._adapter, RecurrentStateAdapter):
+            recurrent_snapshot = self._adapter.snapshot_recurrent_state(
+                self._batch_cache, victim_row_idx
+            )
 
         # 1. Extract prefix K/V into the prefix cache (optional).
         if self._prefix_cache is not None:
@@ -674,7 +748,9 @@ class ContinuousBatcher:
         if self._budgeter is not None:
             self._budgeter.release(victim_req_id)
 
-        return victim_row
+        return _PreemptedRow(
+            detached=victim_row, recurrent_snapshot=recurrent_snapshot
+        )
 
     def _apply_preempt(self, victim_req_id: str) -> bool:
         """Preempt ``victim_req_id`` and re-enqueue it as a replay (16d-4c).
@@ -727,11 +803,12 @@ class ContinuousBatcher:
                 f"{remaining} (victim should have been DONE)"
             )
 
-        detached = self._preempt_active_row(victim_req_id)
+        result = self._preempt_active_row(victim_req_id)
         # The second lookup inside _preempt_active_row scans the same
         # self._rows we just read; no mutation in between so a None
         # here would be a consistency violation.
-        assert detached is not None
+        assert result is not None
+        detached = result.detached
 
         composite_prompt = tuple(
             list(detached.prompt_ids) + list(detached.generated)
@@ -739,12 +816,33 @@ class ContinuousBatcher:
         replay_params = detached.params.model_copy(
             update={"max_tokens": remaining}
         )
+        # P-3-C5.2: stash the recurrent snapshot on the replay's
+        # _PendingAdmit. The snapshot was captured at preempt time
+        # against the **live** cache state, which is one token
+        # earlier than the composite_prompt length:
+        #
+        #   len(composite_prompt) == n_prompt + len(generated)
+        #   snapshot boundary    == n_prompt + len(generated) - 1
+        #
+        # The off-by-one is fundamental: at preempt time, the latest
+        # sample was emitted from the prefill / decode logits but
+        # has NOT yet been fed back into the cache. Snapshot
+        # therefore describes "all of generated except the last
+        # token has been consumed". This is why C5.2's
+        # _admit_miss_cohort does NOT call restore_recurrent_state
+        # on the full-replay path — see the boundary-mismatch
+        # comment at the restore call site for the full derivation.
+        # The pending owns the snapshot's lifetime; C5.3 (prefix-hit
+        # admission) will be the first site to consume the snapshot
+        # via restore, where the prefill ends at the matching
+        # boundary by construction.
         self._waiting_queue.appendleft(
             _PendingAdmit(
                 req_index=detached.req_index,
                 prompt_ids=composite_prompt,
                 params=replay_params,
                 is_replay=True,
+                recurrent_snapshot=result.recurrent_snapshot,
             )
         )
         return True
@@ -1202,6 +1300,25 @@ class ContinuousBatcher:
         events = self._sample_and_emit_rows(
             admitted, logits, is_prefill=True
         )
+
+        # P-3-C5.2 boundary note — restore is INTENTIONALLY NOT called
+        # on the full-replay admission path. The snapshot stashed on
+        # ``pending.recurrent_snapshot`` describes the recurrent state
+        # at boundary ``T + len(generated) - 1`` consumed (the cache's
+        # natural pre-preempt state, with the latest sample held but
+        # not yet fed back). The replay prefills the full
+        # ``composite_prompt = prompt + generated`` (``T + len(generated)``
+        # tokens), so ``k_batch_cache`` ends at ``T + len(generated)``
+        # consumed — one token ahead of the snapshot. Restoring the
+        # snapshot here would rewind the cache by one position and
+        # erase the consumption of the last generated token, breaking
+        # the replay's trajectory. C5.3 (RadixPrefixCache cooperation)
+        # will enable restore only on admission paths whose post-
+        # prefill boundary equals the snapshot boundary, e.g. prefix-
+        # hit paths where the prefill ends at the prefix-block edge
+        # the snapshot was captured against. See
+        # docs/P3_C5_DRIFT_EXPERIMENT/README.md "C5.2 acceptance" for
+        # the full boundary derivation.
 
         if self._batch_cache is None:
             self._batch_cache = k_batch_cache

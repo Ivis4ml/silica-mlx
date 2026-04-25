@@ -552,51 +552,70 @@ B=1, B=4, 0-step, 1-step, 4-step}` on Qwen3.5-0.8B. HF-cache-gated.
 
 **Blocks:** C5.2 (needs the API to call).
 
-### 6.3 C5.2 — Preempt/replay integration
+### 6.3 C5.2 — Preempt-side snapshot capture / stash (post-pivot)
 
 **Goal:** `ContinuousBatcher._apply_preempt` captures the
-victim row's recurrent snapshot before filtering; replay restores
-the snapshot before the resume forward. Under `prefix_cache=None`,
-hybrid adapters now get correct preempt/replay semantics.
+victim row's recurrent snapshot before filtering and stashes it
+on the replay's `_PendingAdmit.recurrent_snapshot` field.
+**Restore is NOT enabled on the full-replay path** — see the
+boundary-mismatch derivation in `docs/P3_C5_DRIFT_EXPERIMENT/README.md`
+"Implication for C5.2 acceptance" (added at C5.2 landing time).
+The natural snapshot boundary (`T + len(generated) - 1` consumed)
+is one token earlier than the replay's post-prefill cache state
+(`T + len(generated)` consumed); restoring at that misaligned
+site would rewind the cache and erase the last generated
+token's consumption. Restore enablement is deferred to C5.3
+(prefix-hit admission, where the boundary aligns naturally).
 
 **Deliverable:**
 
-- **Preempt entry — snapshot from `self._batch_cache`.** In
-  `ContinuousBatcher._apply_preempt`, before the `filter` call
-  that drops the victim row out of every layer's batched cache,
-  resolve `victim_row_idx` (already present in the local scope
-  per the existing 16d preempt path), then under
-  `isinstance(adapter, RecurrentStateAdapter)` call
-  `snapshot = adapter.snapshot_recurrent_state(self._batch_cache,
-  victim_row_idx)`. The adapter walks the per-layer caches and
-  extracts the recurrent slots for that row; the batcher does not
-  inspect the snapshot.
-- **Preempt record schema** extends by one optional field
-  `recurrent_snapshot: RecurrentSnapshot | None`. Adapters
-  without the mixin leave the field `None` and the behaviour is
-  unchanged from today.
-- **Replay entry — restore into the freshly-built row cache.**
-  On replay, after the existing 16d-4c flow rebuilds the
-  per-row cache fragments (`row_cache` in the replay code path)
-  and BEFORE `self._batch_cache[layer].extend(row_cache[layer])`
-  stitches it back into the active batch, call
-  `adapter.restore_recurrent_state(row_cache, row_idx=0,
-  snapshot)`. Restoring before `extend` keeps the splice-point
-  arithmetic clean — the row is at index 0 of `row_cache` until
-  it is `extend`-ed onto `self._batch_cache`. (If C5.2 lands a
-  shape where restore must happen post-`extend`, the call site
-  switches to `adapter.restore_recurrent_state(self._batch_cache,
-  new_row_idx, snapshot)` with the post-extend index; either
-  form fits the API.)
-- Unit test: preempted Qwen3.5-0.8B row resumes to bit-exact
-  tokens vs the "no preempt" baseline at `prefix_cache=None`.
+- **`_PendingAdmit` schema** extends by one optional field
+  `recurrent_snapshot: RecurrentSnapshot | None`, default
+  `None`. Plain (`add_request`) admissions and adapters without
+  `RecurrentStateAdapter` leave the field `None` and behave as
+  today.
+- **`_PreemptedRow` result dataclass** carries the detached
+  `_BatchRow` plus the captured `RecurrentSnapshot | None`.
+  Returned by `_preempt_active_row`; consumed by
+  `_apply_preempt` to compose the replay record.
+- **`_preempt_active_row` capture site.** After `victim_row_idx`
+  is resolved and BEFORE any prefix-extract / state-transition /
+  `layer_cache.filter(kept)` call: under
+  `isinstance(self._adapter, RecurrentStateAdapter)`, call
+  `adapter.snapshot_recurrent_state(self._batch_cache,
+  victim_row_idx)`. Snapshot the cache while `victim_row_idx`
+  still indexes a valid row in `self._batch_cache`.
+- **`_apply_preempt` stash.** Unpack `_PreemptedRow.detached` /
+  `.recurrent_snapshot`; pass the snapshot into the replay's
+  `_PendingAdmit(..., recurrent_snapshot=snap)`.
+- **`_admit_miss_cohort` does NOT call `restore_recurrent_state`**
+  on the full-replay path. The restore site is reserved for
+  C5.3. A pinned in-source comment marks the restore-call
+  position with the boundary-mismatch rationale, so a future
+  reader doesn't accidentally enable it.
 
-**Acceptance:** bit-exactness test green on Qwen3.5-0.8B under
-synthetic preempt injection. Guard (`has_recurrent_state + prefix_cache`)
-unchanged.
+**Acceptance gates** (verified by
+`tests/test_qwen3_5_preempt_replay.py`):
 
-**Blocks:** C5.3 (prefix-hit cooperation depends on the preempt
-pathway being correct).
+1. Snapshot-before-filter call order (spy-adapter ordering test
+   on a B=2 cohort that actually exercises `filter`).
+2. `_PendingAdmit.recurrent_snapshot` stashed on the replay
+   record (synthetic test).
+3. Restore is NOT called on the full-replay admission path
+   (synthetic spy-adapter test directly).
+4. Snapshot survives pending-lifetime aliasing across
+   intervening `step()` calls (synthetic test).
+5. Boundary metadata: snapshot describes
+   `len(prompt_ids of replay pending) - 1` consumed
+   (= `T + len(generated) - 1`).
+
+Guard (`has_recurrent_state + prefix_cache`) unchanged. C5.2
+runs every test under `prefix_cache=None`. Bit-exact restore vs
+no-preempt oracle is intentionally NOT a C5.2 gate; that lands
+at C5.3 where the prefix-hit boundary makes restore correct.
+
+**Blocks:** C5.3 (consumes the snapshot capture surface; restore
+enablement happens there).
 
 ### 6.4 C5.3 — RadixPrefixCache cooperation
 

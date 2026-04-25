@@ -86,51 +86,91 @@ distinguish:
 
 C5.2 should NOT bind its acceptance to "fixes observable token
 drift" — that drift is not observable under greedy bf16 sampling
-on the C5 targets at the horizons tested. Following the user's
-2026-04-24 framing for this exact case, C5.2 instead locks:
+on the C5 targets at the horizons tested.
 
-1. **Call-order invariants** — `snapshot_recurrent_state` is
-   invoked **before** `layer_cache.filter(kept)` inside
-   `_preempt_active_row`; `restore_recurrent_state` is invoked
-   **after** the replay's prefill `forward_batched` completes
-   and **before** `self._batch_cache[layer].extend(row_cache[layer])`
-   stitches it into the active batch.
-2. **Snapshot boundary** — the snapshot stored on the replay's
-   `_PendingAdmit.recurrent_snapshot` field describes the
-   recurrent state at the exact token boundary `n_prompt +
-   len(generated)` for the victim row, byte-aligned with the
-   `composite_prompt` length the same record carries.
-3. **Bit-exact restore** — post-restore `mx.array_equal` between
-   the live cache's per-layer slots and a parallel no-preempt
-   oracle's snapshot at the same token boundary. This is the
-   strict gate that proves C5.2 actually changes the recurrent
-   bytes the live cache holds, regardless of whether the change
-   is observable through tokens.
-4. **R-C5-2 aliasing defense** — the snapshot stashed on a
-   replay `_PendingAdmit` survives multiple subsequent `step()`
-   calls (more forwards on the original `_batch_cache` happen
-   between preempt and replay-admit). The snapshot tensors must
-   remain unchanged across those forwards. Same R-C5-2 invariant
-   C5.1 already enforced inside the snapshot constructor; C5.2
-   re-exercises it across the longer pending lifetime.
+A first draft of the C5.2 implementation tried to bind a
+**bit-exact restore vs no-preempt oracle** gate on the
+full-replay path (snapshot taken at preempt, restore applied
+after the replay's batched re-prefill, before
+`_batch_cache[layer].extend(...)`). Wiring that and running it
+against Qwen3.5-0.8B revealed a fundamental boundary mismatch
+that the experiment's own math admits but did not call out
+explicitly:
 
-C5.2 explicitly does **NOT** prove "token bit-exactness vs
-no-preempt oracle" because today's replay path already
-satisfies that under greedy. It IS still useful to record the
-token-stream observation as a sanity check (assert no
-divergence post-implementation), but it is not the gate.
+```text
+preempt time live cache:
+  cache consumed = T + len(generated) - 1
+  (T prompt tokens fed; the first len(generated) - 1 decoded
+   tokens fed back via decode-step; the latest sample is held
+   in the row's `generated` list but NOT yet consumed by the
+   cache.)
+
+replay's _admit_miss_cohort:
+  composite_prompt = prompt + generated  (T + len(generated) tokens)
+  forward_batched(composite, k_batch_cache) consumes all of it
+  cache consumed = T + len(generated)
+```
+
+The snapshot describes a `T + len(generated) - 1` consumed
+state; the replay's post-prefill cache is at `T + len(generated)`
+consumed — exactly one token (the last generated one) ahead.
+Restoring the snapshot at "after replay's prefill, before
+extend" rewinds the cache by one position and erases the last
+generated token's consumption from the recurrent state. The
+next decode-step then feeds the replay's freshly emitted token
+into a cache that's missing one position from the row's
+trajectory, breaking the sequence.
+
+There is no boundary-aligned restore site on the **full-replay**
+path without restructuring `_admit_miss_cohort` to skip the last
+token of the composite during prefill and run an extra single-
+step decode (a non-trivial change to the P-2 main path). The
+2026-04-24 design call landed on **C5.2 = capture / stash; C5.3
+= restore**, deferring restore enablement to admission paths
+whose post-prefill boundary naturally matches the snapshot
+boundary (the prefix-hit replay, where the prefill ends at the
+prefix-block edge the snapshot was captured against).
+
+C5.2 acceptance gates (the post-pivot list):
+
+1. **Snapshot-before-filter** — `snapshot_recurrent_state` is
+   invoked inside `_preempt_active_row` before
+   `layer_cache.filter(kept)` mutates the batched cache.
+2. **Snapshot stashed on `_PendingAdmit.recurrent_snapshot`** —
+   the captured snapshot travels on the replay record; field
+   defaults to `None` for non-recurrent adapters or for
+   pendings created via `add_request`.
+3. **Restore is NOT called on the full-replay path** — the
+   `_admit_miss_cohort` path's full-prefill of
+   `composite_prompt = prompt + generated` makes the post-
+   prefill cache one token ahead of the snapshot. Restore here
+   is contractually disabled at C5.2 (verified by a direct
+   spy-adapter test).
+4. **Pending-lifetime alias defense** — the snapshot stashed on
+   a replay pending stays byte-identical across intervening
+   `step()` calls that mutate the live `_batch_cache`. Re-
+   exercises the R-C5-2 invariant C5.1's snapshot constructor
+   already enforced, now across the longer pending lifetime.
+5. **Boundary metadata** — the snapshot's boundary
+   (`T + len(generated) - 1` consumed) is one token earlier than
+   the replay record's `len(prompt_ids)` (= `T + len(generated)`
+   composite). The off-by-one is intentional and documented.
+
+C5.2 explicitly does **NOT** prove "bit-exact restore vs
+no-preempt oracle" because the full-replay path's natural
+boundary makes this impossible without restructuring; C5.3
+(prefix-hit cooperation) is where the boundary-aligned restore
+actually lands.
 
 **Why C5.2 is still a correctness foundation, not a noise
-optimization:** the drift exists at fp32 precision, sits ~1-2%
-on the relative-Frobenius scale on tested targets, and is below
-greedy-argmax under bf16 today. Several follow-on contexts can
-push it across the boundary: (a) higher-precision sampling
-(temperature > 0, top-p, beam) where small logit shifts move
-sampled tokens; (b) longer horizons under repeated preempt/replay
-cycles where drift may compound; (c) different hardware /
-compiler stacks. C5.2 closes that drift before it becomes visible
-rather than after, and creates the snapshot pathway C5.3 / P-7
-will lean on for compute reuse and draft rollback.
+optimization:** the snapshot capture / stash plumbing is what
+C5.3 / P-7 build on. C5.3's prefix-hit path snapshots at block
+boundaries during prefill (a different capture site, but using
+the same `RecurrentStateAdapter` API surface C5.1 / C5.2
+ratified). P-7's draft-snapshot lifecycle reuses the same
+`RecurrentSnapshot` value object. By landing the capture path
+end-to-end at C5.2, the API contract is fixed before either
+follow-on unit needs it.
 
 ## Artefacts
 
@@ -186,8 +226,9 @@ status 2 when the repo is absent.
 
 ## C5.2 implementation pause point
 
-This experiment closes. C5.2 implementation now proceeds with the
-acceptance shape locked above:
+This experiment closes. C5.2 implementation lands the
+**capture/stash plumbing only** per the post-pivot acceptance
+shape above:
 
 1. `_PendingAdmit` schema gains
    `recurrent_snapshot: RecurrentSnapshot | None = None` (frozen
@@ -195,11 +236,20 @@ acceptance shape locked above:
    user's 2026-04-24 ruling).
 2. `Qwen3_5Adapter` snapshot/restore surface (already landed at
    C5.1) is wired into `_preempt_active_row` (snapshot before
-   `filter`) and `_admit_miss_cohort` (restore after
-   `forward_batched`, before `extend`).
-3. Tests prove call-order, snapshot-boundary, bit-exact-restore,
-   R-C5-2 aliasing across the longer pending lifetime, plus a
-   greedy-token sanity row.
+   `filter`). `_admit_miss_cohort` does NOT call
+   `restore_recurrent_state` on the full-replay path — the
+   boundary mismatch documented above prevents a correct restore
+   at that site. The restore call site is reserved for C5.3
+   (prefix-hit admission), where the boundary aligns.
+3. Tests prove call-order (snapshot-before-filter), pending-stash
+   (`_PendingAdmit.recurrent_snapshot` populated), restore-NOT-
+   called (full-replay path explicitly disabled), and R-C5-2
+   aliasing across the longer pending lifetime. Bit-exact-restore
+   is omitted (impossible at C5.2's natural boundaries); a
+   greedy-token sanity row is also omitted because today's
+   replay path already produces matching tokens (the experiment
+   above documents this), so a "C5.2 doesn't break tokens" test
+   would just re-verify pre-C5.2 behavior.
 4. The `has_recurrent_state + prefix_cache` guard at
    `silica/scheduler/batcher.py:152-166` stays in place — guard
    removal is C5.4 by design.
