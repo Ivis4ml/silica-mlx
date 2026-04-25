@@ -47,11 +47,15 @@ to "what happens on a hit" travels through one code path.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import mlx.core as mx
 
 from silica.kvcache.manager import PrefixHit
 from silica.kvcache.store import PrefixBlockStore
+
+if TYPE_CHECKING:
+    from silica.models.recurrent import RecurrentSnapshot
 
 _CHUNK = tuple[int, ...]
 
@@ -61,9 +65,23 @@ class _Node:
 
     Root has empty ``tokens`` / ``block_id = -1`` and no parent. Every
     non-root node represents exactly ``block_size`` tokens and one block id.
+
+    ``recurrent_snapshot`` (P-3-C5.3.0): optional per-tree-path recurrent
+    state snapshot, captured at the boundary marked by this node's tokens.
+    Default ``None``; backfilled by ``insert_detached``'s duplicate-prefix
+    branch when an insertion brings a fresh snapshot for a previously
+    snapshotless node. Eviction is automatic — when ``_evict_node`` drops
+    the node, Python GC releases the snapshot's mlx-array tensors.
     """
 
-    __slots__ = ("parent", "tokens", "block_id", "children", "access_tick")
+    __slots__ = (
+        "parent",
+        "tokens",
+        "block_id",
+        "children",
+        "access_tick",
+        "recurrent_snapshot",
+    )
 
     def __init__(
         self,
@@ -71,6 +89,7 @@ class _Node:
         tokens: _CHUNK,
         block_id: int,
         access_tick: int = 0,
+        recurrent_snapshot: "RecurrentSnapshot | None" = None,
     ) -> None:
         self.parent = parent
         self.tokens = tokens
@@ -78,6 +97,7 @@ class _Node:
         # Children keyed by the chunk tuple of the child's tokens.
         self.children: dict[_CHUNK, _Node] = {}
         self.access_tick = access_tick
+        self.recurrent_snapshot: "RecurrentSnapshot | None" = recurrent_snapshot
 
 
 class RadixPrefixCache:
@@ -173,6 +193,76 @@ class RadixPrefixCache:
             self.hits += 1
         return PrefixHit(block_ids=tuple(hit_blocks), num_hit_tokens=idx)
 
+    def peek_with_node(
+        self, tokens: Sequence[int]
+    ) -> tuple[PrefixHit, _Node | None]:
+        """Side-effect-free walk that also returns the deepest matched node.
+
+        Same contract as ``peek``: no ``retain_hit``, no ``self.hits``
+        increment, no LRU touch. Adds a second tuple element — the
+        deepest ``_Node`` reached, or ``None`` when zero blocks matched.
+
+        P-3-C5.3.0. Used by the Phase-B classifier (C5.3.3) on a
+        usable-aligned prompt slice to inspect the deepest USABLE node's
+        ``recurrent_snapshot`` before committing to the hit path.
+        """
+        node = self._root
+        deepest: _Node | None = None
+        hit_blocks: list[int] = []
+        idx = 0
+        n = len(tokens)
+        while idx + self._block_size <= n:
+            chunk = tuple(tokens[idx : idx + self._block_size])
+            child = node.children.get(chunk)
+            if child is None:
+                break
+            hit_blocks.append(child.block_id)
+            deepest = child
+            node = child
+            idx += self._block_size
+        return (
+            PrefixHit(block_ids=tuple(hit_blocks), num_hit_tokens=idx),
+            deepest,
+        )
+
+    def lookup_with_node(
+        self, tokens: Sequence[int]
+    ) -> tuple[PrefixHit, _Node | None]:
+        """Retained walk that also returns the deepest matched node.
+
+        Same contract as ``lookup``: each hit block is ``retain_hit``'d,
+        each touched node advances the LRU tick, ``self.hits`` increments
+        on a non-empty hit. Returns the deepest ``_Node`` reached
+        alongside the ``PrefixHit`` (``None`` when zero blocks matched).
+
+        P-3-C5.3.0. Replaces ``lookup`` at C5.3.3's
+        ``_admit_single_hit_row`` call site so the atomic phase keeps a
+        reference to the deepest USABLE node — the one whose
+        ``recurrent_snapshot`` will be restored before suffix prefill.
+        """
+        node = self._root
+        deepest: _Node | None = None
+        hit_blocks: list[int] = []
+        idx = 0
+        n = len(tokens)
+        while idx + self._block_size <= n:
+            chunk = tuple(tokens[idx : idx + self._block_size])
+            child = node.children.get(chunk)
+            if child is None:
+                break
+            hit_blocks.append(child.block_id)
+            self._store.retain_hit(child.block_id)
+            self._touch(child)
+            deepest = child
+            node = child
+            idx += self._block_size
+        if hit_blocks:
+            self.hits += 1
+        return (
+            PrefixHit(block_ids=tuple(hit_blocks), num_hit_tokens=idx),
+            deepest,
+        )
+
     def insert(
         self, tokens: Sequence[int], block_ids: Sequence[int]
     ) -> None:
@@ -215,6 +305,7 @@ class RadixPrefixCache:
         self,
         tokens: Sequence[int],
         detached_blocks: Sequence[Sequence[tuple[mx.array, mx.array]]],
+        recurrent_snapshots: "Sequence[RecurrentSnapshot | None] | None" = None,
     ) -> tuple[int, ...]:
         """Add tokens as aligned-block nodes with attached K/V slices.
 
@@ -231,6 +322,28 @@ class RadixPrefixCache:
         entry in ``detached_blocks`` is NOT registered and becomes
         GC-eligible when the caller's outer list goes out of scope.
 
+        ``recurrent_snapshots`` (P-3-C5.3.0): optional per-block recurrent
+        state snapshots. ``None`` (default) preserves pre-C5.3 behaviour
+        bit-for-bit — every newly-created node has
+        ``recurrent_snapshot=None`` and the duplicate-prefix branch leaves
+        existing nodes untouched. When provided, length must cover every
+        aligned block; ``recurrent_snapshots[i]`` may itself be ``None``
+        for blocks where no snapshot was captured this insertion.
+
+        With ``recurrent_snapshots`` provided:
+
+        - **New node**: ``recurrent_snapshots[i]`` is attached to the
+          newly created node (may itself be ``None``).
+        - **Duplicate-prefix branch, existing.recurrent_snapshot is None
+          and new is non-None**: backfill the existing node with the
+          fresh snapshot (per design §3.5.1 — self-healing for legacy
+          snapshotless nodes).
+        - **Duplicate-prefix branch, both non-None or new is None**:
+          keep the existing node's snapshot. The caller's
+          ``recurrent_snapshots[i]`` becomes GC-eligible. No equality
+          check today — ``RecurrentSnapshot`` lacks the boundary
+          metadata to make one mechanical (design §3.5.1).
+
         Returns a tuple of the block ids **actually newly inserted**
         (empty tuple for a fully duplicate insert).
         """
@@ -242,14 +355,33 @@ class RadixPrefixCache:
                 "detached_blocks must cover every aligned token block: "
                 f"got {len(detached_blocks)}, need {n_aligned_blocks}"
             )
+        if (
+            recurrent_snapshots is not None
+            and len(recurrent_snapshots) < n_aligned_blocks
+        ):
+            raise ValueError(
+                "recurrent_snapshots must cover every aligned token block "
+                f"when provided: got {len(recurrent_snapshots)}, need "
+                f"{n_aligned_blocks}"
+            )
 
         node = self._root
         new_ids: list[int] = []
         for i in range(n_aligned_blocks):
             start = i * self._block_size
             chunk = tuple(tokens[start : start + self._block_size])
+            new_snap = (
+                recurrent_snapshots[i]
+                if recurrent_snapshots is not None
+                else None
+            )
             existing = node.children.get(chunk)
             if existing is not None:
+                if (
+                    new_snap is not None
+                    and existing.recurrent_snapshot is None
+                ):
+                    existing.recurrent_snapshot = new_snap
                 self._touch(existing)
                 node = existing
                 continue
@@ -264,6 +396,7 @@ class RadixPrefixCache:
                 parent=node,
                 tokens=chunk,
                 block_id=new_id,
+                recurrent_snapshot=new_snap,
             )
             self._touch(new_node)
             node.children[chunk] = new_node
