@@ -1,0 +1,1801 @@
+{
+  "repo": "Qwen/Qwen3.5-0.8B",
+  "n_hidden_layers": 24,
+  "single_request": {
+    "n_global_layers": 6,
+    "n_deltanet_layers": 18,
+    "global_layer_indices": [
+      3,
+      7,
+      11,
+      15,
+      19,
+      23
+    ],
+    "deltanet_layer_indices": [
+      0,
+      1,
+      2,
+      4,
+      5,
+      6,
+      8,
+      9,
+      10,
+      12,
+      13,
+      14,
+      16,
+      17,
+      18,
+      20,
+      21,
+      22
+    ],
+    "total_conv_state_nbytes": 663552,
+    "total_recurrent_state_nbytes": 18874368,
+    "total_kv_nbytes": 3145728,
+    "prompt_n_tokens": 23,
+    "batch_size": 1,
+    "recurrent_bytes_from_state_delta": 19537920,
+    "layers": [
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 1085440,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                1,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 36864
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                1,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 1048576
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 0
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 1085440,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                1,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 36864
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                1,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 1048576
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 1
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 1085440,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                1,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 36864
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                1,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 1048576
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 2
+      },
+      {
+        "is_linear": false,
+        "kind": "GLOBAL",
+        "cache_class": "KVCache",
+        "cache_nbytes_total": 524288,
+        "keys": {
+          "shape": [
+            1,
+            2,
+            256,
+            256
+          ],
+          "dtype": "mlx.core.bfloat16",
+          "nbytes": 262144
+        },
+        "values": {
+          "shape": [
+            1,
+            2,
+            256,
+            256
+          ],
+          "dtype": "mlx.core.bfloat16",
+          "nbytes": 262144
+        },
+        "offset": 23,
+        "layer_idx": 3
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 1085440,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                1,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 36864
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                1,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 1048576
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 4
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 1085440,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                1,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 36864
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                1,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 1048576
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 5
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 1085440,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                1,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 36864
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                1,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 1048576
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 6
+      },
+      {
+        "is_linear": false,
+        "kind": "GLOBAL",
+        "cache_class": "KVCache",
+        "cache_nbytes_total": 524288,
+        "keys": {
+          "shape": [
+            1,
+            2,
+            256,
+            256
+          ],
+          "dtype": "mlx.core.bfloat16",
+          "nbytes": 262144
+        },
+        "values": {
+          "shape": [
+            1,
+            2,
+            256,
+            256
+          ],
+          "dtype": "mlx.core.bfloat16",
+          "nbytes": 262144
+        },
+        "offset": 23,
+        "layer_idx": 7
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 1085440,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                1,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 36864
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                1,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 1048576
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 8
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 1085440,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                1,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 36864
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                1,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 1048576
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 9
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 1085440,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                1,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 36864
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                1,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 1048576
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 10
+      },
+      {
+        "is_linear": false,
+        "kind": "GLOBAL",
+        "cache_class": "KVCache",
+        "cache_nbytes_total": 524288,
+        "keys": {
+          "shape": [
+            1,
+            2,
+            256,
+            256
+          ],
+          "dtype": "mlx.core.bfloat16",
+          "nbytes": 262144
+        },
+        "values": {
+          "shape": [
+            1,
+            2,
+            256,
+            256
+          ],
+          "dtype": "mlx.core.bfloat16",
+          "nbytes": 262144
+        },
+        "offset": 23,
+        "layer_idx": 11
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 1085440,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                1,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 36864
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                1,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 1048576
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 12
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 1085440,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                1,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 36864
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                1,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 1048576
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 13
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 1085440,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                1,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 36864
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                1,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 1048576
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 14
+      },
+      {
+        "is_linear": false,
+        "kind": "GLOBAL",
+        "cache_class": "KVCache",
+        "cache_nbytes_total": 524288,
+        "keys": {
+          "shape": [
+            1,
+            2,
+            256,
+            256
+          ],
+          "dtype": "mlx.core.bfloat16",
+          "nbytes": 262144
+        },
+        "values": {
+          "shape": [
+            1,
+            2,
+            256,
+            256
+          ],
+          "dtype": "mlx.core.bfloat16",
+          "nbytes": 262144
+        },
+        "offset": 23,
+        "layer_idx": 15
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 1085440,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                1,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 36864
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                1,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 1048576
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 16
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 1085440,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                1,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 36864
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                1,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 1048576
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 17
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 1085440,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                1,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 36864
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                1,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 1048576
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 18
+      },
+      {
+        "is_linear": false,
+        "kind": "GLOBAL",
+        "cache_class": "KVCache",
+        "cache_nbytes_total": 524288,
+        "keys": {
+          "shape": [
+            1,
+            2,
+            256,
+            256
+          ],
+          "dtype": "mlx.core.bfloat16",
+          "nbytes": 262144
+        },
+        "values": {
+          "shape": [
+            1,
+            2,
+            256,
+            256
+          ],
+          "dtype": "mlx.core.bfloat16",
+          "nbytes": 262144
+        },
+        "offset": 23,
+        "layer_idx": 19
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 1085440,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                1,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 36864
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                1,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 1048576
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 20
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 1085440,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                1,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 36864
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                1,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 1048576
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 21
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 1085440,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                1,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 36864
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                1,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 1048576
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 22
+      },
+      {
+        "is_linear": false,
+        "kind": "GLOBAL",
+        "cache_class": "KVCache",
+        "cache_nbytes_total": 524288,
+        "keys": {
+          "shape": [
+            1,
+            2,
+            256,
+            256
+          ],
+          "dtype": "mlx.core.bfloat16",
+          "nbytes": 262144
+        },
+        "values": {
+          "shape": [
+            1,
+            2,
+            256,
+            256
+          ],
+          "dtype": "mlx.core.bfloat16",
+          "nbytes": 262144
+        },
+        "offset": 23,
+        "layer_idx": 23
+      }
+    ]
+  },
+  "batched": {
+    "n_global_layers": 6,
+    "n_deltanet_layers": 18,
+    "global_layer_indices": [
+      3,
+      7,
+      11,
+      15,
+      19,
+      23
+    ],
+    "deltanet_layer_indices": [
+      0,
+      1,
+      2,
+      4,
+      5,
+      6,
+      8,
+      9,
+      10,
+      12,
+      13,
+      14,
+      16,
+      17,
+      18,
+      20,
+      21,
+      22
+    ],
+    "total_conv_state_nbytes": 1327104,
+    "total_recurrent_state_nbytes": 37748736,
+    "total_kv_nbytes": 6291456,
+    "prompt_n_tokens_per_row": [
+      10,
+      23
+    ],
+    "padded_n_tokens": 23,
+    "left_padding": [
+      13,
+      0
+    ],
+    "batch_size": 2,
+    "layers": [
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 2170880,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                2,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 73728
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                2,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 2097152
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 0
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 2170880,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                2,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 73728
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                2,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 2097152
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 1
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 2170880,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                2,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 73728
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                2,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 2097152
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 2
+      },
+      {
+        "is_linear": false,
+        "kind": "GLOBAL",
+        "cache_class": "BatchKVCache",
+        "cache_nbytes_total": 1048576,
+        "keys": {
+          "shape": [
+            2,
+            2,
+            256,
+            256
+          ],
+          "dtype": "mlx.core.bfloat16",
+          "nbytes": 524288
+        },
+        "values": {
+          "shape": [
+            2,
+            2,
+            256,
+            256
+          ],
+          "dtype": "mlx.core.bfloat16",
+          "nbytes": 524288
+        },
+        "offset": {
+          "shape": [
+            2
+          ],
+          "dtype": "mlx.core.int32",
+          "values": [
+            10,
+            23
+          ]
+        },
+        "left_padding": {
+          "shape": [
+            2
+          ],
+          "dtype": "mlx.core.int32",
+          "values": [
+            13,
+            0
+          ]
+        },
+        "layer_idx": 3
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 2170880,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                2,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 73728
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                2,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 2097152
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 4
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 2170880,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                2,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 73728
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                2,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 2097152
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 5
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 2170880,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                2,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 73728
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                2,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 2097152
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 6
+      },
+      {
+        "is_linear": false,
+        "kind": "GLOBAL",
+        "cache_class": "BatchKVCache",
+        "cache_nbytes_total": 1048576,
+        "keys": {
+          "shape": [
+            2,
+            2,
+            256,
+            256
+          ],
+          "dtype": "mlx.core.bfloat16",
+          "nbytes": 524288
+        },
+        "values": {
+          "shape": [
+            2,
+            2,
+            256,
+            256
+          ],
+          "dtype": "mlx.core.bfloat16",
+          "nbytes": 524288
+        },
+        "offset": {
+          "shape": [
+            2
+          ],
+          "dtype": "mlx.core.int32",
+          "values": [
+            10,
+            23
+          ]
+        },
+        "left_padding": {
+          "shape": [
+            2
+          ],
+          "dtype": "mlx.core.int32",
+          "values": [
+            13,
+            0
+          ]
+        },
+        "layer_idx": 7
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 2170880,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                2,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 73728
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                2,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 2097152
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 8
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 2170880,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                2,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 73728
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                2,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 2097152
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 9
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 2170880,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                2,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 73728
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                2,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 2097152
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 10
+      },
+      {
+        "is_linear": false,
+        "kind": "GLOBAL",
+        "cache_class": "BatchKVCache",
+        "cache_nbytes_total": 1048576,
+        "keys": {
+          "shape": [
+            2,
+            2,
+            256,
+            256
+          ],
+          "dtype": "mlx.core.bfloat16",
+          "nbytes": 524288
+        },
+        "values": {
+          "shape": [
+            2,
+            2,
+            256,
+            256
+          ],
+          "dtype": "mlx.core.bfloat16",
+          "nbytes": 524288
+        },
+        "offset": {
+          "shape": [
+            2
+          ],
+          "dtype": "mlx.core.int32",
+          "values": [
+            10,
+            23
+          ]
+        },
+        "left_padding": {
+          "shape": [
+            2
+          ],
+          "dtype": "mlx.core.int32",
+          "values": [
+            13,
+            0
+          ]
+        },
+        "layer_idx": 11
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 2170880,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                2,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 73728
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                2,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 2097152
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 12
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 2170880,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                2,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 73728
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                2,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 2097152
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 13
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 2170880,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                2,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 73728
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                2,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 2097152
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 14
+      },
+      {
+        "is_linear": false,
+        "kind": "GLOBAL",
+        "cache_class": "BatchKVCache",
+        "cache_nbytes_total": 1048576,
+        "keys": {
+          "shape": [
+            2,
+            2,
+            256,
+            256
+          ],
+          "dtype": "mlx.core.bfloat16",
+          "nbytes": 524288
+        },
+        "values": {
+          "shape": [
+            2,
+            2,
+            256,
+            256
+          ],
+          "dtype": "mlx.core.bfloat16",
+          "nbytes": 524288
+        },
+        "offset": {
+          "shape": [
+            2
+          ],
+          "dtype": "mlx.core.int32",
+          "values": [
+            10,
+            23
+          ]
+        },
+        "left_padding": {
+          "shape": [
+            2
+          ],
+          "dtype": "mlx.core.int32",
+          "values": [
+            13,
+            0
+          ]
+        },
+        "layer_idx": 15
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 2170880,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                2,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 73728
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                2,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 2097152
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 16
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 2170880,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                2,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 73728
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                2,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 2097152
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 17
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 2170880,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                2,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 73728
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                2,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 2097152
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 18
+      },
+      {
+        "is_linear": false,
+        "kind": "GLOBAL",
+        "cache_class": "BatchKVCache",
+        "cache_nbytes_total": 1048576,
+        "keys": {
+          "shape": [
+            2,
+            2,
+            256,
+            256
+          ],
+          "dtype": "mlx.core.bfloat16",
+          "nbytes": 524288
+        },
+        "values": {
+          "shape": [
+            2,
+            2,
+            256,
+            256
+          ],
+          "dtype": "mlx.core.bfloat16",
+          "nbytes": 524288
+        },
+        "offset": {
+          "shape": [
+            2
+          ],
+          "dtype": "mlx.core.int32",
+          "values": [
+            10,
+            23
+          ]
+        },
+        "left_padding": {
+          "shape": [
+            2
+          ],
+          "dtype": "mlx.core.int32",
+          "values": [
+            13,
+            0
+          ]
+        },
+        "layer_idx": 19
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 2170880,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                2,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 73728
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                2,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 2097152
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 20
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 2170880,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                2,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 73728
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                2,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 2097152
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 21
+      },
+      {
+        "is_linear": true,
+        "kind": "HYBRID_DELTANET",
+        "cache_class": "ArraysCache",
+        "cache_nbytes_total": 2170880,
+        "slots": [
+          {
+            "slot_idx": 0,
+            "tensor": {
+              "shape": [
+                2,
+                3,
+                6144
+              ],
+              "dtype": "mlx.core.bfloat16",
+              "nbytes": 73728
+            }
+          },
+          {
+            "slot_idx": 1,
+            "tensor": {
+              "shape": [
+                2,
+                16,
+                128,
+                128
+              ],
+              "dtype": "mlx.core.float32",
+              "nbytes": 2097152
+            }
+          }
+        ],
+        "lengths": null,
+        "layer_idx": 22
+      },
+      {
+        "is_linear": false,
+        "kind": "GLOBAL",
+        "cache_class": "BatchKVCache",
+        "cache_nbytes_total": 1048576,
+        "keys": {
+          "shape": [
+            2,
+            2,
+            256,
+            256
+          ],
+          "dtype": "mlx.core.bfloat16",
+          "nbytes": 524288
+        },
+        "values": {
+          "shape": [
+            2,
+            2,
+            256,
+            256
+          ],
+          "dtype": "mlx.core.bfloat16",
+          "nbytes": 524288
+        },
+        "offset": {
+          "shape": [
+            2
+          ],
+          "dtype": "mlx.core.int32",
+          "values": [
+            10,
+            23
+          ]
+        },
+        "left_padding": {
+          "shape": [
+            2
+          ],
+          "dtype": "mlx.core.int32",
+          "values": [
+            13,
+            0
+          ]
+        },
+        "layer_idx": 23
+      }
+    ]
+  }
+}
