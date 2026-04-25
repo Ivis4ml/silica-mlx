@@ -1,45 +1,46 @@
-"""P-3-C5.2 numeric-drift probe.
+"""P-3-C5.2 numeric-drift probe — closed experiment reproducibility.
 
-Question this probe answers: under any Qwen3.5 hybrid-DeltaNet
-target plus the ``forward_batched`` runner, does the
-**single-step decode** path produce a recurrent state byte-equal
-to the **batched-prefill** path when both consume the same input
-token sequence?
-
-Concretely, with prefix length ``T`` and decode steps ``k``:
+Compares per-DeltaNet-layer recurrent state between two paths
+through the same input token sequence on a Qwen3.5 hybrid target.
+With prefix length ``T`` and decode steps ``k``:
 
 - **Path A (single-step, simulates the original no-preempt path)**:
   ``forward_batched(prefix, cache_a)`` consumes ``T`` tokens, then
   ``k - 1`` ``forward_batched`` calls each consuming one decoded
-  token. Cache_a ends having consumed ``T + (k - 1)`` tokens.
+  token. ``cache_a`` ends having consumed ``T + (k - 1)`` tokens.
 - **Path B (batched re-prefill, simulates today's replay path)**:
   ``forward_batched(prefix + decoded_a[:k - 1], cache_b)`` — one
   batched call over the same ``T + (k - 1)`` tokens path A
-  consumed.
+  consumed. ``cache_b`` ends having consumed ``T + (k - 1)``
+  tokens.
 
-Both paths process the identical input sequence; only the
-batching boundary differs. Snapshot per-DeltaNet-layer
-``(conv_state, recurrent_state)`` from each cache and compare.
+Snapshot per-DeltaNet-layer ``(conv_state, recurrent_state)``
+from each cache and compare; greedy-decode the next ``M`` tokens
+from each cache and compare token streams.
 
-The answer decides C5.2's acceptance shape:
+**This is a closed experiment.** The probe was run BEFORE C5.2
+implementation; its evidence (the four JSON blobs in this
+directory) drove the C5.2 pivot to capture/stash-only. The
+script's role today is reproducibility, not open inquiry — see
+``docs/P3_C5_DRIFT_EXPERIMENT/README.md`` for the interpretation
+and the C5.2 acceptance shape it produced.
 
-- **State byte-exact**: today's replay-by-re-prefill produces the
-  same recurrent state as the original single-step path; C5.2's
-  snapshot then only locks call-order and edge cases (snapshot
-  taken before filter, restore happens before extend).
-- **State differs but greedy tokens match**: there is a numeric
-  drift below the argmax threshold; C5.2 still cannot rest on
-  "fixes observable token drift" but it ratifies bit-exact
-  recurrent state across preempt/replay.
-- **Greedy tokens diverge**: drift IS observable. C5.2 binds a
-  bit-exact token oracle as a hard gate.
+**Outcome on the committed evidence set (Qwen3.5-0.8B and
+Qwen3.5-4B, T = 61 prompt tokens):** recurrent state is NOT
+byte-equal across the two paths (~1-2% rel-Frobenius at fp32
+cast); greedy bf16 tokens match through every continuation
+horizon tested (``M ∈ {8, 32, 64, 128}``). This is the **middle
+case** — drift below the argmax boundary — that motivated C5.2's
+"capture/stash, defer restore to C5.3" shape.
 
 Output: stdout summary plus a JSON evidence blob to the path
-given by ``--out``.
+given by ``--out``. The four committed JSONs in this directory
+were produced by the four invocations documented in the README's
+"Reproduction" section.
 
 Skip-gated on the requested repo's HF cache (``--repo`` flag,
-default Qwen3.5-0.8B); probe exits with status 2 when the
-requested repo is absent.
+default ``Qwen/Qwen3.5-0.8B``); probe exits with status 2 when
+the requested repo is absent.
 """
 
 from __future__ import annotations
@@ -196,13 +197,14 @@ def main() -> int:
     state_a = _capture_layer_states(adapter, cache_a)
 
     # ===== Path B: batched re-prefill of the same input sequence =====
-    # Path A's cache_a has consumed T + (k - 1) tokens — the prefix
-    # (positions 0..T-1) plus decoded_a[0..k-2] as decode-step
-    # inputs. decoded_a[k-1] was sampled at position T + (k - 1) - 1
-    # but has NOT been fed back as input, so it is not part of the
-    # consumed sequence. Path B prefills exactly that T + (k - 1)
-    # sequence in one batched forward; the resulting state_b is what
-    # we compare against state_a.
+    # Path A's cache_a has consumed T + (k - 1) tokens: the prefix
+    # at positions 0..T-1 plus decoded_a[0..k-2] fed back as
+    # decode-step inputs at positions T..T+k-2. decoded_a[k-1] is
+    # the token sampled from the position-(T+k-2) logits but has
+    # NOT been fed back as input, so it is NOT part of the consumed
+    # sequence. Path B prefills exactly that T + (k - 1) token
+    # sequence in one batched call; state_b is compared against
+    # state_a.
     composite = list(prefix) + decoded_a[: k - 1]
     cache_b = adapter.make_batch_cache([0])
     composite_2d = mx.array([composite], dtype=mx.int32)
