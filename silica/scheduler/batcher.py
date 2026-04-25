@@ -161,6 +161,23 @@ class _BatchRow:
     keep ``_idx`` in lockstep after the row terminates do NOT append
     here (so ``len(generated)`` keeps a clean "how many tokens did this
     row actually produce" reading at any point).
+
+    ``recurrent_snapshots_per_block`` / ``absolute_consumed_tokens``
+    (P-3-C5.3.1): per-row slice-regime accounting for hybrid adapters
+    running with a ``RadixPrefixCache``. The dict maps absolute block
+    index → ``RecurrentSnapshot`` captured at that block boundary by
+    the slice-prefill helper or the decode-step capture path.
+    Absolute index uses ``block_size``-aligned token counts (block 0
+    covers tokens ``[0, block_size)``; block ``i`` covers
+    ``[i * block_size, (i + 1) * block_size)``). Empty for non-slice-
+    regime rows (B>1 cohort admission, non-recurrent adapters,
+    ``prefix_cache=None``). ``absolute_consumed_tokens`` runs in
+    lockstep with the live cache: increments by chunk size after each
+    slice-prefill forward, +1 after each decode-step that consumed a
+    real token (not pad). Stays ``0`` for rows admitted via contiguous
+    prefill — the decode-step capture path uses a ``> 0`` precondition
+    to skip those rows so cross-regime snapshots never reach the radix
+    tree (P-3-C5.3.1 finding C, see ``docs/P3_C5_3_DESIGN.md`` §4.2).
     """
 
     req_index: int
@@ -169,6 +186,10 @@ class _BatchRow:
     params: SamplingParams
     state: RequestState
     generated: list[int] = field(default_factory=list)
+    recurrent_snapshots_per_block: dict[int, RecurrentSnapshot] = field(
+        default_factory=dict
+    )
+    absolute_consumed_tokens: int = 0
 
 
 class ContinuousBatcher:
@@ -847,13 +868,97 @@ class ContinuousBatcher:
         )
         return True
 
+    def _slice_prefill_active(self) -> bool:
+        """C5.3 production-gate predicate for slice-prefill regime.
+
+        Slice-prefill is the canonical regime for hybrid adapters
+        running with a ``RadixPrefixCache`` so the producer (whose
+        snapshots get stored) and the consumer (the C5.3.3 prefix-hit
+        admission) operate in the same trajectory regime — see
+        ``docs/P3_C5_3_DESIGN.md`` §2.2 / §3.2 for why same-regime
+        is required for byte-exact-vs-oracle.
+
+        Production predicate: ``RecurrentStateAdapter`` mixin AND
+        ``prefix_cache is not None``. Non-recurrent adapters and
+        ``prefix_cache=None`` paths preserve today's contiguous
+        prefill bit-for-bit. The test-only oracle clause
+        (``_force_recurrent_slice_prefill_for_c5_3_oracle``) lands at
+        C5.3.3 alongside the byte-exact gate it serves.
+
+        Returns ``True`` to enable slice-prefill in the prefill paths
+        and decode-step capture in ``_decode_phase``; the prefill
+        callers add their own ``len(rows) == 1`` clamp because B>1
+        cohort slicing is post-C5.3 backlog (§5.2).
+        """
+        return (
+            isinstance(self._adapter, RecurrentStateAdapter)
+            and self._prefix_cache is not None
+        )
+
+    def _slice_prefill_with_capture(
+        self, row: _BatchRow, cache: list[Any]
+    ) -> mx.array:
+        """B=1 slice-prefill helper — issues ``ceil(T / block_size)``
+        forwards of up to ``block_size`` tokens each.
+
+        Captures the per-DeltaNet-layer recurrent state at every full-
+        block boundary into ``row.recurrent_snapshots_per_block`` keyed
+        by absolute block index. The final chunk may be shorter than
+        ``block_size`` (for non-aligned prompt lengths) and produces
+        no snapshot — the decode-step capture path picks up snapshots
+        at later block boundaries crossed by single-step decoding.
+
+        Caller invariant: ``self._slice_prefill_active()`` is True and
+        the row is the sole occupant of its cohort (B=1). Returns the
+        final chunk's ``(1, V)`` logits for the sampler.
+        """
+        assert isinstance(self._adapter, RecurrentStateAdapter)
+        assert self._prefix_cache is not None
+        block_size = self._prefix_cache.block_size
+        n = len(row.prompt_ids)
+
+        last_logits: mx.array | None = None
+        start = 0
+        while start < n:
+            end = min(start + block_size, n)
+            chunk_arr = mx.array(
+                [row.prompt_ids[start:end]], dtype=mx.int32
+            )
+            last_logits = forward_batched(self._model, chunk_arr, cache)
+            consumed = end - start
+            row.absolute_consumed_tokens += consumed
+            if consumed == block_size:
+                snap = self._adapter.snapshot_recurrent_state(
+                    cache, row_idx=0
+                )
+                block_idx = (
+                    row.absolute_consumed_tokens // block_size - 1
+                )
+                row.recurrent_snapshots_per_block[block_idx] = snap
+            start = end
+
+        assert last_logits is not None
+        return last_logits
+
     def _prefill_phase(self) -> list[BatchEvent]:
-        """One batched forward over the left-padded prompt tensor."""
+        """One batched forward over the left-padded prompt tensor.
+
+        Routes through ``_slice_prefill_with_capture`` when the C5.3
+        slice-prefill regime is active and the cohort is B=1; falls
+        back to today's single-batched-forward otherwise. B>1 cohorts
+        in slice-regime stay on contiguous prefill — the per-slice
+        left-padding rebuild is post-C5.3 backlog (design §5.2).
+        """
         assert self._batch_cache is not None
-        tokens = self._build_prefill_tokens()  # (B, T_max)
-        logits = forward_batched(
-            self._model, tokens, list(self._batch_cache)
-        )  # (B, V)
+        if self._slice_prefill_active() and len(self._rows) == 1:
+            logits = self._slice_prefill_with_capture(
+                self._rows[0], list(self._batch_cache)
+            )
+        else:
+            tokens = self._build_prefill_tokens()  # (B, T_max)
+            logits = forward_batched(
+                self._model, tokens, list(self._batch_cache)
+            )  # (B, V)
         # 16c.2 step 4: initial-cohort forward_prompt_tokens accounting.
         # Counts effective prompt tokens (not padded B*T_max) so the S-5
         # acceptance assertion reads in user-visible units.
@@ -868,12 +973,42 @@ class ContinuousBatcher:
         Terminal rows are fed ``pad_token_id`` as a placeholder so the
         batch axis stays fixed (16d's filter path is what actually
         reclaims terminal slots). Their output logits are discarded.
+
+        When the C5.3 slice-prefill regime is active, captures
+        per-row recurrent snapshots at decode-step block boundaries.
+        The capture is gated on ``row.absolute_consumed_tokens > 0``:
+        a zero counter means the row was admitted via contiguous
+        prefill (B>1 miss cohort, slice-prefill skipped) and its
+        decode-era trajectory is "contiguous + decode" — a different
+        regime from slice-prefill, so capturing here would contaminate
+        the byte-exact-vs-slice-oracle gate. Pre-step terminal rows
+        are also skipped (their cache fed a pad token, not a real
+        sample). See design §4.2 finding C.
         """
         assert self._batch_cache is not None
         tokens = self._build_decode_tokens()  # (B, 1)
         logits = forward_batched(
             self._model, tokens, list(self._batch_cache)
         )  # (B, V)
+        if self._slice_prefill_active():
+            # mypy narrowing: _slice_prefill_active guarantees both.
+            assert isinstance(self._adapter, RecurrentStateAdapter)
+            assert self._prefix_cache is not None
+            block_size = self._prefix_cache.block_size
+            for row_idx, row in enumerate(self._rows):
+                if row.state.is_terminal:
+                    continue
+                if row.absolute_consumed_tokens == 0:
+                    continue
+                row.absolute_consumed_tokens += 1
+                if row.absolute_consumed_tokens % block_size == 0:
+                    snap = self._adapter.snapshot_recurrent_state(
+                        list(self._batch_cache), row_idx=row_idx
+                    )
+                    idx = (
+                        row.absolute_consumed_tokens // block_size - 1
+                    )
+                    row.recurrent_snapshots_per_block[idx] = snap
         return self._sample_and_emit_batched(logits, is_prefill=False)
 
     def _sample_and_emit_batched(
@@ -1289,14 +1424,26 @@ class ContinuousBatcher:
         # ``BatchKVCache`` interleaving.
         k_batch_cache = _make_batch_cache(self._adapter, k_left_padding)
 
-        pad = self._pad_token_id()
-        rows_2d: list[list[int]] = []
-        for r in admitted:
-            n_pad = k_max_len - len(r.prompt_ids)
-            rows_2d.append([pad] * n_pad + list(r.prompt_ids))
-        tokens = mx.array(rows_2d, dtype=mx.int32)
-
-        logits = forward_batched(self._model, tokens, list(k_batch_cache))
+        # P-3-C5.3.1: route through slice-prefill when the regime is
+        # active and the miss cohort is B=1 (single admitted row).
+        # B>1 cohorts stay on contiguous prefill (per-slice padding
+        # rebuild is post-C5.3 backlog, design §5.2). B=1 path skips
+        # the padded-tensor build entirely since chunk_arr is already
+        # tight.
+        if self._slice_prefill_active() and len(admitted) == 1:
+            logits = self._slice_prefill_with_capture(
+                admitted[0], list(k_batch_cache)
+            )
+        else:
+            pad = self._pad_token_id()
+            rows_2d: list[list[int]] = []
+            for r in admitted:
+                n_pad = k_max_len - len(r.prompt_ids)
+                rows_2d.append([pad] * n_pad + list(r.prompt_ids))
+            tokens = mx.array(rows_2d, dtype=mx.int32)
+            logits = forward_batched(
+                self._model, tokens, list(k_batch_cache)
+            )
         events = self._sample_and_emit_rows(
             admitted, logits, is_prefill=True
         )
