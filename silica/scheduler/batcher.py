@@ -600,6 +600,42 @@ class ContinuousBatcher:
         self._rows = [self._rows[i] for i in kept]
         self._rebuild_slot_table()
 
+    def _token_kv_layer_indices(self) -> list[int]:
+        """Return source-transformer-layer indices in ``self._batch_cache``
+        whose layer cache is a token-granular K/V store
+        (``BatchKVCache``).
+
+        For pure-attention adapters (Qwen3, etc.), every layer is a
+        ``BatchKVCache`` so this returns ``list(range(num_layers))``.
+        For hybrid adapters (Qwen3.5 DeltaNet+attention), this returns
+        only the attention-layer source indices; DeltaNet layers carry
+        ``ArraysCache`` whose state is captured via the recurrent
+        snapshot path, NOT the token-K/V slice path.
+
+        Centralizes the cache-shape introspection so callers
+        (``_extract_and_insert_prefix``, future seed-assembly path)
+        don't sprinkle ``isinstance`` / ``hasattr`` checks across the
+        prefix-cache plumbing. Loud-fail on a pure-recurrent stack
+        (zero ``BatchKVCache`` layers) — the C5.3 prefix-cache extract
+        path has no work to do without token-K/V layers, and silently
+        skipping would mask a misconfiguration.
+
+        P-3-C5.3.3-het.1.
+        """
+        assert self._batch_cache is not None
+        indices = [
+            i
+            for i, layer in enumerate(self._batch_cache)
+            if isinstance(layer, BatchKVCache)
+        ]
+        if not indices:
+            raise RuntimeError(
+                "no token-K/V layers found in batch cache; "
+                "pure-recurrent stacks are not supported by the "
+                "C5.3 prefix-cache extract path"
+            )
+        return indices
+
     def _extract_and_insert_prefix(self, row_idx: int) -> None:
         """Slice a terminating row's block-aligned prefix K/V out of the
         current batched cache and register it with ``self._prefix_cache``
@@ -639,8 +675,20 @@ class ContinuousBatcher:
         else:
             computed_ids = list(row.prompt_ids)
 
+        # P-3-C5.3.3-het.1: hybrid adapters have heterogeneous batch
+        # caches — DeltaNet layers carry ``ArraysCache`` (no
+        # ``.offset`` / ``.keys``), full-attention layers carry
+        # ``BatchKVCache``. The pre-het code at the C5.3.3a snapshot
+        # tripped on ``self._batch_cache[0].offset`` because layer 0
+        # of Qwen3.5 is a DeltaNet layer. ``_token_kv_layer_indices``
+        # filters to the attention-only positions; offset / left_padding
+        # come from the first one (all attention layers share the same
+        # values, they evolve together under extend/filter).
+        attn_layer_indices = self._token_kv_layer_indices()
+        first_attn_cache = self._batch_cache[attn_layer_indices[0]]
+
         # S-3a: cache's own authoritative accounting must agree.
-        computed_len = int(self._batch_cache[0].offset[row_idx].item())
+        computed_len = int(first_attn_cache.offset[row_idx].item())
         assert len(computed_ids) == computed_len, (
             f"row {row_idx}: computed_ids len {len(computed_ids)} != "
             f"offset[row_idx] {computed_len} — sampler/forward drift"
@@ -651,20 +699,23 @@ class ContinuousBatcher:
         if aligned_tokens < block_size:
             return
 
-        # S-3b: every layer's BatchKVCache shares the same left_padding
-        # vector (they evolve together under extend/filter), so layer 0
-        # is authoritative for this row.
-        base = int(self._batch_cache[0].left_padding[row_idx].item())
+        # S-3b: every BatchKVCache layer shares the same left_padding
+        # vector, so the first attention layer is authoritative.
+        base = int(first_attn_cache.left_padding[row_idx].item())
 
         tokens_prefix = computed_ids[:aligned_tokens]
-        num_layers = len(self._batch_cache)
         n_aligned_blocks = aligned_tokens // block_size
+        # detached_blocks[b][i] is the i-th attention layer's K/V for
+        # block b; i is the position in attn_layer_indices, NOT the
+        # source transformer layer index. Hybrid callers (het.2 admit
+        # path) recover the mapping by re-deriving attn_layer_indices
+        # from the empty heterogeneous cache they assemble.
         detached_blocks: list[list[tuple[mx.array, mx.array]]] = []
         for b_idx in range(n_aligned_blocks):
             start = b_idx * block_size
             end = start + block_size
             per_layer: list[tuple[mx.array, mx.array]] = []
-            for layer_idx in range(num_layers):
+            for layer_idx in attn_layer_indices:
                 layer_cache = self._batch_cache[layer_idx]
                 keys = layer_cache.keys
                 values = layer_cache.values

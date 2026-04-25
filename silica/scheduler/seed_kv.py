@@ -9,10 +9,17 @@ cache.
 
 **What this helper does (and does not).**
 
-It assembles a ``list[BatchKVCache]`` — one per transformer layer — each
-with ``B = 1`` row already populated by the caller's detached K/V
-slices along the sequence axis. Gate-0.75 probe A verified that the
-``cache.state`` setter route is equivalent to driving
+It assembles a ``list[BatchKVCache]`` — one per requested token-K/V
+layer — each with ``B = 1`` row already populated by the caller's
+detached K/V slices along the sequence axis. Pure-attention callers
+pass ``num_layers = total_transformer_layers`` (every layer is a
+token-K/V layer); hybrid callers (P-3-C5.3.3-het) pass
+``num_layers = num_attention_layers`` and the helper builds caches
+indexed by attention-layer position rather than absolute transformer
+layer index. The helper itself is shape-agnostic; the hybrid caller
+interleaves these into the heterogeneous empty cache that
+``adapter.make_batch_cache`` produces. Gate-0.75 probe A verified
+that the ``cache.state`` setter route is equivalent to driving
 ``update_and_fetch`` on an empty cache, so we use the setter.
 
 This helper does NOT:
@@ -48,8 +55,17 @@ def build_seeded_batch_kv(
             head_dim)``. The token block_size is shared across layers;
             ``n_kv_heads`` / ``head_dim`` may vary by layer, but each
             layer's shape and dtype must be stable across blocks.
-        num_layers: total number of transformer layers; every inner
-            list must have exactly this length.
+        num_layers: number of caches to build. For pure-attention
+            adapters this is the total transformer layer count. For
+            **hybrid adapters** (P-3-C5.3.3-het), the caller passes
+            ``num_attention_layers`` (the count of token-K/V layers
+            in ``adapter.make_batch_cache``), and ``detached_blocks``
+            is indexed by attention-layer position rather than by
+            absolute transformer layer index. The helper itself is
+            shape-agnostic — it just builds one ``BatchKVCache`` per
+            inner-list entry. The hybrid caller is responsible for
+            interleaving these into the heterogeneous empty cache
+            produced by ``adapter.make_batch_cache``.
 
     Returns:
         ``list[BatchKVCache]`` of length ``num_layers``. Each cache has:
