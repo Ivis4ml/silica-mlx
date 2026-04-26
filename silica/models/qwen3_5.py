@@ -420,6 +420,15 @@ class Qwen3_5Adapter:
 
         Returns zeros for a pure-recurrent stack — P-2 paged KV of size 0
         is a no-op, which is the correct semantics for that case.
+
+        ``dtype`` is read from a representative attention-projection
+        weight (mirrors :func:`Qwen3Adapter._infer_attn_dtype`). Qwen3.5
+        ships bf16; the runtime ``BatchKVCache`` stores K/V in the
+        weight's dtype. Hardcoding ``mx.float16`` here would make
+        codec construction (e.g. ``BlockTurboQuantMSE.encode_tensor``)
+        reject the actual K/V dtype — codecs validate their input
+        dtype against the codec dtype to keep numerical contracts
+        with vqbench (silent up/down-cast would shift decoded output).
         """
         for layer in model.layers:
             if getattr(layer, "is_linear", False):
@@ -431,14 +440,37 @@ class Qwen3_5Adapter:
                 num_layers=len(model.layers),
                 n_kv_heads=int(getattr(sa, "num_key_value_heads", 0) or 0),
                 head_dim=int(getattr(sa, "head_dim", 0) or 0),
-                dtype=mx.float16,
+                dtype=Qwen3_5Adapter._infer_attn_dtype(model),
             )
         return KVLayout(
             num_layers=len(model.layers),
             n_kv_heads=0,
             head_dim=0,
-            dtype=mx.float16,
+            dtype=Qwen3_5Adapter._infer_attn_dtype(model),
         )
+
+    @staticmethod
+    def _infer_attn_dtype(model: Any) -> mx.Dtype:
+        """Read dtype from the first full-attention layer's projection
+        weight. Mirrors :func:`Qwen3Adapter._infer_attn_dtype` but
+        skips ``is_linear`` (DeltaNet) layers — those carry SSM-shape
+        projections that don't represent the K/V dtype.
+        """
+        for layer in model.layers:
+            if getattr(layer, "is_linear", False):
+                continue
+            sa = getattr(layer, "self_attn", None)
+            if sa is None:
+                continue
+            for attr in ("k_proj", "q_proj", "v_proj", "o_proj"):
+                proj = getattr(sa, attr, None)
+                if proj is None:
+                    continue
+                w = getattr(proj, "weight", None)
+                if w is not None and hasattr(w, "dtype"):
+                    dtype: mx.Dtype = w.dtype
+                    return dtype
+        return mx.float16
 
     @staticmethod
     def _build_attention_pattern(model: Any) -> AttentionPattern:

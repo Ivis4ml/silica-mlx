@@ -166,6 +166,56 @@ def test_kv_layout_all_linear_returns_zeros() -> None:
     assert layout.head_dim == 0
 
 
+def test_kv_layout_dtype_inferred_from_attention_projection_weight() -> None:
+    """``_build_kv_layout`` reads dtype from the first full-attention
+    layer's projection weight (mirrors ``Qwen3Adapter._infer_attn_dtype``).
+    Qwen3.5 ships bf16 in production; before this test a hardcoded
+    ``mx.float16`` made BlockTQ codec construction reject the actual K/V
+    tensors. The fake stub here mounts a ``k_proj.weight`` of dtype
+    ``mx.bfloat16`` to pin that the adapter reads through to the
+    weight's dtype rather than the previous hardcoded value.
+    """
+
+    @dataclass
+    class _FakeProjBF16:
+        weight: mx.array = field(
+            default_factory=lambda: mx.zeros((4, 4), dtype=mx.bfloat16)
+        )
+
+    @dataclass
+    class _FakeSelfAttnBF16:
+        num_key_value_heads: int = 2
+        head_dim: int = 8
+        k_proj: _FakeProjBF16 = field(default_factory=_FakeProjBF16)
+
+    @dataclass
+    class _FakeLayerBF16:
+        is_linear: bool = False
+        self_attn: _FakeSelfAttnBF16 = field(
+            default_factory=_FakeSelfAttnBF16
+        )
+
+    class _FakeModelBF16(_FakeQwen35Model):
+        def __init__(self) -> None:
+            super().__init__(n_linear=1, n_full=1)
+            # Replace the full-attention layer with one that mounts a
+            # bf16 weight on its k_proj — mirrors how mlx-lm's real
+            # qwen3_5.Model layers expose typed projection weights.
+            self.layers = [
+                _FakeLayer(is_linear=True),
+                _FakeLayerBF16(),  # type: ignore[list-item]
+            ]
+
+    model = _FakeModelBF16()
+    kv = SimpleKVCache([KVCache(), KVCache()])
+    adapter = Qwen3_5Adapter(model, _FakeTokenizer(), kv_manager=kv)
+    layout = adapter.kv_layout()
+    assert layout.dtype == mx.bfloat16, (
+        f"layout.dtype expected mx.bfloat16 (read from k_proj.weight); "
+        f"got {layout.dtype}"
+    )
+
+
 # --- attention_pattern (D-015) ---
 
 
