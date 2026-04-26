@@ -8,9 +8,13 @@ one instance represents one side (K or V) of the per-layer K/V pair.
 Algorithm (per-vector, matching vqbench verbatim except for MLX-native
 primitives):
 
-1. Rotate: ``y = rotation @ x`` using a Haar-random orthogonal matrix
-   shared across all codec families at the same ``(head_dim, seed)``
-   (``silica.vq._calibration.haar_rotation``).
+1. Rotate: ``y = rotation @ x`` using a Haar-random orthogonal matrix.
+   Default mode draws a single shared rotation at ``(head_dim, seed)``
+   (``silica.vq._calibration.haar_rotation``). Opt-in per-head mode
+   (``per_head_rotation=True``) draws ``n_kv_heads`` independent
+   rotations seeded by ``seed * 1000 + head_idx``, mirroring vqbench's
+   ``actual_seed = run_seed * 1000 + head_idx`` convention in
+   ``vqbench/scripts/variance_qwen35_4b.py``.
 2. Block split: reshape ``y`` from ``(head_dim,)`` to
    ``(num_blocks, vq_block_size)``.
 3. Per-block norm extraction: ``scales = ||y_blocks||_2`` along axis 1;
@@ -78,7 +82,20 @@ class BlockTurboQuantMSE:
         seed: Haar-rotation PRNG seed. Shared across codec families at
             the same ``(head_dim, seed)`` for fairness (the same
             rotation lands under ``TurboQuantMSE``, ``RaBitQ1Bit``, and
-            ``ExtRaBitQ`` with matching args).
+            ``ExtRaBitQ`` with matching args). When
+            ``per_head_rotation=True`` this becomes the base seed; the
+            per-head seed is ``seed * 1000 + head_idx``.
+        per_head_rotation: opt-in flag (default ``False``). When
+            ``True`` the codec draws ``n_kv_heads`` independent Haar
+            rotations and applies one rotation per head. The vqbench
+            REPORT.md (4-b) reference numbers were measured with this
+            mode active (`vqbench/scripts/variance_qwen35_4b.py:63`
+            sets ``actual_seed = run_seed * 1000 + head_idx``); the
+            silica default is the single shared rotation, matching the
+            (4-b) D.2a 3-seed cross-check baseline. Default OFF
+            preserves the closed (4-b) gate evidence; the flip is a
+            separate empirical decision after re-running D.2a with
+            this opt-in active.
         norm_correction: if ``True`` (default), renormalize each
             dequantized block to unit norm before rescaling. Matches
             the ``turboquant_plus`` production behaviour and improves
@@ -108,6 +125,7 @@ class BlockTurboQuantMSE:
         vq_block_size: int,
         num_bits: int,
         seed: int = 42,
+        per_head_rotation: bool = False,
         norm_correction: bool = True,
         dtype: mx.Dtype = mx.float16,
     ) -> None:
@@ -149,21 +167,39 @@ class BlockTurboQuantMSE:
         self._codebook_size = 1 << num_bits  # 2 ** num_bits
         self._norm_correction = norm_correction
         self._seed = seed
+        self._per_head_rotation = per_head_rotation
 
         # -- Offline calibration (NumPy + stdlib math — scipy not used;
         #    Lloyd-Max uses math.erf / math.exp. All NumPy is quarantined
         #    to silica.vq._calibration). Upload the outputs as frozen
         #    fp32 mx.array constants held on the codec instance. Runtime
         #    hot path reads only these mx.array fields.
-        rotation_np = haar_rotation(head_dim, seed)  # (d, d), float64, read-only
         sigma = 1.0 / math.sqrt(vq_block_size)
         centroids_np, _boundaries_np = lloyd_max_codebook(num_bits, sigma)
 
         # fp32 for numerical stability on matmul + argmin; fp16 would
         # introduce avoidable quantization noise before Lloyd-Max's
-        # boundary decisions. Memory cost is a (d x d) fp32 matrix —
-        # for d=256 that is 256 KB; negligible next to the KV cache.
-        self._rotation = mx.array(rotation_np, dtype=mx.float32)
+        # boundary decisions. Memory cost is a (d x d) fp32 matrix in
+        # the shared-rotation default — for d=256 that is 256 KB,
+        # negligible next to the KV cache. Per-head mode multiplies
+        # the rotation tensor by ``n_kv_heads`` (still a one-time
+        # construction cost; no growth on the hot path).
+        if per_head_rotation:
+            # Per-head Haar rotations, seeded ``seed * 1000 + h`` to
+            # match vqbench's per-head seed convention (see module
+            # docstring + vqbench/scripts/variance_qwen35_4b.py:63).
+            per_head = [
+                haar_rotation(head_dim, seed * 1000 + h)
+                for h in range(n_kv_heads)
+            ]
+            # Stack along axis 0 → (n_kv_heads, d, d).
+            self._rotation = mx.stack(
+                [mx.array(R, dtype=mx.float32) for R in per_head],
+                axis=0,
+            )
+        else:
+            rotation_np = haar_rotation(head_dim, seed)  # (d, d)
+            self._rotation = mx.array(rotation_np, dtype=mx.float32)
         self._centroids = mx.array(centroids_np, dtype=mx.float32)
 
     # --- VectorCodec surface ---------------------------------------------
@@ -210,7 +246,22 @@ class BlockTurboQuantMSE:
         n_vectors = flat.shape[0]
 
         # 1. Rotate: y[i] = rotation @ x[i]  ==  flat @ rotation.T
-        y = flat @ self._rotation.T  # (n_vectors, head_dim)
+        #    Per-head mode reshapes flat to (n_kv_heads, block_size, d)
+        #    so the rotation tensor (n_kv_heads, d, d) broadcasts head-
+        #    wise via batched matmul; the input row layout from
+        #    ``x.reshape(-1, head_dim)`` puts head h's block_size
+        #    vectors contiguously at rows [h*B, (h+1)*B), so this
+        #    reshape preserves the per-head grouping.
+        if self._per_head_rotation:
+            per_head = flat.reshape(
+                self._n_kv_heads, self.block_size, self._head_dim
+            )
+            y_per_head = mx.matmul(
+                per_head, self._rotation.swapaxes(-1, -2)
+            )  # (n_kv_heads, block_size, d)
+            y = y_per_head.reshape(n_vectors, self._head_dim)
+        else:
+            y = flat @ self._rotation.T  # (n_vectors, head_dim)
 
         # 2. Block split: (n_vectors, num_blocks, vq_block_size)
         y_blocks = y.reshape(n_vectors, self._num_vq_blocks, self._vq_block_size)
@@ -308,9 +359,19 @@ class BlockTurboQuantMSE:
         y_blocks = y_blocks * scales_fp32[..., None]
 
         # 5. Flatten block axis → (n_vectors, head_dim), inverse rotate,
-        #    reshape to original shape, cast to output dtype.
+        #    reshape to original shape, cast to output dtype. Per-head
+        #    mode mirrors the encode reshape: (n_kv_heads, block_size,
+        #    d) batched-matmul against (n_kv_heads, d, d). For an
+        #    orthogonal R, ``y @ R`` is the inverse of ``flat @ R^T``.
         y = y_blocks.reshape(n_vectors, self._head_dim)
-        x_hat = y @ self._rotation  # inverse of ``flat @ rotation.T``
+        if self._per_head_rotation:
+            y_per_head = y.reshape(
+                self._n_kv_heads, self.block_size, self._head_dim
+            )
+            x_hat_per_head = mx.matmul(y_per_head, self._rotation)
+            x_hat = x_hat_per_head.reshape(n_vectors, self._head_dim)
+        else:
+            x_hat = y @ self._rotation  # inverse of ``flat @ rotation.T``
         out = x_hat.astype(self.dtype).reshape(
             1, self._n_kv_heads, self.block_size, self._head_dim
         )

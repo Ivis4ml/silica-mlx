@@ -89,7 +89,15 @@ class ExtRaBitQ:
             exceeds the :mod:`silica.vq.core.packing` codec catalog cap
             (uint8 payload limit).
         seed: Haar-rotation PRNG seed. Matches BlockTQ / RaBitQ1Bit
-            conventions so the same rotation matrix is shared.
+            conventions so the same rotation matrix is shared. When
+            ``per_head_rotation=True`` this becomes the base seed; the
+            per-head seed is ``seed * 1000 + head_idx``.
+        per_head_rotation: opt-in flag (default ``False``). When
+            ``True`` the codec draws ``n_kv_heads`` independent Haar
+            rotations and applies one per head, mirroring vqbench's
+            ``actual_seed = run_seed * 1000 + head_idx`` convention
+            (`vqbench/scripts/variance_qwen35_4b.py:63`). Default OFF
+            preserves the shared-rotation baseline.
         dtype: output dtype for :meth:`decode_tensor`; must be
             ``mx.float16`` or ``mx.bfloat16`` (D-003).
     """
@@ -105,6 +113,7 @@ class ExtRaBitQ:
         head_dim: int,
         num_bits: int,
         seed: int = 42,
+        per_head_rotation: bool = False,
         dtype: mx.Dtype = mx.float16,
     ) -> None:
         if num_bits not in self._ALLOWED_NUM_BITS:
@@ -139,6 +148,7 @@ class ExtRaBitQ:
         self._head_dim = head_dim
         self._num_bits = num_bits
         self._seed = seed
+        self._per_head_rotation = per_head_rotation
 
         # Explicit zero centroid (P-5-B §5.3). encode subtracts, decode
         # adds, fit is a no-op. Lets the algorithm flow read naturally
@@ -146,9 +156,22 @@ class ExtRaBitQ:
         self._centroid = mx.zeros((head_dim,), dtype=mx.float32)
 
         # Haar rotation calibrated once, shared with BlockTQ / RaBitQ1Bit
-        # at the same (head_dim, seed).
-        rotation_np = haar_rotation(head_dim, seed)
-        self._rotation = mx.array(rotation_np, dtype=mx.float32)  # (d, d)
+        # at the same (head_dim, seed). Per-head mode draws
+        # ``n_kv_heads`` independent rotations seeded ``seed * 1000 +
+        # head_idx`` to match vqbench's per-head convention
+        # (vqbench/scripts/variance_qwen35_4b.py:63).
+        if per_head_rotation:
+            per_head = [
+                haar_rotation(head_dim, seed * 1000 + h)
+                for h in range(n_kv_heads)
+            ]
+            self._rotation = mx.stack(
+                [mx.array(R, dtype=mx.float32) for R in per_head],
+                axis=0,
+            )  # (n_kv_heads, d, d)
+        else:
+            rotation_np = haar_rotation(head_dim, seed)
+            self._rotation = mx.array(rotation_np, dtype=mx.float32)  # (d, d)
 
         # Odd-integer codebook: [-(2^B - 1), -(2^B - 3), ..., -1, +1, ..., +(2^B - 1)]
         # indexed by [0, 2^B - 1]. Paper arXiv 2409.09913 Eq. 3.
@@ -207,11 +230,22 @@ class ExtRaBitQ:
         n_vectors = flat.shape[0]
 
         # Centroid subtract + per-vector norm + normalize + rotate.
+        # Per-head mode reshapes (n_vectors, d) → (n_kv_heads, B, d) and
+        # uses batched matmul against the (n_kv_heads, d, d) rotation;
+        # the input row order from ``x.reshape(-1, head_dim)`` is head-
+        # major so this preserves per-head grouping.
         centered = flat - self._centroid
         norm_o = mx.linalg.norm(centered, axis=1)              # (n_vectors,)
         safe_norm = mx.maximum(norm_o, mx.array(1e-30, dtype=mx.float32))
         o_bar = centered / safe_norm[:, None]                  # (n_vectors, d)
-        Y = o_bar @ self._rotation.T                           # (n_vectors, d)
+        if self._per_head_rotation:
+            o_bar_ph = o_bar.reshape(
+                self._n_kv_heads, self.block_size, d
+            )
+            Y_ph = mx.matmul(o_bar_ph, self._rotation.swapaxes(-1, -2))
+            Y = Y_ph.reshape(-1, d)
+        else:
+            Y = o_bar @ self._rotation.T                       # (n_vectors, d)
 
         # Scale to codebook range.
         scaled = Y * self._quant_scale                         # (n_vectors, d)
@@ -306,8 +340,16 @@ class ExtRaBitQ:
         safe_y_norm = mx.maximum(y_norm, mx.array(1e-30, dtype=mx.float32))
         y_hat = y_hat / safe_y_norm                            # (n_vectors, d)
 
-        # Inverse rotate + scale by norm_o + add centroid.
-        x_hat = y_hat @ self._rotation                         # (n_vectors, d)
+        # Inverse rotate + scale by norm_o + add centroid. Per-head
+        # mode mirrors the encode reshape.
+        if self._per_head_rotation:
+            y_hat_ph = y_hat.reshape(
+                self._n_kv_heads, self.block_size, d
+            )
+            x_hat_ph = mx.matmul(y_hat_ph, self._rotation)
+            x_hat = x_hat_ph.reshape(-1, d)
+        else:
+            x_hat = y_hat @ self._rotation                     # (n_vectors, d)
         norm_o_fp32 = payload.norm_o.astype(mx.float32)[:, None]  # (n_vectors, 1)
         x_hat = x_hat * norm_o_fp32 + self._centroid
 

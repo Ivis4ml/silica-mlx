@@ -58,6 +58,15 @@ class RaBitQ1Bit:
         seed: Haar-rotation PRNG seed. Matches the convention of
             BlockTurboQuantMSE so the same rotation matrix is shared when
             both codecs are instantiated with the same (head_dim, seed).
+            When ``per_head_rotation=True`` this becomes the base seed;
+            the per-head seed is ``seed * 1000 + head_idx``.
+        per_head_rotation: opt-in flag (default ``False``). When
+            ``True`` the codec draws ``n_kv_heads`` independent Haar
+            rotations and applies one per head, mirroring vqbench's
+            ``actual_seed = run_seed * 1000 + head_idx`` convention
+            (`vqbench/scripts/variance_qwen35_4b.py:63`). Default OFF
+            preserves the shared-rotation baseline used by the rest of
+            the silica codec catalog.
         dtype: output dtype for decode_tensor. Must be mx.float16 or
             mx.bfloat16 (D-003). Default is mx.float16.
     """
@@ -72,6 +81,7 @@ class RaBitQ1Bit:
         head_dim: int,
         num_bits: int = 1,
         seed: int = 42,
+        per_head_rotation: bool = False,
         dtype: mx.Dtype = mx.float16,
     ) -> None:
         if num_bits != 1:
@@ -103,6 +113,7 @@ class RaBitQ1Bit:
         self._n_kv_heads = n_kv_heads
         self._head_dim = head_dim
         self._seed = seed
+        self._per_head_rotation = per_head_rotation
 
         # Centroid lives on the codec instance per opening §5.3. P-5-B pins
         # it at zero; fit() keeps it unchanged. Stored explicitly so encode
@@ -110,12 +121,25 @@ class RaBitQ1Bit:
         # the value is a no-op; ExtRaBitQ will reuse the same field.
         self._centroid = mx.zeros((head_dim,), dtype=mx.float32)
 
-        # Offline calibration: Haar rotation (d, d) float32 mx.array constant.
+        # Offline calibration: Haar rotation float32 mx.array constant.
+        # Default mode draws (d, d); per-head mode draws (n_kv_heads, d, d)
+        # with seeds ``seed * 1000 + head_idx`` to match vqbench's
+        # per-head convention (vqbench/scripts/variance_qwen35_4b.py:63).
         # NumPy is used only inside haar_rotation (D-009 boundary); the
         # result is immediately uploaded to mx.array and never re-consulted
         # on the hot path.
-        rotation_np = haar_rotation(head_dim, seed)
-        self._rotation = mx.array(rotation_np, dtype=mx.float32)  # (d, d)
+        if per_head_rotation:
+            per_head = [
+                haar_rotation(head_dim, seed * 1000 + h)
+                for h in range(n_kv_heads)
+            ]
+            self._rotation = mx.stack(
+                [mx.array(R, dtype=mx.float32) for R in per_head],
+                axis=0,
+            )  # (n_kv_heads, d, d)
+        else:
+            rotation_np = haar_rotation(head_dim, seed)
+            self._rotation = mx.array(rotation_np, dtype=mx.float32)  # (d, d)
 
     # -------------------------------------------------------------------------
     # VectorCodec surface
@@ -163,9 +187,20 @@ class RaBitQ1Bit:
         norm_o = mx.linalg.norm(centered, axis=1)              # (n_vectors,)
         safe_norm = mx.maximum(norm_o, mx.array(1e-30, dtype=mx.float32))
 
-        # Normalize then rotate: Y = o_bar @ P^T
+        # Normalize then rotate: Y = o_bar @ P^T. Per-head mode reshapes
+        # (n_vectors=n_kv_heads*B, d) → (n_kv_heads, B, d) and uses
+        # batched matmul against the (n_kv_heads, d, d) rotation; the
+        # input row order from ``x.reshape(-1, head_dim)`` is head-major
+        # so this reshape preserves the per-head grouping.
         o_bar = centered / safe_norm[:, None]                  # (n_vectors, d)
-        Y = o_bar @ self._rotation.T                           # (n_vectors, d)
+        if self._per_head_rotation:
+            o_bar_ph = o_bar.reshape(
+                self._n_kv_heads, self.block_size, self._head_dim
+            )
+            Y_ph = mx.matmul(o_bar_ph, self._rotation.swapaxes(-1, -2))
+            Y = Y_ph.reshape(-1, self._head_dim)
+        else:
+            Y = o_bar @ self._rotation.T                       # (n_vectors, d)
 
         # Sign with tie-break 0 → +1 (matches vqbench signs[signs==0] = 1).
         signs_fp32 = mx.where(
@@ -242,8 +277,16 @@ class RaBitQ1Bit:
         # y_hat is the approximated rotated-normalized vector in Y-space.
         y_hat = signs_fp32 / math.sqrt(d)                        # (n_vectors, d)
 
-        # Inverse rotation: Y-space → O-space (y_hat @ P recovers O_bar approx).
-        x_hat = y_hat @ self._rotation                           # (n_vectors, d)
+        # Inverse rotation: Y-space → O-space (y_hat @ P recovers O_bar
+        # approx). Per-head mode mirrors the encode reshape.
+        if self._per_head_rotation:
+            y_hat_ph = y_hat.reshape(
+                self._n_kv_heads, self.block_size, self._head_dim
+            )
+            x_hat_ph = mx.matmul(y_hat_ph, self._rotation)
+            x_hat = x_hat_ph.reshape(-1, self._head_dim)
+        else:
+            x_hat = y_hat @ self._rotation                       # (n_vectors, d)
 
         # Scale by stored per-vector norm, add centroid (no-op for zero centroid).
         norm_o_fp32 = payload.norm_o.astype(mx.float32)[:, None]  # (n_vectors, 1)
