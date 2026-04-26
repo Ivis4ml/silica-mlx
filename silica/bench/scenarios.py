@@ -1130,6 +1130,98 @@ _QWEN3_5_0_8B_WIKITEXT_PPL_EXT_RABITQ_B4 = Scenario(
 
 
 # =============================================================================
+# P-3-C5-step2-E — WikiText-2 PPL rows on Qwen3.5-4B (hybrid).
+#
+# Same workload knobs as the Qwen3.5-0.8B block above; Qwen3.5-4B
+# is the model vqbench REPORT §3.1 used to claim "strictly lossless
+# at std=0% across three seeds" for block_tq_b64_b4. Mirroring on
+# silica's post-RoPE production-store oracle gives the head-to-head
+# comparison the user requested: vqbench's pre-RoPE-patch claim on
+# Qwen3.5-4B vs silica's post-RoPE-store claim on the same model.
+# =============================================================================
+
+
+_QWEN3_5_4B_WIKITEXT_PPL_FP16 = Scenario(
+    id="qwen3.5-4b-wikitext-ppl-fp16",
+    repo="Qwen/Qwen3.5-4B",
+    workload=Workload(
+        name="wikitext-ppl-fp16",
+        prompts=(),
+        max_tokens=0,
+        max_batch_size=1,
+        prefix_cache=False,
+        temperature=0.0,
+        top_p=1.0,
+        kv_codec=None,
+    ),
+    oracle=OracleKind.PPL,
+    oracle_config=dict(_WIKITEXT_PPL_ORACLE_CONFIG),
+    gate_env_var=None,
+    description=(
+        "P-3-C5-step2-E fp16 baseline PPL row on Qwen3.5-4B "
+        "(hybrid-DeltaNet, the model vqbench REPORT used for its "
+        "BlockTQ lossless claim). Same chunk_size=256 / "
+        "max_tokens=512 wikitext-2 workload as the Qwen3.5-0.8B "
+        "and Qwen3-0.6B fp16 rows so the codec rows below are "
+        "directly comparable across model sizes."
+    ),
+)
+
+
+_QWEN3_5_4B_WIKITEXT_PPL_BLOCK_TQ_B64_B4 = Scenario(
+    id="qwen3.5-4b-wikitext-ppl-block-tq-b64-b4",
+    repo="Qwen/Qwen3.5-4B",
+    workload=Workload(
+        name="wikitext-ppl-block-tq-b64-b4",
+        prompts=(),
+        max_tokens=0,
+        max_batch_size=1,
+        prefix_cache=True,
+        temperature=0.0,
+        top_p=1.0,
+        kv_codec="block_tq_b64_b4",
+    ),
+    oracle=OracleKind.PPL,
+    oracle_config=dict(_WIKITEXT_PPL_ORACLE_CONFIG),
+    gate_env_var=None,
+    description=(
+        "P-3-C5-step2-E BlockTurboQuantMSE B=64 4-bit K+V PPL row "
+        "on Qwen3.5-4B. Drives the C5-step2-W hybrid-aware codec "
+        "oracle (heterogeneous cache + recurrent snapshot/restore "
+        "across chunks) on the same model vqbench REPORT used for "
+        "its lossless claim. Cross-method comparison: vqbench's "
+        "pre-RoPE projection-patch path vs silica's post-RoPE "
+        "production-store path on identical inputs."
+    ),
+)
+
+
+_QWEN3_5_4B_WIKITEXT_PPL_EXT_RABITQ_B4 = Scenario(
+    id="qwen3.5-4b-wikitext-ppl-ext-rabitq-b4",
+    repo="Qwen/Qwen3.5-4B",
+    workload=Workload(
+        name="wikitext-ppl-ext-rabitq-b4",
+        prompts=(),
+        max_tokens=0,
+        max_batch_size=1,
+        prefix_cache=True,
+        temperature=0.0,
+        top_p=1.0,
+        kv_codec="ext_rabitq_b4",
+    ),
+    oracle=OracleKind.PPL,
+    oracle_config=dict(_WIKITEXT_PPL_ORACLE_CONFIG),
+    gate_env_var=None,
+    description=(
+        "P-3-C5-step2-E ExtRaBitQ 4-bit K+V PPL row on "
+        "Qwen3.5-4B. Same hybrid-aware codec oracle path as the "
+        "BlockTQ row; effective bits/coord depends on Qwen3.5-4B's "
+        "head_dim (read at runtime from the adapter's kv_layout)."
+    ),
+)
+
+
+# =============================================================================
 # P-5-C.3 step 1 — memory-residency rows on Qwen3-0.6B.
 #
 # Same shared-prefix 2-prompt workload the A.3c / B.3 decode-speed
@@ -1360,6 +1452,11 @@ BUILTIN_SCENARIOS: dict[str, Scenario] = {
         _QWEN3_5_0_8B_WIKITEXT_PPL_BLOCK_TQ_B64_B4
     ),
     _QWEN3_5_0_8B_WIKITEXT_PPL_EXT_RABITQ_B4.id: _QWEN3_5_0_8B_WIKITEXT_PPL_EXT_RABITQ_B4,
+    _QWEN3_5_4B_WIKITEXT_PPL_FP16.id: _QWEN3_5_4B_WIKITEXT_PPL_FP16,
+    _QWEN3_5_4B_WIKITEXT_PPL_BLOCK_TQ_B64_B4.id: (
+        _QWEN3_5_4B_WIKITEXT_PPL_BLOCK_TQ_B64_B4
+    ),
+    _QWEN3_5_4B_WIKITEXT_PPL_EXT_RABITQ_B4.id: _QWEN3_5_4B_WIKITEXT_PPL_EXT_RABITQ_B4,
     _QWEN3_0_6B_COMPRESSION_FP16.id: _QWEN3_0_6B_COMPRESSION_FP16,
     _QWEN3_0_6B_COMPRESSION_TQ_MSE_B4.id: _QWEN3_0_6B_COMPRESSION_TQ_MSE_B4,
     _QWEN3_0_6B_COMPRESSION_BLOCK_TQ_B64_B4.id: _QWEN3_0_6B_COMPRESSION_BLOCK_TQ_B64_B4,
