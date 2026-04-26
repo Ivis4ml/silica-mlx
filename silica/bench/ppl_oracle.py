@@ -93,9 +93,14 @@ from collections.abc import Callable
 from typing import Any, cast
 
 import mlx.core as mx
+from mlx_lm.models.cache import BatchKVCache
 
 from silica.kvcache.codec import VectorCodec
 from silica.mlx.runner import forward_batched_full
+from silica.models.recurrent import (
+    RecurrentSnapshot,
+    RecurrentStateAdapter,
+)
 from silica.scheduler.seed_kv import build_seeded_batch_kv
 
 
@@ -341,7 +346,19 @@ def teacher_forced_chunked_nll_with_codec(
     total_nll = 0.0
     total_tokens = 0
     prev_last_logit: mx.array | None = None
-    num_layers: int | None = None
+    attn_layer_indices: list[int] | None = None
+
+    # P-3-C5-step2-W: hybrid (recurrent) adapters carry per-layer
+    # recurrent state in DeltaNet ``ArraysCache`` slots that the
+    # K/V codec doesn't touch. Without explicit handling, each hit
+    # chunk's freshly-built cache would lose the prior chunks'
+    # recurrent trajectory, inflating PPL artificially. Mirror C5.3's
+    # capture/restore at chunk boundaries (advisor sharpening:
+    # snapshot/restore is the highest-fidelity option for the
+    # "compare to vqbench" claim — same per-block snapshot
+    # contract C5.3.3b validates byte-exact in production).
+    is_hybrid_recurrent = isinstance(adapter, RecurrentStateAdapter)
+    prev_recurrent_snapshot: RecurrentSnapshot | None = None
 
     for start in range(0, seq_len, chunk_size):
         end = min(start + chunk_size, seq_len)
@@ -350,14 +367,20 @@ def teacher_forced_chunked_nll_with_codec(
 
         if start == 0:
             # Cold path — no prior prefix, allocate a fresh cache.
+            # The cache may be heterogeneous on hybrid adapters
+            # (interleaved ``ArraysCache`` + ``BatchKVCache``).
             cache_list = adapter.make_batch_cache([0])
-            num_layers = len(cache_list)
+            attn_layer_indices = [
+                i
+                for i, c in enumerate(cache_list)
+                if isinstance(c, BatchKVCache)
+            ]
         else:
             # Hit path — look up aligned prefix and seed a fresh cache
             # from the store-owned decoded K/V. ``lookup`` increments
             # hit refs; the ``release`` call after ``fetch_detached_blocks``
             # matches the scheduler's admission-hit pattern.
-            assert num_layers is not None
+            assert attn_layer_indices is not None
             prefix_token_list = _mx_1d_to_int_list(token_ids[0, :start])
             hit = prefix_cache.lookup(prefix_token_list)
             # ``lookup`` retained hit refs on every returned block; the
@@ -379,11 +402,38 @@ def teacher_forced_chunked_nll_with_codec(
                 detached_blocks = prefix_cache.fetch_detached_blocks(
                     hit.block_ids
                 )
-                cache_list = build_seeded_batch_kv(
-                    detached_blocks, num_layers=num_layers
+                # P-3-C5-step2-W: per-block detached_blocks carry one
+                # ``(K, V)`` per attention-layer position (the bench
+                # extract below stores it that way). For hybrid
+                # adapters, build an empty heterogeneous cache via
+                # ``adapter.make_batch_cache`` and interleave the
+                # seeded ``BatchKVCache`` into the attention positions;
+                # DeltaNet positions remain empty ``ArraysCache`` (the
+                # recurrent state is restored separately below). For
+                # pure-attention adapters, ``attn_layer_indices`` is
+                # ``range(num_layers)`` and the assembly degenerates
+                # to today's all-``BatchKVCache`` shape.
+                seeded_attn = build_seeded_batch_kv(
+                    detached_blocks, num_layers=len(attn_layer_indices)
                 )
+                cache_list = adapter.make_batch_cache([0])
+                for pos, src_idx in enumerate(attn_layer_indices):
+                    cache_list[src_idx] = seeded_attn[pos]
             finally:
                 prefix_cache.release(hit.block_ids)
+
+            # P-3-C5-step2-W: restore the prior chunk's recurrent state
+            # so DeltaNet layers continue from the correct trajectory
+            # rather than re-initialising lazily on this chunk's first
+            # forward. Mirrors ``_admit_single_hit_row``'s Insertion B
+            # (P-3-C5.3.3a) — the cache_list at this point has empty
+            # ``ArraysCache`` slots that ``_splice_row`` case 4 fills
+            # in directly from the snapshot.
+            if is_hybrid_recurrent and prev_recurrent_snapshot is not None:
+                assert isinstance(adapter, RecurrentStateAdapter)
+                adapter.restore_recurrent_state(
+                    cache_list, 0, prev_recurrent_snapshot
+                )
 
         logits = forward_batched_full(
             model, chunk_tokens, cache_list
@@ -419,6 +469,17 @@ def teacher_forced_chunked_nll_with_codec(
         )
         mx.eval(prev_last_logit)
 
+        # P-3-C5-step2-W: capture the post-forward recurrent state so
+        # the next chunk's hit path can restore it onto the freshly-
+        # built cache. The capture covers every DeltaNet layer; pure-
+        # attention adapters skip this (no RecurrentStateAdapter
+        # mixin → predicate False).
+        if is_hybrid_recurrent:
+            assert isinstance(adapter, RecurrentStateAdapter)
+            prev_recurrent_snapshot = adapter.snapshot_recurrent_state(
+                cache_list, row_idx=0
+            )
+
         # Extract every aligned block covered by the current cache
         # ([0, aligned_end)) and hand the prefix over to
         # ``prefix_cache.insert_detached``. Duplicate-prefix branches
@@ -445,15 +506,26 @@ def _extract_aligned_blocks_from_seeded_cache(
     block_size: int,
     num_aligned_tokens: int,
 ) -> list[list[tuple[mx.array, mx.array]]]:
-    """Slice per-block K/V out of a B=1 ``BatchKVCache`` list.
+    """Slice per-block K/V out of a B=1 cache list.
 
-    Returns a list indexed ``[block_idx][layer_idx] -> (K, V)`` that
+    Returns a list indexed ``[block_idx][attn_pos] -> (K, V)`` that
     :meth:`silica.kvcache.prefix.RadixPrefixCache.insert_detached`
     consumes. Each ``(K, V)`` has shape
     ``(1, n_kv_heads, block_size, head_dim)`` — the shape contract
     ``build_seeded_batch_kv`` and ``register_detached`` share.
 
-    Precondition: every cache in ``cache_list`` has
+    P-3-C5-step2-W: under hybrid adapters the cache_list is
+    heterogeneous (interleaved ``ArraysCache`` for DeltaNet layers
+    + ``BatchKVCache`` for full-attention layers). DeltaNet layers
+    carry recurrent state, not token K/V — there is no per-block
+    slicing to do for them. The helper introspects each layer's
+    type and only extracts from ``BatchKVCache`` layers; the
+    output's per-block list length is the number of attention
+    layers, not the total transformer layer count. Pure-attention
+    adapters degenerate to today's behaviour (every layer is a
+    ``BatchKVCache`` so ``attn_pos == layer_idx``).
+
+    Precondition: every ``BatchKVCache`` in ``cache_list`` has
     ``left_padding[0] == 0`` (B=1 fresh admission). The seeded caches
     the oracle builds satisfy this by construction (:func:`build_seeded_batch_kv`
     sets ``left_padding=[0]``); the cold-path cache from
@@ -471,8 +543,8 @@ def _extract_aligned_blocks_from_seeded_cache(
 
     Raises:
         ValueError: if ``num_aligned_tokens`` is not a non-negative
-            multiple of ``block_size``, or any layer's cache is
-            missing its K/V (forward never ran).
+            multiple of ``block_size``, or any attention layer's
+            cache is missing its K/V (forward never ran).
     """
     if num_aligned_tokens < 0:
         raise ValueError(
@@ -484,14 +556,18 @@ def _extract_aligned_blocks_from_seeded_cache(
             f"multiple of block_size ({block_size})"
         )
     num_blocks = num_aligned_tokens // block_size
-    num_layers = len(cache_list)
+    attn_layer_indices = [
+        i
+        for i, c in enumerate(cache_list)
+        if isinstance(c, BatchKVCache)
+    ]
 
     detached: list[list[tuple[mx.array, mx.array]]] = []
     for b_idx in range(num_blocks):
         start = b_idx * block_size
         end = start + block_size
         per_layer: list[tuple[mx.array, mx.array]] = []
-        for layer_idx in range(num_layers):
+        for layer_idx in attn_layer_indices:
             cache_obj = cache_list[layer_idx]
             keys = cache_obj.keys
             values = cache_obj.values
