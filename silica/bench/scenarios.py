@@ -1222,6 +1222,102 @@ _QWEN3_5_4B_WIKITEXT_PPL_EXT_RABITQ_B4 = Scenario(
 
 
 # =============================================================================
+# P-3-C5-step2.5 — WikiText-2 PPL rows on Qwen3-4B (pure-attention
+# control point).
+#
+# step2-D / step2-E surfaced a 3-orders-of-magnitude gap in K/V
+# codec ΔPPL between pure-attention Qwen3-0.6B (+20 PPL) and
+# hybrid Qwen3.5 (≈0 PPL). The gap conflates three variables:
+# architecture (pure-attention vs hybrid-DeltaNet), head_dim (128
+# vs 256), and model size (0.6B vs 0.8B/4B).
+#
+# Qwen3-4B is the cheapest control point that disambiguates size:
+# pure-attention, head_dim=128, num_kv_heads=8 — identical to
+# Qwen3-0.6B except scaled to 4B. Running the same three PPL rows
+# gives a clean answer to "is the gap explained by model size?"
+# Architecture vs head_dim disambiguation would require a hybrid
+# head_dim=128 model (does not appear in the Qwen3.5 family) and
+# is left as future work.
+# =============================================================================
+
+
+_QWEN3_4B_WIKITEXT_PPL_FP16 = Scenario(
+    id="qwen3-4b-wikitext-ppl-fp16",
+    repo="Qwen/Qwen3-4B",
+    workload=Workload(
+        name="wikitext-ppl-fp16",
+        prompts=(),
+        max_tokens=0,
+        max_batch_size=1,
+        prefix_cache=False,
+        temperature=0.0,
+        top_p=1.0,
+        kv_codec=None,
+    ),
+    oracle=OracleKind.PPL,
+    oracle_config=dict(_WIKITEXT_PPL_ORACLE_CONFIG),
+    gate_env_var=None,
+    description=(
+        "P-3-C5-step2.5 fp16 baseline PPL row on Qwen3-4B "
+        "(pure-attention, head_dim=128). Control point for the "
+        "size dimension of the hybrid-vs-attention codec gap "
+        "surfaced in step2-D / step2-E."
+    ),
+)
+
+
+_QWEN3_4B_WIKITEXT_PPL_BLOCK_TQ_B64_B4 = Scenario(
+    id="qwen3-4b-wikitext-ppl-block-tq-b64-b4",
+    repo="Qwen/Qwen3-4B",
+    workload=Workload(
+        name="wikitext-ppl-block-tq-b64-b4",
+        prompts=(),
+        max_tokens=0,
+        max_batch_size=1,
+        prefix_cache=True,
+        temperature=0.0,
+        top_p=1.0,
+        kv_codec="block_tq_b64_b4",
+    ),
+    oracle=OracleKind.PPL,
+    oracle_config=dict(_WIKITEXT_PPL_ORACLE_CONFIG),
+    gate_env_var=None,
+    description=(
+        "P-3-C5-step2.5 BlockTurboQuantMSE B=64 4-bit K+V PPL "
+        "row on Qwen3-4B. Pure-attention control point at "
+        "head_dim=128 same as Qwen3-0.6B, scaled to 4B size. "
+        "ΔPPL against fp16 disambiguates whether the +20 PPL gap "
+        "on Qwen3-0.6B was driven by model size."
+    ),
+)
+
+
+_QWEN3_4B_WIKITEXT_PPL_EXT_RABITQ_B4 = Scenario(
+    id="qwen3-4b-wikitext-ppl-ext-rabitq-b4",
+    repo="Qwen/Qwen3-4B",
+    workload=Workload(
+        name="wikitext-ppl-ext-rabitq-b4",
+        prompts=(),
+        max_tokens=0,
+        max_batch_size=1,
+        prefix_cache=True,
+        temperature=0.0,
+        top_p=1.0,
+        kv_codec="ext_rabitq_b4",
+    ),
+    oracle=OracleKind.PPL,
+    oracle_config=dict(_WIKITEXT_PPL_ORACLE_CONFIG),
+    gate_env_var=None,
+    description=(
+        "P-3-C5-step2.5 ExtRaBitQ 4-bit K+V PPL row on Qwen3-4B. "
+        "Same control-point intent as the BlockTQ row; provides "
+        "a second codec data point for the size-dimension "
+        "ablation."
+    ),
+)
+
+
+# =============================================================================
 # P-5-C.3 step 1 — memory-residency rows on Qwen3-0.6B.
 #
 # Same shared-prefix 2-prompt workload the A.3c / B.3 decode-speed
@@ -1457,6 +1553,11 @@ BUILTIN_SCENARIOS: dict[str, Scenario] = {
         _QWEN3_5_4B_WIKITEXT_PPL_BLOCK_TQ_B64_B4
     ),
     _QWEN3_5_4B_WIKITEXT_PPL_EXT_RABITQ_B4.id: _QWEN3_5_4B_WIKITEXT_PPL_EXT_RABITQ_B4,
+    _QWEN3_4B_WIKITEXT_PPL_FP16.id: _QWEN3_4B_WIKITEXT_PPL_FP16,
+    _QWEN3_4B_WIKITEXT_PPL_BLOCK_TQ_B64_B4.id: (
+        _QWEN3_4B_WIKITEXT_PPL_BLOCK_TQ_B64_B4
+    ),
+    _QWEN3_4B_WIKITEXT_PPL_EXT_RABITQ_B4.id: _QWEN3_4B_WIKITEXT_PPL_EXT_RABITQ_B4,
     _QWEN3_0_6B_COMPRESSION_FP16.id: _QWEN3_0_6B_COMPRESSION_FP16,
     _QWEN3_0_6B_COMPRESSION_TQ_MSE_B4.id: _QWEN3_0_6B_COMPRESSION_TQ_MSE_B4,
     _QWEN3_0_6B_COMPRESSION_BLOCK_TQ_B64_B4.id: _QWEN3_0_6B_COMPRESSION_BLOCK_TQ_B64_B4,
