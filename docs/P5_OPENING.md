@@ -878,11 +878,36 @@ At the same `BlockTurboQuantMSE B=64` 4-bit K+V codec config, the production-rou
 
 **P-5-F closes this gap (v1.7.6).** F.1-F.4 land a pre-norm K/V store via the (3b) projection-output capture path: `silica/models/pre_norm_capture.py` ships a runtime-checkable `PreNormCaptureAdapter` Protocol (`install_pre_norm_capture` arming + `apply_k_norm_then_rope` reconstruction) plus a per-family proxy on `attn.k_proj` installed at adapter construction; the proxy returns `k_proj(x)` unchanged and side-effects pre-k_norm K to a buffer. `SyntheticPrefixBlockStore` accepts a `pre_norm: bool = False` contract flag; `ContinuousBatcher` arms / disarms the buffer per prefill chunk forward, sources K from a per-row `_BatchRow.k_pre_per_block` dict in `_extract_and_insert_prefix`, and calls `apply_k_norm_then_rope` per block per attn-pos in `_admit_single_hit_row` before `build_seeded_batch_kv`. F.3 flips the production wikitext PPL default to `codec_quality_path="prefix_store_pre_norm"`. The (4-b) anchor row now measures **ΔPPL +0.012** on the production path (single seed; F.0b' 3-seed verification is +0.015), inside D.2a's `+0.51 ± 0.35 PPL` envelope. ~360× improvement over the legacy +20.83 PPL post-RoPE store. Three legacy comparison arms (`prefix_store_post_rope`, `prefix_store_pre_rope`, `vqbench_aligned`) retained as bench-only opt-ins per `docs/P5_F_OPENING.md` §6.9 reading order. The (4-b) `[x]` continues to record algorithmic parity between silica MLX and vqbench NumPy BlockTQ; the production-routing arm is now structurally aligned with that algorithmic parity.
 
-### (b-static) End-to-end PPL vs `vqbench/REPORT.md` static baseline — post-P-5 required follow-up
+### (b-static) End-to-end PPL vs `vqbench/REPORT.md` static baseline — closed at v1.7.7
 
-The literal v1.5.1 form of Acceptance (b) — silica BlockTQ end-to-end PPL on **Qwen3.5-4B**, compared against the static `PPL_fp16 ≈ 10.3866` baseline in `vqbench/REPORT.md` §3.1 — is **not reachable on the current tree**. Qwen3.5-4B is hybrid-DeltaNet (8 full-attention + 24 linear-attention layers, `has_recurrent_state=True` — `vqbench/REPORT.md` §2.1) and `ContinuousBatcher` refuses to pair `RadixPrefixCache` with recurrent adapters (`docs/P3_DELTANET_SURVEY.md` C-open-3), which the C.2 codec-backed oracle requires.
+silica's MLX-native `BlockTurboQuantMSE B=64` 4-bit K+V codec on Qwen3.5-4B reproduces vqbench/REPORT.md §3.1's lossless-at-measurement-precision finding under independent measurement: at the same workload (WikiText-2 first 512 tokens, `chunk_size=256`, 3 seeds `{42, 43, 44}`), silica's mean ΔPPL is statistically indistinguishable from vqbench's reported `+0.000% ± 0.000%`.
 
-This item is **post-P-5 required follow-up**, blocked on **the remaining P-3-C recurrent / prefix-cache cooperation work** (`docs/P3_DELTANET_SURVEY.md` C-open-3; may land through P-3-C5 preempt/replay-with-recurrent-snapshot, or through a narrower targeted fix if prefix-reuse support arrives without the full snapshot machinery), **or on an alternate monkey-patch measurement path** wrapping `k_proj` / `v_proj` on the 8 full-attention layers to inject quantize→dequantize inside the forward pass, bypassing `RadixPrefixCache` (mirrors `vqbench/scripts/reproduce_qwen35_4b_headline.py`'s own fallback — `vqbench/REPORT.md` §2.2 documents the monkey-patch as "pessimistic" but valid). The dependency is intentionally written at the P-3-C work-area granularity; pinning it to P-3-C5 specifically would re-introduce the same drift if prefix-reuse support lands via a different P-3-C sub-unit. Qwen3.5-4B remains a required v0.1 cross-validation target; v1.7.2 moves it from the P-5 close gate to the correct workstream, does not drop it.
+**Setup.** Bench command `scripts/bench.py --scenario qwen3.5-4b-wikitext-ppl-{fp16,block-tq-b64-b4} --seeds 42,43,44`. The `block_tq_b64_b4` row routes through `prefix_store_pre_norm` by default after P-5-F F.3 (commit `df2b3f4`); no flag override needed. Hybrid Qwen3.5-4B's slice-regime is active (`RecurrentStateAdapter + prefix_cache != None`); the slice-prefill helpers exercise F.2b's per-chunk K_pre capture (commit `cc249e7`).
+
+**Per-seed silica numbers** (raw JSONL at `docs/P5_ACCEPTANCE_SWEEP/qwen35_4b_b_static_3seeds.jsonl`):
+
+| Seed | fp16 PPL | codec PPL | ΔPPL    | ΔPPL %  |
+| --- | --- | --- | --- | --- |
+| 42 | 8.855979 | 8.880764 | +0.024785 | +0.280% |
+| 43 | 8.855979 | 8.839237 | −0.016742 | −0.189% |
+| 44 | 8.855979 | 8.852605 | −0.003374 | −0.038% |
+
+silica aggregated: mean ΔPPL = `+0.001556 PPL`, std = `0.021198`, SEM = `0.012238`.
+
+vqbench/REPORT.md §3.1 row "Block B=64 4-bit K+V": mean ΔPPL_pct = `+0.000%`, std = `0.000%` (3 seeds {42, 43, 44}, monkey-patch fallback on the 8 full-attention layers per REPORT §2.2).
+
+**Gate.** The (4-b)-style two-part aggregated gate inherited from PLAN §7:
+
+- `mean_gap` = silica.ΔPPL_mean − vqbench.ΔPPL_mean = `+0.001556 PPL`.
+- `SEM_diff` = √(SEM_silica² + SEM_vqbench²) = `0.012238 PPL` (vqbench's static row reports 0.000% std, contributes 0).
+- Gate (i): `|mean_gap| ≤ 2 × SEM_diff` ⇔ `0.001556 ≤ 0.024477` → **PASS** (~16× headroom).
+- Gate (ii): `|mean_gap| < 1.0 PPL` ⇔ `0.001556 < 1.0` → **PASS** (~640× headroom).
+
+**Production hot-path measurement, not monkey-patch.** v1.7.5's earlier wording of (b-static) recorded "blocked on P-3-C recurrent + prefix-cache cooperation work, or on an alternate monkey-patch measurement path wrapping `k_proj` / `v_proj` on the 8 full-attention layers". That dependency was correct at v1.7.5 — `ContinuousBatcher` refused to pair `RadixPrefixCache` with recurrent adapters until P-3-C5.4 lifted the C3b guard, and pre-P-5-F the post-RoPE prefix-cache store paid a chunk-boundary quality cost on the production path. Both blockers are resolved at v1.7.6: P-5-F's (3b) projection-output capture path lands the production hot path inside D.2a's quality envelope on Qwen3.5-4B, so the monkey-patch fallback is no longer needed. (b-static) closes via the same routing the production deployment will use, not via a measurement-only patch.
+
+**Why silica's absolute fp16 PPL differs from vqbench's.** silica's fp16 PPL = `8.856`; vqbench's REPORT.md reports `10.3866`. The difference traces to tokeniser (silica uses Qwen3.5 mlx-lm tokenizer; vqbench uses HF transformers tokenizer with different boundary-handling), precision (silica MLX bf16; vqbench torch.float16 + MPS — different matmul accumulation), and harness (silica's `teacher_forced_chunked_nll` vs vqbench's `evaluate_perplexity`). The (b-static) gate compares **ΔPPL** (relative to each respective fp16 baseline), which is the harness-independent codec-quality observable.
+
+**Evidence files.** `docs/P5_ACCEPTANCE_SWEEP/qwen35_4b_b_static_close.md` (full analysis); `qwen35_4b_b_static_3seeds.jsonl` (raw bench rows); `qwen35_4b_b_static_3seeds.md` (auto-generated bench report).
 
 ### (c) Prefix residency enters `headroom_bytes()`, admission benefits follow
 
