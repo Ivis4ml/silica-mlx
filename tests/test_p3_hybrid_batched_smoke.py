@@ -37,6 +37,8 @@ from mlx_lm.models.cache import ArraysCache, BatchKVCache
 
 from silica import Engine
 from silica.core.sampling import SamplingParams
+from silica.kvcache.prefix import RadixPrefixCache
+from silica.kvcache.store import SyntheticPrefixBlockStore
 from silica.models.adapter import AttentionKind
 from silica.models.factory import adapter_for_repo
 from silica.scheduler.batcher import ContinuousBatcher
@@ -167,3 +169,191 @@ def test_batcher_batch_cache_is_genuinely_hybrid_on_qwen3_5_0_8b() -> None:
                 f"Qwen3_5Adapter.make_batch_cache is producing caches "
                 f"for layers it should not own."
             )
+
+
+# --- P-3-C5.3.4 sibling: prefix_cache enabled, multi-token byte-exact ---
+
+_PREFIX_CACHE_BLOCK_SIZE = 16
+# Long enough to tokenize to >= 33 tokens (2 * BLOCK_SIZE + 1) so the
+# subject's request 1 produces a non-trivial seeded tree (>= 2 blocks)
+# and request 2's hit-admission has a non-empty suffix.
+_C5_3_4_PROMPT_TEXT = (
+    "The recurrent associative memory accumulates across every "
+    "processed token in this sequence. Each forward pass advances "
+    "the cache state without resetting until the request completes. "
+    "Slice-prefill regime captures snapshots at fixed block "
+    "boundaries to support prefix-cache cooperation under hybrid "
+    "DeltaNet attention."
+)
+
+
+def _drain_until_req_done(
+    batcher: ContinuousBatcher, req_index: int
+) -> list[object]:
+    """Drive ``step()`` calls until the given req_index emits a
+    ``"done"`` event. Collects events from every step.
+
+    Used to walk the multi-step decode sequence from admission
+    through ``max_tokens`` reach. The reclaim step (where the
+    DONE row is removed and prefix is extracted) typically emits
+    no events, so the loop exits before reclaim runs; callers
+    that need reclaim done can call ``step()`` once more.
+    """
+    collected: list[object] = []
+    for _ in range(64):  # generous upper bound; max_tokens stays small
+        events = batcher.step()
+        collected.extend(events)
+        for ev in events:
+            if (
+                ev.kind == "done"  # type: ignore[attr-defined]
+                and ev.req_index == req_index  # type: ignore[attr-defined]
+            ):
+                return collected
+    raise AssertionError(
+        f"req_index={req_index} did not finish within 64 steps; "
+        f"last events: {collected[-5:]}"
+    )
+
+
+@pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
+def test_batcher_prefix_cache_hit_admission_multi_token_byte_exact_on_qwen3_5_0_8b() -> (
+    None
+):
+    """C5.3.4 acceptance — multi-token byte-exact gate.
+
+    Drives Qwen3.5-0.8B with two sequentially-admitted requests
+    sharing a long prompt. Request 1 seeds the radix tree
+    (prefill + decode + reclaim's extract); request 2 admits
+    mid-run via Phase-B + ``_admit_single_hit_row``. The hit row
+    runs ``max_tokens`` decode steps; the full token stream is
+    asserted byte-equal to a slice-regime oracle running the
+    same prompt + ``max_tokens`` from scratch under
+    ``prefix_cache=None`` + ``_force_recurrent_slice_prefill_for_c5_3_oracle``.
+
+    Multi-token verification extends the C5.3.3b first-token gate
+    (tests/test_batcher_hit_admission_byte_exact_oracle.py) to
+    ensure post-restore decode stays byte-exact across multiple
+    decode steps. Token equality across the full stream is
+    implied by first-token equality + cache byte-equality at
+    admission, plus deterministic forward; this test pins that
+    chain in practice on a real model.
+    """
+    adapter, _ = adapter_for_repo(REPO)
+    tokenizer = adapter.tokenizer()
+    prompt_ids = list(tokenizer.encode(_C5_3_4_PROMPT_TEXT))
+    assert len(prompt_ids) >= 2 * _PREFIX_CACHE_BLOCK_SIZE + 1, (
+        f"_C5_3_4_PROMPT_TEXT tokenized to {len(prompt_ids)}; need "
+        f">= {2 * _PREFIX_CACHE_BLOCK_SIZE + 1}"
+    )
+    eos_ids = tuple(sorted(getattr(tokenizer, "eos_token_ids", set()) or ()))
+
+    max_tokens_request_2 = 4
+
+    # === Subject: prefix_cache + opt-in flag ===
+    pc = RadixPrefixCache(
+        block_size=_PREFIX_CACHE_BLOCK_SIZE,
+        store=SyntheticPrefixBlockStore(
+            block_size=_PREFIX_CACHE_BLOCK_SIZE
+        ),
+    )
+    subject = ContinuousBatcher(
+        adapter,
+        prefix_cache=pc,
+        _allow_recurrent_prefix_cache_for_c5_3_testing=True,
+    )
+    assert subject._slice_prefill_active() is True
+    assert (
+        subject._effective_slice_block_size()
+        == _PREFIX_CACHE_BLOCK_SIZE
+    )
+
+    # Request 1: short max_tokens just to drive the row to DONE so
+    # reclaim's extract seeds the radix tree.
+    subject.add_request(
+        0,
+        prompt_ids,
+        SamplingParams(
+            temperature=0.0,
+            max_tokens=2,
+            stop_token_ids=eos_ids,
+        ),
+    )
+    _drain_until_req_done(subject, 0)
+    subject.step()  # reclaim → extract → tree seeded
+    assert pc.node_count() >= 2, (
+        f"request 1 reclaim should have seeded >= 2 radix nodes; "
+        f"got {pc.node_count()}"
+    )
+
+    # Request 2: admits mid-run via Phase-B + hit; runs
+    # ``max_tokens_request_2`` decode steps total.
+    subject.add_request(
+        1,
+        prompt_ids,
+        SamplingParams(
+            temperature=0.0,
+            max_tokens=max_tokens_request_2,
+            stop_token_ids=eos_ids,
+        ),
+    )
+    subject_events = _drain_until_req_done(subject, 1)
+    assert subject.prefix_hits == 1, (
+        f"request 2 must hit the radix tree; "
+        f"prefix_hits={subject.prefix_hits}"
+    )
+
+    subject_tokens = [
+        ev.token_id  # type: ignore[attr-defined]
+        for ev in subject_events
+        if ev.kind == "token"  # type: ignore[attr-defined]
+        and ev.req_index == 1  # type: ignore[attr-defined]
+    ]
+    assert len(subject_tokens) == max_tokens_request_2, (
+        f"subject emitted {len(subject_tokens)} tokens for req 1; "
+        f"expected {max_tokens_request_2}"
+    )
+
+    # === Oracle: prefix_cache=None + slice-regime force flag ===
+    oracle = ContinuousBatcher(
+        adapter,
+        prefix_cache=None,
+        _force_recurrent_slice_prefill_for_c5_3_oracle=(
+            _PREFIX_CACHE_BLOCK_SIZE
+        ),
+    )
+    assert oracle._slice_prefill_active() is True
+    assert (
+        oracle._effective_slice_block_size()
+        == _PREFIX_CACHE_BLOCK_SIZE
+    )
+
+    oracle.add_request(
+        1,
+        prompt_ids,
+        SamplingParams(
+            temperature=0.0,
+            max_tokens=max_tokens_request_2,
+            stop_token_ids=eos_ids,
+        ),
+    )
+    oracle_events = _drain_until_req_done(oracle, 1)
+    assert oracle.prefix_hits == 0, (
+        "oracle has no prefix_cache; prefix_hits must stay 0"
+    )
+
+    oracle_tokens = [
+        ev.token_id  # type: ignore[attr-defined]
+        for ev in oracle_events
+        if ev.kind == "token"  # type: ignore[attr-defined]
+        and ev.req_index == 1  # type: ignore[attr-defined]
+    ]
+    assert len(oracle_tokens) == max_tokens_request_2
+
+    # === Byte-exact token stream ===
+    assert subject_tokens == oracle_tokens, (
+        f"multi-token byte-exact mismatch:\n"
+        f"  subject: {subject_tokens}\n"
+        f"  oracle:  {oracle_tokens}\n"
+        f"slice-regime greedy decode should produce identical "
+        f"streams under byte-exact recurrent state at admission"
+    )
