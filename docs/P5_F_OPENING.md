@@ -150,7 +150,18 @@ after — removes the chunk-boundary cost.
 
 ## 3. Architectural options
 
-### 3.1 Option A — Inverse-RoPE round-trip at the store seam (recommended)
+> **Re-scoped 2026-04-26 (commit after `503da76`).** Original §3 had
+> Option A as recommended default. F.0b's verification found a recon
+> gap (mlx-lm's `k_norm` between `k_proj` and RoPE) that invalidates
+> the RoPE-orthogonality argument for Option A as a stand-alone
+> production path. F.0b''s (3b) variant (projection-output capture
+> wrapper) was verified at +0.015 PPL — better than D.2a's +0.51 — and
+> is the new recommended default. Sections §3.1-§3.4 below preserve
+> the original options as written; §3.5 introduces (3b) as the chosen
+> architecture; §3.6 records the updated decision. See §10.3 for the
+> verification data.
+
+### 3.1 Option A — Inverse-RoPE round-trip at the store seam (measurement variant only)
 
 **Where the change lives**: `silica/kvcache/store.py` (encode /
 decode hooks) + a small adapter Protocol extension exposing the
@@ -199,6 +210,20 @@ near-zero cost (one cast each side) if a stricter path is wanted.
   before codec; this is below codec-noise budget per §5.1 but
   must be empirically confirmed via F.0 PPL measurement.
 
+> **F.0b verification result (2026-04-26)**: Option A reaches
+> "post-k_norm pre-RoPE" space, NOT vqbench's pre-k_norm space —
+> mlx-lm's `k_norm` (RMSNorm) sits between `k_proj` and RoPE
+> (`qwen3_next.py:138-148`). The inverse-RoPE round-trip undoes RoPE
+> only; `k_norm` cannot be undone without per-token `rms_x` metadata
+> the cache doesn't preserve. Empirical ΔPPL on Qwen3-0.6B + BlockTQ
+> b64 b4: **+4.12 PPL** (3 seeds), 8× worse than D.2a's +0.51 because
+> `k_norm` absorbs ~2× of the noise injected pre-norm but does not
+> absorb noise injected post-norm. Option A **fails** the F.0 (b)
+> gate. Demoted to a measurement variant of (3b) for codec deployment
+> ablations on the post-k_norm space; not the production architecture.
+> Bench scenario `qwen3-0.6b-wikitext-ppl-block-tq-b64-b4-pre-rope`
+> remains in the catalog as a third data point.
+
 ### 3.2 Option B — Cache holds pre-RoPE K throughout (not v0.1)
 
 **Where the change lives**: every adapter family's `Attention.__call__`
@@ -230,7 +255,7 @@ unconditionally, no inverse-RoPE math anywhere. The elegance cost
 is owning attention forwards across five families. **Not a v0.1
 candidate.**
 
-### 3.3 Option C — Persistent projection-wrapper (fallback)
+### 3.3 Option C / (3a) — In-flight injecting projection-wrapper (rejected)
 
 **Where the change lives**: a silica-owned `_QuantizedProjStore`
 wrapping `attn.k_proj` / `attn.v_proj` per layer, backed by a
@@ -257,11 +282,108 @@ shows fp16 inverse-RoPE round-trip pushes ΔPPL outside the
 D.2a `+0.51 ± 0.35 PPL` envelope and fp32-cast doesn't recover
 it. F.0 result determines whether we ship A or escalate to C.
 
-### 3.4 Decision
+> **(3a) framing rejected 2026-04-26 in favour of (3b) — see §3.5.**
+> Both (3a) and (3b) install a wrapper on `attn.k_proj`. The
+> difference is what the wrapper does: (3a) injects codec noise on
+> the in-flight forward (mirroring D.2a's `_QuantizedProj`); (3b)
+> only captures K_pre and returns `k_proj(x)` unchanged. (3b) is
+> strictly less noisy (current chunk's K stays clean — codec noise
+> affects only PRIOR chunks via the seeded cache hit path) and
+> matches the production prefix-cache deployment semantic exactly.
+> Empirically, (3b) gives +0.015 PPL on the F.0 (b) reference scenario,
+> vs D.2a's +0.51 PPL. (3a) was never prototyped because the
+> in-flight injection is by construction at least as noisy as D.2a.
 
-**A is the recommended default.** F.0 validation gates the
-escalation to C (no escalation if A's empirical numbers land in
-the D.2a envelope).
+### 3.4 Decision (original — superseded by §3.6 on 2026-04-26)
+
+**Superseded — current decision in §3.6.**
+
+**A was the recommended default at first plan version (v1.0.0).**
+F.0 validation found A reaches the wrong space (post-k_norm
+pre-RoPE, not vqbench's pre-k_norm), so this decision is
+superseded by §3.6 below.
+
+### 3.5 Option (3b) — Capture-only projection wrapper (recommended)
+
+**Where the change lives**: a thin proxy installed on every
+attention layer's `attn.k_proj` at adapter build time. Adapter
+exposes a method to enable / disable a per-request capture
+buffer; scheduler manages the buffer lifecycle.
+
+**Algorithm** (production hot path):
+
+```
+on prefill chunk forward (with capture enabled):
+    K_post = mlx-lm forward as today  # in-flight forward UNCHANGED
+    side-effect: capture_buffer[layer_idx] = k_proj(x_chunk)  # K_pre
+on reclaim (request DONE):
+    for each (block_idx, layer_idx) in capture_buffer:
+        K_pre_block = capture_buffer[layer_idx][block_start:block_end]
+        payload[layer_idx][block_idx] = codec.encode_tensor(K_pre_block)
+    store(payload, V_extracted_from_cache)
+on admit (next request, prefix hit):
+    payload, V_blocks = store.fetch(block_ids)
+    for each (block_idx, layer_idx):
+        K_pre = codec.decode_tensor(payload[layer_idx][block_idx])
+        K_post = adapter.apply_k_norm_then_rope(layer_idx, K_pre, offset=block_idx*block_size)
+        seeded_cache[layer_idx][block_idx] = (K_post, V_blocks[...])
+    forward through seeded cache
+```
+
+**Why (3b) over (3a)**: (3a) wraps `k_proj` to inject noise on
+the in-flight forward as well, mirroring D.2a's `_QuantizedProj`.
+(3b)'s wrapper is **capture-only** — `__call__` returns
+`k_proj(x)` unchanged, only side-effecting a write to the
+capture buffer. This means:
+
+- In-flight attention sees clean K (no codec noise on the chunk's
+  own forward).
+- Codec noise enters the cache only via the **hit path** at admit
+  time (decoded from store).
+- This is exactly the production prefix-cache deployment
+  semantic: a fresh chunk's K is always clean; only K reused
+  from a prior request through the prefix cache carries codec
+  noise.
+
+**F.0b' verification (2026-04-26, §10.3)**: 3-seed ΔPPL = +0.015
+PPL on Qwen3-0.6B + BlockTQ b64 b4 — well below D.2a's +0.51 PPL,
+and ~360× reduction from the post-RoPE +5.43 PPL. IdentityCodec
+sanity check gives ΔPPL = 0.000000 exactly. Both F.0 (b) gates
+pass with significant margin.
+
+**Pros**:
+- In-flight forward is bit-identical to the unwrapped path when
+  capture buffer is None (production decode path is uncharged).
+- Codec noise lives in the same pre-k_norm space vqbench's
+  `_QuantizedProj` injects in — algorithmically equivalent to
+  vqbench's quality reference.
+- Persistent block-grained encoding via `RadixPrefixCache`.
+- V handling unchanged from the post-RoPE store: V is `v_proj(x)`
+  in cache (no normalisation, no RoPE), extracted at reclaim,
+  encoded through V codec, decoded at admit, seeded directly.
+- Adapter Protocol surface is small: enable/disable capture +
+  per-layer reconstruct method.
+
+**Cons**:
+- Adapter must permanently install the proxy on every attention
+  layer — touches `adapter.build()` per family (Qwen3 / Qwen3.5 /
+  Gemma4 + MoE variants). Build-time installation is one-time
+  per adapter instance; not a per-request cost.
+- Capture buffer adds `(B × chunk_len × n_kv_heads × head_dim ×
+  fp16_bytes × num_attn_layers)` working memory during prefill.
+  Worst case Qwen3-27B at chunk=256: 64 layers × 4 KV-heads ×
+  256 head_dim × 256 tokens × 2 bytes = ~33 MB per request —
+  small relative to the cache itself.
+- Hit-path requires per-block `apply_k_norm_then_rope` math
+  before seeding the cache. Cost is tiny per block (16 tokens ×
+  RMSNorm + RoPE) but adds a step the post-RoPE path skipped.
+
+### 3.6 Decision (current, 2026-04-26)
+
+**(3b) is the recommended default.** F.0 (b) gate empirically
+verified at +0.015 PPL (§10.3); §3.6 replaces §3.4. Plan §6 is
+re-scoped around (3b) below; legacy text in the original §6.2-§6.5
+is preserved as historical record.
 
 ## 4. Per-family RoPE inventory
 
@@ -300,6 +422,41 @@ storage and both use RoPE — pre-RoPE store applies uniformly.
 The existing `attn_layer_indices` filter in
 `silica/scheduler/batcher.py:596` already skips non-attention
 layers and is reused unchanged.
+
+### 4.1 Per-family `k_norm` inventory (added 2026-04-26 per F.0b finding)
+
+mlx-lm's attention forward inserts an RMSNorm on K (and Q)
+between projection and RoPE. F.0b's recon gap missed this; (3b)
+relies on it for the hit-path reconstruction
+(`decode → k_norm → RoPE → seed`). The call pattern is uniform
+across silica's supported families:
+
+```python
+# qwen3_next.py:138-148 (used by Qwen3.5 / Qwen3.5-MoE)
+keys = self.k_norm(keys.reshape(B, L, n_kv_heads, head_dim)).transpose(0, 2, 1, 3)
+
+# qwen3.py and gemma4_text.py have the same k_norm().reshape().transpose() shape.
+```
+
+| Family | k_norm site | k_norm class | Acts on |
+| --- | --- | --- | --- |
+| Qwen3 (0.6B / 4B / 27B) | `qwen3.py` Attention | `nn.RMSNorm` | last axis (head_dim) |
+| Qwen3.5 GLOBAL layers | `qwen3_next.py:Qwen3NextAttention` | `nn.RMSNorm` | last axis (head_dim) |
+| Gemma4 SLIDING + GLOBAL | `gemma4_text.py` Attention | `nn.RMSNorm` | last axis (head_dim) |
+| Qwen3.5-MoE / Gemma4-MoE | inherited from dense parent | same | same |
+
+Implication for (3b): `adapter.apply_k_norm_then_rope(layer_idx,
+k_pre, *, offset)` reads `model.layers[layer_idx].self_attn.k_norm`
+and `.rope`, applies them in mlx-lm's order. The reconstruction is
+deterministic given K_pre (k_norm consumes `rms(K_pre + ε) =
+rms(K_pre + ε)` — for codec noise this equals
+`rms(K_pre) * (1 + O(ε/||K_pre||))` to first order, so the
+reconstruction is k_norm-faithful within fp noise).
+
+**No k_norm on V**: V skips both `v_norm` and RoPE in mlx-lm's
+attention. V is `v_proj(x)` directly written to cache. The (3b)
+hit-path applies k_norm + RoPE to K only; V is decoded and
+seeded directly.
 
 ## 5. Numerical readiness
 
@@ -455,7 +612,12 @@ seeds (the same `{42, 43, 44}` the (4-b) gate uses).
    ΔPPL gate; record result in this opening doc and in PLAN
    §7 P-5 Notes empirical findings.
 
-### 6.2 F.1 — Adapter Protocol: `apply_rope_inverse_to_k`
+> **§6.2-§6.5 superseded 2026-04-26 by §6.6+** (re-scoped around
+> (3b) after F.0b verification). Original sub-units below preserve
+> the v1.0.0 plan as historical record; current implementation
+> follows §6.6+ instead.
+
+### 6.2 F.1 — Adapter Protocol: `apply_rope_inverse_to_k` (superseded)
 
 Add a new method to the adapter Protocol surface:
 
@@ -522,7 +684,7 @@ Unit tests against scripted adapters:
 
 **Commit**: one.
 
-### 6.3 F.2 — Store: pre-RoPE round-trip behind a flag
+### 6.3 F.2 — Store: pre-RoPE round-trip behind a flag (superseded)
 
 Wire `SyntheticPrefixBlockStore.register_detached` /
 `fetch_detached` to call the adapter's `apply_rope_inverse_to_k`
@@ -538,7 +700,7 @@ behind a typed Protocol method instead of an experimental flag.
 **Commit**: one. Small (~150 lines) and entirely additive — the
 default-off flag means existing behaviour is byte-identical.
 
-### 6.4 F.3 — Production default flip + bench oracle convergence
+### 6.4 F.3 — Production default flip + bench oracle convergence (superseded)
 
 Flip the default `pre_rope` flag in two places:
 
@@ -583,7 +745,7 @@ Tests:
 
 **Commit**: one.
 
-### 6.5 F.4 — Legacy path retention + documentation sync
+### 6.5 F.4 — Legacy path retention + documentation sync (superseded)
 
 Keep `prefix_store_post_rope` reachable as a bench-only opt-in
 (`--codec-quality-path post_rope` on the bench CLI), retained
@@ -604,34 +766,277 @@ P-5-F scope.
 
 **Commit**: one.
 
+### 6.6 F.1 (re-scoped) — Adapter Protocol for K_pre capture + reconstruction
+
+(Replaces the original §6.2.) Adds two related methods to the
+adapter Protocol surface:
+
+```python
+class PreNormCaptureAdapter(Protocol):
+    """Adapter capability surface for the (3b) production prefix-cache."""
+
+    def install_pre_norm_capture(self, buffer: dict[int, mx.array] | None) -> None:
+        """Install or reset the K_pre capture buffer on every
+        attention layer's k_proj proxy. When ``buffer`` is None,
+        the proxy reverts to a no-op (returns k_proj(x) unchanged
+        without writing). When non-None, the proxy writes
+        ``buffer[attn_layer_pos] = k_proj(x_chunk)`` on every call.
+
+        The proxy is installed permanently at adapter build time;
+        this method only swaps the active buffer. Per-request
+        buffer lifecycle is owned by the scheduler.
+        """
+
+    def apply_k_norm_then_rope(
+        self,
+        attn_layer_pos: int,
+        k_pre_block: mx.array,
+        *,
+        offset: int,
+    ) -> mx.array:
+        """Reconstruct post-RoPE K from a pre-norm K block.
+
+        ``attn_layer_pos`` is the index into the dense list of
+        attention layers (the same indexing
+        ``attn_layer_indices`` already produces in the scheduler /
+        bench oracle). The method reads the layer's
+        ``self_attn.k_norm`` and ``self_attn.rope`` and applies
+        them in mlx-lm's order:
+
+        ```
+        k_post = rope(k_norm(k_pre_block.transpose(0,2,1,3)).transpose(0,2,1,3),
+                      offset=offset)
+        ```
+
+        ``offset`` is the absolute token-position of the block's
+        first token in the request's prefix.
+        """
+```
+
+Implementation:
+
+1. Adapter `build()` installs `_PreNormCaptureProxy` on every
+   `self_attn.k_proj` (only attention layers; DeltaNet layers
+   skipped via `attn_layer_indices`). The proxy holds a
+   reference to the adapter's current capture buffer.
+2. **Proxy `__call__` checks `buffer is None` first; when None,
+   returns `k_proj(x)` immediately with no write — required to
+   keep decode-step overhead at zero (decode forwards never need
+   K_pre capture).** Capture is enabled only during chunked
+   prefill forwards where the scheduler has set a non-None
+   buffer via `install_pre_norm_capture`.
+3. `install_pre_norm_capture` is a thin setter that updates the
+   adapter's "current buffer" attribute the proxies all read.
+   Setting `buffer=None` is the canonical "disable capture"
+   call; setting a non-None buffer arms the next forward.
+4. `apply_k_norm_then_rope` is the same logic the F.0b'
+   `_apply_k_norm_then_rope_to_block` helper uses, lifted onto
+   the adapter Protocol.
+
+Unit tests:
+
+- Capture proxy fires correctly during a real prefill forward;
+  buffer contents match `attn.k_proj(x)` for each attention
+  layer (Frobenius distance ≤ fp16 noise floor).
+- `apply_k_norm_then_rope` round-trip: extract a known K_post
+  from a fresh forward, capture K_pre via the proxy, run
+  `apply_k_norm_then_rope(K_pre, offset=0)`, assert it matches
+  K_post bit-exactly (the function is deterministic given inputs).
+- IdentityCodec regression: roundtrip K_pre → encode → decode →
+  apply_k_norm_then_rope must equal the original K_post bit-exactly.
+- `install_pre_norm_capture(None)` returns proxy to no-op;
+  forward through the adapter is bit-identical to the
+  unwrapped reference.
+
+In-use coverage spans `nn.RoPE` and `ProportionalRoPE` per the
+§4 inventory; forward-compat coverage on `Llama3RoPE` /
+`YarnRoPE` retained from the original §6.2 spec.
+
+**Commit**: one (~300-500 lines including tests). Per-family
+implementations (Qwen3 / Qwen3.5 / Gemma4 + MoE wrappers) are
+2-line delegations to a base helper.
+
+### 6.7 F.2 (re-scoped) — Store: pre-norm payload contract + scheduler integration
+
+(Replaces the original §6.3.) Two sub-commits:
+
+**F.2a — Store layer**: extend `SyntheticPrefixBlockStore` to
+accept a `pre_norm: bool = False` flag at construction. When
+True:
+
+- `register_detached(block_id, per_layer_kv)` interprets the K
+  side of `per_layer_kv` as pre-k_norm K (the wrapper-captured
+  output of `k_proj`); V is unchanged from the post-RoPE path.
+- `fetch_detached(block_id)` returns pre-norm K + V; the caller
+  is responsible for `apply_k_norm_then_rope` before seeding
+  the cache.
+
+Default is False (post-RoPE legacy path stays).
+
+**F.2b — Scheduler integration**: `ContinuousBatcher` /
+`RadixPrefixCache` paths route K_pre to the store on
+reclaim, and call `adapter.apply_k_norm_then_rope` on admit
+hit. Specifically:
+
+- Before each chunked prefill forward, `_prepare_cohort` calls
+  `adapter.install_pre_norm_capture(buffer)` to enable capture.
+- After forward, K_pre is read out of `buffer[attn_layer_pos]`,
+  split per block, paired with V extracted from the live cache,
+  and written to the store.
+- Before each forward, `install_pre_norm_capture(None)` clears
+  the buffer (decode steps don't need capture).
+- `_admit_single_hit_row` (and the batched siblings) fetch
+  pre-norm K + V, call `apply_k_norm_then_rope` per block per
+  attention layer, build the seeded `BatchKVCache` with the
+  reconstructed post-RoPE K.
+
+The slice-prefill path (C5.5) integrates naturally: the wrapper
+captures the chunk's K_pre at chunk-forward time; reclaim's
+`_extract_and_insert_prefix` reads from the captured buffer
+instead of slicing the live cache for K (V continues to come
+from cache, unchanged).
+
+**Commit count**: two (F.2a store-level, F.2b scheduler
+integration). F.2a is purely additive and small; F.2b touches
+the hot path and needs careful testing.
+
+### 6.8 F.3 (re-scoped) — Production default flip + bench oracle anchor migration
+
+(Replaces the original §6.4.) Flip three defaults:
+
+1. `RadixPrefixCache` constructor: default `pre_norm=True` on
+   the store. Production prefix-cache uses (3b) by default.
+2. `silica/bench/ppl_oracle.py::teacher_forced_chunked_nll_with_codec`
+   now wraps `teacher_forced_chunked_nll_with_codec_pre_norm` —
+   the F.0b' code path becomes the production-store oracle.
+3. PLAN §7 P-5 Acceptance (4-b) anchor row migrates from
+   `qwen3-0.6b-wikitext-ppl-block-tq-b64-b4-vqbench-aligned`
+   (D.2a) to `qwen3-0.6b-wikitext-ppl-block-tq-b64-b4`
+   (production, now (3b)). Numbers should match D.2a's
+   `+0.51 ± 0.35` envelope to seed-level noise; F.0b' showed
+   even better (+0.015 PPL), so the gate continues to pass.
+
+PLAN.md updates:
+
+- §7 P-5 Notes "Production `prefix_store_post_rope` prefix-cache
+  quality cost" bullet flips to "closed at P-5-F via (3b)".
+- Status line removes "pre-RoPE production routing (P-5-F)" from
+  backlog.
+- Empirical findings add a 2026-04-26+ entry recording the F.0b'
+  verification number and the (3b) close.
+
+Tests:
+
+- All existing `test_*_codec*.py` tests stay green (they use
+  small prompts where post-RoPE chunk-boundary cost was already
+  small; (3b) is strictly less noisy).
+- New regression test: full ContinuousBatcher + RadixPrefixCache
+  + BlockTQ codec end-to-end, verify token stream matches the
+  fp16 reference within seed-level noise.
+- (4-b) gate runs against the migrated anchor row.
+
+**Commit**: one (default flips + PLAN sync + the new regression
+test).
+
+### 6.9 F.4 (re-scoped) — Legacy retention + three regression backstops
+
+(Replaces the original §6.5.) Three legacy paths retained as
+bench-only opt-ins, all available via `--codec-quality-path
+<value>` on the bench CLI:
+
+1. `prefix_store_post_rope` — the original production path (no
+   pre-RoPE handling; ΔPPL +5.43 PPL). Quantity-cost observable
+   for "what does the deployment look like without P-5-F".
+2. `prefix_store_pre_rope` — F.0b's inverse-RoPE round-trip
+   (post-k_norm pre-RoPE space; ΔPPL +4.12 PPL). Useful as a
+   third data point for codec-deployment ablations on the
+   intermediate space.
+3. `vqbench_aligned` — D.2a oracle (chunk-grained re-encoding
+   pre-k_norm; ΔPPL +0.51 PPL). Reference against vqbench's own
+   harness; structurally distinct from (3b) (chunk-grained
+   re-encode vs persistent block-grained).
+
+`prefix_store_pre_norm` is the new default (3b). All four
+columns can run side-by-side via `python -m scripts.bench
+--scenario qwen3-0.6b-wikitext-ppl-block-tq-b64-b4
+--scenario qwen3-0.6b-wikitext-ppl-block-tq-b64-b4-pre-rope
+--scenario qwen3-0.6b-wikitext-ppl-block-tq-b64-b4-pre-norm
+--scenario qwen3-0.6b-wikitext-ppl-block-tq-b64-b4-vqbench-aligned`.
+
+**Reading order — what each arm answers**:
+
+Production rows route through `prefix_store_pre_norm` (default
+after F.3). The other three arms remain because each measures a
+different question; consume them in this order when interpreting
+codec ablations:
+
+1. **`prefix_store_post_rope`** — the cost of NOT shipping P-5-F.
+   Quantifies the chunk-boundary RoPE phase mismatch on the
+   legacy production path. Read this first to bound P-5-F's
+   deployment ROI on a given (model, codec) combination.
+2. **`prefix_store_pre_rope`** — the intermediate post-k_norm
+   pre-RoPE space (F.0b's failed prototype). Read this when
+   characterising codec sensitivity to `k_norm` specifically: it
+   isolates the RMSNorm-induced rescaling effect on K block
+   statistics, since the codec sees post-norm activations but
+   the chunk-boundary RoPE mismatch is removed.
+3. **`vqbench_aligned`** — the chunk-grained re-encoding D.2a
+   reference. Read this for cross-implementation parity against
+   vqbench's harness; it is structurally distinct from (3b)
+   (chunk-grained re-encode vs persistent block-grained store),
+   so the (4-b) gate uses it as the seed envelope anchor.
+
+The three arms share row-ID prefix
+`qwen3-0.6b-wikitext-ppl-block-tq-b64-b4`; suffixes
+(`-pre-rope`, `-pre-norm`, `-vqbench-aligned`) distinguish the
+oracle path. The unsuffixed row is the production default and
+follows whatever `prefix_store_pre_norm` resolves to after F.3.
+
+Documentation sync:
+
+- Module docstring on `SyntheticPrefixBlockStore` explaining the
+  three retention paths and (3b) as default.
+- README roadmap row (P-5-F closed via (3b)).
+- `docs/P5_OPENING.md` §7 P-5 Notes sync.
+- `project_kv_codec_ppl_findings.md` augment with a parallel
+  pre-norm column for the cross-arch table.
+
+Removal of any legacy path is its own follow-up unit, not
+P-5-F scope.
+
+**Commit**: one (docs only).
+
 ## 7. Open questions left for plan→implement
 
-These are decisions deferred to the plan/implement boundary, not
-data gaps. Each has a concrete tie-break path so they don't
-re-open scope.
+> **§7.1 / §7.2 resolved by F.0b verification (2026-04-26).**
+> §7.3 / §7.4 stand. New §7.5 / §7.6 added to track (3b)-specific
+> open items.
 
-### 7.1 Slice-prefill (C5.5) interaction — encode trigger timing
+### 7.1 Slice-prefill (C5.5) interaction — encode trigger timing (RESOLVED)
 
-**Question**: in the C5.5 batched slice-prefill path, the encode
-hook fires at reclaim time as today. The pre-RoPE round-trip
-happens against post-RoPE K extracted from `BatchKVCache` at that
-time — same contract as the current post-RoPE path, just with two
-extra RoPE applications.
+**Original question**: where the encode hook fires in the C5.5
+batched slice-prefill path — reclaim time (Option A's "extract
+from cache, inverse-RoPE, encode") vs projection time (Option C's
+"wrap k_proj").
 
-**Tie-break**: stay with post-extract reverse-then-encode (Option
-A's natural shape). If F.0 ΔPPL passes, this stays. If F.0 fails
-and fp32-cast doesn't recover it, C-style "encode at projection
-time" becomes the escape, but that's a re-plan, not a §7 detail.
+**Resolution**: (3b) fires the capture at **projection time**
+(during prefill forward, via the wrapper) and the encode at
+**reclaim time** (scheduler reads buffered K_pre, splits per
+block, encodes). This is structurally what C5.5 already does for
+recurrent snapshots (per-block capture during forward), so the
+two mechanisms align — the wrapper's capture buffer is read at
+the same reclaim seam C5.5's snapshot machinery uses.
 
-### 7.2 fp16 native vs fp16-via-fp32 cast on the round-trip
+### 7.2 fp16 native vs fp16-via-fp32 cast on the round-trip (RESOLVED — N/A under (3b))
 
-**Question**: F.0 prototype uses fp16 native. If empirical ΔPPL
-lands in envelope, fp16 native is the production path. If it
-lands above envelope, F.0 retries with fp16-via-fp32-cast (one
-extra cast each side, near-zero cost) before declaring A failed.
+**Original question**: whether the inverse-RoPE round-trip needs
+fp32 cast to keep noise within the codec budget.
 
-**Tie-break**: F.0's data drives this — no architectural decision
-needed up front.
+**Resolution**: not applicable under (3b). (3b) does not
+inverse-RoPE; the wrapper captures K_pre directly from
+`k_proj(x)` output. Hit-path applies `k_norm + RoPE` going forward
+(no inverse). fp16 round-trip noise is now zero (verified by
+F.0b' IdentityCodec sanity check: ΔPPL = 0.000000 exact).
 
 ### 7.3 Per-head Haar rotation (vqbench) vs shared rotation (silica)
 
@@ -652,31 +1057,68 @@ store architecture this doc covers.
 **Tie-break**: F.4 retains it as a bench-only opt-in (`--codec-quality-path
 post_rope`) indefinitely until stability data on the new
 production path accumulates. D.2a oracle is also retained
-(§6.4 / §6.5) until the migrated (4-b) gate is observed stable
-across multiple releases. Removal of either is its own follow-up
-unit, not P-5-F scope.
+(§6.9 / §9.2) until the migrated (4-b) gate is observed stable
+across multiple releases. Removal of any legacy path is its own
+follow-up unit, not P-5-F scope.
+
+### 7.5 Capture buffer lifecycle under batched slice-prefill (NEW)
+
+**Question**: under C5.5 B>1 slice-prefill, the wrapper writes
+`buffer[attn_layer_pos] = k_proj(chunk)` where `chunk` has shape
+`(B, L, n_kv_heads * head_dim)`. The scheduler must split the
+buffer per row (`buffer[attn_pos][row_b, ...]`) when assembling
+per-row blocks for the prefix store.
+
+**Tie-break**: F.2b implements per-row split at the same seam
+where the slice-prefill path already splits live cache per row.
+Concretely, the per-row split happens inside
+`_extract_and_insert_prefix_batched` in `silica/scheduler/batcher.py`
+(post-C5.5), which already iterates `(row, block_idx)` to slice
+live-cache K per row. The F.2b change replaces the
+`cache.keys[row, ..., start:end]` lookup for K with
+`buffer[attn_layer_pos][row, start:end, ...]` (V continues to
+come from `cache.values[row, ..., start:end]`, unchanged). B=1
+is the F.0b' verified case; B>1 will be tested as a regression
+in F.2b once the substitution is wired.
+
+### 7.6 Adapter Protocol shape — install lifecycle (NEW)
+
+**Question**: should `install_pre_norm_capture(buffer)` be a
+context manager (`with adapter.pre_norm_capture(buffer):`) or a
+plain setter pair (`install`, then `install(None)` to restore)?
+
+**Tie-break**: setter pair is simpler for the scheduler hot path
+(no nesting of context managers around per-chunk forwards). F.1
+ships the setter; if a future use case wants ergonomic
+context-manager semantics, the wrapper is trivial. Setter is
+the canonical Protocol method.
 
 ## 8. Acceptance criteria
 
 P-5-F closes when **all** of the following hold:
 
-1. F.0 (b) ΔPPL on `qwen3-0.6b-wikitext-ppl-block-tq-b64-b4`
-   under the pre-RoPE prototype passes the F.0 (b) two-part OR
-   gate (§6.1): **either** lands inside the D.2a oracle envelope
-   `+0.51 ± 0.35 PPL` (tight gate (i)) **or** mean ΔPPL ≤ 2.0 PPL
-   representing ≥ 10× reduction from the post-RoPE arm's ~+20 PPL
-   (structural gate (ii)). 3-seed evaluation, same seeds
-   `{42, 43, 44}` the (4-b) gate uses.
-2. F.1 unit tests green on adapter `apply_rope_inverse_to_k` for
-   each of the five RoPE classes (`nn.RoPE`, `Llama3RoPE`,
-   `YarnRoPE`, `SuScaledRoPE`, `ProportionalRoPE`) — round-trip
-   identity within fp16/fp32 noise floors.
-3. F.3 production default flipped; the `prefix_store_post_rope`
-   ΔPPL on the same scenario after the flip matches F.0 (b)'s
-   measurement to within seed-level noise.
-4. (4-b) gate continues to pass against the post-flip production
-   path (same `mean_gap ≤ 2 · SEM_diff` and `|mean_gap| < 1.0
-   PPL` thresholds, same evidence format).
+1. **(closed 2026-04-26 via F.0b')** F.0 (b) ΔPPL on
+   `qwen3-0.6b-wikitext-ppl-block-tq-b64-b4-pre-norm` passes the
+   two-part OR gate from the original §6.1 (kept verbatim for
+   audit trail): **either** lands inside the D.2a oracle envelope
+   `+0.51 ± 0.35 PPL` **or** mean ΔPPL ≤ 1.5 PPL (≥ 13× reduction
+   from post-RoPE). F.0b' result: **+0.015 PPL** mean over 3
+   seeds — both gates pass. Evidence in §10.3.
+2. F.1 unit tests green on the adapter Protocol surface (§6.6) —
+   `install_pre_norm_capture` toggles between no-op and capture
+   modes correctly; `apply_k_norm_then_rope` reconstructs
+   post-RoPE K bit-exactly under IdentityCodec round-trip;
+   forward-compat coverage on `Llama3RoPE` / `YarnRoPE`.
+3. F.2b production hot path integration: `ContinuousBatcher` +
+   `RadixPrefixCache` + non-identity codec end-to-end ΔPPL on
+   the same reference scenario matches F.0b' measurement to
+   seed-level noise. The bench oracle and the production hot
+   path now exercise the same algorithmic path.
+4. F.3 default flip lands; the migrated (4-b) gate continues to
+   pass on the (3b)-anchor row (`qwen3-0.6b-wikitext-ppl-block-tq-b64-b4`,
+   now `prefix_store_pre_norm` default) with the same
+   `mean_gap ≤ 2 · SEM_diff` and `|mean_gap| < 1.0 PPL`
+   thresholds.
 5. PLAN.md / README sync; the "pre-RoPE production routing
    (P-5-F)" backlog item flips to closed.
 
@@ -686,7 +1128,9 @@ Out of scope (tracked separately):
   P-5-F unblocks it, but the actual measurement run is its own
   unit.
 - Per-head Haar rotation — codec-level, independent.
-- Legacy `prefix_store_post_rope` removal — separate follow-up.
+- Legacy path removal (post-RoPE / post-k_norm pre-RoPE / D.2a
+  oracle) — separate follow-up. (3b) is the production default;
+  the three legacy arms remain as bench-only opt-ins per §6.9.
 
 ## 9. Dependencies and risks
 
@@ -704,13 +1148,15 @@ Out of scope (tracked separately):
 
 ### 9.2 Risks
 
-| Risk | Severity | Mitigation |
+| Risk | Severity | Mitigation / Status |
 | --- | --- | --- |
-| F.0 (b) ΔPPL fails both tight (i) and structural (ii) gates despite §5.1 numerical readiness | medium | diagnose per §6.1 D1 / D2 / D3; only D3 escalates to Option C |
-| Some adapter family's RoPE doesn't fit the `_freqs` / `base` shape | low | manual sin/cos fallback in adapter helper; current in-use classes are `nn.RoPE` (uses `base` reconstruction) and `ProportionalRoPE` (exposes `_freqs`); other classes are forward-compat coverage |
-| Production runtime cost of one extra RoPE per cached block at encode + decode | low | cold-path operation; not in per-token decode loop; small block sizes (16) keep it negligible |
-| (4-b) gate anchor row migration breaks gate thresholds | medium | (4-b) gate currently anchors on the D.2a row (`...-vqbench-aligned`). F.3 migrates the anchor to the production row. If the migrated gate's `mean_gap ≤ 2·SEM_diff` no longer passes despite same algorithm, the divergence is a F.2 wiring bug — diagnose, don't relax thresholds. **Hard constraint**: D.2a row is **retained, not removed** in F.4 (legacy bench-only opt-in) so the original (4-b) anchor remains reachable for one release as a regression backstop. Removal of D.2a is its own follow-up only after the migrated gate has stable production data |
-| 4B aggressive codec ROI (F.0 (a)) shows P-5-F has low marginal value on production targets at b64 b4 | low | not a blocker — P-5-F still ships for small-model and aggressive-codec deployment; PLAN urgency framing adjusts downward |
+| F.0 (b) ΔPPL fails the gate | resolved | (3b) closed F.0 (b) at +0.015 PPL (§10.3); both gates pass with significant margin. Original Option A risk no longer applies. |
+| Adapter `install_pre_norm_capture` lifecycle bug — proxy installed but buffer never set, leaks captures across requests | medium | F.1 unit test asserts `install_pre_norm_capture(None)` returns proxy to no-op; F.2b adds a per-chunk-forward setter/clear pattern in `_prepare_cohort` so buffer is always reset before forward and never persists across requests. |
+| Production runtime cost of capture buffer + per-block `apply_k_norm_then_rope` on hit | low | capture buffer is ~33 MB worst case per request (§3.5 cons); `apply_k_norm_then_rope` adds ~16-token RMSNorm + RoPE per block per attention layer, far below per-token decode cost; operations only fire on prefill (capture) and admit hits (reconstruct), not in the per-token decode loop. |
+| (4-b) gate anchor row migration breaks gate thresholds | medium | (4-b) currently anchors on the D.2a row. F.3 migrates the anchor to the (3b) production row. Numbers should match D.2a's `+0.51 ± 0.35` envelope to seed-level noise; F.0b' showed even better (+0.015), so the gate continues to pass. **Hard constraint**: D.2a row is **retained, not removed** in F.4 (bench-only opt-in) so the original (4-b) anchor remains reachable for one release as a regression backstop. |
+| Capture proxy interferes with mlx-lm's parameter registration | low | `_PreNormCaptureProj` is a thin callable wrapping the original `nn.Linear` k_proj; doesn't subclass `mlx.nn.Module`. F.0b' verified the wrapper installs cleanly without affecting parameter discovery (model.parameters() / sanitize()). F.1 adds a regression test. |
+| Hybrid-DeltaNet adapters mis-route — DeltaNet layers don't have `k_proj` and shouldn't carry a capture proxy | low | `attn_layer_indices` already filters; F.1 install loop only touches indices in this set. F.0b' verified on Qwen3.5 hybrid (no DeltaNet layers in scope of test). |
+| 4B aggressive codec ROI (F.0a) shows P-5-F has low marginal value on production targets at b64 b4 | low | not a blocker — P-5-F is critical-path on pure-attention 4B+ at b3/b2 (Qwen3-4B b2 = +62.7 PPL post-RoPE per §10.1), and remains useful on hybrid 4B+ for codec-deployment cleanliness even where the +0.67 PPL gap is small. |
 
 ## 10. Empirical findings (updated as sub-units land)
 
@@ -852,10 +1298,12 @@ noise ratio amplifies through the attention softmax to ~8× PPL
 ratio — softmax is non-linear in K, so noise propagation is not
 linear in PPL.
 
-#### Path forward — three options, advisor decision pending
+#### Path forward — three options (resolved 2026-04-26 via §10.3 — option 3 escalated to (3b))
 
 The three options below have updated blast-radius reading after
-advisor pass on the verification data:
+advisor pass on the verification data. Decision: option 3 below
+was escalated to (3b) (projection-output capture wrapper); §10.3
+records the verification of that variant.
 
 1. **Ship F.0b as the "post-k_norm pre-RoPE" variant of A.**
    Accept the 1.3× improvement over post-RoPE; the +4.12 PPL
@@ -942,10 +1390,15 @@ and is the chosen architecture for P-5-F.
 
 #### Plan re-scope implications
 
-The plan's §3 / §6 / §7 / §8 / §9 sections were written assuming
-Option A (inverse-RoPE round-trip at store seam) was the chosen
-architecture. F.0b's failure + (3b)'s success means several
-plan sections need re-write:
+(Re-scope applied to the doc on 2026-04-26 in the same commit as
+this entry; the bullet list below records what was changed in §3
+/ §4 / §6 / §8 — see the corresponding sections for the new
+contents.)
+
+The plan's §3 / §6 / §7 / §8 / §9 sections were originally
+written assuming Option A (inverse-RoPE round-trip at store
+seam) was the chosen architecture. F.0b's failure + (3b)'s
+success required re-writes across:
 
 - **§3 Architectural options** — Option A (inverse-RoPE
   round-trip alone) is a measurement variant for the codec
