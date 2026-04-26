@@ -39,11 +39,13 @@ mlx-lm. Silica contributes:
     D-011 "per-expert at dispatch, fused at fetch" resolution
     (E-open-1 resolution, 2026-04-20).
 
-Batched execution is **not** opened for MoE adapters at E1.1. The
-existing ``ContinuousBatcher._enforce_capability_gate`` rejects
-``has_moe=True`` regardless of attention kinds; E4 (batched MoE
-smoke + parity, mirroring C3d / D3.1) will revisit the gate and
-the corresponding error-text pointer.
+Batched execution opens at E4 (smoke-only, parity deferred): the
+``ContinuousBatcher._enforce_capability_gate`` ``has_moe=True``
+rejection is lifted. mlx-lm's ``SwitchGLU`` + ``gather_mm`` path
+is B-agnostic per the P3_MOE_SURVEY §5 E4 audit — a batched
+forward dispatches per-row top-k experts without further
+scheduler work. Real-model B=2 coverage:
+``tests/test_p3_qwen3_5_moe_batched_smoke.py``.
 """
 
 from __future__ import annotations

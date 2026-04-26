@@ -240,8 +240,10 @@ def test_adapter_exposes_config_attribute() -> None:
 
 def test_capabilities_declare_has_moe_true() -> None:
     """The load-bearing override: Qwen3.5-MoE adapter must report
-    has_moe=True so the ContinuousBatcher capability gate routes it
-    to the MoE branch (rejected until P-3-E4)."""
+    has_moe=True so downstream consumers can detect the MoE path.
+    Pre-E4 this routed to the gate's MoE rejection; post-E4 the
+    bit remains informational — the gate now accepts has_moe=True
+    when attention_kinds are supported."""
     adapter, _, _ = _make_adapter()
     caps = adapter.capabilities()
     assert isinstance(caps, ModelCapabilities)

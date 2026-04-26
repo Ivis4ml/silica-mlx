@@ -495,6 +495,52 @@ Out of scope for E:
   need only to expose the `(layer_idx, expert_id)` dispatch seam;
   real streaming lands later.
 
+### 5.1 E4 closure (smoke-only, parity deferred) — 2026-04-25
+
+E4 lands as a capability-gate lift plus per-family B=2 smoke. The
+load-bearing audit finding from §5: mlx-lm's `SwitchGLU` +
+`gather_mm` path is **B-agnostic**. The router computes per-row
+top-k expert indices over the full `(B, T)` activation tensor,
+and `gather_mm` dispatches each row's top-k experts independently
+through the stacked-weights fast path (including the quantized
+`QuantizedSwitchLinear` path on 4-bit checkpoints). No additional
+scheduler plumbing is needed to admit batched MoE; the existing
+`adapter.make_batch_cache` factory is sufficient because the MoE
+FFN does not interact with KV cache shape.
+
+**Scope landed at E4:**
+
+- `ContinuousBatcher._enforce_capability_gate` accepts
+  `has_moe=True` when `attention_kinds` are inside the supported
+  set (`{GLOBAL, HYBRID_DELTANET, SLIDING}`). RECURRENT-bearing
+  MoE adapters still raise.
+- `tests/test_batcher.py` flips its pre-E4 has_moe rejection test
+  and adds two positive cases (pure GLOBAL + has_moe; the
+  Qwen3.5-MoE-shape HYBRID_DELTANET+GLOBAL + has_moe pattern) plus
+  one safety-guard case (RECURRENT + has_moe still rejects).
+- `tests/test_p3_qwen3_5_moe_batched_smoke.py` and
+  `tests/test_p3_gemma4_moe_batched_smoke.py` exercise B=2 with
+  **different prompts per row** so per-row top-k expert dispatch
+  is genuinely tested (same-prompt B=2 would degenerate the
+  routing test). Dual-gated on HF cache + `SILICA_REAL_*_MOE`.
+  Conservative memory: `max_tokens=4`, short prompts, B=1
+  fallback path documented if peak memory exceeds the 48 GB
+  target on the 35B-A3B-4bit checkpoint (~20 GB on disk).
+
+**Explicitly deferred (not in E4 scope):**
+
+- Token parity. Per-row top-k expert indices under different
+  right-padding lengths through the quantized SwitchGLU is its
+  own definition exercise — what counts as "the same routing"
+  when row-A's token-7 pads differently from row-B's token-7 is
+  not obvious, and the survey's original "smoke + parity" framing
+  conflated two concerns. Mirror the E3 close: structural
+  correctness under batched dispatch is sufficient to claim E4
+  done; HF-vs-mlx-lm parity is post-P-5 alongside (b-static).
+- B>1 across the full activation set the dense families' C3d /
+  D3.1 lock down. MoE-specific parity needs the deferred
+  definition above.
+
 ## 6. Open questions (local to E track)
 
 Using the local `E-open-*` convention, not the global `Q-NNN`

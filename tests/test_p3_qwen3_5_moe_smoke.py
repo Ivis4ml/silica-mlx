@@ -23,9 +23,11 @@ tests:
     mlx-lm silently drops ``attn_output_gate``, so a hypothetical
     HF-parity attempt would fail on attention before reaching MoE).
 
-``Engine.generate`` is single-request; batched MoE remains rejected
-at the ``ContinuousBatcher`` capability gate via the
-``has_moe=True`` branch (P-3-E4 will revisit).
+``Engine.generate`` is single-request; batched MoE coverage
+(B=2 with different prompts to exercise per-row top-k expert
+dispatch) lives in ``tests/test_p3_qwen3_5_moe_batched_smoke.py``
+after P-3-E4 lifted the ``has_moe=True`` rejection at the
+``ContinuousBatcher`` capability gate.
 
 **Dual gate**: real weights cached AND ``SILICA_REAL_QWEN3_5_MOE=1``
 must be set. The 35B-A3B-4bit checkpoint is ~20 GB on disk and the

@@ -19,9 +19,11 @@ smoke file exercises the same adapter against the real
     crash through the always-on dense MLP + experts additive
     forward path on the real weights"; no token parity.
 
-``Engine.generate`` is single-request; batched MoE remains rejected
-at the ``ContinuousBatcher`` capability gate via ``has_moe=True``
-(P-3-E4 will revisit).
+``Engine.generate`` is single-request; batched MoE coverage
+(B=2 with different prompts to exercise per-row top-k expert
+dispatch) lives in ``tests/test_p3_gemma4_moe_batched_smoke.py``
+after P-3-E4 lifted the ``has_moe=True`` rejection at the
+``ContinuousBatcher`` capability gate.
 
 **Dual gate**: real weights cached AND ``SILICA_REAL_GEMMA4_MOE=1``
 must be set. Mirrors the Qwen3.5-MoE smoke's gate; the 26B-A4B

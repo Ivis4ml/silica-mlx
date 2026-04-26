@@ -330,15 +330,27 @@ def test_capability_gate_error_skips_every_supported_kind() -> None:
 # --- D-016: capability gate reads ModelCapabilities, not attention_pattern ---
 
 
-def test_capability_gate_reads_has_moe_bit_via_capabilities() -> None:
-    """An adapter whose attention_kinds are pure GLOBAL but that
-    declares has_moe=True still fails the gate. This locks in the
-    capability-based branch rather than a pure pattern walk."""
+def test_capability_gate_accepts_has_moe_after_e4_when_attention_kinds_supported() -> (
+    None
+):
+    """P-3-E4 lifted the ``has_moe=True`` rejection from the gate.
+    An adapter whose ``attention_kinds`` are entirely inside
+    ``_SUPPORTED_ATTENTION_KINDS`` (here pure ``GLOBAL``) and that
+    declares ``has_moe=True`` now passes without raising — mlx-lm's
+    ``SwitchGLU`` + ``gather_mm`` path is B-agnostic per the
+    P3_MOE_SURVEY §5 E4 audit, so batched MoE dispatches per-row
+    top-k experts without further scheduler work. Real-model B=2
+    coverage on Qwen3.5-MoE / Gemma4-MoE lives in
+    ``tests/test_p3_qwen3_5_moe_batched_smoke.py`` and
+    ``tests/test_p3_gemma4_moe_batched_smoke.py``.
+
+    Pre-E4 this same adapter raised ``NotImplementedError`` matching
+    ``has_moe=True``; the flipped assertion locks in the lift.
+    """
 
     class _MoEScriptedAdapter(_ScriptedAdapter):
         def capabilities(self) -> ModelCapabilities:
             base = capabilities_from_attention_pattern(self._pattern)
-            # Override has_moe to exercise the MoE branch of the gate.
             return ModelCapabilities(
                 attention_kinds=base.attention_kinds,
                 has_recurrent_state=base.has_recurrent_state,
@@ -346,8 +358,78 @@ def test_capability_gate_reads_has_moe_bit_via_capabilities() -> None:
             )
 
     adapter = _MoEScriptedAdapter(n_layers=2)  # all-GLOBAL attention_pattern
-    with pytest.raises(NotImplementedError, match="has_moe=True"):
+    ContinuousBatcher(adapter)  # no raise
+
+
+def test_capability_gate_accepts_has_moe_with_hybrid_deltanet_after_e4() -> None:
+    """The Qwen3.5-MoE shape (``HYBRID_DELTANET`` + ``GLOBAL`` +
+    ``has_moe=True``) is the load-bearing real-world combination
+    P-3-E4 unlocks. Pin the gate predicate against a scripted adapter
+    that mimics this capability surface — without the lift, this
+    raised ``has_moe=True``; with the lift, it passes.
+    """
+
+    class _MoEScriptedAdapter(_ScriptedAdapter):
+        def capabilities(self) -> ModelCapabilities:
+            base = capabilities_from_attention_pattern(self._pattern)
+            return ModelCapabilities(
+                attention_kinds=base.attention_kinds,
+                has_recurrent_state=base.has_recurrent_state,
+                has_moe=True,
+            )
+
+    pattern = AttentionPattern(
+        per_layer=(
+            AttentionKind.HYBRID_DELTANET,
+            AttentionKind.HYBRID_DELTANET,
+            AttentionKind.HYBRID_DELTANET,
+            AttentionKind.GLOBAL,
+        )
+    )
+    adapter = _MoEScriptedAdapter(n_layers=4, attention_pattern=pattern)
+    ContinuousBatcher(adapter)  # no raise
+
+
+def test_capability_gate_still_rejects_has_moe_when_attention_kind_unsupported() -> (
+    None
+):
+    """Gate-lift safety guard: ``has_moe=True`` is now accepted only
+    when ``attention_kinds`` are themselves all supported. An adapter
+    that happens to declare both ``has_moe=True`` and an unsupported
+    attention kind (here ``RECURRENT``) must still raise — pre-E4 it
+    would have raised on either condition independently; post-E4 the
+    attention-kind path is the sole rejector. The error text names
+    the offending kind (no longer the MoE branch). Locks in that the
+    lift didn't accidentally open the door for adapters whose
+    attention surface the batcher genuinely can't schedule.
+    """
+
+    class _MoEScriptedAdapter(_ScriptedAdapter):
+        def capabilities(self) -> ModelCapabilities:
+            base = capabilities_from_attention_pattern(self._pattern)
+            return ModelCapabilities(
+                attention_kinds=base.attention_kinds,
+                has_recurrent_state=base.has_recurrent_state,
+                has_moe=True,
+            )
+
+    pattern = AttentionPattern(
+        per_layer=(
+            AttentionKind.GLOBAL,
+            AttentionKind.RECURRENT,
+            AttentionKind.GLOBAL,
+        )
+    )
+    adapter = _MoEScriptedAdapter(n_layers=3, attention_pattern=pattern)
+    with pytest.raises(NotImplementedError) as exc:
         ContinuousBatcher(adapter)
+    msg = str(exc.value)
+    # The lifted gate must still report the RECURRENT layer, and the
+    # has_moe=True flag is now informational on the error rather than
+    # the rejection cause.
+    assert "'recurrent'" in msg or "RECURRENT" in msg
+    assert "layer 1" in msg
+    assert "has_moe=True" in msg
 
 
 # --- P-3-C3a: _prepare_cohort uses adapter.make_batch_cache --------------

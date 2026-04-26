@@ -1885,19 +1885,20 @@ class ContinuousBatcher:
         for per-layer detail — used here only to locate the offending
         layer index for the error message.
 
-        As of P-3-D3 the accepted set is ``GLOBAL`` (plain attention,
+        As of P-3-E4 the accepted set is ``GLOBAL`` (plain attention,
         P-2), ``HYBRID_DELTANET`` (Qwen3.5 hybrid family, P-3-C3c), and
         ``SLIDING`` (Gemma4 sliding-window family, P-3-D3 — restricted
         to the ``prefix_cache=None`` path by a separate constructor
-        guard). ``RECURRENT`` (pure-Mamba), ``HYBRID`` (single-kind
-        sliding/global hybrid), and MoE routing still need their own
-        scheduler plumbing before being unlocked here.
+        guard). ``has_moe=True`` is no longer rejected: the gate-lift
+        landed at P-3-E4 (smoke-only, parity deferred) — mlx-lm's
+        ``SwitchGLU`` + ``gather_mm`` path is B-agnostic per the
+        P3_MOE_SURVEY §5 E4 audit, so a batched forward through an
+        MoE adapter dispatches per-row top-k experts without further
+        scheduler work. ``RECURRENT`` (pure-Mamba) and ``HYBRID``
+        (single-kind sliding/global hybrid) remain rejected.
         """
         caps = adapter.capabilities()
-        if (
-            caps.attention_kinds.issubset(_SUPPORTED_ATTENTION_KINDS)
-            and not caps.has_moe
-        ):
+        if caps.attention_kinds.issubset(_SUPPORTED_ATTENTION_KINDS):
             return
         # Locate a concrete offending layer for the error message. We
         # walk ``attention_pattern`` and skip every kind in the
@@ -1910,44 +1911,20 @@ class ContinuousBatcher:
             if kind in _SUPPORTED_ATTENTION_KINDS:
                 continue
             reason = _unsupported_kind_reason(kind)
-            extra = (
-                "; adapter also declares MoE routing (has_moe=True) — "
-                "MoE adapters (e.g. qwen3_5_moe, gemma4_moe) are "
-                "single-request-only until P-3-E4 lands batched MoE "
-                "smoke + parity"
-                if caps.has_moe
-                else ""
-            )
             raise NotImplementedError(
                 f"ContinuousBatcher accepts AttentionKind.GLOBAL, "
                 f"AttentionKind.HYBRID_DELTANET, and AttentionKind.SLIDING "
                 f"only; adapter capabilities include {kind.value!r} "
                 f"(layer {layer_idx}, has_recurrent_state="
-                f"{caps.has_recurrent_state}) — {reason}{extra}"
+                f"{caps.has_recurrent_state}, has_moe={caps.has_moe}) — "
+                f"{reason}"
             )
-        # Fallback: the capability predicate rejected the adapter but
-        # the attention_pattern walk found no layer outside
-        # ``_SUPPORTED_ATTENTION_KINDS``. The normal path into here
-        # is ``has_moe=True`` with an otherwise supported
-        # ``attention_kinds`` set (e.g. pure ``{GLOBAL}``, pure
-        # ``{HYBRID_DELTANET}``, or a mix of the two); a pathological
-        # adapter whose ``attention_kinds`` disagree with its
-        # ``attention_pattern`` would also fall here. Emit a generic
-        # message that names the capabilities values explicitly, and
-        # append MoE context only when ``has_moe`` is actually set —
-        # no hard-coded assumption.
-        moe_tail = (
-            " — MoE adapters (Qwen3.5-35B-A3B, gemma-4-26B-A4B) are "
-            "registered as of P-3-E1 for single-request execution "
-            "only; batched MoE scheduling is P-3-E4"
-            if caps.has_moe
-            else (
-                "; attention_pattern() reports no unsupported layer, so "
-                "ModelCapabilities and AttentionPattern disagree — "
-                "re-run capabilities_from_attention_pattern on the "
-                "adapter's pattern to regenerate a consistent summary"
-            )
-        )
+        # Fallback: ``ModelCapabilities`` and ``AttentionPattern``
+        # disagree — ``attention_kinds`` reported an unsupported kind
+        # but the per-layer walk found none. Pre-E4 this branch also
+        # caught the ``has_moe=True`` path; that branch is now
+        # accepted, so the only way to reach here is a pathological
+        # adapter whose two capability views disagree.
         kinds_display = sorted(k.value for k in caps.attention_kinds)
         raise NotImplementedError(
             f"ContinuousBatcher accepts AttentionKind.GLOBAL, "
@@ -1955,7 +1932,11 @@ class ContinuousBatcher:
             f"only; adapter capabilities are unsupported: "
             f"attention_kinds={kinds_display!r}, "
             f"has_recurrent_state={caps.has_recurrent_state}, "
-            f"has_moe={caps.has_moe}{moe_tail}"
+            f"has_moe={caps.has_moe}; attention_pattern() reports no "
+            f"unsupported layer, so ModelCapabilities and "
+            f"AttentionPattern disagree — re-run "
+            f"capabilities_from_attention_pattern on the adapter's "
+            f"pattern to regenerate a consistent summary"
         )
 
 

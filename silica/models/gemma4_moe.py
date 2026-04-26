@@ -47,8 +47,13 @@ This adapter does **not** reimplement any MoE math. All routing,
     (not the dense ``layer.mlp``) and wraps each with the shared
     ``_DispatchProxy`` imported from ``qwen3_5_moe``.
 
-Batched execution stays closed at ``has_moe=True``; ``ContinuousBatcher``
-rejects both MoE adapters uniformly until P-3-E4. The dense
+Batched execution opens at E4 (smoke-only, parity deferred): the
+``ContinuousBatcher._enforce_capability_gate`` ``has_moe=True``
+rejection is lifted. mlx-lm's ``SwitchGLU`` + ``gather_mm`` path
+is B-agnostic per the P3_MOE_SURVEY §5 E4 audit — a batched
+forward dispatches per-row top-k experts without further
+scheduler work. Real-model B=2 coverage:
+``tests/test_p3_gemma4_moe_batched_smoke.py``. The dense
 ``Gemma4Adapter`` guard is intentionally unchanged — constructing
 the dense adapter directly on a MoE checkpoint must still loud-fail
 (factory routing is the normal path; the dense guard is the
