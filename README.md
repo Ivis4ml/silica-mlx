@@ -15,7 +15,7 @@ plus a planned mini-sglang outer layer for Phase 8. Target: run dense
 | P-3 | Family adapters — Qwen3 dense, Qwen3.5 hybrid DeltaNet, Gemma4-31B dense, Qwen3.5-MoE, Gemma4-MoE | ✅ mostly (`C5` preempt/replay with recurrent-state snapshot pending; `E4` batched MoE pending) |
 | P-4 | Unified bench harness — runner, oracles, 15 registered scenarios, JSONL + Markdown reports, vqbench subprocess PPL | ✅ complete; P-4 exit surfaced Q-010 chunked-prefill trigger → P-4.5 bridge planned |
 | P-4.5 | P-4 exit bridge — chunked-prefill minimal + VectorCodec runtime integration spike | ✅ complete (v1.6.9) |
-| P-5 | VQ KV compression (BlockTQ / RaBitQ) | ✅ complete (v1.7.4 — P-5-A / B / C / D sub-units + P-5 Acceptance (1)–(4) all closed: codec-swap neutrality by inspection, `--all-kv-codecs` one-command report, `n_block > n_fp16` admission-headroom gate, vqbench-aligned mean-over-seeds PPL cross-check; `PagedPrefixBlockStore` codec injection intentionally deferred under D-003) |
+| P-5 | VQ KV compression (BlockTQ / RaBitQ) | ✅ complete (v1.7.4 — P-5-A / B / C / D sub-units + P-5 Acceptance (1)–(4) all closed: codec-swap neutrality by inspection, `--all-kv-codecs` one-command report, `n_block > n_fp16` admission-headroom gate, vqbench-aligned mean-over-seeds PPL cross-check. P-5-F pre-RoPE production routing closed at v1.7.6 via the (3b) projection-output capture path; production (4-b) anchor row measures ΔPPL +0.012 inside D.2a envelope. `PagedPrefixBlockStore` codec injection intentionally deferred under D-003) |
 | P-6 | Weight streaming | Stub (`ResidentWeightProvider` today) |
 | P-7 | Speculative decoding (DraftTarget / EAGLE / Medusa) | Stub (`NoopDraftEngine` today) |
 | P-8 | OpenAI-compatible HTTP server + session layer | ⏳ planned (leaning T1 tail, after P-5) |
@@ -472,17 +472,24 @@ P-4.5 bridges both.
   vqbench-aligned oracle (mean-over-seeds gate on the
   `qwen3-0.6b-wikitext-ppl-block-tq-b64-b4-vqbench-aligned` row:
   `|mean_gap| ≤ 2·SEM_diff` AND `|mean_gap| < 1.0` PPL).
-  **Post-P-5 follow-up in backlog (not blocking close):** the
-  production `prefix_store_post_rope` prefix-cache arm at the
-  same codec config pays a ~5–10 PPL ΔPPL quality cost (post-RoPE
-  noise injection through RoPE-coupled attention) — a real
-  production-path cost, **not closed by (4-b)**; remediation via
-  a pre-RoPE KV-store architecture is tracked as post-P-5
-  required follow-up in `docs/PLAN.md` §7 P-5 Notes. The single
-  intentionally-deferred Deliverable is `PagedPrefixBlockStore`
-  codec injection (`NotImplementedError` stub per D-003 no-
-  compressed-domain-attention scope; lands when the paged-attention
-  kernel track advances).
+  **Post-P-5 follow-up closed at P-5-F (v1.7.6):** the production
+  `prefix_store_post_rope` prefix-cache arm at the same codec
+  config previously paid a ~5–10 PPL ΔPPL quality cost (post-RoPE
+  noise injection through RoPE-coupled attention). P-5-F lands a
+  pre-norm K/V store via the (3b) projection-output capture path
+  (`silica/models/pre_norm_capture.py` Protocol + per-family
+  proxy on `attn.k_proj`); production wikitext PPL rows now
+  default to `codec_quality_path="prefix_store_pre_norm"` (F.3
+  default flip). The (4-b) anchor row measures ΔPPL +0.012 on
+  the production path post-F.3 (was +20.83 PPL pre-F.3 on the
+  legacy post-RoPE store), inside D.2a's `+0.51 ± 0.35 PPL`
+  envelope. Three legacy comparison arms (`prefix_store_post_rope`,
+  `prefix_store_pre_rope`, `vqbench_aligned`) retained as bench-
+  only opt-ins per `docs/P5_F_OPENING.md` §6.9 reading order.
+  The single intentionally-deferred Deliverable remains
+  `PagedPrefixBlockStore` codec injection (`NotImplementedError`
+  stub per D-003 no-compressed-domain-attention scope; lands when
+  the paged-attention kernel track advances).
   - **P-5-A** — Codec scaffolding + BlockTQ hot path + memory
     accounting + decode-speed gate. Side-level `VectorCodec[P]`
     Protocol + `CodedPayload` hierarchy + MLX-native bit-packing +

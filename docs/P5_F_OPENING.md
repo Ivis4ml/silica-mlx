@@ -1502,6 +1502,40 @@ F.4 (legacy retention + doc sync) is the remaining P-5-F
 sub-unit: README roadmap row, store module docstring,
 `docs/P5_OPENING.md` §7 sync.
 
+### 10.5 F.4 — legacy retention + doc sync (2026-04-26)
+
+Doc-only closure of P-5-F:
+
+- **`silica/kvcache/store.py` module docstring** — added the
+  pre-norm contract section: `pre_norm=False` (legacy post-RoPE
+  semantics) vs `pre_norm=True` (P-5-F default after F.3, K is
+  pre-k_norm captured via `PreNormCaptureAdapter`); the
+  `ContinuousBatcher.__init__` gate that pairs the two; the
+  three §6.9 reading-order legacy comparison arms.
+- **`docs/PLAN.md`** — header status line flips P-5-F from
+  backlog to "closed at v1.7.6"; §13 Changelog adds the v1.7.6
+  entry covering F.1-F.4 architecture / surfaces / bench /
+  acceptance / what-is-not-closed.
+- **`README.md`** — Status table P-5 row records the v1.7.6
+  P-5-F close; Roadmap P-5 paragraph rewritten to flip the
+  "post-P-5 follow-up in backlog" subsection to "closed at
+  P-5-F (v1.7.6)" with the +0.012 PPL anchor number.
+- **`docs/P5_OPENING.md` §7(b-postrope)** — heading flipped
+  from "post-P-5 follow-up (NOT closed by (4-b))" to "closed
+  at P-5-F (v1.7.6)"; body rewritten to record the F.1-F.4
+  architecture and the post-F.3 anchor numbers.
+- **`memory/project_kv_codec_ppl_findings.md`** — F.3 default
+  flip section already added under that commit; F.4 leaves the
+  memory unchanged.
+
+Single-source rule: P-5-F architecture lives in
+`docs/P5_F_OPENING.md`; the references above point to it
+rather than re-stating contents.
+
+**P-5-F closed.** All F.1-F.4 sub-units landed across
+`4fd9bf9` → `f943f94` → `cc249e7` → `df2b3f4` → this F.4
+commit. v1.7.6 is the version stamp.
+
 P-5-F's final architecture decision is **(3b)**: projection-output
 capture wrapper + pre-k_norm K storage + on-hit
 `decode → k_norm → RoPE → seed`.

@@ -88,6 +88,62 @@ The ``PagedPrefixBlockStore`` deliberately does not accept a codec —
 Option (A) / (C) codec integration on the active-KV path is excluded
 in v0.1 by D-003 (no compressed-domain attention) and Q-009 / R-7
 (no MLX variable-length SDPA).
+
+**Pre-norm contract — P-5-F (3b) projection-output capture.**
+
+``SyntheticPrefixBlockStore`` accepts a ``pre_norm: bool = False``
+flag at construction. The flag is a contract tag declaring the
+semantic shape of the K side of every ``register_detached`` payload
+the store will accept; encode / decode behaviour is unchanged.
+
+- ``pre_norm=False`` (default, legacy): K is post-RoPE — the K
+  tensor mlx-lm's attention forward writes into the cache after
+  ``k_norm`` and ``rope`` have been applied. Reclaim slices K
+  directly out of the live cache; admit seeds K directly into a
+  freshly-built ``BatchKVCache``. Codec noise enters at chunk-
+  boundary RoPE phase, paying an additional cost relative to the
+  pre-RoPE injection vqbench's ``_QuantizedProj`` uses (see
+  ``docs/P5_D2_INVESTIGATION/README.md`` §Root cause).
+
+- ``pre_norm=True`` (P-5-F default after F.3): K is pre-k_norm —
+  the output of ``attn.k_proj(x)`` captured via the
+  ``PreNormCaptureAdapter`` Protocol installed at adapter
+  construction (``silica/models/pre_norm_capture.py``). The
+  ``ContinuousBatcher`` arms / disarms the capture buffer per
+  prefill chunk forward; reclaim reads K_pre out of the buffer
+  instead of slicing the live cache; admit calls
+  ``adapter.apply_k_norm_then_rope`` per block per attention-layer
+  position to reconstruct post-RoPE K before seeding the cache.
+  V is unchanged across the contract — V never normalises or
+  rotates and can flow through either path identically.
+
+The constructor gate at ``ContinuousBatcher.__init__`` raises when
+``store.pre_norm=True`` is paired with an adapter that does not
+implement ``PreNormCaptureAdapter``; bench oracle paths drive the
+adapter Protocol directly and do not consume the store flag, but
+the gate keeps the contract honest at the production-deployment
+boundary.
+
+The three codec_quality_path arms retained as bench-only opt-ins
+(``docs/P5_F_OPENING.md`` §6.9 reading order):
+
+1. ``prefix_store_post_rope`` — the cost of NOT shipping P-5-F.
+   K sliced from the live cache after RoPE; chunk-boundary cost
+   on top of codec reconstruction error.
+2. ``prefix_store_pre_rope`` — F.0b's inverse-RoPE round-trip
+   (post-k_norm pre-RoPE space). Useful when isolating codec
+   sensitivity to ``k_norm`` from the chunk-boundary RoPE
+   mismatch.
+3. ``vqbench_aligned`` — D.2a's chunk-grained re-encoding via
+   the projection-patch wrapper. Cross-implementation parity
+   anchor against vqbench's harness; structurally distinct from
+   (3b) (chunk-grained re-encode vs persistent block-grained
+   store).
+
+Production rows route through ``prefix_store_pre_norm`` after
+F.3 (default in ``_WIKITEXT_PPL_ORACLE_CONFIG``); the three
+arms above remain reachable via explicit ``codec_quality_path``
+overrides on individual scenarios.
 """
 
 from __future__ import annotations
