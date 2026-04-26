@@ -459,3 +459,109 @@ def test_engine_generate_batch_with_prefix_cache_on_qwen3_5_0_8b() -> None:
     # must remain populated (release fires after admission, but
     # eviction only happens under memory pressure).
     assert pc.node_count() >= 1
+
+
+@pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
+def test_engine_generate_batch_with_block_tq_codec_on_qwen3_5_0_8b() -> None:
+    """P-3-C5-step2 X-verify: hybrid + K/V codec end-to-end smoke.
+
+    Drives ``Engine.generate_batch`` on Qwen3.5-0.8B with a
+    ``RadixPrefixCache`` whose store carries a ``BlockTurboQuantMSE``
+    4-bit codec keyed off the adapter's K/V layout. Pre-C5.4 the
+    hybrid + prefix_cache combination was guard-rejected; post-C5.4
+    + the C5.3.3-het.1/2 work, the production scheduler handles the
+    heterogeneous extract/admit shape generically over the store's
+    codec. This test pins that the codec hot path
+    (``encode_tensor`` on extract, ``decode_tensor`` on admit) works
+    on Qwen3.5 — the codec is orthogonal to the het.1/.2 layer
+    indexing fix.
+
+    Two sequential ``generate_batch`` calls share the same prefix
+    cache: the cold call seeds the tree (extract calls
+    ``store.encode_tensor`` per block per attention layer); the
+    warm call admits via the hit path (admit's
+    ``fetch_detached_blocks`` calls ``store.decode_tensor``). With a
+    codec like BlockTurboQuantMSE the round-trip is near-lossless on
+    short prompts, so deterministic-greedy tokens match between cold
+    and warm under temperature=0.0.
+    """
+    from silica.bench.codec_registry import get_codec_spec
+
+    adapter, kv = adapter_for_repo(REPO)
+    engine = Engine(adapter, kv)
+    tokenizer = adapter.tokenizer()
+    eos_ids = tuple(sorted(getattr(tokenizer, "eos_token_ids", set()) or ()))
+
+    layout = adapter.kv_layout()
+    spec = get_codec_spec("block_tq_b64_b4")
+    codec = spec.factory(
+        block_size=_PREFIX_CACHE_BLOCK_SIZE,
+        n_kv_heads=layout.n_kv_heads,
+        head_dim=layout.head_dim,
+        dtype=layout.dtype,
+        seed=0,
+    )
+    pc = RadixPrefixCache(
+        block_size=_PREFIX_CACHE_BLOCK_SIZE,
+        store=SyntheticPrefixBlockStore(
+            block_size=_PREFIX_CACHE_BLOCK_SIZE, codec=codec
+        ),
+    )
+    params = SamplingParams(
+        temperature=0.0,
+        max_tokens=2,
+        stop_token_ids=eos_ids,
+    )
+    prompts = [_C5_3_4_PROMPT_TEXT]
+
+    def _drain(call_idx: int) -> tuple[
+        list[int], list[str], list[tuple[int, str]]
+    ]:
+        token_ids: list[int] = []
+        dones: list[str] = []
+        aborts: list[tuple[int, str]] = []
+        for event in engine.generate_batch(
+            prompts,
+            params,
+            max_batch_size=1,
+            prefix_cache=pc,
+        ):
+            if event.kind == "token":
+                assert event.token_id is not None, (
+                    f"call {call_idx}: token event missing token_id"
+                )
+                token_ids.append(event.token_id)
+            elif event.kind == "done":
+                assert event.finish_reason is not None
+                dones.append(event.finish_reason)
+            elif event.kind == "aborted":
+                assert event.finish_reason is not None
+                aborts.append((event.req_index, event.finish_reason))
+        return token_ids, dones, aborts
+
+    cold_tokens, cold_dones, cold_aborts = _drain(0)
+    assert cold_aborts == [], f"cold call aborts: {cold_aborts}"
+    assert len(cold_tokens) >= 1
+    assert len(cold_dones) == 1
+    assert pc.node_count() >= 1, (
+        f"cold call should seed the radix tree through the codec's "
+        f"encode_tensor path; got node_count={pc.node_count()}"
+    )
+
+    warm_tokens, warm_dones, warm_aborts = _drain(1)
+    assert warm_aborts == [], f"warm call aborts: {warm_aborts}"
+    assert len(warm_tokens) >= 1
+    assert len(warm_dones) == 1
+    assert pc.node_count() >= 1
+
+    # Token-stream parity between cold (cache miss → fresh forward)
+    # and warm (cache hit → seeded forward through codec round-trip).
+    # BlockTurboQuantMSE 4-bit is near-lossless on production
+    # workloads; under greedy temperature=0.0 the warm call's first
+    # token must match the cold call's first token. Pin this to
+    # catch the case where the codec round-trip distorts K/V badly
+    # enough to flip the argmax.
+    assert cold_tokens[0] == warm_tokens[0], (
+        f"first-token parity violated under codec round-trip: "
+        f"cold={cold_tokens[0]} warm={warm_tokens[0]}"
+    )
