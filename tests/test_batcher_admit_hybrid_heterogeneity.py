@@ -104,7 +104,6 @@ def _make_batcher(
     return ContinuousBatcher(
         adapter,
         prefix_cache=pc,
-        _allow_recurrent_prefix_cache_for_c5_3_testing=True,
     )
 
 

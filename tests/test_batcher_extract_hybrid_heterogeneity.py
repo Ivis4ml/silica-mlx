@@ -316,7 +316,6 @@ def _make_hybrid_batcher(
     return ContinuousBatcher(
         adapter,
         prefix_cache=_prefix_cache(),
-        _allow_recurrent_prefix_cache_for_c5_3_testing=True,
     )
 
 

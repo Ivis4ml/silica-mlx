@@ -401,32 +401,37 @@ def test_prepare_cohort_falls_back_when_adapter_lacks_make_batch_cache() -> None
     assert all(isinstance(c, BatchKVCache) for c in cache)
 
 
-# --- P-3-C3b: hybrid prefix-cache guard + mid-run admission factory -----
+# --- P-3-C5.4: hybrid + prefix_cache supported; sliding-window guard kept --
 
 
-def test_hybrid_adapter_with_prefix_cache_raises_before_capability_gate() -> None:
-    """P-3-C3b: ``has_recurrent_state=True`` adapter + a non-None
-    prefix_cache is rejected at construction time with a specific
-    'DeltaNet is a running accumulation' error — not an AttributeError
-    surfacing later from inside ``_extract_and_insert_prefix`` on
-    ``ArraysCache.offset`` / ``.keys`` / ``.values``.
+def test_hybrid_adapter_with_prefix_cache_constructs_after_c5_4() -> None:
+    """P-3-C5.4: the C3b ctor guard rejecting
+    ``has_recurrent_state=True + prefix_cache != None`` was removed
+    after the C5.3 chain wired the slice-regime trajectory + Phase-B
+    classifier + heterogeneous row-cache assembly end-to-end.
+    Hybrid adapters now construct with a prefix_cache without
+    raising; the slice-prefill regime activates per
+    ``_slice_prefill_active()`` (RecurrentStateAdapter mixin +
+    prefix_cache is not None).
 
-    The guard sits BEFORE ``_enforce_capability_gate`` so the more
-    specific error surfaces first; the placement also stays stable
-    once C3c lifts the capability gate for hybrid adapters running
-    without a prefix cache.
+    The ``_ScriptedAdapter`` synthetic stand-in here lacks the
+    RecurrentStateAdapter mixin, so the slice predicate stays
+    False even though the attention pattern is hybrid — the
+    prefix_cache simply cooperates via the existing contiguous
+    prefill path. RecurrentStateAdapter-bearing adapters
+    (Qwen3.5) exercise the full slice-regime path; the dedicated
+    C5.3 test files cover that.
     """
     pattern = AttentionPattern(per_layer=(AttentionKind.HYBRID_DELTANET,))
     adapter = _ScriptedAdapter(n_layers=1, attention_pattern=pattern)
     pc = RadixPrefixCache(
         block_size=16, store=SyntheticPrefixBlockStore(block_size=16)
     )
-    with pytest.raises(NotImplementedError) as exc:
-        ContinuousBatcher(adapter, prefix_cache=pc)
-    msg = str(exc.value)
-    assert "has_recurrent_state=True" in msg
-    assert "prefix_cache=None" in msg
-    assert "DeltaNet" in msg or "recurrent" in msg.lower()
+    batcher = ContinuousBatcher(adapter, prefix_cache=pc)
+    # Slice regime requires RecurrentStateAdapter; the synthetic
+    # _ScriptedAdapter doesn't carry the mixin, so the predicate
+    # stays False here.
+    assert batcher._slice_prefill_active() is False
 
 
 def test_non_hybrid_adapter_with_prefix_cache_still_constructs() -> None:

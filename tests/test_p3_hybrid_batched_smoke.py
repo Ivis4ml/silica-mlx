@@ -227,8 +227,10 @@ def test_batcher_prefix_cache_hit_admission_multi_token_byte_exact_on_qwen3_5_0_
     mid-run via Phase-B + ``_admit_single_hit_row``. The hit row
     runs ``max_tokens`` decode steps; the full token stream is
     asserted byte-equal to a slice-regime oracle running the
-    same prompt + ``max_tokens`` from scratch under
-    ``prefix_cache=None`` + ``_force_recurrent_slice_prefill_for_c5_3_oracle``.
+    same prompt + ``max_tokens`` from scratch under an empty
+    ``RadixPrefixCache`` (Phase-B walks the empty tree → miss →
+    slice-regime full-prompt prefill, same trajectory regime as
+    the subject's hit-path restore + suffix prefill).
 
     Multi-token verification extends the C5.3.3b first-token gate
     (tests/test_batcher_hit_admission_byte_exact_oracle.py) to
@@ -259,7 +261,6 @@ def test_batcher_prefix_cache_hit_admission_multi_token_byte_exact_on_qwen3_5_0_
     subject = ContinuousBatcher(
         adapter,
         prefix_cache=pc,
-        _allow_recurrent_prefix_cache_for_c5_3_testing=True,
     )
     assert subject._slice_prefill_active() is True
     assert (
@@ -314,13 +315,18 @@ def test_batcher_prefix_cache_hit_admission_multi_token_byte_exact_on_qwen3_5_0_
     )
 
     # === Oracle: prefix_cache=None + slice-regime force flag ===
-    oracle = ContinuousBatcher(
-        adapter,
-        prefix_cache=None,
-        _force_recurrent_slice_prefill_for_c5_3_oracle=(
-            _PREFIX_CACHE_BLOCK_SIZE
+    # P-3-C5.4: oracle uses an empty RadixPrefixCache for slice-regime
+    # parity with the subject. Phase-B walks the empty tree → miss →
+    # slice-prefill the full prompt; same trajectory regime as the
+    # subject's hit-path restore + suffix prefill, only without any
+    # tree state to consume.
+    oracle_pc = RadixPrefixCache(
+        block_size=_PREFIX_CACHE_BLOCK_SIZE,
+        store=SyntheticPrefixBlockStore(
+            block_size=_PREFIX_CACHE_BLOCK_SIZE
         ),
     )
+    oracle = ContinuousBatcher(adapter, prefix_cache=oracle_pc)
     assert oracle._slice_prefill_active() is True
     assert (
         oracle._effective_slice_block_size()
@@ -337,9 +343,11 @@ def test_batcher_prefix_cache_hit_admission_multi_token_byte_exact_on_qwen3_5_0_
         ),
     )
     oracle_events = _drain_until_req_done(oracle, 1)
-    assert oracle.prefix_hits == 0, (
-        "oracle has no prefix_cache; prefix_hits must stay 0"
-    )
+    # Oracle's prefix_cache is empty (no prior request seeded it),
+    # so the single request runs through the initial cohort path
+    # (prefill + decode) without ever hitting the Phase-B
+    # classifier. prefix_hits stays 0.
+    assert oracle.prefix_hits == 0
 
     oracle_tokens = [
         ev.token_id  # type: ignore[attr-defined]
@@ -357,3 +365,97 @@ def test_batcher_prefix_cache_hit_admission_multi_token_byte_exact_on_qwen3_5_0_
         f"slice-regime greedy decode should produce identical "
         f"streams under byte-exact recurrent state at admission"
     )
+
+
+# --- P-3-C5.4: production path through Engine.generate_batch ---
+
+
+@pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
+def test_engine_generate_batch_with_prefix_cache_on_qwen3_5_0_8b() -> None:
+    """C5.4 production-path smoke: ``Engine.generate_batch`` runs
+    Qwen3.5-0.8B with a shared ``RadixPrefixCache`` end-to-end.
+
+    Pre-C5.4 the ``ContinuousBatcher`` ctor rejected this combination
+    (hybrid + prefix_cache) with NotImplementedError; the C5.3 test
+    files relied on a private ``_allow_recurrent_prefix_cache_for_c5_3_testing``
+    flag to bypass the guard. C5.4 removed the guard and the flag,
+    so ``Engine.generate_batch`` — which has no awareness of the flag —
+    can now drive the path.
+
+    Two sequential ``generate_batch`` calls share the same
+    ``RadixPrefixCache``: the first call admits cold and seeds the
+    radix tree on reclaim; the second call admits the same prompt
+    and hits via Phase-B + the slice-regime restore path. The smoke
+    asserts the public API yields token + done events with no aborts
+    on both calls, and that the second call observes a tree
+    populated by the first (``pc.node_count() > 0`` after the first
+    call drains).
+    """
+    adapter, kv = adapter_for_repo(REPO)
+    engine = Engine(adapter, kv)
+    tokenizer = adapter.tokenizer()
+    eos_ids = tuple(sorted(getattr(tokenizer, "eos_token_ids", set()) or ()))
+
+    pc = RadixPrefixCache(
+        block_size=_PREFIX_CACHE_BLOCK_SIZE,
+        store=SyntheticPrefixBlockStore(
+            block_size=_PREFIX_CACHE_BLOCK_SIZE
+        ),
+    )
+    params = SamplingParams(
+        temperature=0.0,
+        max_tokens=2,
+        stop_token_ids=eos_ids,
+    )
+    prompts = [_C5_3_4_PROMPT_TEXT]
+
+    def _drain(call_idx: int) -> tuple[int, list[str], list[tuple[int, str]]]:
+        tokens = 0
+        dones: list[str] = []
+        aborts: list[tuple[int, str]] = []
+        for event in engine.generate_batch(
+            prompts,
+            params,
+            max_batch_size=1,
+            prefix_cache=pc,
+        ):
+            if event.kind == "token":
+                assert event.token_id is not None, (
+                    f"call {call_idx}: token event missing token_id"
+                )
+                tokens += 1
+            elif event.kind == "done":
+                assert event.finish_reason is not None
+                dones.append(event.finish_reason)
+            elif event.kind == "aborted":
+                assert event.finish_reason is not None
+                aborts.append((event.req_index, event.finish_reason))
+        return tokens, dones, aborts
+
+    # Cold call seeds the radix tree.
+    cold_tokens, cold_dones, cold_aborts = _drain(0)
+    assert cold_aborts == [], (
+        f"cold call produced abort events: {cold_aborts}"
+    )
+    assert cold_tokens >= 1
+    assert len(cold_dones) == 1
+    # Reclaim happened during the cold call's drain (the row reaches
+    # DONE during decode, the next step's reclaim phase fires the
+    # extract). Tree should now carry at least one block-aligned
+    # node from the prompt prefix.
+    assert pc.node_count() >= 1, (
+        f"cold call should have seeded the radix tree; "
+        f"node_count={pc.node_count()}"
+    )
+
+    # Warm call observes the tree populated by the cold call.
+    warm_tokens, warm_dones, warm_aborts = _drain(1)
+    assert warm_aborts == [], (
+        f"warm call produced abort events: {warm_aborts}"
+    )
+    assert warm_tokens >= 1
+    assert len(warm_dones) == 1
+    # The same-prompt warm call admits via the hit path; the tree
+    # must remain populated (release fires after admission, but
+    # eviction only happens under memory pressure).
+    assert pc.node_count() >= 1

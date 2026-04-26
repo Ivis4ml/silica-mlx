@@ -205,73 +205,25 @@ class ContinuousBatcher:
         max_batch_size: int = 1,
         prefix_cache: RadixPrefixCache | None = None,
         budgeter: MemoryBudgeter | None = None,
-        _allow_recurrent_prefix_cache_for_c5_3_testing: bool = False,
-        _force_recurrent_slice_prefill_for_c5_3_oracle: int | None = None,
     ) -> None:
         if max_batch_size < 1:
             raise ValueError(
                 f"max_batch_size must be >= 1, got {max_batch_size}"
             )
-        # P-3-C5.3.3 oracle flag: when non-None, the value is the
-        # slice block_size. Mirror RadixPrefixCache.__init__'s
-        # validation so a misconfigured oracle batcher fails fast at
-        # construction rather than mid-step on a divide-by-zero in
-        # the block-index math.
-        if (
-            _force_recurrent_slice_prefill_for_c5_3_oracle is not None
-            and _force_recurrent_slice_prefill_for_c5_3_oracle <= 0
-        ):
-            raise ValueError(
-                "_force_recurrent_slice_prefill_for_c5_3_oracle must "
-                "be > 0 when set (it carries the oracle block_size); "
-                f"got {_force_recurrent_slice_prefill_for_c5_3_oracle}"
-            )
-        # P-3-C3b: the prefix-cache extract path (``_extract_and_insert_prefix``
-        # + the seeded-admission path through the radix trie) assumes
-        # per-token K/V slicing on every layer's cache. DeltaNet
-        # recurrent state is a running accumulation over the full
-        # sequence; it cannot be sliced to an arbitrary block-aligned
-        # prefix (see ``docs/P3_DELTANET_SURVEY.md`` C-open-3). Reject
-        # the combination at construction time with a specific error
-        # rather than crashing deep inside ``_extract_and_insert_prefix``
-        # at an ``AttributeError`` on ``ArraysCache.offset`` / ``.keys``.
-        # The guard sits BEFORE ``_enforce_capability_gate`` so the more
-        # specific error surfaces first and the placement stays stable
-        # once C3c lifts the capability gate for hybrid adapters running
-        # without a prefix cache.
+        # P-3-D3 sliding-window guard. ``build_seeded_batch_kv`` /
+        # ``_extract_and_insert_prefix`` emit ``BatchKVCache`` per layer;
+        # adapting that to ``BatchRotatingKVCache``'s window truncation,
+        # ``offset`` arithmetic, and ``rotated`` state has not been
+        # validated. D3 only commits to the ``prefix_cache=None`` path
+        # for SLIDING-bearing adapters; future work widens the seed
+        # path rather than bypassing this guard.
         #
-        # P-3-C5.3.3 test-only escape: ``_allow_recurrent_prefix_cache_for_c5_3_testing``
-        # bypasses this guard so the C5.3.3 byte-exact oracle test can
-        # construct a hybrid + RadixPrefixCache batcher. The flag is
-        # private, defaults False, and is removed at C5.4 alongside
-        # the guard itself. Production paths never set it.
+        # The earlier C3b recurrent-state guard (rejecting hybrid +
+        # ``RadixPrefixCache``) was removed at P-3-C5.4 once the
+        # C5.3 chain wired the slice-regime trajectory + heterogeneous
+        # row-cache assembly + Phase-B classifier through end-to-end.
         if prefix_cache is not None:
             caps = adapter.capabilities()
-            if (
-                caps.has_recurrent_state
-                and not _allow_recurrent_prefix_cache_for_c5_3_testing
-            ):
-                raise NotImplementedError(
-                    "ContinuousBatcher does not support a RadixPrefixCache "
-                    "on adapters with has_recurrent_state=True "
-                    f"(attention_kinds="
-                    f"{sorted(k.value for k in caps.attention_kinds)!r}): "
-                    "DeltaNet / recurrent state is a running accumulation "
-                    "over the full sequence and cannot be sliced into "
-                    "block-aligned prefix K/V entries (see "
-                    "docs/P3_DELTANET_SURVEY.md C-open-3). Pass "
-                    "prefix_cache=None to run hybrid adapters under the "
-                    "miss-only admission path."
-                )
-            # P-3-D3: sliding-window attention needs its own guard against
-            # the seeded-admission path. ``build_seeded_batch_kv`` /
-            # ``_extract_and_insert_prefix`` emit ``BatchKVCache`` per
-            # layer; adapting that to ``BatchRotatingKVCache``'s window
-            # truncation, ``offset`` arithmetic, and ``rotated`` state
-            # has not been validated. D3 only commits to the
-            # ``prefix_cache=None`` path for SLIDING-bearing adapters;
-            # future work widens the seed path rather than bypassing
-            # this guard.
             if AttentionKind.SLIDING in caps.attention_kinds:
                 raise NotImplementedError(
                     "ContinuousBatcher does not support a RadixPrefixCache "
@@ -316,29 +268,6 @@ class ContinuousBatcher:
         # the cache's lifetime so it can span multiple Engine.generate_batch
         # invocations (that is the whole point of prefix reuse).
         self._prefix_cache: RadixPrefixCache | None = prefix_cache
-        # P-3-C5.3.3 test-only flags. Both default False and are removed
-        # at C5.4 alongside the ctor guard. Production paths never set
-        # either.
-        # ``_allow_recurrent_prefix_cache_for_c5_3_testing``: stored for
-        # symmetry only — actually consumed by the ctor guard above
-        # before the assignment runs. Kept as an attribute so test
-        # introspection / future audits can read which flags are
-        # active on a constructed batcher.
-        self._allow_recurrent_prefix_cache_for_c5_3_testing: bool = (
-            _allow_recurrent_prefix_cache_for_c5_3_testing
-        )
-        # ``_force_recurrent_slice_prefill_for_c5_3_oracle``: flips the
-        # slice-regime predicate to fire on hybrid + ``prefix_cache=None``,
-        # used only by the §4.4 byte-exact oracle batcher so it runs
-        # the same trajectory regime as the subject. The flag's value
-        # (an ``int`` when active, ``None`` when off) is the block_size
-        # the oracle slices at — must match the subject's
-        # ``RadixPrefixCache.block_size`` for regime parity. Production
-        # hybrid + ``prefix_cache=None`` stays contiguous because the
-        # default is ``None``.
-        self._force_recurrent_slice_prefill_for_c5_3_oracle: int | None = (
-            _force_recurrent_slice_prefill_for_c5_3_oracle
-        )
         # 16c.2 observability counters. ``forward_prompt_tokens`` tracks
         # tokens fed through prefill forwards (excludes decode steps).
         # ``prefix_hits`` counts admissions that used the hit path. Step
@@ -1003,26 +932,20 @@ class ContinuousBatcher:
         return True
 
     def _slice_prefill_active(self) -> bool:
-        """C5.3 production-gate predicate for slice-prefill regime.
+        """Predicate for the slice-prefill trajectory regime.
 
         Slice-prefill is the canonical regime for hybrid adapters
         running with a ``RadixPrefixCache`` so the producer (whose
-        snapshots get stored) and the consumer (C5.3.3 prefix-hit
-        admission) operate in the same trajectory regime — see
-        ``docs/P3_C5_3_DESIGN.md`` §2.2 / §3.2 for why same-regime
-        is required for byte-exact-vs-oracle.
+        snapshots get stored) and the consumer (the prefix-hit
+        admission path in ``_admit_single_hit_row``) operate in the
+        same trajectory regime — see ``docs/P3_C5_3_DESIGN.md``
+        §2.2 / §3.2 for why same-regime is required for byte-exact
+        cooperation.
 
-        Production predicate: ``RecurrentStateAdapter`` mixin AND
+        Predicate: ``RecurrentStateAdapter`` mixin AND
         ``prefix_cache is not None``. Non-recurrent adapters and
-        ``prefix_cache=None`` paths preserve today's contiguous
-        prefill bit-for-bit.
-
-        P-3-C5.3.3 test-only oracle clause: when
-        ``_force_recurrent_slice_prefill_for_c5_3_oracle`` is set,
-        the predicate also fires for hybrid + ``prefix_cache=None``
-        so the §4.4 byte-exact oracle batcher runs the same
-        trajectory regime as the subject. Production paths never
-        set the flag.
+        ``prefix_cache=None`` paths stay on contiguous prefill
+        bit-for-bit.
 
         Returns ``True`` to enable slice-prefill in the prefill paths,
         the suffix prefill in ``_admit_single_hit_row``, and decode-
@@ -1032,27 +955,20 @@ class ContinuousBatcher:
         """
         if not isinstance(self._adapter, RecurrentStateAdapter):
             return False
-        if self._prefix_cache is not None:
-            return True
-        return self._force_recurrent_slice_prefill_for_c5_3_oracle is not None
+        return self._prefix_cache is not None
 
     def _effective_slice_block_size(self) -> int:
         """The block_size the slice helper / decode capture uses.
 
-        Reads from ``self._prefix_cache.block_size`` in the production
-        path; falls back to the test-only oracle flag's int value when
-        the oracle path is active. Caller must guarantee
-        ``_slice_prefill_active()`` is True — otherwise the helper has
-        no business asking for a block_size.
+        Reads from ``self._prefix_cache.block_size``. Caller must
+        guarantee ``_slice_prefill_active()`` is True — otherwise
+        the helper has no business asking for a block_size.
         """
-        if self._prefix_cache is not None:
-            return self._prefix_cache.block_size
-        oracle_block_size = self._force_recurrent_slice_prefill_for_c5_3_oracle
-        assert oracle_block_size is not None, (
-            "_effective_slice_block_size called without prefix_cache "
-            "and without the oracle flag — _slice_prefill_active() bug"
+        assert self._prefix_cache is not None, (
+            "_effective_slice_block_size called without a prefix_cache "
+            "— _slice_prefill_active() should have been False"
         )
-        return oracle_block_size
+        return self._prefix_cache.block_size
 
     def _slice_prefill_with_capture(
         self,

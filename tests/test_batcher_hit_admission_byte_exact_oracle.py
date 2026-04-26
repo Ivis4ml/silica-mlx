@@ -3,21 +3,24 @@
 Drives the C5.3.3a wiring through Qwen3.5-0.8B and asserts that a
 prefix-hit admission's post-restore recurrent state byte-equals an
 oracle batcher that runs the same trajectory regime (slice-prefill)
-but doesn't see the prefix cache. Same model, two independent
+but doesn't carry a seeded radix tree. Same model, two independent
 batchers + caches.
 
-Acceptance per ``docs/P3_C5_3_DESIGN.md`` §4.4:
+Acceptance per ``docs/P3_C5_3_DESIGN.md`` §4.4 (post-C5.4 wording):
 
-- **Subject**: ``prefix_cache=RadixPrefixCache(block_size=B)`` +
-  ``_allow_recurrent_prefix_cache_for_c5_3_testing=True``. Slice
-  regime active via the production predicate's
-  ``prefix_cache is not None`` clause. Processes request 1 to seed
-  the radix tree, then request 2 (mid-run admission) hits.
-- **Oracle**: ``prefix_cache=None`` +
-  ``_force_recurrent_slice_prefill_for_c5_3_oracle=B`` (same
-  block_size, regime parity). Slice regime active via the test-only
-  predicate clause. Processes request 2 (pre-step admission) via
-  the slice-regime miss path.
+- **Subject**: ``prefix_cache=RadixPrefixCache(block_size=B)``. Slice
+  regime active via the production predicate
+  ``RecurrentStateAdapter + prefix_cache is not None``. Processes
+  request 1 to seed the radix tree, then request 2 (mid-run
+  admission) hits.
+- **Oracle**: ``prefix_cache=RadixPrefixCache(block_size=B)`` with no
+  seeded nodes (an empty cache). Phase-B walks the empty tree and
+  routes to miss; the miss-path slice-prefill runs the same
+  trajectory regime as the subject's hit-path restore + suffix
+  prefill — same byte-exactness contract, different starting tree
+  state. Pre-C5.4 this used ``prefix_cache=None`` plus a
+  ``_force_recurrent_slice_prefill_for_c5_3_oracle`` flag; C5.4
+  removed the flag in favour of the empty-cache construction.
 - **Comparison**: snapshot LIVE caches via
   ``adapter.snapshot_recurrent_state(batcher._batch_cache, 0)``
   and assert ``mx.array_equal`` on every DeltaNet layer's
@@ -98,16 +101,24 @@ def _make_subject(adapter: Qwen3_5Adapter) -> ContinuousBatcher:
     return ContinuousBatcher(
         adapter,
         prefix_cache=pc,
-        _allow_recurrent_prefix_cache_for_c5_3_testing=True,
     )
 
 
 def _make_oracle(adapter: Qwen3_5Adapter) -> ContinuousBatcher:
-    return ContinuousBatcher(
-        adapter,
-        prefix_cache=None,
-        _force_recurrent_slice_prefill_for_c5_3_oracle=BLOCK_SIZE,
+    # P-3-C5.4: oracle batcher uses an empty RadixPrefixCache to
+    # enter slice regime via the production predicate
+    # (RecurrentStateAdapter + prefix_cache is not None). Phase-B
+    # walks the empty tree and routes to miss; the miss-path slice
+    # prefill produces the same trajectory the subject's hit-path
+    # restore + suffix prefill must match. The two paths share the
+    # same trajectory regime, which is what byte-exactness needs;
+    # the oracle's prefix_cache having no nodes is the only
+    # difference at admission.
+    pc = RadixPrefixCache(
+        block_size=BLOCK_SIZE,
+        store=SyntheticPrefixBlockStore(block_size=BLOCK_SIZE),
     )
+    return ContinuousBatcher(adapter, prefix_cache=pc)
 
 
 def _params(max_tokens: int) -> SamplingParams:

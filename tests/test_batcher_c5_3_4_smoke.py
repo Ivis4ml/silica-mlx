@@ -16,15 +16,16 @@ existing pre-cache hybrid smoke.
      snapshotless nodes get filled in as soon as a row that
      re-prefills the same prefix is extracted.
 
-  2. **Production-path-no-flag stays contiguous** (§4.5
+  2. **Production-path-no-prefix-cache stays contiguous** (§4.5
      acceptance bullet 3): a hybrid adapter constructed with
-     ``prefix_cache=None`` and neither test-only flag must NOT
-     activate the slice-prefill regime. The predicate
-     ``_slice_prefill_active()`` returns False, no snapshot
-     captures fire, and the row's
-     ``recurrent_snapshots_per_block`` stays empty. This is the
-     synthetic guard the design note calls for to prevent the
-     test-only flags from leaking into production behaviour.
+     ``prefix_cache=None`` must NOT activate the slice-prefill
+     regime. The predicate ``_slice_prefill_active()`` returns
+     False, no snapshot captures fire, and the row's
+     ``recurrent_snapshots_per_block`` stays empty. Pre-C5.4 this
+     gate also defended against two test-only flags leaking into
+     production; both flags were removed at C5.4 so the gate now
+     just verifies the production predicate's ``prefix_cache``
+     clause.
 
 Both tests reuse the het.1 ``_ScriptedHybridAdapter`` /
 ``_SpyLog`` scaffolding so the contract surface is the same one
@@ -141,7 +142,6 @@ class TestBackfillConvergence:
         batcher = ContinuousBatcher(
             adapter,
             prefix_cache=pc,
-            _allow_recurrent_prefix_cache_for_c5_3_testing=True,
         )
 
         # Flip _cohort_prepared so add_request lands in the waiting
@@ -238,13 +238,11 @@ class TestBackfillConvergence:
 
 
 class TestProductionPathStaysContiguous:
-    def test_no_prefix_cache_no_flag_disables_slice_regime(self) -> None:
-        # Hybrid adapter, prefix_cache=None, neither
-        # _allow_recurrent_prefix_cache_for_c5_3_testing nor
-        # _force_recurrent_slice_prefill_for_c5_3_oracle. The
-        # predicate's first clause (prefix_cache is not None) is
-        # False, the third (oracle flag) is None → predicate is
-        # False even though the adapter is a RecurrentStateAdapter.
+    def test_no_prefix_cache_disables_slice_regime(self) -> None:
+        # Hybrid adapter, prefix_cache=None. The slice predicate is
+        # ``RecurrentStateAdapter + prefix_cache is not None`` (post-
+        # C5.4); with prefix_cache=None the predicate is False even
+        # though the adapter is a RecurrentStateAdapter.
         pattern = AttentionPattern(
             per_layer=(
                 AttentionKind.GLOBAL,

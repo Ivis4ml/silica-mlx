@@ -1,18 +1,21 @@
 """P-3-C5.3.3a — Phase-B classifier + hit-admission ancestor seeding /
-restore / suffix slice + two test-only flags.
+restore / suffix slice.
 
 Synthetic-adapter coverage. The slice-regime byte-exact-vs-oracle gate
 on Qwen3.5-0.8B lands separately at C5.3.3b.
 
+Originally landed at C5.3.3a alongside two private ctor flags
+(``_allow_recurrent_prefix_cache_for_c5_3_testing``,
+``_force_recurrent_slice_prefill_for_c5_3_oracle``) that opened the
+hybrid + RadixPrefixCache combination for testing while a ctor guard
+still rejected it in production. Both flags and the guard were removed
+at P-3-C5.4 — the production predicate
+``RecurrentStateAdapter + prefix_cache is not None`` is now the only
+gate, and tests construct hybrid + prefix_cache directly.
+
 Acceptance shape per ``docs/P3_C5_3_DESIGN.md`` §4.4 + the C5.3.3
 recon findings:
 
-- Two test-only ``ContinuousBatcher.__init__`` flags:
-  ``_allow_recurrent_prefix_cache_for_c5_3_testing`` bypasses the
-  hybrid + prefix_cache ctor guard; without it the ctor still raises.
-  ``_force_recurrent_slice_prefill_for_c5_3_oracle: int | None``
-  flips ``_slice_prefill_active()`` for hybrid + prefix_cache=None
-  using its int value as the slice block_size.
 - Phase-B classifier consults ``peek_with_node(prompt[:usable])`` —
   i.e., the deepest USABLE node, NOT the raw deepest leaf — and
   routes to miss when that node lacks a recurrent snapshot. The
@@ -41,7 +44,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import mlx.core as mx
-import pytest
 
 from silica.core.sampling import SamplingParams
 from silica.kvcache.prefix import RadixPrefixCache
@@ -201,106 +203,53 @@ def _prep_cohort(batcher: ContinuousBatcher) -> None:
     assert batcher.step() == []  # 0 rows, 0 work
 
 
-# --- two test-only flags ---
+# --- slice-prefill predicate ---
 
 
-class TestCtorGuardBypassFlag:
-    def test_ctor_raises_without_flag(self) -> None:
+class TestSlicePrefillPredicate:
+    """P-3-C5.4: production predicate is
+    ``RecurrentStateAdapter + prefix_cache is not None``. Non-recurrent
+    adapters and ``prefix_cache=None`` paths stay on contiguous prefill.
+    """
+
+    def test_off_when_no_prefix_cache(self) -> None:
         log = _SpyLog()
         adapter = _make_recurrent_hybrid_spy_adapter(log)
-        with pytest.raises(NotImplementedError, match="has_recurrent_state"):
-            ContinuousBatcher(adapter, prefix_cache=_prefix_cache())
-
-    def test_ctor_succeeds_with_flag(self) -> None:
-        log = _SpyLog()
-        adapter = _make_recurrent_hybrid_spy_adapter(log)
-        # Flag opens the hybrid + prefix_cache combination for tests.
-        batcher = ContinuousBatcher(
-            adapter,
-            prefix_cache=_prefix_cache(),
-            _allow_recurrent_prefix_cache_for_c5_3_testing=True,
-        )
-        assert batcher._slice_prefill_active() is True
-
-    def test_flag_does_not_affect_non_hybrid_adapter_ctor(self) -> None:
-        # Non-recurrent adapter constructs without the flag (no guard
-        # to bypass); the flag is a no-op there.
-        from tests.test_batcher import _ScriptedAdapter
-
-        adapter = _ScriptedAdapter(n_layers=1)
-        ContinuousBatcher(
-            adapter,
-            prefix_cache=_prefix_cache(),
-            _allow_recurrent_prefix_cache_for_c5_3_testing=True,
-        )
-
-
-class TestOracleSliceFlag:
-    def test_default_off_for_hybrid_no_prefix_cache(self) -> None:
-        log = _SpyLog()
-        adapter = _make_recurrent_hybrid_spy_adapter(log)
-        # Hybrid + prefix_cache=None defaults to off — production
-        # behaviour stays contiguous.
         batcher = ContinuousBatcher(adapter, prefix_cache=None)
         assert batcher._slice_prefill_active() is False
 
-    def test_int_value_activates_slice_regime(self) -> None:
+    def test_active_with_prefix_cache_on_recurrent_adapter(self) -> None:
         log = _SpyLog()
         adapter = _make_recurrent_hybrid_spy_adapter(log)
         batcher = ContinuousBatcher(
-            adapter,
-            prefix_cache=None,
-            _force_recurrent_slice_prefill_for_c5_3_oracle=BLOCK_SIZE,
+            adapter, prefix_cache=_prefix_cache()
         )
         assert batcher._slice_prefill_active() is True
         assert batcher._effective_slice_block_size() == BLOCK_SIZE
 
-    def test_flag_inert_on_non_recurrent_adapter(self) -> None:
-        # Predicate's first clause (RecurrentStateAdapter) gates the
-        # flag — non-recurrent adapters stay False even with the flag.
+    def test_off_for_non_recurrent_adapter_with_prefix_cache(self) -> None:
+        # Predicate's first clause gates by RecurrentStateAdapter
+        # mixin — non-recurrent adapters stay False even when a
+        # prefix_cache is wired.
         from tests.test_batcher import _ScriptedAdapter
 
         adapter = _ScriptedAdapter(n_layers=1)
         batcher = ContinuousBatcher(
-            adapter,
-            prefix_cache=None,
-            _force_recurrent_slice_prefill_for_c5_3_oracle=BLOCK_SIZE,
+            adapter, prefix_cache=_prefix_cache()
         )
         assert batcher._slice_prefill_active() is False
 
-    def test_zero_block_size_rejected(self) -> None:
-        log = _SpyLog()
-        adapter = _make_recurrent_hybrid_spy_adapter(log)
-        with pytest.raises(ValueError, match="must be > 0"):
-            ContinuousBatcher(
-                adapter,
-                prefix_cache=None,
-                _force_recurrent_slice_prefill_for_c5_3_oracle=0,
-            )
-
-    def test_negative_block_size_rejected(self) -> None:
-        log = _SpyLog()
-        adapter = _make_recurrent_hybrid_spy_adapter(log)
-        with pytest.raises(ValueError, match="must be > 0"):
-            ContinuousBatcher(
-                adapter,
-                prefix_cache=None,
-                _force_recurrent_slice_prefill_for_c5_3_oracle=-4,
-            )
-
-    def test_oracle_path_produces_block_size_aligned_captures(
+    def test_block_size_aligned_captures_under_active_regime(
         self,
     ) -> None:
-        # Drive a 2-block prefill in oracle mode; captures must fire
-        # at the flag's block_size, not some other value.
+        # Drive a 2-block prefill with the regime active; captures
+        # must fire at the prefix_cache's block_size boundaries.
         log = _SpyLog()
         adapter = _make_recurrent_hybrid_spy_adapter(
             log, script=(0, 1)
         )
         batcher = ContinuousBatcher(
-            adapter,
-            prefix_cache=None,
-            _force_recurrent_slice_prefill_for_c5_3_oracle=BLOCK_SIZE,
+            adapter, prefix_cache=_prefix_cache()
         )
         prompt = list(range(1, 2 * BLOCK_SIZE + 1))
         batcher.add_request(0, prompt, _params(max_tokens=1))
@@ -359,7 +308,6 @@ class TestPhaseBClampCorrectness:
         batcher = ContinuousBatcher(
             adapter,
             prefix_cache=pc,
-            _allow_recurrent_prefix_cache_for_c5_3_testing=True,
         )
         _prep_cohort(batcher)
         batcher.add_request(0, prompt, _params(max_tokens=1))
@@ -392,7 +340,6 @@ class TestPhaseBClampCorrectness:
         batcher = ContinuousBatcher(
             adapter,
             prefix_cache=pc,
-            _allow_recurrent_prefix_cache_for_c5_3_testing=True,
         )
         _prep_cohort(batcher)
         batcher.add_request(0, prompt, _params(max_tokens=1))
@@ -425,7 +372,6 @@ class TestPhaseBFallbackToMiss:
         batcher = ContinuousBatcher(
             adapter,
             prefix_cache=pc,
-            _allow_recurrent_prefix_cache_for_c5_3_testing=True,
         )
         _prep_cohort(batcher)
         batcher.add_request(0, prompt, _params(max_tokens=1))
@@ -465,7 +411,6 @@ class TestAncestorSeeding:
         batcher = ContinuousBatcher(
             adapter,
             prefix_cache=pc,
-            _allow_recurrent_prefix_cache_for_c5_3_testing=True,
         )
         _prep_cohort(batcher)
         batcher.add_request(0, prompt, _params(max_tokens=1))
@@ -520,7 +465,6 @@ class TestAncestorSeeding:
         batcher = ContinuousBatcher(
             adapter,
             prefix_cache=pc,
-            _allow_recurrent_prefix_cache_for_c5_3_testing=True,
         )
         _prep_cohort(batcher)
         batcher.add_request(0, prompt, _params(max_tokens=1))
@@ -560,7 +504,6 @@ class TestRestoreBeforeSuffixSlice:
         batcher = ContinuousBatcher(
             adapter,
             prefix_cache=pc,
-            _allow_recurrent_prefix_cache_for_c5_3_testing=True,
         )
         _prep_cohort(batcher)
         batcher.add_request(0, prompt, _params(max_tokens=1))
@@ -637,7 +580,6 @@ class TestExtractAfterFallbackBackfillsLegacy:
         batcher = ContinuousBatcher(
             adapter,
             prefix_cache=pc,
-            _allow_recurrent_prefix_cache_for_c5_3_testing=True,
         )
         _prep_cohort(batcher)
         batcher.add_request(0, prompt, _params(max_tokens=1))
@@ -700,7 +642,6 @@ class TestHitAdmissionExtractAttachesNewSuffixNodes:
         batcher = ContinuousBatcher(
             adapter,
             prefix_cache=pc,
-            _allow_recurrent_prefix_cache_for_c5_3_testing=True,
         )
         _prep_cohort(batcher)
         batcher.add_request(0, prompt, _params(max_tokens=1))
@@ -744,7 +685,6 @@ class TestSuffixSliceCapturesAtAbsoluteIndex:
         batcher = ContinuousBatcher(
             adapter,
             prefix_cache=pc,
-            _allow_recurrent_prefix_cache_for_c5_3_testing=True,
         )
         _prep_cohort(batcher)
         batcher.add_request(0, prompt, _params(max_tokens=1))
