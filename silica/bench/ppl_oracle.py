@@ -599,6 +599,833 @@ def _extract_aligned_blocks_from_seeded_cache(
 
 
 # =============================================================================
+# P-5-F F.0b — pre-RoPE store oracle (Option A minimum prototype).
+#
+# Mirrors ``teacher_forced_chunked_nll_with_codec`` (the post-RoPE
+# production path) but inserts an inverse-RoPE round-trip at the
+# encode seam and a forward-RoPE re-application at the decode seam
+# so the codec sees pre-RoPE K. RoPE is orthogonal, so injecting
+# noise in pre-RoPE space is mathematically equivalent to vqbench's
+# ``_QuantizedProj`` injection (per ``docs/P5_F_OPENING.md`` §3.1).
+# Persistence and block-grained encoding match the production
+# store, unlike the D.2a oracle which re-encodes per chunk.
+#
+# This is a flag-gated minimum prototype, NOT the final F.1+
+# adapter Protocol. Goal: measure ΔPPL on the F.0 (b) gate before
+# committing to the full Option A architecture (F.1: adapter
+# `apply_rope_inverse_to_k`; F.2: store-side flag).
+#
+# V is not rotated in any silica-supported family
+# (P5_F_OPENING.md §4) so V passes through unchanged on this
+# path; only K participates in the RoPE round-trip.
+# =============================================================================
+
+
+def _apply_rope_to_k_block(
+    k_block: mx.array,
+    rope_instance: Any,
+    *,
+    base_offset: int,
+    inverse: bool,
+) -> mx.array:
+    """Apply forward or inverse RoPE to one (1, n_kv_heads, block_size, head_dim) K block.
+
+    Inverse path: ``mx.fast.rope(..., freqs=-freqs)`` (or ``scale=-1.0``
+    on the freqs path), verified to match identity round-trip at
+    Frobenius ratio 9.6e-8 fp32 / 1.36e-4 fp16 in the F.0b numerical
+    readiness probe (``docs/P5_F_OPENING.md`` §5.1).
+
+    Supports two RoPE classes that silica's adapters actually
+    instantiate (F.1 inventory in ``docs/P5_F_OPENING.md`` §4):
+
+    - ``nn.RoPE`` — exposes ``dims`` / ``base`` / ``scale`` /
+      ``traditional``; freqs is reconstructed as
+      ``base ** (mx.arange(0, dims, 2) / dims)``.
+    - ``ProportionalRoPE`` — exposes ``_freqs`` (with infinite
+      entries for the non-rotated dimensions); ``mx.fast.rope``
+      handles the partial-rotation case via the ``dims`` arg
+      naming the rotated prefix.
+
+    Other RoPE classes (``Llama3RoPE``, ``YarnRoPE``, ``SuScaledRoPE``)
+    raise ``NotImplementedError`` here — their forward paths apply
+    additional ``mscale`` factors before fast.rope, which the
+    inverse must also undo. None are in use on silica's targets,
+    so handling them is forward-compat work for F.1 not F.0b.
+    """
+    cls_name = type(rope_instance).__name__
+    if cls_name == "RoPE":
+        # mlx.nn.RoPE — reconstruct freqs from base.
+        dims = rope_instance.dims
+        base = rope_instance.base
+        traditional = rope_instance.traditional
+        scale = rope_instance.scale
+        freqs = base ** (mx.arange(0, dims, 2, dtype=mx.float32) / dims)
+    elif cls_name == "ProportionalRoPE":
+        dims = rope_instance.dims
+        traditional = rope_instance.traditional
+        scale = 1.0
+        freqs = rope_instance._freqs
+    else:
+        raise NotImplementedError(
+            f"F.0b prototype does not handle RoPE class {cls_name!r} "
+            f"(only nn.RoPE and ProportionalRoPE are in use on "
+            f"silica's targets per docs/P5_F_OPENING.md §4); "
+            f"add explicit dispatch in F.1 if a new family routes "
+            f"here. See docs/P5_F_OPENING.md §6.2 for the F.1 "
+            f"in-use vs forward-compat coverage policy."
+        )
+    if inverse:
+        freqs = -freqs
+    return mx.fast.rope(
+        k_block,
+        dims,
+        traditional=traditional,
+        base=None,
+        scale=scale,
+        offset=base_offset,
+        freqs=freqs,
+    )
+
+
+def _round_trip_inverse_rope_for_extract(
+    detached_blocks: list[list[tuple[mx.array, mx.array]]],
+    *,
+    block_size: int,
+    rope_instances_per_attn_layer: list[Any],
+) -> list[list[tuple[mx.array, mx.array]]]:
+    """Inverse-RoPE every K block extracted from a post-RoPE cache.
+
+    Input shape per outer index: ``[block_idx][attn_pos] -> (K, V)``
+    where K is post-RoPE shape ``(1, n_kv_heads, block_size, head_dim)``
+    and V is the same shape unrotated.
+
+    Output preserves the structure; K is replaced with its pre-RoPE
+    counterpart (``mx.fast.rope`` with ``freqs=-freqs`` at offset
+    ``block_idx * block_size``). V passes through unchanged.
+
+    The store / codec downstream sees pre-RoPE K, matching the
+    space vqbench's ``_QuantizedProj`` injects in.
+    """
+    return [
+        [
+            (
+                _apply_rope_to_k_block(
+                    k,
+                    rope_instances_per_attn_layer[attn_pos],
+                    base_offset=block_idx * block_size,
+                    inverse=True,
+                ),
+                v,
+            )
+            for attn_pos, (k, v) in enumerate(per_attn_layer)
+        ]
+        for block_idx, per_attn_layer in enumerate(detached_blocks)
+    ]
+
+
+def _round_trip_forward_rope_for_admit(
+    detached_blocks: list[list[tuple[mx.array, mx.array]]],
+    *,
+    block_size: int,
+    rope_instances_per_attn_layer: list[Any],
+) -> list[list[tuple[mx.array, mx.array]]]:
+    """Forward-RoPE every K block decoded from the pre-RoPE store.
+
+    Inverse of :func:`_round_trip_inverse_rope_for_extract`. K is
+    re-rotated at offset ``block_idx * block_size`` so the seeded
+    ``BatchKVCache`` carries post-RoPE K — matching what mlx-lm's
+    attention forward expects when the cache is passed in.
+    """
+    return [
+        [
+            (
+                _apply_rope_to_k_block(
+                    k,
+                    rope_instances_per_attn_layer[attn_pos],
+                    base_offset=block_idx * block_size,
+                    inverse=False,
+                ),
+                v,
+            )
+            for attn_pos, (k, v) in enumerate(per_attn_layer)
+        ]
+        for block_idx, per_attn_layer in enumerate(detached_blocks)
+    ]
+
+
+def teacher_forced_chunked_nll_with_codec_pre_rope(
+    adapter: Any,
+    prefix_cache: Any,
+    token_ids: mx.array,
+    *,
+    chunk_size: int = 256,
+) -> tuple[float, int]:
+    """P-5-F F.0b prototype — pre-RoPE store via inverse-RoPE round-trip.
+
+    Mirrors :func:`teacher_forced_chunked_nll_with_codec` block-for-
+    block but adds two RoPE round-trips:
+
+    - **Encode seam** (after extract, before insert_detached): every
+      K block extracted from the seeded ``BatchKVCache`` (post-RoPE)
+      is inverse-rotated to pre-RoPE space before the codec sees it.
+    - **Decode seam** (after fetch_detached_blocks, before
+      build_seeded_batch_kv): every K block decoded from the store
+      (still pre-RoPE) is forward-rotated to post-RoPE space so the
+      seeded cache mlx-lm consumes carries post-RoPE K as the
+      forward expects.
+
+    V is unrotated in mlx-lm attention for every silica-supported
+    family (P5_F_OPENING.md §4), so V passes through unchanged.
+
+    Math: RoPE is orthogonal, so noise ε injected by the codec in
+    pre-RoPE space and then forward-rotated equals the same ε
+    rotated to post-RoPE space — the same noise distribution
+    vqbench's ``_QuantizedProj`` produces. The chunk-boundary cost
+    the post-RoPE store pays comes from RoPE-coupled noise
+    interacting with subsequent positions during refills; that
+    coupling vanishes when the codec's noise lives in pre-RoPE
+    space until it is rotated alongside the K it belongs to.
+
+    Closes the production-vs-D.2a-oracle ΔPPL gap (currently +20
+    PPL on Qwen3-0.6B + BlockTQ b64 b4 vs +0.51 PPL on the D.2a
+    oracle) when the F.0 (b) gate (§6.1) accepts.
+
+    Args / Returns: same contract as
+    :func:`teacher_forced_chunked_nll_with_codec`.
+
+    Raises: same shape / chunk validation, plus
+    :class:`NotImplementedError` if any attention layer's RoPE
+    instance is outside the F.0b-supported set
+    (``nn.RoPE`` or ``ProportionalRoPE``); see
+    :func:`_apply_rope_to_k_block`.
+    """
+    if token_ids.ndim != 2:
+        raise ValueError(
+            f"token_ids must be 2-D (1, seq_len); got shape "
+            f"{tuple(token_ids.shape)}"
+        )
+    B, seq_len = token_ids.shape
+    if B != 1:
+        raise ValueError(
+            f"teacher_forced_chunked_nll_with_codec_pre_rope supports "
+            f"B=1 only (streaming PPL is per-sequence); got B={B}"
+        )
+    if chunk_size < 1:
+        raise ValueError(f"chunk_size must be >= 1; got {chunk_size}")
+    block_size = prefix_cache.block_size
+    if chunk_size % block_size != 0:
+        raise ValueError(
+            f"chunk_size ({chunk_size}) must be a positive multiple of "
+            f"prefix_cache.block_size ({block_size}); misaligned chunks "
+            f"leave a tail outside the prefix cache's block-granular "
+            f"coverage and break the seeded-cache-per-chunk contract."
+        )
+    if seq_len == 0:
+        return 0.0, 0
+
+    model = adapter._model
+
+    total_nll = 0.0
+    total_tokens = 0
+    prev_last_logit: mx.array | None = None
+    attn_layer_indices: list[int] | None = None
+    rope_instances_per_attn_layer: list[Any] | None = None
+
+    is_hybrid_recurrent = isinstance(adapter, RecurrentStateAdapter)
+    prev_recurrent_snapshot: RecurrentSnapshot | None = None
+
+    for start in range(0, seq_len, chunk_size):
+        end = min(start + chunk_size, seq_len)
+        chunk_tokens = token_ids[:, start:end]
+        chunk_len = end - start
+
+        if start == 0:
+            cache_list = adapter.make_batch_cache([0])
+            attn_layer_indices = [
+                i
+                for i, c in enumerate(cache_list)
+                if isinstance(c, BatchKVCache)
+            ]
+            # Capture per-attention-layer RoPE handles up front so the
+            # encode-/decode-seam wrappers can apply forward / inverse
+            # rotation without re-resolving on every chunk. Reads from
+            # the live mlx-lm model the adapter built; same handles
+            # mlx-lm's attention forward uses, so any RoPE
+            # configuration the adapter carries (theta / freqs /
+            # partial-rotary-factor) flows through naturally.
+            rope_instances_per_attn_layer = [
+                model.layers[layer_idx].self_attn.rope
+                for layer_idx in attn_layer_indices
+            ]
+        else:
+            assert attn_layer_indices is not None
+            assert rope_instances_per_attn_layer is not None
+            prefix_token_list = _mx_1d_to_int_list(token_ids[0, :start])
+            hit = prefix_cache.lookup(prefix_token_list)
+            try:
+                if hit.num_hit_tokens != start:
+                    raise RuntimeError(
+                        f"prefix_cache.lookup returned {hit.num_hit_tokens} "
+                        f"hit tokens; expected full prefix hit of {start} "
+                        f"tokens (chunk_size % block_size contract broken, "
+                        f"or prefix cache lost blocks between chunks)."
+                    )
+                detached_blocks = prefix_cache.fetch_detached_blocks(
+                    hit.block_ids
+                )
+                # F.0b decode seam: K is pre-RoPE in the store
+                # (encode seam below stripped RoPE). Apply forward
+                # RoPE so the seeded cache carries post-RoPE K as
+                # mlx-lm's attention expects.
+                detached_blocks = _round_trip_forward_rope_for_admit(
+                    list(detached_blocks),
+                    block_size=block_size,
+                    rope_instances_per_attn_layer=(
+                        rope_instances_per_attn_layer
+                    ),
+                )
+                seeded_attn = build_seeded_batch_kv(
+                    detached_blocks, num_layers=len(attn_layer_indices)
+                )
+                cache_list = adapter.make_batch_cache([0])
+                for pos, src_idx in enumerate(attn_layer_indices):
+                    cache_list[src_idx] = seeded_attn[pos]
+            finally:
+                prefix_cache.release(hit.block_ids)
+
+            if is_hybrid_recurrent and prev_recurrent_snapshot is not None:
+                assert isinstance(adapter, RecurrentStateAdapter)
+                adapter.restore_recurrent_state(
+                    cache_list, 0, prev_recurrent_snapshot
+                )
+
+        logits = forward_batched_full(model, chunk_tokens, cache_list)
+
+        if prev_last_logit is not None:
+            target = chunk_tokens[:, 0]
+            total_nll += float(
+                _cross_entropy_sum(prev_last_logit, target).item()
+            )
+            total_tokens += 1
+
+        if chunk_len > 1:
+            within_logits = logits[:, :-1, :]
+            within_targets = chunk_tokens[:, 1:]
+            total_nll += float(
+                _cross_entropy_sum(
+                    within_logits.reshape(-1, within_logits.shape[-1]),
+                    within_targets.reshape(-1),
+                ).item()
+            )
+            total_tokens += chunk_len - 1
+
+        prev_last_logit = mx.contiguous(
+            logits[:, -1, :].astype(mx.float32)
+        )
+        mx.eval(prev_last_logit)
+
+        if is_hybrid_recurrent:
+            assert isinstance(adapter, RecurrentStateAdapter)
+            prev_recurrent_snapshot = adapter.snapshot_recurrent_state(
+                cache_list, row_idx=0
+            )
+
+        aligned_end = (end // block_size) * block_size
+        if aligned_end > 0:
+            detached_to_insert = _extract_aligned_blocks_from_seeded_cache(
+                cache_list, block_size, aligned_end
+            )
+            # F.0b encode seam: K extracted from the seeded cache is
+            # post-RoPE (mlx-lm's attention rotated it before
+            # cache.update_and_fetch). Inverse-rotate K to pre-RoPE
+            # so the codec's noise-injection lives in the same
+            # space as vqbench's ``_QuantizedProj``.
+            detached_to_insert = _round_trip_inverse_rope_for_extract(
+                detached_to_insert,
+                block_size=block_size,
+                rope_instances_per_attn_layer=(
+                    rope_instances_per_attn_layer
+                ),
+            )
+            prefix_tokens_to_insert = _mx_1d_to_int_list(
+                token_ids[0, :aligned_end]
+            )
+            prefix_cache.insert_detached(
+                prefix_tokens_to_insert, detached_to_insert
+            )
+
+    return total_nll, total_tokens
+
+
+# =============================================================================
+# P-5-F F.0b' — pre-norm store oracle (Option 3b prototype).
+#
+# F.0b's "post-k_norm pre-RoPE" injection (above) verified empirically
+# that codec noise injected after k_norm is ~2x larger in the
+# post-k_norm space mlx-lm reads, leading to ~8x worse PPL through
+# attention softmax non-linearity. (3b) hooks `attn.k_proj` and
+# captures K_pre BEFORE k_norm, persisting K_pre in the prefix store.
+# On hit-path admission, K_pre is decoded → `k_norm` → `rope` → seeded
+# into cache. Codec noise lives in the same pre-k_norm space vqbench's
+# `_QuantizedProj` injects in, so the same +0.51 PPL D.2a achieves
+# should be reachable here under persistent block-grained encoding.
+#
+# Difference vs (3a) / D.2a: the wrapper does NOT modify the
+# in-flight forward. `_PreNormCaptureProj.__call__` returns
+# `k_proj(x)` unchanged, only side-effecting a capture for later
+# encode. In-flight attention runs clean — the current chunk's
+# logits use noise-free K. Codec noise affects only PRIOR chunks'
+# K (the seeded cache contents), matching the production prefix-
+# cache hit semantic. (3a) injects noise on the in-flight forward
+# too; (3b) is strictly less noisy and matches what the F.1+
+# production store would do.
+# =============================================================================
+
+
+class _PreNormCaptureProj:
+    """Wrap ``attn.k_proj`` to capture K_pre without modifying in-flight K.
+
+    Returns ``k_proj(x)`` unchanged on every call. The captured tensor
+    is written to ``self._sink`` (a list shared by the oracle), keyed
+    by ``layer_idx``; the oracle reads it after each chunk's forward
+    to encode K_pre per block into the prefix store.
+
+    Why capture-only: codec noise on prior chunks' K is the
+    deployment scenario silica's prefix-cache models. Noise on the
+    *current* chunk's K (D.2a's wrapper does this) is harmless for
+    PPL but doesn't match production semantics. (3b) keeps in-flight
+    forward clean and only persists noisy K for next chunks.
+    """
+
+    __slots__ = ("_orig", "_sink", "_layer_idx")
+
+    def __init__(self, orig: Any, *, sink: list[Any], layer_idx: int) -> None:
+        self._orig = orig
+        self._sink = sink
+        self._layer_idx = layer_idx
+
+    def __call__(self, x: mx.array) -> mx.array:
+        out: mx.array = self._orig(x)
+        # Side-effect: store captured K_pre for this layer index.
+        # Output is returned unchanged — in-flight forward sees no
+        # codec interference.
+        self._sink[self._layer_idx] = out
+        return out
+
+
+def _install_pre_norm_capture_wrappers(
+    model: Any,
+    *,
+    attn_layer_indices: list[int],
+) -> tuple[list[Any], list[tuple[Any, Any]]]:
+    """Install ``_PreNormCaptureProj`` on every attention layer's k_proj.
+
+    Returns ``(captures, restorations)`` where:
+
+    - ``captures`` is the per-layer-index capture sink. Indexed by
+      attention-layer-index position in ``attn_layer_indices``
+      (0-based, dense). Each entry is set by the wrapper on every
+      forward call; the oracle reads it after each chunk forward.
+    - ``restorations`` is a list of ``(attn_module, orig_k_proj)``
+      tuples that :func:`_restore_pre_norm_capture_wrappers` consumes
+      to put the original projections back in place.
+
+    Only ``k_proj`` is wrapped (not ``v_proj``); V is RoPE-free and
+    norm-free per silica's supported family inventory (P5_F_OPENING.md
+    §4) — V can be encoded directly from cache extract as the F.0b
+    path does, no projection-time hook needed.
+    """
+    captures: list[Any] = [None] * len(attn_layer_indices)
+    restorations: list[tuple[Any, Any]] = []
+    for capture_pos, layer_idx in enumerate(attn_layer_indices):
+        attn = model.layers[layer_idx].self_attn
+        orig_k = attn.k_proj
+        attn.k_proj = _PreNormCaptureProj(
+            orig_k, sink=captures, layer_idx=capture_pos
+        )
+        restorations.append((attn, orig_k))
+    return captures, restorations
+
+
+def _restore_pre_norm_capture_wrappers(
+    restorations: list[tuple[Any, Any]],
+) -> None:
+    for attn, orig_k in restorations:
+        attn.k_proj = orig_k
+
+
+def _apply_k_norm_then_rope_to_block(
+    k_pre_block: mx.array,
+    *,
+    k_norm: Any,
+    rope_instance: Any,
+    base_offset: int,
+) -> mx.array:
+    """Reconstruct post-RoPE K from a pre-norm K block.
+
+    Input: ``(1, n_kv_heads, block_size, head_dim)`` pre-norm K.
+    Output: same shape, post-RoPE.
+
+    Mirrors mlx-lm's attention forward exactly:
+
+    ```python
+    keys = self.k_norm(keys.reshape(B, L, n_kv_heads, head_dim))
+                .transpose(0, 2, 1, 3)
+    keys = self.rope(keys, offset=cache.offset)
+    ```
+
+    The pre-norm K block we receive is in the per-head transposed
+    layout already, so transpose back to the pre-k_norm layout
+    (B, L, n_kv_heads, head_dim) for k_norm, then transpose to
+    per-head and apply RoPE.
+    """
+    B, n_kv_heads, block_size, head_dim = k_pre_block.shape
+    # pre-norm format expected by k_norm: (B, L, n_kv_heads, head_dim)
+    k_pre_seq = k_pre_block.transpose(0, 2, 1, 3)
+    # Apply k_norm (RMSNorm on last axis)
+    k_post_norm_seq = k_norm(k_pre_seq)
+    # Transpose back to per-head (B, n_kv_heads, L, head_dim)
+    k_post_norm_per_head = k_post_norm_seq.transpose(0, 2, 1, 3)
+    # Apply RoPE at the absolute block-start offset
+    k_post_rope: mx.array = rope_instance(
+        k_post_norm_per_head, offset=base_offset
+    )
+    return k_post_rope
+
+
+def _split_k_pre_capture_into_blocks(
+    captures: list[mx.array],
+    *,
+    aligned_end: int,
+    block_size: int,
+    n_kv_heads: int,
+    head_dim: int,
+) -> list[list[mx.array]]:
+    """Split each layer's captured K_pre into per-block slices.
+
+    Each capture has shape ``(B, L, n_kv_heads * head_dim)``. Reshape
+    to ``(B, L, n_kv_heads, head_dim)`` then transpose to per-head
+    ``(B, n_kv_heads, L, head_dim)`` so each block slice has the
+    standard `(1, n_kv_heads, block_size, head_dim)` shape the codec
+    consumes.
+
+    Returns a list indexed ``[block_idx][attn_pos] -> k_pre_block``.
+    """
+    num_blocks = aligned_end // block_size
+    out: list[list[mx.array]] = [[] for _ in range(num_blocks)]
+    for capture in captures:
+        B, L, _ = capture.shape
+        per_head = capture.reshape(B, L, n_kv_heads, head_dim).transpose(
+            0, 2, 1, 3
+        )
+        for block_idx in range(num_blocks):
+            start = block_idx * block_size
+            block = per_head[:, :, start : start + block_size, :]
+            block = mx.contiguous(block)
+            out[block_idx].append(block)
+    # Force materialization: the next iteration of the outer chunk
+    # loop discards the cache_list and the captures, lazy slices
+    # would lose their source.
+    for blocks in out:
+        for b in blocks:
+            mx.eval(b)
+    return out
+
+
+def teacher_forced_chunked_nll_with_codec_pre_norm(
+    adapter: Any,
+    prefix_cache: Any,
+    token_ids: mx.array,
+    *,
+    chunk_size: int = 256,
+) -> tuple[float, int]:
+    """P-5-F F.0b' prototype — pre-norm store via projection-output capture.
+
+    Wraps each attention layer's ``k_proj`` with
+    :class:`_PreNormCaptureProj` to capture K_pre during each chunk
+    forward. Encodes K_pre per block into the prefix store at
+    chunk-end time. On hit-path, decodes K_pre → applies layer's
+    ``k_norm`` and ``rope`` → seeds cache with the reconstructed
+    post-RoPE K. V is extracted from the seeded cache (already
+    ``v_proj(x)`` since V never normalises or rotates) and encoded
+    on the V codec, mirroring F.0b's V handling.
+
+    Codec noise lives in pre-k_norm space, identical to vqbench's
+    ``_QuantizedProj`` injection point. F.0b' should reach D.2a's
+    +0.51 PPL on the (4-b) reference scenario — the F.0b verification
+    showed codec is space-invariant, so any ΔPPL gap left vs D.2a is
+    noise (per-seed, per-block-grain) not algorithmic.
+
+    Restoration: wrappers are restored in a try/finally so an
+    exception during forward leaves the adapter's model untouched.
+    """
+    if token_ids.ndim != 2:
+        raise ValueError(
+            f"token_ids must be 2-D (1, seq_len); got shape "
+            f"{tuple(token_ids.shape)}"
+        )
+    B, seq_len = token_ids.shape
+    if B != 1:
+        raise ValueError(
+            f"teacher_forced_chunked_nll_with_codec_pre_norm supports "
+            f"B=1 only; got B={B}"
+        )
+    if chunk_size < 1:
+        raise ValueError(f"chunk_size must be >= 1; got {chunk_size}")
+    block_size = prefix_cache.block_size
+    if chunk_size % block_size != 0:
+        raise ValueError(
+            f"chunk_size ({chunk_size}) must be a positive multiple of "
+            f"prefix_cache.block_size ({block_size})"
+        )
+    if seq_len == 0:
+        return 0.0, 0
+
+    model = adapter._model
+    # Probe attn_layer_indices via a dry cache build before installing
+    # wrappers. Using ``adapter.make_batch_cache([0])`` here is cheap;
+    # we discard the cache. This avoids needing a model forward to
+    # learn the heterogeneous layout for hybrid adapters.
+    probe_cache = adapter.make_batch_cache([0])
+    attn_layer_indices = [
+        i for i, c in enumerate(probe_cache) if isinstance(c, BatchKVCache)
+    ]
+
+    # Resolve per-attn-layer k_norm and RoPE handles up front.
+    # Reads from the model in-place; same handles mlx-lm's attention
+    # forward uses.
+    k_norms_per_attn: list[Any] = [
+        model.layers[layer_idx].self_attn.k_norm
+        for layer_idx in attn_layer_indices
+    ]
+    ropes_per_attn: list[Any] = [
+        model.layers[layer_idx].self_attn.rope
+        for layer_idx in attn_layer_indices
+    ]
+    layout = adapter.kv_layout()
+    n_kv_heads = layout.n_kv_heads
+    head_dim = layout.head_dim
+
+    captures, restorations = _install_pre_norm_capture_wrappers(
+        model, attn_layer_indices=attn_layer_indices
+    )
+
+    try:
+        return _run_pre_norm_oracle_inner(
+            adapter=adapter,
+            model=model,
+            prefix_cache=prefix_cache,
+            token_ids=token_ids,
+            seq_len=seq_len,
+            chunk_size=chunk_size,
+            block_size=block_size,
+            attn_layer_indices=attn_layer_indices,
+            k_norms_per_attn=k_norms_per_attn,
+            ropes_per_attn=ropes_per_attn,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            captures=captures,
+        )
+    finally:
+        _restore_pre_norm_capture_wrappers(restorations)
+
+
+def _run_pre_norm_oracle_inner(
+    *,
+    adapter: Any,
+    model: Any,
+    prefix_cache: Any,
+    token_ids: mx.array,
+    seq_len: int,
+    chunk_size: int,
+    block_size: int,
+    attn_layer_indices: list[int],
+    k_norms_per_attn: list[Any],
+    ropes_per_attn: list[Any],
+    n_kv_heads: int,
+    head_dim: int,
+    captures: list[Any],
+) -> tuple[float, int]:
+    total_nll = 0.0
+    total_tokens = 0
+    prev_last_logit: mx.array | None = None
+
+    is_hybrid_recurrent = isinstance(adapter, RecurrentStateAdapter)
+    prev_recurrent_snapshot: RecurrentSnapshot | None = None
+
+    for start in range(0, seq_len, chunk_size):
+        end = min(start + chunk_size, seq_len)
+        chunk_tokens = token_ids[:, start:end]
+        chunk_len = end - start
+
+        if start == 0:
+            cache_list = adapter.make_batch_cache([0])
+        else:
+            prefix_token_list = _mx_1d_to_int_list(token_ids[0, :start])
+            hit = prefix_cache.lookup(prefix_token_list)
+            try:
+                if hit.num_hit_tokens != start:
+                    raise RuntimeError(
+                        f"prefix_cache.lookup returned "
+                        f"{hit.num_hit_tokens} hit tokens; expected "
+                        f"full prefix hit of {start}"
+                    )
+                detached_blocks = list(
+                    prefix_cache.fetch_detached_blocks(hit.block_ids)
+                )
+                # Convert pre-norm K + (still-pre-RoPE) V payloads
+                # into the post-RoPE seeded cache mlx-lm expects.
+                # K: apply k_norm then RoPE per layer at the block's
+                # absolute offset. V: pass through (V never normalises
+                # or rotates in mlx-lm's supported attention forwards).
+                seeded_blocks: list[list[tuple[mx.array, mx.array]]] = []
+                for block_idx, per_attn_layer in enumerate(detached_blocks):
+                    block_post_rope: list[tuple[mx.array, mx.array]] = []
+                    for attn_pos, (k_pre, v) in enumerate(per_attn_layer):
+                        k_post = _apply_k_norm_then_rope_to_block(
+                            k_pre,
+                            k_norm=k_norms_per_attn[attn_pos],
+                            rope_instance=ropes_per_attn[attn_pos],
+                            base_offset=block_idx * block_size,
+                        )
+                        block_post_rope.append((k_post, v))
+                    seeded_blocks.append(block_post_rope)
+
+                seeded_attn = build_seeded_batch_kv(
+                    seeded_blocks, num_layers=len(attn_layer_indices)
+                )
+                cache_list = adapter.make_batch_cache([0])
+                for pos, src_idx in enumerate(attn_layer_indices):
+                    cache_list[src_idx] = seeded_attn[pos]
+            finally:
+                prefix_cache.release(hit.block_ids)
+
+            if is_hybrid_recurrent and prev_recurrent_snapshot is not None:
+                assert isinstance(adapter, RecurrentStateAdapter)
+                adapter.restore_recurrent_state(
+                    cache_list, 0, prev_recurrent_snapshot
+                )
+
+        # Reset capture sink before each chunk forward so any state
+        # from a prior chunk does not leak.
+        for i in range(len(captures)):
+            captures[i] = None
+
+        logits = forward_batched_full(model, chunk_tokens, cache_list)
+
+        if prev_last_logit is not None:
+            target = chunk_tokens[:, 0]
+            total_nll += float(
+                _cross_entropy_sum(prev_last_logit, target).item()
+            )
+            total_tokens += 1
+
+        if chunk_len > 1:
+            within_logits = logits[:, :-1, :]
+            within_targets = chunk_tokens[:, 1:]
+            total_nll += float(
+                _cross_entropy_sum(
+                    within_logits.reshape(-1, within_logits.shape[-1]),
+                    within_targets.reshape(-1),
+                ).item()
+            )
+            total_tokens += chunk_len - 1
+
+        prev_last_logit = mx.contiguous(
+            logits[:, -1, :].astype(mx.float32)
+        )
+        mx.eval(prev_last_logit)
+
+        if is_hybrid_recurrent:
+            assert isinstance(adapter, RecurrentStateAdapter)
+            prev_recurrent_snapshot = adapter.snapshot_recurrent_state(
+                cache_list, row_idx=0
+            )
+
+        # Encode K_pre + V per block. The wrapper captured this chunk's
+        # full K_pre (output of k_proj on the chunk's hidden); split
+        # into block_size slices and pair with the V slices extracted
+        # from the seeded cache (V is unchanged in cache vs v_proj
+        # output, so cache-extract is cheaper than wrapping v_proj
+        # too).
+        aligned_end = (end // block_size) * block_size
+        if aligned_end > 0:
+            # Validate captures populated correctly during forward.
+            for i, capture in enumerate(captures):
+                if capture is None:
+                    raise RuntimeError(
+                        f"_PreNormCaptureProj capture[{i}] is None "
+                        f"after chunk forward (start={start}, end={end}); "
+                        f"wrapper for layer "
+                        f"{attn_layer_indices[i]} did not fire."
+                    )
+            # On hit chunks (start > 0) the wrapper captured only the
+            # new chunk's K_pre — block_idx for new tokens runs from
+            # (start // block_size) to (aligned_end // block_size).
+            # Old blocks (0..start//block_size) are already in the
+            # store from prior reclaims; insert_detached's
+            # duplicate-prefix handling will skip them.
+            chunk_first_new_block = start // block_size
+            new_block_count = (aligned_end - start) // block_size
+            new_blocks_kv: list[list[tuple[mx.array, mx.array]]] = []
+            v_extracted = _extract_aligned_blocks_from_seeded_cache(
+                cache_list, block_size, aligned_end
+            )
+            for new_block_offset in range(new_block_count):
+                block_idx = chunk_first_new_block + new_block_offset
+                # K_pre slice from this chunk's capture: tokens
+                # [new_block_offset * block_size : (new_block_offset+1) * block_size]
+                # within the chunk are absolute-position
+                # [block_idx * block_size : (block_idx+1) * block_size].
+                per_attn_kv: list[tuple[mx.array, mx.array]] = []
+                cap_start = new_block_offset * block_size
+                cap_end = cap_start + block_size
+                for attn_pos, capture in enumerate(captures):
+                    cap_per_head = capture.reshape(
+                        1, chunk_len, n_kv_heads, head_dim
+                    ).transpose(0, 2, 1, 3)
+                    k_pre_block = mx.contiguous(
+                        cap_per_head[:, :, cap_start:cap_end, :]
+                    )
+                    # V from the extracted-cache list at the same
+                    # absolute block index.
+                    _k_post_unused, v_block = v_extracted[block_idx][attn_pos]
+                    per_attn_kv.append((k_pre_block, v_block))
+                new_blocks_kv.append(per_attn_kv)
+
+            # Pad with empty blocks for the prefix-tree positions
+            # before the first new block; insert_detached's
+            # duplicate-prefix handling skips these (the existing
+            # tree nodes are reused), but we still need the outer
+            # list to cover every aligned block in
+            # `prefix_tokens_to_insert` per the contract.
+            full_blocks: list[list[tuple[mx.array, mx.array]]] = []
+            # Old blocks: provide a placeholder that won't be touched
+            # (insert_detached on a duplicate-prefix branch ignores
+            # the corresponding entry). Use the last new block's K/V
+            # shape so the contract `len(per_layer) == num_layers`
+            # holds even on the duplicate path.
+            placeholder = (
+                new_blocks_kv[0] if new_blocks_kv else []
+            )
+            for _ in range(chunk_first_new_block):
+                full_blocks.append(placeholder)
+            full_blocks.extend(new_blocks_kv)
+
+            mx.eval(*[
+                t for blk in new_blocks_kv for kv in blk for t in kv
+            ])
+            prefix_tokens_to_insert = _mx_1d_to_int_list(
+                token_ids[0, :aligned_end]
+            )
+            prefix_cache.insert_detached(
+                prefix_tokens_to_insert, full_blocks
+            )
+
+    return total_nll, total_tokens
+
+
+# =============================================================================
 # P-5-D.2a — vqbench-aligned PPL path (pre-RoPE projection patch).
 # =============================================================================
 

@@ -759,7 +759,220 @@ quality reasons; they may still benefit architecturally
 (injection-space cleanliness, codec-oracle convergence) but the
 quality urgency is on pure-attention.
 
-### 10.2 F.0b — pending
+### 10.2 F.0b — Option A inverse-RoPE round-trip prototype (2026-04-26, 3 seeds)
 
-(F.0b lands the Option A minimum prototype + ΔPPL gate per
-§6.1 (b). Will be filled here when the prototype run completes.)
+**Result: F.0 (b) gate FAILS on both (i) and (ii). Diagnosis surfaces a
+plan-level finding: the inverse-RoPE round-trip alone does not
+reach vqbench's injection space because of the `k_norm` (RMSNorm)
+layer between `k_proj` and RoPE in mlx-lm's attention.**
+
+Method: scenario `qwen3-0.6b-wikitext-ppl-block-tq-b64-b4-pre-rope`
+runs `teacher_forced_chunked_nll_with_codec_pre_rope` —
+inverse-RoPE on K at extract seam, forward-RoPE at decode seam,
+V passes through unchanged. WikiText-2, chunk_size=256,
+max_tokens=512, block_size=16, seeds {42, 43, 44}.
+
+Result table (same fp16 baseline 19.6731 across all rows):
+
+| Path | ΔPPL per seed (42, 43, 44) | mean ± std |
+| --- | --- | --- |
+| post-RoPE (production) | +4.93 / +5.25 / +6.11 | **+5.43 ± 0.61** |
+| F.0b pre-RoPE (this) | +3.06 / +4.41 / +4.89 | **+4.12 ± 0.95** |
+| D.2a vqbench-aligned | +0.88 / +0.17 / +0.48 | **+0.51 ± 0.35** |
+
+F.0 (b) two-part OR gate (§6.1 (b)):
+
+- **Tight gate (i)** — inside D.2a envelope `+0.51 ± 0.35 PPL`?
+  F.0b mean +4.12 PPL — **FAIL** (8× outside envelope).
+- **Structural gate (ii)** — mean ≤ 1.5 PPL representing ≥ 13×
+  reduction from post-RoPE +5.43 PPL? F.0b reduction is 1.3× —
+  **FAIL** (only marginal improvement).
+
+#### Diagnosis — `k_norm` between `k_proj` and RoPE; verified empirically
+
+D1 (fp16 round-trip noise) and D2 (codec calibration drift)
+ruled out by sanity checks:
+
+- **Identity codec via the same F.0b code path**: ΔPPL +0.044 PPL.
+  The inverse-RoPE / forward-RoPE round-trip is fp16-clean; the
+  +4.12 PPL is not from RoPE round-trip noise.
+- **Codec output is space-invariant**: BlockTQ codec applied to
+  the same K tensor in pre-k_norm vs post-k_norm spaces gives
+  Frobenius reconstruction ratios that match within 2% (9.46e-2
+  vs 9.24e-2 on Qwen3-0.6B layer 0, 256 tokens). The codec is
+  not the issue; codec behaviour is independent of which
+  pre-RoPE space the input lives in.
+
+**Recon gap (not a "new failure category")**: mlx-lm's attention
+forward (`qwen3_next.py:138-148`, mirrored in `qwen3.py` and
+`gemma4_text.py`) inserts a `k_norm` (RMSNorm) between
+`k_proj` and `rope`:
+
+```python
+keys = self.k_proj(x)
+keys = self.k_norm(keys.reshape(...).transpose(...))  # RMSNorm
+keys = self.rope(keys, offset=cache.offset)
+cache.update_and_fetch(keys, values)
+```
+
+The §3.1 / §5.1 RoPE-orthogonality argument
+(`R(-θ)·R(θ) = I`) is mathematically correct — but it accounts
+only for the RoPE axis. It does not state where the codec sees K
+in the unrotated space; the implicit assumption was "right after
+`k_proj`", matching vqbench's `_QuantizedProj` injection point.
+Reading 4 more lines of mlx-lm attention forward (the four lines
+above) would have surfaced `k_norm` as the second intermediate
+operation. The recon at task #184 focused on RoPE only and missed
+this. **This is a recon gap to fix in future plans**, not a
+re-categorisation of F.0's failure modes.
+
+Three injection spaces exist on real mlx-lm; F.0b's inverse-RoPE
+lands in the middle one, not vqbench's:
+
+| Space | Codec sees | ΔPPL (Qwen3-0.6B + BlockTQ b64 b4) |
+| --- | --- | --- |
+| post-RoPE (current production) | `RoPE(k_norm(k_proj(x)))` | +5.43 PPL |
+| F.0b post-k_norm pre-RoPE (this) | `k_norm(k_proj(x))` | +4.12 PPL |
+| vqbench / D.2a pre-k_norm | `k_proj(x)` | +0.51 PPL |
+
+**Mechanism — empirically verified, 2026-04-26**: codec
+reconstruction quality is the same in both pre-norm and
+post-norm spaces (Frobenius ratios match within 2%). The PPL gap
+comes from how the noise propagates downstream:
+
+| Path | Noise injection point | Frobenius noise ratio at the post-norm K mlx-lm reads | Effective amplification |
+| --- | --- | --- | --- |
+| D.2a | pre-norm: `codec(k_proj(x))` then `k_norm(...)` | 4.49e-2 | k_norm partially absorbs the noise (RMSNorm's `1/rms` scaling regularises perturbations on `K_pre + ε`) |
+| F.0b | post-norm: `codec(k_norm(k_proj(x)))` directly | 9.24e-2 | No downstream regularisation; full codec error reaches RoPE |
+
+Same codec on the same K, but D.2a's effective noise after the
+full pre-norm → norm pipeline is **~2× smaller** than F.0b's at
+the post-norm K mlx-lm's RoPE actually sees. The 2× absolute
+noise ratio amplifies through the attention softmax to ~8× PPL
+ratio — softmax is non-linear in K, so noise propagation is not
+linear in PPL.
+
+#### Path forward — three options, advisor decision pending
+
+The three options below have updated blast-radius reading after
+advisor pass on the verification data:
+
+1. **Ship F.0b as the "post-k_norm pre-RoPE" variant of A.**
+   Accept the 1.3× improvement over post-RoPE; the +4.12 PPL
+   stays well above D.2a's +0.51. Cheap, no further work, but
+   does NOT close (4-b) production-path gap. Useful only as a
+   third data point alongside post-RoPE and D.2a.
+2. **Extend A with k_norm inverse round-trip.** Originally
+   framed as "store-layer + per-block metadata" cheap
+   extension. Advisor correction: capturing the per-token
+   `rms_x` scalar that k_norm consumes and discards requires a
+   forward-time hook **inside attention**, the same hook surface
+   as Option C. (2) is no longer "cheap" relative to (3) — they
+   differ only in *what gets stored*, not in *where the hook
+   lives*.
+3. **Escalate to Option C (projection wrapper persistence).**
+   Hook `attn.k_proj` directly so the codec sees `k_proj(x)` by
+   construction — matches vqbench's injection point. Plan §3.3
+   originally fallback; (2) and (3) now collapse to roughly the
+   same blast radius, with (3) structurally simpler (replace one
+   linear layer with a wrapper, not "leave linear, add second
+   hook to capture rms, plus encode/decode at separate times").
+
+F.0b code stays as a flag-gated bench scenario regardless of the
+chosen path — the "post-k_norm pre-RoPE" measurement is itself
+a useful data point for codec deployment decisions on smaller
+models or different bit depths where the 1.3× improvement might
+matter. Bench scenario `qwen3-0.6b-wikitext-ppl-block-tq-b64-b4-pre-rope`
+remains in the catalog.
+
+### 10.3 F.0b' — (3b) projection-output capture prototype (2026-04-26, 3 seeds)
+
+**Result: F.0 (b) gate PASSES with significant margin. (3b) is
+the chosen P-5-F architecture; plan §3 / §6 needs re-scope away
+from Option A (inverse-RoPE round-trip) toward Option (3b)
+(projection-output capture wrapper).**
+
+Method: scenario `qwen3-0.6b-wikitext-ppl-block-tq-b64-b4-pre-norm`
+runs `teacher_forced_chunked_nll_with_codec_pre_norm`. Wraps
+each attention layer's `attn.k_proj` with `_PreNormCaptureProj`,
+which **returns `k_proj(x)` unchanged** (in-flight forward sees
+clean K) and side-effects a capture for later encode. At chunk
+end, K_pre is split per block and stored. On hit-path admit:
+decode K_pre → apply layer's `k_norm` → apply RoPE → seed cache.
+V handled identically to F.0b (extracted from cache, encoded
+through V codec). 3 seeds {42, 43, 44}.
+
+Result table (same fp16 baseline 19.6731 across all rows):
+
+| Path | ΔPPL per seed | mean ± std |
+| --- | --- | --- |
+| post-RoPE (production) | +4.93 / +5.25 / +6.11 | +5.43 ± 0.61 |
+| F.0b post-k_norm pre-RoPE | +3.06 / +4.41 / +4.89 | +4.12 ± 0.95 |
+| D.2a vqbench-aligned | +0.88 / +0.17 / +0.48 | +0.51 ± 0.35 |
+| **(3b) pre-k_norm via capture** | **-0.07 / +0.01 / +0.10** | **+0.015 ± 0.085** |
+
+**Sanity check**: IdentityCodec via the same `(3b)` code path gives
+ΔPPL = **0.000000** exactly (clean fp16 reproduction), confirming
+the K_pre → k_norm → RoPE → seed reconstruction matches mlx-lm's
+attention forward bit-exactly. The +0.015 PPL on BlockTQ b64 b4
+is real codec noise on prior chunks' K, not implementation drift.
+
+**Why (3b) outperforms D.2a**: D.2a's `_QuantizedProj` wrapper
+injects codec noise on **every** forward, including the current
+chunk's K. (3b)'s wrapper only captures K_pre — in-flight forward
+runs clean. Codec noise affects only PRIOR chunks' K via the
+seeded cache hit path, mirroring the production prefix-cache
+deployment semantic where current-chunk K is freshly computed
+clean and only prior chunks' K is reconstructed from the store.
+The result is **strictly less noisy than D.2a** and matches what
+the F.1+ production store will do.
+
+#### F.0 (b) gate verdict
+
+- **Tight gate (i)** — inside D.2a envelope `+0.51 ± 0.35 PPL`?
+  (3b) mean +0.015 PPL — **PASS** (well below the lower bound
+  +0.16, but the gate's intent is "≤ D.2a + tolerance"; (3b)
+  exceeds D.2a's quality so the gate condition is satisfied).
+- **Structural gate (ii)** — mean ≤ 1.5 PPL representing ≥ 13×
+  reduction from post-RoPE +5.43 PPL? (3b) reduction is
+  **~360×** — **PASS** (far exceeds the 13× threshold).
+
+Both gates pass. F.0 (b) closes; (3b) is verified empirically
+and is the chosen architecture for P-5-F.
+
+#### Plan re-scope implications
+
+The plan's §3 / §6 / §7 / §8 / §9 sections were written assuming
+Option A (inverse-RoPE round-trip at store seam) was the chosen
+architecture. F.0b's failure + (3b)'s success means several
+plan sections need re-write:
+
+- **§3 Architectural options** — Option A (inverse-RoPE
+  round-trip alone) is a measurement variant for the codec
+  deployment ablation, not the production architecture; (3b)
+  becomes the production architecture and was not enumerated in
+  the original §3.
+- **§4 Per-family RoPE inventory** — needs extension to per-family
+  k_norm inventory (every supported family in mlx-lm uses RMSNorm
+  on K with the same call convention `attn.k_norm(keys.reshape(...))`,
+  so the inventory is uniform; the doc just needs to record this).
+- **§6 Sub-unit decomposition** — F.1 (adapter Protocol method)
+  changes from `apply_rope_inverse_to_k` to a hook that captures
+  K_pre at projection time. F.2's store-flag structure changes
+  from "inverse-RoPE round-trip" to "K_pre persistence + on-hit
+  reconstruction". F.3's default flip changes target. F.4's
+  legacy retention now retains both the post-RoPE arm AND the
+  post-k_norm pre-RoPE arm (two regression backstops, not one).
+- **§8 Acceptance** — F.0 (b) gate is met by (3b); §8 closure
+  criteria stay similar (production path ΔPPL inside D.2a
+  envelope OR ≤ 1.5 PPL) but the implementation that achieves
+  it is (3b), not the original Option A.
+
+The re-scope itself is a separate commit; **this F.0 commit
+lands the prototypes + verification data without changing
+the plan's §3-§9 forward**. F.1+ will incorporate (3b) and
+update the plan in the same commit that lands F.1.
+
+P-5-F's final architecture decision is **(3b)**: projection-output
+capture wrapper + pre-k_norm K storage + on-hit
+`decode → k_norm → RoPE → seed`.

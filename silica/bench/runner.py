@@ -2126,6 +2126,8 @@ def _run_ppl(
         teacher_forced_chunked_nll,
         teacher_forced_chunked_nll_vqbench_aligned,
         teacher_forced_chunked_nll_with_codec,
+        teacher_forced_chunked_nll_with_codec_pre_norm,
+        teacher_forced_chunked_nll_with_codec_pre_rope,
     )
     from silica.bench.wikitext import (
         load_wikitext_text,
@@ -2148,23 +2150,36 @@ def _run_ppl(
             f"must be >= 1; got {chunk_size}"
         )
 
-    # P-5-D.2a: ``codec_quality_path`` selects where the codec is
-    # injected on the compressed arm:
+    # P-5-D.2a / P-5-F: ``codec_quality_path`` selects where the
+    # codec is injected on the compressed arm:
     #
     # * ``"prefix_store_post_rope"`` (default) — C.2 production path.
     #   Noise is injected in the prefix-cache store after RoPE has
     #   been applied. This is the observable of the store path silica
-    #   actually ships, and every pre-D.2a PPL scenario hits this
-    #   branch.
+    #   actually ships pre-P-5-F, and every pre-D.2a PPL scenario
+    #   hits this branch.
     # * ``"vqbench_aligned"`` — D.2a diagnostic path. Monkey-patches
     #   ``attn.k_proj`` / ``attn.v_proj`` so noise is injected before
     #   RoPE, mirroring vqbench's ``_QuantizedProj``. Exists so the
     #   C.6 cross-check compares against vqbench's *own* semantic;
     #   does not replace the production store path's ΔPPL.
+    # * ``"prefix_store_pre_rope"`` — P-5-F F.0b prototype path.
+    #   Same prefix-cache store as ``prefix_store_post_rope`` but
+    #   with an inverse-RoPE round-trip on K at the encode/decode
+    #   seams so the codec sees pre-RoPE K. Algebraically equivalent
+    #   to the ``vqbench_aligned`` injection space (RoPE is
+    #   orthogonal) but with persistent block-grained encoding,
+    #   matching what the production store would do once F.1+ ships.
+    #   See ``docs/P5_F_OPENING.md`` §3.1.
     #
     # fp16 rows ignore this key — they never hit either codec branch.
     codec_quality_path = str(cfg.get("codec_quality_path", "prefix_store_post_rope"))
-    _VALID_CODEC_QUALITY_PATHS = {"prefix_store_post_rope", "vqbench_aligned"}
+    _VALID_CODEC_QUALITY_PATHS = {
+        "prefix_store_post_rope",
+        "prefix_store_pre_rope",
+        "prefix_store_pre_norm",
+        "vqbench_aligned",
+    }
     if codec_quality_path not in _VALID_CODEC_QUALITY_PATHS:
         raise RuntimeError(
             f"scenario {scenario.id!r}: oracle_config["
@@ -2242,6 +2257,50 @@ def _run_ppl(
             codec_factory=spec.factory,
             seed=seed,
             wrap_v=True,
+        )
+    elif codec_quality_path == "prefix_store_pre_rope":
+        # P-5-F F.0b — pre-RoPE store via inverse-RoPE round-trip.
+        # Same prefix-cache store as the post-RoPE path but with
+        # K rotated back to pre-RoPE space at the encode seam and
+        # forward to post-RoPE at the decode seam. F.0b verification
+        # found this lands in "post-k_norm pre-RoPE" space (not
+        # vqbench's pre-k_norm) — kept for the third data point.
+        if prefix_cache is None:
+            raise RuntimeError(
+                f"scenario {scenario.id!r}: compressed kv_codec="
+                f"{scenario.workload.kv_codec!r} on "
+                f"codec_quality_path='prefix_store_pre_rope' "
+                f"requires workload.prefix_cache=True so a "
+                f"RadixPrefixCache is built; got prefix_cache="
+                f"{scenario.workload.prefix_cache!r}."
+            )
+        nll_sum, n_tokens = teacher_forced_chunked_nll_with_codec_pre_rope(
+            adapter,
+            prefix_cache,
+            tokens,
+            chunk_size=chunk_size,
+        )
+    elif codec_quality_path == "prefix_store_pre_norm":
+        # P-5-F F.0b' — pre-k_norm store via projection-output capture.
+        # Wraps attn.k_proj to capture K_pre, persists pre-k_norm K
+        # in the store. On hit, decode → k_norm → RoPE → seed cache.
+        # Codec noise lives in the same pre-k_norm space vqbench's
+        # `_QuantizedProj` injects in. Should reach D.2a's +0.51 PPL
+        # on Qwen3-0.6B + BlockTQ b64 b4.
+        if prefix_cache is None:
+            raise RuntimeError(
+                f"scenario {scenario.id!r}: compressed kv_codec="
+                f"{scenario.workload.kv_codec!r} on "
+                f"codec_quality_path='prefix_store_pre_norm' "
+                f"requires workload.prefix_cache=True so a "
+                f"RadixPrefixCache is built; got prefix_cache="
+                f"{scenario.workload.prefix_cache!r}."
+            )
+        nll_sum, n_tokens = teacher_forced_chunked_nll_with_codec_pre_norm(
+            adapter,
+            prefix_cache,
+            tokens,
+            chunk_size=chunk_size,
         )
     else:
         # C.2 codec-backed store path — build_seeded_batch_kv seeds

@@ -980,6 +980,82 @@ _QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4_VQBENCH_ALIGNED = Scenario(
 )
 
 
+_QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4_PRE_NORM = Scenario(
+    id="qwen3-0.6b-wikitext-ppl-block-tq-b64-b4-pre-norm",
+    repo="Qwen/Qwen3-0.6B",
+    workload=Workload(
+        name="wikitext-ppl-block-tq-b64-b4-pre-norm",
+        prompts=(),
+        max_tokens=0,
+        max_batch_size=1,
+        prefix_cache=True,
+        temperature=0.0,
+        top_p=1.0,
+        kv_codec="block_tq_b64_b4",
+    ),
+    oracle=OracleKind.PPL,
+    oracle_config={
+        **_WIKITEXT_PPL_ORACLE_CONFIG,
+        "codec_quality_path": "prefix_store_pre_norm",
+    },
+    gate_env_var=None,
+    description=(
+        "P-5-F F.0b' prototype row — pre-k_norm store via "
+        "_PreNormCaptureProj wrapper. Wraps attn.k_proj to capture "
+        "K_pre at projection output (the same space vqbench's "
+        "_QuantizedProj injects in), persists pre-k_norm K in the "
+        "prefix store, applies k_norm + RoPE on hit-path admit. "
+        "F.0b verified that codec is space-invariant in "
+        "reconstruction quality; the +0.51 D.2a PPL floor is the "
+        "expected target. Persistent block-grained encoding "
+        "mirrors what the F.1+ production store does, unlike the "
+        "D.2a oracle which re-encodes per chunk. Wrapper does NOT "
+        "modify in-flight forward (returns k_proj(x) unchanged) — "
+        "in-flight K stays clean; codec noise affects only prior "
+        "chunks' K via the seeded-cache hit path. Matches the "
+        "production prefix-cache deployment semantic."
+    ),
+)
+
+
+_QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4_PRE_ROPE = Scenario(
+    id="qwen3-0.6b-wikitext-ppl-block-tq-b64-b4-pre-rope",
+    repo="Qwen/Qwen3-0.6B",
+    workload=Workload(
+        name="wikitext-ppl-block-tq-b64-b4-pre-rope",
+        prompts=(),
+        max_tokens=0,
+        max_batch_size=1,
+        prefix_cache=True,
+        temperature=0.0,
+        top_p=1.0,
+        kv_codec="block_tq_b64_b4",
+    ),
+    oracle=OracleKind.PPL,
+    oracle_config={
+        **_WIKITEXT_PPL_ORACLE_CONFIG,
+        "codec_quality_path": "prefix_store_pre_rope",
+    },
+    gate_env_var=None,
+    description=(
+        "P-5-F F.0b prototype row — same workload shape as the "
+        "post-RoPE production row but ``codec_quality_path="
+        "'prefix_store_pre_rope'`` selects the inverse-RoPE "
+        "round-trip oracle (``teacher_forced_chunked_nll_with_codec_pre_rope``). "
+        "The codec sees pre-RoPE K, mathematically equivalent to "
+        "vqbench's ``_QuantizedProj`` injection space (RoPE is "
+        "orthogonal). Persistent block-grained encoding mirrors "
+        "what the F.1+ production store will do, unlike the D.2a "
+        "row which re-encodes per chunk. F.0 (b) gate: ΔPPL "
+        "should land inside the D.2a oracle envelope "
+        "(+0.51 +/- 0.35 PPL) or at minimum <= 1.5 PPL "
+        "representing >=13x reduction from the post-RoPE row's "
+        "+20 PPL (P5_F_OPENING.md §6.1). 3-seed evaluation, same "
+        "{42, 43, 44} the (4-b) gate uses."
+    ),
+)
+
+
 _QWEN3_0_6B_WIKITEXT_PPL_EXT_RABITQ_B4 = Scenario(
     id="qwen3-0.6b-wikitext-ppl-ext-rabitq-b4",
     repo="Qwen/Qwen3-0.6B",
@@ -1648,6 +1724,12 @@ BUILTIN_SCENARIOS: dict[str, Scenario] = {
     _QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4.id: _QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4,
     _QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4_VQBENCH_ALIGNED.id: (
         _QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4_VQBENCH_ALIGNED
+    ),
+    _QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4_PRE_ROPE.id: (
+        _QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4_PRE_ROPE
+    ),
+    _QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4_PRE_NORM.id: (
+        _QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4_PRE_NORM
     ),
     _QWEN3_0_6B_WIKITEXT_PPL_EXT_RABITQ_B4.id: _QWEN3_0_6B_WIKITEXT_PPL_EXT_RABITQ_B4,
     _QWEN3_5_0_8B_WIKITEXT_PPL_FP16.id: _QWEN3_5_0_8B_WIKITEXT_PPL_FP16,
