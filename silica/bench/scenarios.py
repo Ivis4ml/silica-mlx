@@ -805,6 +805,14 @@ _WIKITEXT_PPL_ORACLE_CONFIG: dict[str, int | str] = {
     # run is a measurement degenerate that the oracle should reject
     # loudly.
     "min_scored_tokens": 256,
+    # P-5-F F.3 default flip: production wikitext PPL rows route
+    # through ``teacher_forced_chunked_nll_with_codec_pre_norm`` —
+    # the (3b) projection-output capture path verified at +0.015
+    # PPL on Qwen3-0.6B + BlockTQ b64 b4 (F.0b', see §10.3 of
+    # docs/P5_F_OPENING.md). Override to ``prefix_store_post_rope``
+    # on legacy comparison rows; ``prefix_store_pre_rope`` /
+    # ``vqbench_aligned`` for diagnostic ablations.
+    "codec_quality_path": "prefix_store_pre_norm",
 }
 
 
@@ -895,7 +903,13 @@ _QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4 = Scenario(
         "downstream computation (bench report / C.6 vqbench "
         "cross-check), not wired into the per-row runner in 3a. "
         "C.6 step 1 wires this row through --vqbench-xcheck so a "
-        "side-by-side vqbench PPL lands in metadata.vqbench_*."
+        "side-by-side vqbench PPL lands in metadata.vqbench_*. "
+        "P-5-F F.3: routes through ``codec_quality_path="
+        "'prefix_store_pre_norm'`` by default (inherited from "
+        "_WIKITEXT_PPL_ORACLE_CONFIG) — the (3b) production path. "
+        "Pre-F.3 this row used the post-RoPE store; that legacy "
+        "behaviour is now pinned by ``-post-rope`` for the §6.9 "
+        "reading-order legacy comparison."
     ),
     # P-5-C.6 step 1 live demo. Runner auto-appends --model /
     # --seed / --chunk / --max-tokens from execution context; the
@@ -1055,6 +1069,41 @@ _QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4_PRE_ROPE = Scenario(
         "representing >=13x reduction from the post-RoPE row's "
         "+20 PPL (P5_F_OPENING.md §6.1). 3-seed evaluation, same "
         "{42, 43, 44} the (4-b) gate uses."
+    ),
+)
+
+
+_QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4_POST_ROPE = Scenario(
+    id="qwen3-0.6b-wikitext-ppl-block-tq-b64-b4-post-rope",
+    repo="Qwen/Qwen3-0.6B",
+    workload=Workload(
+        name="wikitext-ppl-block-tq-b64-b4-post-rope",
+        prompts=(),
+        max_tokens=0,
+        max_batch_size=1,
+        prefix_cache=True,
+        temperature=0.0,
+        top_p=1.0,
+        kv_codec="block_tq_b64_b4",
+    ),
+    oracle=OracleKind.PPL,
+    oracle_config={
+        **_WIKITEXT_PPL_ORACLE_CONFIG,
+        # Override the F.3 default back to the legacy post-RoPE arm.
+        "codec_quality_path": "prefix_store_post_rope",
+    },
+    gate_env_var=None,
+    description=(
+        "P-5-F F.3 legacy comparison row — pins the post-RoPE store "
+        "path that the unsuffixed production row used pre-F.3. K is "
+        "sliced from the live cache after RoPE has already been "
+        "applied; codec noise enters the chunk-boundary RoPE phase "
+        "mismatch. Reading order arm 1 of P5_F_OPENING.md §6.9: the "
+        "cost of NOT shipping P-5-F. ΔPPL on Qwen3-0.6B + BlockTQ "
+        "b64 b4 measured at ~+5.43 (F.0b' verification, §10.3) — "
+        "~360x worse than the (3b) production default. Run alongside "
+        "the unsuffixed production row to bound P-5-F's deployment "
+        "ROI on a given (model, codec) combination."
     ),
 )
 
@@ -1733,6 +1782,9 @@ BUILTIN_SCENARIOS: dict[str, Scenario] = {
     ),
     _QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4_PRE_NORM.id: (
         _QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4_PRE_NORM
+    ),
+    _QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4_POST_ROPE.id: (
+        _QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4_POST_ROPE
     ),
     _QWEN3_0_6B_WIKITEXT_PPL_EXT_RABITQ_B4.id: _QWEN3_0_6B_WIKITEXT_PPL_EXT_RABITQ_B4,
     _QWEN3_5_0_8B_WIKITEXT_PPL_FP16.id: _QWEN3_5_0_8B_WIKITEXT_PPL_FP16,

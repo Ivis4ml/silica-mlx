@@ -1450,6 +1450,58 @@ lands the prototypes + verification data without changing
 the plan's §3-§9 forward**. F.1+ will incorporate (3b) and
 update the plan in the same commit that lands F.1.
 
+### 10.4 F.3 — production default flip (2026-04-26, single seed)
+
+**Result: F.3 default flip lands; (4-b) anchor migrates to the
+unsuffixed production row (3b) — gate continues to pass.**
+
+Implementation (commits `4fd9bf9` F.1 adapter Protocol,
+`f943f94` F.2a store flag + batcher gate, `cc249e7` F.2b
+scheduler integration, plus this F.3 commit):
+
+- `silica/bench/scenarios.py::_WIKITEXT_PPL_ORACLE_CONFIG` adds
+  `"codec_quality_path": "prefix_store_pre_norm"`. Every wikitext
+  PPL scenario inheriting the shared config (the entire production
+  PPL row family — Qwen3-0.6B / 4B, Qwen3.5-0.8B / 4B) now routes
+  through the (3b) projection-output capture oracle by default.
+- New scenario row `qwen3-0.6b-wikitext-ppl-block-tq-b64-b4-post-rope`
+  pins the legacy post-RoPE store path with explicit
+  `codec_quality_path="prefix_store_post_rope"`, providing the
+  §6.9 reading-order arm 1 (the cost of NOT shipping P-5-F).
+- The unsuffixed production row's docstring records the F.3
+  default flip and the post-RoPE row's role.
+
+Empirical verification on Qwen3-0.6B + BlockTQ b64 b4 (single seed,
+the F.0b' three-seed +0.015 envelope already pinned the multi-seed
+behaviour):
+
+| Path | ΔPPL (single seed) | Rel. to F.0b' baseline |
+| --- | --- | --- |
+| `prefix_store_pre_norm` (production default after F.3) | **+0.012** | inside +0.015 ± 0.085 envelope |
+| `prefix_store_post_rope` (new `-post-rope` row) | **+20.83** | matches pre-F.3 production cost |
+
+The (4-b) acceptance gate continues to pass: the production
+unsuffixed row now lands inside D.2a's `+0.51 ± 0.35 PPL`
+envelope (the F.0b' result was even better than D.2a). PLAN.md
+§7 P-5 Notes updates the production-`prefix_store_post_rope`
+quality-cost bullet from "post-P-5 required follow-up" to
+"closed at P-5-F F.3 via the (3b) projection-output capture
+path".
+
+#### F.3 deliverables
+
+- [x] `_WIKITEXT_PPL_ORACLE_CONFIG` default flips to
+  `prefix_store_pre_norm`.
+- [x] `-post-rope` legacy comparison row added for §6.9 reading
+  order.
+- [x] PLAN.md §7 P-5 Notes updated.
+- [x] Memory `project_kv_codec_ppl_findings.md` updated.
+- [x] `docs/P5_F_OPENING.md` §10.4 records the close.
+
+F.4 (legacy retention + doc sync) is the remaining P-5-F
+sub-unit: README roadmap row, store module docstring,
+`docs/P5_OPENING.md` §7 sync.
+
 P-5-F's final architecture decision is **(3b)**: projection-output
 capture wrapper + pre-k_norm K storage + on-hit
 `decode → k_norm → RoPE → seed`.
