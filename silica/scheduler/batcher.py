@@ -42,7 +42,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import mlx.core as mx
 from mlx_lm.models.cache import BatchKVCache
@@ -192,6 +192,19 @@ class _BatchRow:
         default_factory=dict
     )
     absolute_consumed_tokens: int = 0
+    # P-5-F F.2b: per-row pre-norm K capture for the (3b) prefix-cache.
+    # Populated only when ``prefix_cache.store.pre_norm`` is True. Outer
+    # key is absolute block index (block 0 covers tokens
+    # ``[0, block_size)``); inner list is indexed by attention-layer
+    # position (the same ``attn_layer_indices`` order
+    # ``_extract_and_insert_prefix`` uses), each entry shape
+    # ``(1, n_kv_heads, block_size, head_dim)`` carrying ``k_proj(x)``
+    # output (pre-k_norm K). At ``_extract_and_insert_prefix`` time the
+    # K side of every block-aligned payload comes from this dict
+    # instead of slicing the live cache; V continues to come from the
+    # live cache as before. Empty for legacy ``pre_norm=False`` rows
+    # so the memory cost is bounded to active (3b) deployments.
+    k_pre_per_block: dict[int, list[mx.array]] = field(default_factory=dict)
 
 
 class ContinuousBatcher:
@@ -610,6 +623,97 @@ class ContinuousBatcher:
             )
         return indices
 
+    def _pre_norm_capture_active(self) -> bool:
+        """Whether the (3b) pre-norm K capture path is engaged.
+
+        True iff the active ``RadixPrefixCache`` was constructed with a
+        ``pre_norm=True`` store (P-5-F F.2a contract). Pure post-RoPE
+        deployments and ``prefix_cache=None`` paths return False; the
+        F.2a constructor gate has already validated the adapter
+        implements ``PreNormCaptureAdapter`` when this is True.
+        """
+        if self._prefix_cache is None:
+            return False
+        return bool(getattr(self._prefix_cache.store, "pre_norm", False))
+
+    def _capture_adapter(self) -> PreNormCaptureAdapter:
+        """Typed accessor for the F.2b protocol surface.
+
+        The F.2a constructor gate guarantees the adapter implements
+        ``PreNormCaptureAdapter`` whenever ``_pre_norm_capture_active``
+        is True; this helper narrows the static type so the call sites
+        do not each repeat the ``isinstance`` assertion.
+        """
+        return cast(PreNormCaptureAdapter, self._adapter)
+
+    def _split_capture_into_row_kpre(
+        self,
+        buffer: dict[int, mx.array],
+        rows: list[_BatchRow],
+        *,
+        pad_per_row: list[int],
+        pre_consumed_per_row: list[int],
+        real_in_chunk_per_row: list[int],
+        block_size: int,
+    ) -> None:
+        """Slice block-aligned K_pre per row out of a chunk's capture
+        buffer and append to each row's ``k_pre_per_block`` dict.
+
+        Buffer shape per ``attn_pos``: ``(B, chunk_len, n_kv_heads * head_dim)``.
+        For row ``i``, real tokens in this chunk live at axis-1
+        ``[pad_per_row[i], pad_per_row[i] + real_in_chunk_per_row[i])``
+        and cover absolute positions
+        ``[pre_consumed_per_row[i], pre_consumed_per_row[i] + real_in_chunk_per_row[i])``.
+
+        Each block ``b`` whose absolute range
+        ``[b*block_size, (b+1)*block_size)`` is fully contained in the
+        row's real-token range gets its K_pre slice written to
+        ``row.k_pre_per_block[b]``. Slices are reshaped + transposed to
+        the standard per-head ``(1, n_kv_heads, block_size, head_dim)``
+        layout the codec / seeded-cache pipelines consume, then forced
+        to materialised storage so the next chunk forward overwriting
+        the buffer cannot reach back into them.
+
+        The ``b_idx`` keying matches the absolute-block contract used by
+        ``recurrent_snapshots_per_block`` and the radix tree's
+        ancestor-chain walk in ``_admit_single_hit_row``.
+        """
+        layout = self._adapter.kv_layout()
+        n_kv_heads = layout.n_kv_heads
+        head_dim = layout.head_dim
+        n_attn = len(buffer)
+        for row_idx, row in enumerate(rows):
+            pad_i = pad_per_row[row_idx]
+            pre = pre_consumed_per_row[row_idx]
+            real_in = real_in_chunk_per_row[row_idx]
+            if real_in <= 0:
+                continue
+            # Range of complete blocks in [pre, pre + real_in).
+            first_b = (pre + block_size - 1) // block_size  # ceil
+            last_b_excl = (pre + real_in) // block_size  # floor
+            for b_idx in range(first_b, last_b_excl):
+                # Map absolute block bounds back to chunk axis-1 positions
+                # for this row: real tokens for row i in this chunk start
+                # at axis-1 pad_i and absolute pre. So absolute pos x maps
+                # to axis-1 (x - pre) + pad_i.
+                chunk_start = pad_i + (b_idx * block_size - pre)
+                chunk_end = chunk_start + block_size
+                per_attn: list[mx.array] = []
+                for attn_pos in range(n_attn):
+                    cap = buffer[attn_pos]
+                    slc = cap[
+                        row_idx : row_idx + 1, chunk_start:chunk_end, :
+                    ]
+                    k_pre = slc.reshape(
+                        1, block_size, n_kv_heads, head_dim
+                    ).transpose(0, 2, 1, 3)
+                    k_pre = mx.contiguous(k_pre)
+                    per_attn.append(k_pre)
+                # Force materialisation — next chunk's forward will
+                # rebind buffer entries.
+                mx.eval(*per_attn)
+                row.k_pre_per_block[b_idx] = per_attn
+
     def _extract_and_insert_prefix(self, row_idx: int) -> None:
         """Slice a terminating row's block-aligned prefix K/V out of the
         current batched cache and register it with ``self._prefix_cache``
@@ -684,30 +788,89 @@ class ContinuousBatcher:
         # source transformer layer index. Hybrid callers (het.2 admit
         # path) recover the mapping by re-deriving attn_layer_indices
         # from the empty heterogeneous cache they assemble.
+        #
+        # P-5-F F.2b: when the prefix-cache store carries the pre-norm
+        # contract (``store.pre_norm=True``), the K side comes from
+        # ``row.k_pre_per_block`` (captured at every prefill chunk
+        # forward by the proxy installed in
+        # ``PreNormCaptureAdapter.install_pre_norm_capture``). V
+        # continues to come from the live cache as before — V is
+        # unchanged across families (no normalisation, no RoPE), so
+        # the live cache's V slice is directly reusable. Legacy
+        # ``pre_norm=False`` deployments stay on the live-cache K
+        # slice, bit-identical to today.
+        use_captured_k = self._pre_norm_capture_active()
+        # Hit-admit rows enter ``_extract_and_insert_prefix`` with the
+        # first ``K = absolute_consumed_tokens // block_size`` blocks
+        # already in the prefix tree from the prior request that
+        # registered them. Those blocks have no entry in
+        # ``row.k_pre_per_block`` (this row never forwarded their
+        # tokens through ``k_proj``); ``insert_detached``'s
+        # duplicate-prefix branch will skip them. We still need a
+        # type-correct K placeholder so the per-layer list shape is
+        # uniform; ``mx.zeros`` of the captured shape stands in. The
+        # placeholder is GC-eligible after ``insert_detached`` returns.
+        layout = self._adapter.kv_layout()
+        kpre_placeholder: mx.array | None = None
+        if use_captured_k:
+            kpre_placeholder = mx.zeros(
+                (1, layout.n_kv_heads, block_size, layout.head_dim),
+                dtype=layout.dtype,
+            )
         detached_blocks: list[list[tuple[mx.array, mx.array]]] = []
         for b_idx in range(n_aligned_blocks):
             start = b_idx * block_size
             end = start + block_size
             per_layer: list[tuple[mx.array, mx.array]] = []
-            for layer_idx in attn_layer_indices:
+            captured_kpre: list[mx.array] | None = None
+            if use_captured_k:
+                captured_kpre = row.k_pre_per_block.get(b_idx)
+                if (
+                    captured_kpre is not None
+                    and len(captured_kpre) != len(attn_layer_indices)
+                ):
+                    raise AssertionError(
+                        f"row {row_idx} block {b_idx}: captured "
+                        f"K_pre has {len(captured_kpre)} layers but "
+                        f"{len(attn_layer_indices)} attention layers "
+                        "expected — proxy install drift"
+                    )
+            for pos, layer_idx in enumerate(attn_layer_indices):
                 layer_cache = self._batch_cache[layer_idx]
-                keys = layer_cache.keys
                 values = layer_cache.values
-                if keys is None or values is None:
+                if values is None:
                     raise AssertionError(
                         f"row {row_idx} layer {layer_idx}: "
-                        "cache tensors are not initialised"
+                        "cache values tensor is not initialised"
                     )
-                k = mx.contiguous(
-                    keys[
-                        row_idx : row_idx + 1, :, base + start : base + end, :
-                    ]
-                )
                 v = mx.contiguous(
                     values[
                         row_idx : row_idx + 1, :, base + start : base + end, :
                     ]
                 )
+                if use_captured_k:
+                    if captured_kpre is not None:
+                        k = captured_kpre[pos]
+                    else:
+                        # Hit-admit duplicate block — insert_detached
+                        # skips it; placeholder content is irrelevant.
+                        assert kpre_placeholder is not None
+                        k = kpre_placeholder
+                else:
+                    keys = layer_cache.keys
+                    if keys is None:
+                        raise AssertionError(
+                            f"row {row_idx} layer {layer_idx}: "
+                            "cache keys tensor is not initialised"
+                        )
+                    k = mx.contiguous(
+                        keys[
+                            row_idx : row_idx + 1,
+                            :,
+                            base + start : base + end,
+                            :,
+                        ]
+                    )
                 per_layer.append((k, v))
             detached_blocks.append(per_layer)
 
@@ -1047,6 +1210,16 @@ class ContinuousBatcher:
         block_size = self._effective_slice_block_size()
         n = len(tokens)
 
+        # P-5-F F.2b: per-chunk K_pre capture. Allocated once outside
+        # the loop and reused via ``buffer.clear()`` between chunks —
+        # ``adapter.install_pre_norm_capture(buffer)`` arms before each
+        # forward, ``install_pre_norm_capture(None)`` disarms after.
+        # The disarm in the finally guards against the buffer leaking
+        # past this scope into a subsequent decode forward.
+        capture_buffer: dict[int, mx.array] | None = (
+            {} if self._pre_norm_capture_active() else None
+        )
+
         last_logits: mx.array | None = None
         start = 0
         while start < n:
@@ -1054,8 +1227,16 @@ class ContinuousBatcher:
             chunk_arr = mx.array(
                 [list(tokens[start:end])], dtype=mx.int32
             )
-            last_logits = forward_batched(self._model, chunk_arr, cache)
+            pre_consumed = row.absolute_consumed_tokens
             consumed = end - start
+            if capture_buffer is not None:
+                capture_buffer.clear()
+                self._capture_adapter().install_pre_norm_capture(capture_buffer)
+            try:
+                last_logits = forward_batched(self._model, chunk_arr, cache)
+            finally:
+                if capture_buffer is not None:
+                    self._capture_adapter().install_pre_norm_capture(None)
             row.absolute_consumed_tokens += consumed
             if consumed == block_size:
                 snap = self._adapter.snapshot_recurrent_state(
@@ -1065,6 +1246,16 @@ class ContinuousBatcher:
                     row.absolute_consumed_tokens // block_size - 1
                 )
                 row.recurrent_snapshots_per_block[block_idx] = snap
+            if capture_buffer is not None:
+                # B=1, no left-padding (tight chunk_arr); pad_per_row=[0].
+                self._split_capture_into_row_kpre(
+                    capture_buffer,
+                    [row],
+                    pad_per_row=[0],
+                    pre_consumed_per_row=[pre_consumed],
+                    real_in_chunk_per_row=[consumed],
+                    block_size=block_size,
+                )
             start = end
 
         assert last_logits is not None
@@ -1124,13 +1315,34 @@ class ContinuousBatcher:
         prompt_lens = [len(row.prompt_ids) for row in rows]
         pad_per_row = [max_len - n for n in prompt_lens]
 
+        # P-5-F F.2b: per-chunk K_pre capture, same lifecycle as the
+        # B=1 helper. The capture buffer holds entries shaped
+        # ``(B, end - start, n_kv_heads * head_dim)`` per attn pos —
+        # ``_split_capture_into_row_kpre`` slices each row's
+        # block-aligned region back out using the same left-padding
+        # math the snapshot-capture predicate already uses.
+        capture_buffer: dict[int, mx.array] | None = (
+            {} if self._pre_norm_capture_active() else None
+        )
+
         last_logits: mx.array | None = None
         start = 0
         while start < max_len:
             end = min(start + block_size, max_len)
             chunk = tokens_2d[:, start:end]
-            last_logits = forward_batched(self._model, chunk, cache)
+            pre_consumed_per_row = [
+                row.absolute_consumed_tokens for row in rows
+            ]
+            if capture_buffer is not None:
+                capture_buffer.clear()
+                self._capture_adapter().install_pre_norm_capture(capture_buffer)
+            try:
+                last_logits = forward_batched(self._model, chunk, cache)
+            finally:
+                if capture_buffer is not None:
+                    self._capture_adapter().install_pre_norm_capture(None)
 
+            real_in_chunk_per_row: list[int] = []
             for row_idx, row in enumerate(rows):
                 pad_i = pad_per_row[row_idx]
                 # Real tokens in chunk = overlap between chunk axis
@@ -1139,6 +1351,7 @@ class ContinuousBatcher:
                 real_start = max(start, pad_i)
                 real_end = min(end, max_len)
                 real_in_chunk = max(0, real_end - real_start)
+                real_in_chunk_per_row.append(real_in_chunk)
                 row.absolute_consumed_tokens += real_in_chunk
                 if (
                     row.absolute_consumed_tokens > 0
@@ -1151,6 +1364,22 @@ class ContinuousBatcher:
                         row.absolute_consumed_tokens // block_size - 1
                     )
                     row.recurrent_snapshots_per_block[block_idx] = snap
+
+            if capture_buffer is not None:
+                # In the chunk's local axis-1, real tokens for row i
+                # start at ``max(0, pad_i - start)``. Slice helper
+                # accepts that as ``pad_per_row``.
+                local_pad_per_row = [
+                    max(0, pad_per_row[i] - start) for i in range(b)
+                ]
+                self._split_capture_into_row_kpre(
+                    capture_buffer,
+                    rows,
+                    pad_per_row=local_pad_per_row,
+                    pre_consumed_per_row=pre_consumed_per_row,
+                    real_in_chunk_per_row=real_in_chunk_per_row,
+                    block_size=block_size,
+                )
             start = end
 
         assert last_logits is not None
@@ -1187,9 +1416,39 @@ class ContinuousBatcher:
                 )
         else:
             tokens = self._build_prefill_tokens()  # (B, T_max)
-            logits = forward_batched(
-                self._model, tokens, list(self._batch_cache)
-            )  # (B, V)
+            # P-5-F F.2b: contiguous prefill capture. Single forward
+            # over the entire left-padded cohort; the buffer holds the
+            # full prompt's K_pre per attention layer. After the
+            # forward completes, ``_split_capture_into_row_kpre``
+            # slices each row's block-aligned region using the same
+            # left-padding math the live cache uses (axis-2 tokens
+            # ``[pad_i, pad_i + L_i)`` carry row i's real K_pre).
+            capture_buffer: dict[int, mx.array] | None = (
+                {} if self._pre_norm_capture_active() else None
+            )
+            if capture_buffer is not None:
+                self._capture_adapter().install_pre_norm_capture(capture_buffer)
+            try:
+                logits = forward_batched(
+                    self._model, tokens, list(self._batch_cache)
+                )  # (B, V)
+            finally:
+                if capture_buffer is not None:
+                    self._capture_adapter().install_pre_norm_capture(None)
+            if capture_buffer is not None:
+                # ``_pre_norm_capture_active`` implies prefix_cache.
+                assert self._prefix_cache is not None
+                prompt_lens = [len(r.prompt_ids) for r in self._rows]
+                max_len = max(prompt_lens)
+                pad_per_row = [max_len - n for n in prompt_lens]
+                self._split_capture_into_row_kpre(
+                    capture_buffer,
+                    list(self._rows),
+                    pad_per_row=pad_per_row,
+                    pre_consumed_per_row=[0] * len(self._rows),
+                    real_in_chunk_per_row=prompt_lens,
+                    block_size=self._prefix_cache.block_size,
+                )
         # 16c.2 step 4: initial-cohort forward_prompt_tokens accounting.
         # Counts effective prompt tokens (not padded B*T_max) so the S-5
         # acceptance assertion reads in user-visible units.
@@ -1604,6 +1863,34 @@ class ContinuousBatcher:
                 list(hit.block_ids)
             )
 
+            # P-5-F F.2b: when the store carries pre-norm K
+            # (``store.pre_norm=True``, F.2a contract), the K side of
+            # every fetched ``(K, V)`` is pre-k_norm — the proxy-
+            # captured ``k_proj(x)``. Reconstruct post-RoPE K via the
+            # adapter Protocol method ``apply_k_norm_then_rope`` per
+            # block at offset ``b_idx * block_size`` before passing
+            # into ``build_seeded_batch_kv``. ``b_idx`` here is dense
+            # over the hit's aligned blocks (block 0 is the radix
+            # tree's first hit block); RoPE offset arithmetic in the
+            # capture path used the same dense indexing, so the
+            # phase-rotation contract holds across the seam.
+            if self._pre_norm_capture_active():
+                hit_block_size = self._prefix_cache.block_size
+                detached = [
+                    [
+                        (
+                            self._capture_adapter().apply_k_norm_then_rope(
+                                attn_pos,
+                                k_pre,
+                                offset=b_idx * hit_block_size,
+                            ),
+                            v,
+                        )
+                        for attn_pos, (k_pre, v) in enumerate(per_layer)
+                    ]
+                    for b_idx, per_layer in enumerate(detached)
+                ]
+
             # P-3-C5.3.3-het.2: row_cache assembly for hybrid adapters.
             # ``detached_blocks[b]`` is indexed by **attention-layer
             # position** (the het.1 extract path stores only token-K/V
@@ -1694,14 +1981,45 @@ class ContinuousBatcher:
             # S-5 edge 1 guarantees suffix_tokens is non-empty — the
             # max_aligned formula above reserves at least one token.
             if self._slice_prefill_active():
+                # Slice helper (B=1) installs and reads the K_pre
+                # capture buffer per chunk inside the loop; nothing
+                # more to do here. The helper's pre_consumed / split
+                # math accounts for the row's seeded
+                # ``absolute_consumed_tokens = K * block_size``.
                 logits = self._slice_prefill_with_capture(
                     row, list(row_cache), suffix_tokens
                 )
             else:
+                # P-5-F F.2b non-slice suffix capture. The seeded
+                # ``row.absolute_consumed_tokens`` is 0 here (this
+                # branch is reached on non-recurrent adapters where
+                # the seed step did not initialise the counter); use
+                # ``usable_hit_tokens`` directly as the pre-consumed
+                # baseline so block-index math lines up with the hit
+                # block range (blocks ``[K, K + suffix_blocks)``).
                 suffix_arr = mx.array([suffix_tokens], dtype=mx.int32)
-                logits = forward_batched(
-                    self._model, suffix_arr, list(row_cache)
-                )  # (1, V)
+                hit_capture: dict[int, mx.array] | None = (
+                    {} if self._pre_norm_capture_active() else None
+                )
+                if hit_capture is not None:
+                    self._capture_adapter().install_pre_norm_capture(hit_capture)
+                try:
+                    logits = forward_batched(
+                        self._model, suffix_arr, list(row_cache)
+                    )  # (1, V)
+                finally:
+                    if hit_capture is not None:
+                        self._capture_adapter().install_pre_norm_capture(None)
+                if hit_capture is not None:
+                    suffix_block_size = self._prefix_cache.block_size
+                    self._split_capture_into_row_kpre(
+                        hit_capture,
+                        [row],
+                        pad_per_row=[0],
+                        pre_consumed_per_row=[usable_hit_tokens],
+                        real_in_chunk_per_row=[len(suffix_tokens)],
+                        block_size=suffix_block_size,
+                    )
             events = self._sample_and_emit_rows(
                 [row], logits, is_prefill=True
             )
@@ -1798,9 +2116,35 @@ class ContinuousBatcher:
                 n_pad = k_max_len - len(r.prompt_ids)
                 rows_2d.append([pad] * n_pad + list(r.prompt_ids))
             tokens = mx.array(rows_2d, dtype=mx.int32)
-            logits = forward_batched(
-                self._model, tokens, list(k_batch_cache)
+            # P-5-F F.2b: same contiguous-prefill capture as
+            # ``_prefill_phase`` non-slice branch. The mid-run cohort
+            # uses a fresh ``k_batch_cache`` rather than the main
+            # ``self._batch_cache``, but K_pre capture is independent
+            # of the cache (it hooks ``attn.k_proj`` projection
+            # output), so the same arm/disarm/split lifecycle applies.
+            mc_capture: dict[int, mx.array] | None = (
+                {} if self._pre_norm_capture_active() else None
             )
+            if mc_capture is not None:
+                self._capture_adapter().install_pre_norm_capture(mc_capture)
+            try:
+                logits = forward_batched(
+                    self._model, tokens, list(k_batch_cache)
+                )
+            finally:
+                if mc_capture is not None:
+                    self._capture_adapter().install_pre_norm_capture(None)
+            if mc_capture is not None:
+                assert self._prefix_cache is not None
+                pad_per_row = [k_max_len - n for n in k_prompt_lens]
+                self._split_capture_into_row_kpre(
+                    mc_capture,
+                    admitted,
+                    pad_per_row=pad_per_row,
+                    pre_consumed_per_row=[0] * len(admitted),
+                    real_in_chunk_per_row=k_prompt_lens,
+                    block_size=self._prefix_cache.block_size,
+                )
         events = self._sample_and_emit_rows(
             admitted, logits, is_prefill=True
         )
