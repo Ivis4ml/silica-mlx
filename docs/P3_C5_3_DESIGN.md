@@ -436,6 +436,25 @@ A miss cohort with B=4 rows of different lengths is sliced into chunks where the
 
 **Scope status**: post-C5.3 backlog (working name C5.5), NOT a C5.3.4 prerequisite. C5.3.1 lands B=1 slicing only; bigger cohorts run contiguous prefill and skip snapshot capture. C5.3.4's smoke test sequences admissions B=1-at-a-time so this gap does not block the smoke. The functional consequence in production is that simultaneous-arrival cohorts pay full prefill the first time and only enjoy prefix hits after one row preempts and re-extracts; correctness is preserved. C5.5's sequencing relative to P-7 is TBD.
 
+#### 5.2.1 C5.5 α MVP — addendum (post-implementation)
+
+C5.5 lands the α MVP: a batched slice helper `_slice_prefill_with_capture_batched` lifts the `len(rows) == 1` clamp at `_prefill_phase` / `_admit_miss_cohort`. The implementation keeps the existing **left-padding** convention (matching today's `_build_prefill_tokens` and the `BatchKVCache.left_padding` cache invariant) and runs lockstep chunked forwards over the `(B, max_L)` tensor. Per-row absolute math:
+
+> `absolute_after_chunk_c = max(0, min((c+1) * block_size, max_L) - pad_i)` (capped at `L_i`)
+
+The capture predicate `absolute % block_size == 0 and absolute > 0` evaluates at each chunk's end. Reliable per-chunk alignment requires `pad_i ≡ 0 (mod block_size)` — every chunk-end then lands on a multiple of `block_size`. A row whose `pad_i` is not a multiple may still receive a single capture at the final chunk if `L_i ≡ 0 (mod block_size)`, but otherwise gets zero prefill captures.
+
+**α MVP scope**:
+
+- Same-length cohorts (the common PPL / benchmark shape) get full coverage — every row pad-aligned by construction.
+- Mixed-length cohorts get partial coverage: pad-aligned rows captured fully, others at most once or not at all during prefill.
+- Misaligned rows' decode-era captures continue to fire normally — `_decode_phase`'s capture loop populates the dict at any block boundary the row's per-step `+= 1` counter crosses past `L_i`. The pre-α MVP "B>1 contiguous → counter = 0 → decode capture skipped" pathway no longer exists; B>1 slice-regime rows always have non-zero counter after prefill.
+- **Functional consequence on prefix-cache hit rate**: misaligned rows in mixed cohorts do not seed block-aligned snapshots for their own prompt prefixes. Their K/V is still inserted into the radix tree (the extract path slices block-aligned K/V from the cache), but with `recurrent_snapshot=None` for those blocks. Phase-B routes future hits at those depths to miss; same overall outcome as the pre-C5.5 "B>1 contiguous → no captures" path, just localised to the misaligned subset rather than the whole cohort.
+
+**Out of scope for C5.5 α MVP — full coverage (γ scope)**:
+
+Right-padding the cohort + per-slice `tokens_2d` rebuild + active-subset carve-out (the design's original §5.2 vision) gives every row full coverage at the cost of a meaningful cache-invariant adjustment (`BatchKVCache.left_padding` and `make_mask` semantics under right-padding). Deferred until measurement evidence shows partial coverage is a real bottleneck on production workloads. The α MVP unblocks step-2 PPL (post-C5.4 plan) on equal-length batches and remains correct under all cohort shapes; γ becomes a separate sub-unit if and when needed.
+
 ### 5.3 R-C5.3-3 — opt-in flag rot
 
 The `_allow_recurrent_prefix_cache_for_c5_3_testing` flag is a test-only escape hatch. C5.4 must remove both the flag and the underlying guard simultaneously; if C5.4 is delayed, the flag becomes a footgun for production code that finds and uses it.

@@ -1040,22 +1040,121 @@ class ContinuousBatcher:
         assert last_logits is not None
         return last_logits
 
+    def _slice_prefill_with_capture_batched(
+        self,
+        rows: list[_BatchRow],
+        cache: list[Any],
+        tokens_2d: mx.array,
+    ) -> mx.array:
+        """B>=1 slice-prefill helper for left-padded cohorts (P-3-C5.5).
+
+        Companion to ``_slice_prefill_with_capture`` — same chunked
+        forward + per-row snapshot capture, generalised to a batched
+        cohort. Splits the existing B=1 path off from a dual-signature
+        approach to avoid putting the C5.3.3b byte-exact gate at risk
+        on every C5.5 edit (advisor sharpening 2).
+
+        ``tokens_2d`` is the left-padded ``(B, max_L)`` prompt tensor
+        — exactly the shape ``_build_prefill_tokens`` /
+        ``_admit_miss_cohort`` produce. Each row ``i`` has
+        ``pad_i = max_L - len(rows[i].prompt_ids)`` left-pad tokens at
+        axis-2 ``[0, pad_i)`` and real prompt at ``[pad_i, max_L)``.
+
+        Per-row absolute math under left-padding:
+
+          absolute_after_chunk_c =
+            max(0, min((c+1)*B, max_L) - pad_i)
+
+        capped at ``L_i``. The capture predicate is
+        ``absolute % block_size == 0 and absolute > 0`` evaluated at
+        each chunk's end. **α MVP scope (design §5.2 addendum)**: this
+        predicate fires reliably for every chunk only when
+        ``pad_i ≡ 0 (mod block_size)`` — i.e., the longest row(s) in
+        the cohort. Rows with non-aligned padding may get one capture
+        at the final chunk if their ``L_i`` is a multiple of
+        ``block_size``, otherwise zero captures during prefill. The
+        decode-era capture path in ``_decode_phase`` picks up
+        subsequent block boundaries past ``L_i``; the prefill-side
+        partial-coverage limitation is documented at design §5.2.
+
+        ``forward_batched`` returns ``(B, V)`` last-position logits
+        per chunk; only the final chunk's logits feed the sampler.
+
+        Caller invariant: ``self._slice_prefill_active()`` is True and
+        every row's ``prompt_ids`` is non-empty. Returns the final
+        chunk's ``(B, V)`` logits.
+        """
+        assert isinstance(self._adapter, RecurrentStateAdapter)
+        block_size = self._effective_slice_block_size()
+        b, max_len = tokens_2d.shape
+        assert b == len(rows), (
+            f"tokens_2d B={b} != rows={len(rows)}"
+        )
+
+        prompt_lens = [len(row.prompt_ids) for row in rows]
+        pad_per_row = [max_len - n for n in prompt_lens]
+
+        last_logits: mx.array | None = None
+        start = 0
+        while start < max_len:
+            end = min(start + block_size, max_len)
+            chunk = tokens_2d[:, start:end]
+            last_logits = forward_batched(self._model, chunk, cache)
+
+            for row_idx, row in enumerate(rows):
+                pad_i = pad_per_row[row_idx]
+                # Real tokens in chunk = overlap between chunk axis
+                # range [start, end) and row's real range
+                # [pad_i, max_len). Negative overlaps clamp to 0.
+                real_start = max(start, pad_i)
+                real_end = min(end, max_len)
+                real_in_chunk = max(0, real_end - real_start)
+                row.absolute_consumed_tokens += real_in_chunk
+                if (
+                    row.absolute_consumed_tokens > 0
+                    and row.absolute_consumed_tokens % block_size == 0
+                ):
+                    snap = self._adapter.snapshot_recurrent_state(
+                        cache, row_idx=row_idx
+                    )
+                    block_idx = (
+                        row.absolute_consumed_tokens // block_size - 1
+                    )
+                    row.recurrent_snapshots_per_block[block_idx] = snap
+            start = end
+
+        assert last_logits is not None
+        return last_logits
+
     def _prefill_phase(self) -> list[BatchEvent]:
         """One batched forward over the left-padded prompt tensor.
 
-        Routes through ``_slice_prefill_with_capture`` when the C5.3
-        slice-prefill regime is active and the cohort is B=1; falls
-        back to today's single-batched-forward otherwise. B>1 cohorts
-        in slice-regime stay on contiguous prefill — the per-slice
-        left-padding rebuild is post-C5.3 backlog (design §5.2).
+        Routes through the slice-prefill helpers when the C5.3
+        slice-prefill regime is active:
+
+        - B=1: ``_slice_prefill_with_capture`` (the original B=1
+          helper, byte-exact-gated by C5.3.3b).
+        - B>1: ``_slice_prefill_with_capture_batched`` (P-3-C5.5
+          α MVP — full capture for ``pad_i ≡ 0 (mod block_size)``
+          rows, partial elsewhere; design §5.2 addendum).
+
+        Non-slice-regime falls back to today's single-batched-forward.
         """
         assert self._batch_cache is not None
-        if self._slice_prefill_active() and len(self._rows) == 1:
-            logits = self._slice_prefill_with_capture(
-                self._rows[0],
-                list(self._batch_cache),
-                self._rows[0].prompt_ids,
-            )
+        if self._slice_prefill_active():
+            if len(self._rows) == 1:
+                logits = self._slice_prefill_with_capture(
+                    self._rows[0],
+                    list(self._batch_cache),
+                    self._rows[0].prompt_ids,
+                )
+            else:
+                tokens = self._build_prefill_tokens()  # (B, T_max)
+                logits = self._slice_prefill_with_capture_batched(
+                    list(self._rows),
+                    list(self._batch_cache),
+                    tokens,
+                )
         else:
             tokens = self._build_prefill_tokens()  # (B, T_max)
             logits = forward_batched(
@@ -1640,21 +1739,31 @@ class ContinuousBatcher:
         # ``BatchKVCache`` interleaving.
         k_batch_cache = _make_batch_cache(self._adapter, k_left_padding)
 
-        # P-3-C5.3.1: route through slice-prefill when the regime is
-        # active and the miss cohort is B=1 (single admitted row).
-        # B>1 cohorts stay on contiguous prefill (per-slice padding
-        # rebuild is post-C5.3 backlog, design §5.2). B=1 path skips
-        # the padded-tensor build entirely since chunk_arr is already
-        # tight.
-        if self._slice_prefill_active() and len(admitted) == 1:
-            logits = self._slice_prefill_with_capture(
-                admitted[0],
-                list(k_batch_cache),
-                admitted[0].prompt_ids,
-            )
+        # P-3-C5.3.1 / P-3-C5.5: route through slice-prefill when the
+        # regime is active. B=1 takes the original tight-tensor path
+        # (no padding); B>1 builds the (B, max_L) left-padded tensor
+        # and routes to the C5.5 batched helper. Non-slice-regime
+        # cohorts stay on contiguous batched prefill bit-for-bit.
+        if self._slice_prefill_active():
+            if len(admitted) == 1:
+                logits = self._slice_prefill_with_capture(
+                    admitted[0],
+                    list(k_batch_cache),
+                    admitted[0].prompt_ids,
+                )
+            else:
+                pad = self._pad_token_id()
+                rows_2d: list[list[int]] = []
+                for r in admitted:
+                    n_pad = k_max_len - len(r.prompt_ids)
+                    rows_2d.append([pad] * n_pad + list(r.prompt_ids))
+                tokens = mx.array(rows_2d, dtype=mx.int32)
+                logits = self._slice_prefill_with_capture_batched(
+                    admitted, list(k_batch_cache), tokens
+                )
         else:
             pad = self._pad_token_id()
-            rows_2d: list[list[int]] = []
+            rows_2d = []
             for r in admitted:
                 n_pad = k_max_len - len(r.prompt_ids)
                 rows_2d.append([pad] * n_pad + list(r.prompt_ids))

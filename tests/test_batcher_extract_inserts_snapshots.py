@@ -213,32 +213,13 @@ class TestNonSliceRegimeNoSnapshots:
         for node in chain:
             assert node.recurrent_snapshot is None
 
-    def test_b2_cohort_extract_attaches_none(self) -> None:
-        # B=2 slice-regime cohort: gate active but len(rows)>1 clamp
-        # forces contiguous prefill → both rows' dicts stay empty →
-        # extract forwards all-None lists → tree nodes have
-        # recurrent_snapshot=None for both rows' inserted blocks.
-        prompt_a = list(range(1, 2 * BLOCK_SIZE + 1))
-        prompt_b = list(range(100, 100 + 2 * BLOCK_SIZE))
-        log = _SliceCaptureLog()
-        adapter = _make_slice_spy_adapter(log, script=((0, 0),))
-        pc = _prefix_cache()
-        batcher = ContinuousBatcher(
-            adapter, max_batch_size=2, prefix_cache=pc
-        )
-        batcher.add_request(0, prompt_a, _params(max_tokens=1))
-        batcher.add_request(1, prompt_b, _params(max_tokens=1))
-
-        batcher.step()  # B=2 contiguous prefill, no captures
-        batcher.step()  # reclaim → extract for both rows
-
-        chain_a = _walk_chain(pc, prompt_a)
-        chain_b = _walk_chain(pc, prompt_b)
-        assert len(chain_a) == 2 and len(chain_b) == 2
-        for node in chain_a + chain_b:
-            assert node.recurrent_snapshot is None
-        # Slice-helper never fired.
-        assert log.snapshot_calls == []
+    # P-3-C5.5 lifted the B>1 clamp on slice-prefill: equal-length
+    # B=2 cohorts now route through the batched slice helper and
+    # capture for every aligned row (both rows have pad=0 here).
+    # The pre-C5.5 "B=2 contiguous → all-None snapshots" assertion
+    # no longer holds; positive coverage of B=2 batched capture
+    # lives in tests/test_batcher_b_n_slice_prefill.py (the C5.5
+    # synthetic test file).
 
 
 # --- preempt path also forwards snapshots ---

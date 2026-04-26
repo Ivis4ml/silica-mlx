@@ -269,31 +269,11 @@ class TestB1PrefillCapture:
         assert log.snapshot_calls == []
 
 
-# --- B=1 clamp: B>1 cohorts skip slicing ---
-
-
-class TestB1OnlyClamp:
-    def test_b2_cohort_stays_contiguous_and_skips_capture(self) -> None:
-        # Two requests admit pre-step → B=2 cohort. Slice gate
-        # requires len(rows)==1; B=2 falls back to contiguous prefill,
-        # NO snapshots.
-        prompt_a = list(range(1, BLOCK_SIZE * 2 + 1))  # 8 tokens
-        prompt_b = list(range(100, 100 + BLOCK_SIZE * 2))  # 8 tokens
-        log = _SliceCaptureLog()
-        # Per-row script step for the single contiguous prefill
-        # forward: each row gets a target.
-        adapter = _make_slice_spy_adapter(log, script=((0, 0),))
-        batcher = _make_batcher(
-            adapter, prefix_cache=_prefix_cache(), max_batch_size=2
-        )
-        batcher.add_request(0, prompt_a, _params())
-        batcher.add_request(1, prompt_b, _params())
-        batcher.step()
-
-        for row in batcher._rows:
-            assert row.absolute_consumed_tokens == 0
-            assert row.recurrent_snapshots_per_block == {}
-        assert log.snapshot_calls == []
+# P-3-C5.5 lifted the B>1 clamp on slice-prefill: the pre-C5.5
+# "B=2 stays contiguous, no captures" assertion no longer holds.
+# Positive coverage of B>1 batched capture lives in
+# tests/test_batcher_b_n_slice_prefill.py (the C5.5 synthetic test
+# file).
 
 
 # --- decode-step capture ---
@@ -365,32 +345,16 @@ class TestDecodeStepCapture:
 
 
 class TestDecodeCaptureGate:
-    def test_zero_counter_row_skips_decode_capture(self) -> None:
-        # B=2 cohort admits via contiguous prefill (no slicing per the
-        # B=1-only clamp). Both rows have counter=0. After a decode
-        # step the gate's > 0 check skips them — no decode-era
-        # snapshots reach the radix tree.
-        prompt_a = list(range(1, 5))  # 4 tokens
-        prompt_b = list(range(100, 104))  # 4 tokens
-        log = _SliceCaptureLog()
-        # Prefill (B=2 contiguous): per-row targets.
-        # Decode steps follow; with max_tokens=2 each row decodes once.
-        adapter = _make_slice_spy_adapter(
-            log,
-            script=((0, 0), (0, 0)),  # prefill, decode-step 0
-        )
-        batcher = _make_batcher(
-            adapter, prefix_cache=_prefix_cache(), max_batch_size=2
-        )
-        batcher.add_request(0, prompt_a, _params(max_tokens=2))
-        batcher.add_request(1, prompt_b, _params(max_tokens=2))
-        batcher.step()  # prefill: contiguous (B=2), no capture
-        batcher.step()  # decode: gate's > 0 clause skips
-
-        for row in batcher._rows:
-            assert row.absolute_consumed_tokens == 0
-            assert row.recurrent_snapshots_per_block == {}
-        assert log.snapshot_calls == []
+    # P-3-C5.5 lifted the B>1 clamp; the prior "B=2 contiguous →
+    # counter=0 → decode capture skipped" pathway no longer
+    # exists under slice regime. The defensive ``counter == 0``
+    # gate at silica/scheduler/batcher.py:_decode_phase is kept
+    # for any future code path that might land a row in the
+    # batcher with counter still at the dataclass default — e.g.,
+    # rows admitted via a non-slice-regime ingress that later runs
+    # decode under an active slice predicate. No natural
+    # production path triggers that combination today.
+    pass
 
 
 # --- non-recurrent adapter / prefix_cache=None preservation ---
