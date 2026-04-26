@@ -66,6 +66,11 @@ from silica.models.capabilities import (
     ModelCapabilities,
     capabilities_from_attention_pattern,
 )
+from silica.models.pre_norm_capture import (
+    _PreNormCaptureBufferHolder,
+    apply_k_norm_then_rope_to_block,
+    install_pre_norm_capture_proxies,
+)
 from silica.weights.provider import WeightProvider
 
 _KV_LAYOUT_CAVEAT = (
@@ -106,6 +111,29 @@ class Gemma4Adapter:
         self._attention_pattern = self._build_attention_pattern(model)
         self.config = self._build_config(model, tokenizer)
         self._kv_layout = self._build_kv_layout(model, self._attention_pattern)
+        # P-5-F F.1: install pre-norm K capture proxies on every
+        # attention layer. Gemma4-31B has both sliding and global
+        # attention layers; both use the same ``Attention`` class
+        # with ``k_proj`` / ``k_norm`` / ``rope`` per
+        # ``mlx_lm/models/gemma4_text.py``, so all layers participate
+        # in K_pre capture. F.2 scheduler integration (next sub-unit)
+        # must handle the sliding-layer reconstruction case
+        # specifically: ``cache_list[src_idx] = seeded_attn[pos]``
+        # would replace a ``BatchRotatingKVCache`` (sliding) with a
+        # fresh ``BatchKVCache``, breaking the rotating-window
+        # invariants. F.2's seeded-cache assembly needs either a
+        # Gemma4-specific filter that excludes sliding layers from
+        # ``attn_layer_indices`` for cache reconstruction (capture
+        # still active on all layers — only the seeded admit path is
+        # affected) or a sliding-aware seeded-cache build that
+        # re-constructs into a ``BatchRotatingKVCache``.
+        self._attn_layer_indices: list[int] = list(range(len(model.layers)))
+        self._capture_holder = _PreNormCaptureBufferHolder()
+        install_pre_norm_capture_proxies(
+            model,
+            attn_layer_indices=self._attn_layer_indices,
+            holder=self._capture_holder,
+        )
 
     @classmethod
     def from_hf_repo(cls, repo: str) -> tuple[Gemma4Adapter, SimpleKVCache]:
@@ -197,6 +225,41 @@ class Gemma4Adapter:
         cache_list = self._kv_manager.cache_list(kv_handle.req_id)
         logits = forward(self._model, token, cache_list)
         return logits, StateDelta()
+
+    # --- P-5-F F.1: PreNormCaptureAdapter implementation ---
+
+    def install_pre_norm_capture(
+        self, buffer: dict[int, mx.array] | None
+    ) -> None:
+        """Arm or disarm the K_pre capture buffer for the next forward.
+
+        Disarmed by default; sliding and global layers share the same
+        proxy treatment.
+        """
+        self._capture_holder.buffer = buffer
+
+    def apply_k_norm_then_rope(
+        self,
+        attn_layer_pos: int,
+        k_pre_block: mx.array,
+        *,
+        offset: int,
+    ) -> mx.array:
+        """Reconstruct post-RoPE K on the layer at
+        ``self._attn_layer_indices[attn_layer_pos]``.
+
+        Gemma4 has all layers as attention (sliding or global), so
+        ``attn_layer_pos == layer_idx`` here. Both kinds share the
+        same per-layer ``self_attn.k_norm`` / ``self_attn.rope`` API.
+        """
+        layer_idx = self._attn_layer_indices[attn_layer_pos]
+        attn = self._model.layers[layer_idx].self_attn
+        return apply_k_norm_then_rope_to_block(
+            k_pre_block,
+            k_norm=attn.k_norm,
+            rope_instance=attn.rope,
+            offset=offset,
+        )
 
     # --- variant guard ---
 

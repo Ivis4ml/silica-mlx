@@ -1000,20 +1000,23 @@ _QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4_PRE_NORM = Scenario(
     },
     gate_env_var=None,
     description=(
-        "P-5-F F.0b' prototype row — pre-k_norm store via "
-        "_PreNormCaptureProj wrapper. Wraps attn.k_proj to capture "
-        "K_pre at projection output (the same space vqbench's "
-        "_QuantizedProj injects in), persists pre-k_norm K in the "
-        "prefix store, applies k_norm + RoPE on hit-path admit. "
-        "F.0b verified that codec is space-invariant in "
-        "reconstruction quality; the +0.51 D.2a PPL floor is the "
-        "expected target. Persistent block-grained encoding "
-        "mirrors what the F.1+ production store does, unlike the "
-        "D.2a oracle which re-encodes per chunk. Wrapper does NOT "
-        "modify in-flight forward (returns k_proj(x) unchanged) — "
-        "in-flight K stays clean; codec noise affects only prior "
-        "chunks' K via the seeded-cache hit path. Matches the "
-        "production prefix-cache deployment semantic."
+        "P-5-F (3b) production-store row — pre-k_norm store via "
+        "the adapter PreNormCaptureAdapter Protocol "
+        "(silica/models/pre_norm_capture.py). The adapter installs "
+        "_PreNormCaptureProxy on every attention layer's k_proj at "
+        "construction time; the oracle arms the proxy via "
+        "adapter.install_pre_norm_capture(buffer), captures K_pre at "
+        "projection output (the same space vqbench's _QuantizedProj "
+        "injects in), persists pre-k_norm K in the prefix store, and "
+        "calls adapter.apply_k_norm_then_rope on hit-path admit. "
+        "F.0b' verified +0.015 PPL on the (4-b) reference scenario "
+        "(better than D.2a's +0.51); persistent block-grained "
+        "encoding mirrors what the F.2+ production store does, "
+        "unlike the D.2a oracle which re-encodes per chunk. Proxy "
+        "does NOT modify in-flight forward (returns k_proj(x) "
+        "unchanged) — in-flight K stays clean; codec noise affects "
+        "only prior chunks' K via the seeded-cache hit path. "
+        "Matches the production prefix-cache deployment semantic."
     ),
 )
 

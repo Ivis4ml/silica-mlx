@@ -958,178 +958,35 @@ def teacher_forced_chunked_nll_with_codec_pre_rope(
 
 
 # =============================================================================
-# P-5-F F.0b' — pre-norm store oracle (Option 3b prototype).
+# P-5-F F.0b' — pre-norm store oracle (Option 3b).
 #
 # F.0b's "post-k_norm pre-RoPE" injection (above) verified empirically
 # that codec noise injected after k_norm is ~2x larger in the
 # post-k_norm space mlx-lm reads, leading to ~8x worse PPL through
-# attention softmax non-linearity. (3b) hooks `attn.k_proj` and
-# captures K_pre BEFORE k_norm, persisting K_pre in the prefix store.
-# On hit-path admission, K_pre is decoded → `k_norm` → `rope` → seeded
-# into cache. Codec noise lives in the same pre-k_norm space vqbench's
-# `_QuantizedProj` injects in, so the same +0.51 PPL D.2a achieves
-# should be reachable here under persistent block-grained encoding.
+# attention softmax non-linearity. (3b) routes the prefix store
+# through ``adapter.install_pre_norm_capture`` —
+# ``silica/models/pre_norm_capture.py`` installs a per-attention-layer
+# proxy on ``self_attn.k_proj`` at adapter construction. The proxy
+# captures ``k_proj(x)`` (pre-k_norm K) into a buffer the oracle
+# supplies for each chunk forward, leaving the in-flight forward
+# bit-identical to the unwrapped reference.
 #
-# Difference vs (3a) / D.2a: the wrapper does NOT modify the
-# in-flight forward. `_PreNormCaptureProj.__call__` returns
-# `k_proj(x)` unchanged, only side-effecting a capture for later
-# encode. In-flight attention runs clean — the current chunk's
-# logits use noise-free K. Codec noise affects only PRIOR chunks'
-# K (the seeded cache contents), matching the production prefix-
-# cache hit semantic. (3a) injects noise on the in-flight forward
-# too; (3b) is strictly less noisy and matches what the F.1+
-# production store would do.
+# On hit-path admission, K_pre blocks decode → ``adapter.apply_k_norm_then_rope``
+# (k_norm + RoPE) → seeded cache. Codec noise lives in the same
+# pre-k_norm space vqbench's ``_QuantizedProj`` injects in, so the
+# same +0.51 PPL D.2a achieves is reachable under persistent block-
+# grained encoding (F.0b' verified +0.015 PPL — even better; see
+# ``docs/P5_F_OPENING.md`` §10.3).
+#
+# Difference vs (3a) / D.2a: the proxy does NOT modify the in-flight
+# forward. ``_PreNormCaptureProxy.__call__`` returns ``k_proj(x)``
+# unchanged, only side-effecting a capture for later encode. In-flight
+# attention runs clean — the current chunk's logits use noise-free K.
+# Codec noise affects only PRIOR chunks' K (the seeded cache
+# contents), matching the production prefix-cache hit semantic.
+# (3a) injects noise on the in-flight forward too; (3b) is strictly
+# less noisy and matches what the F.2+ production store does.
 # =============================================================================
-
-
-class _PreNormCaptureProj:
-    """Wrap ``attn.k_proj`` to capture K_pre without modifying in-flight K.
-
-    Returns ``k_proj(x)`` unchanged on every call. The captured tensor
-    is written to ``self._sink`` (a list shared by the oracle), keyed
-    by ``layer_idx``; the oracle reads it after each chunk's forward
-    to encode K_pre per block into the prefix store.
-
-    Why capture-only: codec noise on prior chunks' K is the
-    deployment scenario silica's prefix-cache models. Noise on the
-    *current* chunk's K (D.2a's wrapper does this) is harmless for
-    PPL but doesn't match production semantics. (3b) keeps in-flight
-    forward clean and only persists noisy K for next chunks.
-    """
-
-    __slots__ = ("_orig", "_sink", "_layer_idx")
-
-    def __init__(self, orig: Any, *, sink: list[Any], layer_idx: int) -> None:
-        self._orig = orig
-        self._sink = sink
-        self._layer_idx = layer_idx
-
-    def __call__(self, x: mx.array) -> mx.array:
-        out: mx.array = self._orig(x)
-        # Side-effect: store captured K_pre for this layer index.
-        # Output is returned unchanged — in-flight forward sees no
-        # codec interference.
-        self._sink[self._layer_idx] = out
-        return out
-
-
-def _install_pre_norm_capture_wrappers(
-    model: Any,
-    *,
-    attn_layer_indices: list[int],
-) -> tuple[list[Any], list[tuple[Any, Any]]]:
-    """Install ``_PreNormCaptureProj`` on every attention layer's k_proj.
-
-    Returns ``(captures, restorations)`` where:
-
-    - ``captures`` is the per-layer-index capture sink. Indexed by
-      attention-layer-index position in ``attn_layer_indices``
-      (0-based, dense). Each entry is set by the wrapper on every
-      forward call; the oracle reads it after each chunk forward.
-    - ``restorations`` is a list of ``(attn_module, orig_k_proj)``
-      tuples that :func:`_restore_pre_norm_capture_wrappers` consumes
-      to put the original projections back in place.
-
-    Only ``k_proj`` is wrapped (not ``v_proj``); V is RoPE-free and
-    norm-free per silica's supported family inventory (P5_F_OPENING.md
-    §4) — V can be encoded directly from cache extract as the F.0b
-    path does, no projection-time hook needed.
-    """
-    captures: list[Any] = [None] * len(attn_layer_indices)
-    restorations: list[tuple[Any, Any]] = []
-    for capture_pos, layer_idx in enumerate(attn_layer_indices):
-        attn = model.layers[layer_idx].self_attn
-        orig_k = attn.k_proj
-        attn.k_proj = _PreNormCaptureProj(
-            orig_k, sink=captures, layer_idx=capture_pos
-        )
-        restorations.append((attn, orig_k))
-    return captures, restorations
-
-
-def _restore_pre_norm_capture_wrappers(
-    restorations: list[tuple[Any, Any]],
-) -> None:
-    for attn, orig_k in restorations:
-        attn.k_proj = orig_k
-
-
-def _apply_k_norm_then_rope_to_block(
-    k_pre_block: mx.array,
-    *,
-    k_norm: Any,
-    rope_instance: Any,
-    base_offset: int,
-) -> mx.array:
-    """Reconstruct post-RoPE K from a pre-norm K block.
-
-    Input: ``(1, n_kv_heads, block_size, head_dim)`` pre-norm K.
-    Output: same shape, post-RoPE.
-
-    Mirrors mlx-lm's attention forward exactly:
-
-    ```python
-    keys = self.k_norm(keys.reshape(B, L, n_kv_heads, head_dim))
-                .transpose(0, 2, 1, 3)
-    keys = self.rope(keys, offset=cache.offset)
-    ```
-
-    The pre-norm K block we receive is in the per-head transposed
-    layout already, so transpose back to the pre-k_norm layout
-    (B, L, n_kv_heads, head_dim) for k_norm, then transpose to
-    per-head and apply RoPE.
-    """
-    B, n_kv_heads, block_size, head_dim = k_pre_block.shape
-    # pre-norm format expected by k_norm: (B, L, n_kv_heads, head_dim)
-    k_pre_seq = k_pre_block.transpose(0, 2, 1, 3)
-    # Apply k_norm (RMSNorm on last axis)
-    k_post_norm_seq = k_norm(k_pre_seq)
-    # Transpose back to per-head (B, n_kv_heads, L, head_dim)
-    k_post_norm_per_head = k_post_norm_seq.transpose(0, 2, 1, 3)
-    # Apply RoPE at the absolute block-start offset
-    k_post_rope: mx.array = rope_instance(
-        k_post_norm_per_head, offset=base_offset
-    )
-    return k_post_rope
-
-
-def _split_k_pre_capture_into_blocks(
-    captures: list[mx.array],
-    *,
-    aligned_end: int,
-    block_size: int,
-    n_kv_heads: int,
-    head_dim: int,
-) -> list[list[mx.array]]:
-    """Split each layer's captured K_pre into per-block slices.
-
-    Each capture has shape ``(B, L, n_kv_heads * head_dim)``. Reshape
-    to ``(B, L, n_kv_heads, head_dim)`` then transpose to per-head
-    ``(B, n_kv_heads, L, head_dim)`` so each block slice has the
-    standard `(1, n_kv_heads, block_size, head_dim)` shape the codec
-    consumes.
-
-    Returns a list indexed ``[block_idx][attn_pos] -> k_pre_block``.
-    """
-    num_blocks = aligned_end // block_size
-    out: list[list[mx.array]] = [[] for _ in range(num_blocks)]
-    for capture in captures:
-        B, L, _ = capture.shape
-        per_head = capture.reshape(B, L, n_kv_heads, head_dim).transpose(
-            0, 2, 1, 3
-        )
-        for block_idx in range(num_blocks):
-            start = block_idx * block_size
-            block = per_head[:, :, start : start + block_size, :]
-            block = mx.contiguous(block)
-            out[block_idx].append(block)
-    # Force materialization: the next iteration of the outer chunk
-    # loop discards the cache_list and the captures, lazy slices
-    # would lose their source.
-    for blocks in out:
-        for b in blocks:
-            mx.eval(b)
-    return out
 
 
 def teacher_forced_chunked_nll_with_codec_pre_norm(
@@ -1139,25 +996,24 @@ def teacher_forced_chunked_nll_with_codec_pre_norm(
     *,
     chunk_size: int = 256,
 ) -> tuple[float, int]:
-    """P-5-F F.0b' prototype — pre-norm store via projection-output capture.
+    """P-5-F (3b) production-store oracle — pre-norm store via projection-output capture.
 
-    Wraps each attention layer's ``k_proj`` with
-    :class:`_PreNormCaptureProj` to capture K_pre during each chunk
-    forward. Encodes K_pre per block into the prefix store at
-    chunk-end time. On hit-path, decodes K_pre → applies layer's
-    ``k_norm`` and ``rope`` → seeds cache with the reconstructed
-    post-RoPE K. V is extracted from the seeded cache (already
-    ``v_proj(x)`` since V never normalises or rotates) and encoded
-    on the V codec, mirroring F.0b's V handling.
+    Routes through ``adapter.install_pre_norm_capture(buffer)`` and
+    ``adapter.apply_k_norm_then_rope(layer_pos, K_pre, offset=...)``
+    (P-5-F F.1; see ``silica/models/pre_norm_capture.py``). The proxy
+    on each attention layer's ``k_proj`` captures K_pre into the
+    oracle-supplied buffer during chunk forward; the oracle reads it
+    back, encodes K_pre per block into the prefix store, and reuses
+    the adapter's reconstruction method on hit-path admit.
 
     Codec noise lives in pre-k_norm space, identical to vqbench's
-    ``_QuantizedProj`` injection point. F.0b' should reach D.2a's
-    +0.51 PPL on the (4-b) reference scenario — the F.0b verification
-    showed codec is space-invariant, so any ΔPPL gap left vs D.2a is
-    noise (per-seed, per-block-grain) not algorithmic.
+    ``_QuantizedProj`` injection point. F.0b' verification reached
+    +0.015 PPL on Qwen3-0.6B + BlockTQ b64 b4 — better than D.2a's
+    +0.51 (see ``docs/P5_F_OPENING.md`` §10.3).
 
-    Restoration: wrappers are restored in a try/finally so an
-    exception during forward leaves the adapter's model untouched.
+    Buffer disarm: the buffer pointer is reset to ``None`` in a
+    try/finally so an exception during forward leaves the adapter
+    in the disarmed (no-capture) state.
     """
     if token_ids.ndim != 2:
         raise ValueError(
@@ -1182,33 +1038,14 @@ def teacher_forced_chunked_nll_with_codec_pre_norm(
         return 0.0, 0
 
     model = adapter._model
-    # Probe attn_layer_indices via a dry cache build before installing
-    # wrappers. Using ``adapter.make_batch_cache([0])`` here is cheap;
-    # we discard the cache. This avoids needing a model forward to
-    # learn the heterogeneous layout for hybrid adapters.
-    probe_cache = adapter.make_batch_cache([0])
-    attn_layer_indices = [
-        i for i, c in enumerate(probe_cache) if isinstance(c, BatchKVCache)
-    ]
-
-    # Resolve per-attn-layer k_norm and RoPE handles up front.
-    # Reads from the model in-place; same handles mlx-lm's attention
-    # forward uses.
-    k_norms_per_attn: list[Any] = [
-        model.layers[layer_idx].self_attn.k_norm
-        for layer_idx in attn_layer_indices
-    ]
-    ropes_per_attn: list[Any] = [
-        model.layers[layer_idx].self_attn.rope
-        for layer_idx in attn_layer_indices
-    ]
+    # Read the adapter's attn_layer_indices directly — set at adapter
+    # __init__ alongside the proxy install (P-5-F F.1).
+    attn_layer_indices: list[int] = list(adapter._attn_layer_indices)
     layout = adapter.kv_layout()
     n_kv_heads = layout.n_kv_heads
     head_dim = layout.head_dim
 
-    captures, restorations = _install_pre_norm_capture_wrappers(
-        model, attn_layer_indices=attn_layer_indices
-    )
+    capture_buffer: dict[int, mx.array] = {}
 
     try:
         return _run_pre_norm_oracle_inner(
@@ -1220,14 +1057,12 @@ def teacher_forced_chunked_nll_with_codec_pre_norm(
             chunk_size=chunk_size,
             block_size=block_size,
             attn_layer_indices=attn_layer_indices,
-            k_norms_per_attn=k_norms_per_attn,
-            ropes_per_attn=ropes_per_attn,
             n_kv_heads=n_kv_heads,
             head_dim=head_dim,
-            captures=captures,
+            capture_buffer=capture_buffer,
         )
     finally:
-        _restore_pre_norm_capture_wrappers(restorations)
+        adapter.install_pre_norm_capture(None)
 
 
 def _run_pre_norm_oracle_inner(
@@ -1240,11 +1075,9 @@ def _run_pre_norm_oracle_inner(
     chunk_size: int,
     block_size: int,
     attn_layer_indices: list[int],
-    k_norms_per_attn: list[Any],
-    ropes_per_attn: list[Any],
     n_kv_heads: int,
     head_dim: int,
-    captures: list[Any],
+    capture_buffer: dict[int, mx.array],
 ) -> tuple[float, int]:
     total_nll = 0.0
     total_tokens = 0
@@ -1275,18 +1108,18 @@ def _run_pre_norm_oracle_inner(
                 )
                 # Convert pre-norm K + (still-pre-RoPE) V payloads
                 # into the post-RoPE seeded cache mlx-lm expects.
-                # K: apply k_norm then RoPE per layer at the block's
-                # absolute offset. V: pass through (V never normalises
-                # or rotates in mlx-lm's supported attention forwards).
+                # K: adapter.apply_k_norm_then_rope per layer at the
+                # block's absolute offset. V: pass through (V never
+                # normalises or rotates in mlx-lm's supported attention
+                # forwards).
                 seeded_blocks: list[list[tuple[mx.array, mx.array]]] = []
                 for block_idx, per_attn_layer in enumerate(detached_blocks):
                     block_post_rope: list[tuple[mx.array, mx.array]] = []
                     for attn_pos, (k_pre, v) in enumerate(per_attn_layer):
-                        k_post = _apply_k_norm_then_rope_to_block(
+                        k_post = adapter.apply_k_norm_then_rope(
+                            attn_pos,
                             k_pre,
-                            k_norm=k_norms_per_attn[attn_pos],
-                            rope_instance=ropes_per_attn[attn_pos],
-                            base_offset=block_idx * block_size,
+                            offset=block_idx * block_size,
                         )
                         block_post_rope.append((k_post, v))
                     seeded_blocks.append(block_post_rope)
@@ -1306,12 +1139,17 @@ def _run_pre_norm_oracle_inner(
                     cache_list, 0, prev_recurrent_snapshot
                 )
 
-        # Reset capture sink before each chunk forward so any state
-        # from a prior chunk does not leak.
-        for i in range(len(captures)):
-            captures[i] = None
+        # Arm capture: clear any leftover entries and route the next
+        # forward's k_proj outputs into ``capture_buffer``.
+        capture_buffer.clear()
+        adapter.install_pre_norm_capture(capture_buffer)
 
         logits = forward_batched_full(model, chunk_tokens, cache_list)
+
+        # Disarm immediately; the next read on ``capture_buffer`` is
+        # safe because the proxy has already populated entries during
+        # the forward.
+        adapter.install_pre_norm_capture(None)
 
         if prev_last_logit is not None:
             target = chunk_tokens[:, 0]
@@ -1350,16 +1188,17 @@ def _run_pre_norm_oracle_inner(
         # too).
         aligned_end = (end // block_size) * block_size
         if aligned_end > 0:
-            # Validate captures populated correctly during forward.
-            for i, capture in enumerate(captures):
-                if capture is None:
+            # Validate the buffer received an entry for every attention
+            # layer position (proxy fired during forward).
+            for attn_pos in range(len(attn_layer_indices)):
+                if attn_pos not in capture_buffer:
                     raise RuntimeError(
-                        f"_PreNormCaptureProj capture[{i}] is None "
+                        f"capture_buffer missing attn_pos={attn_pos} "
                         f"after chunk forward (start={start}, end={end}); "
-                        f"wrapper for layer "
-                        f"{attn_layer_indices[i]} did not fire."
+                        f"adapter proxy for layer "
+                        f"{attn_layer_indices[attn_pos]} did not fire."
                     )
-            # On hit chunks (start > 0) the wrapper captured only the
+            # On hit chunks (start > 0) the proxy captured only the
             # new chunk's K_pre — block_idx for new tokens runs from
             # (start // block_size) to (aligned_end // block_size).
             # Old blocks (0..start//block_size) are already in the
@@ -1380,7 +1219,8 @@ def _run_pre_norm_oracle_inner(
                 per_attn_kv: list[tuple[mx.array, mx.array]] = []
                 cap_start = new_block_offset * block_size
                 cap_end = cap_start + block_size
-                for attn_pos, capture in enumerate(captures):
+                for attn_pos in range(len(attn_layer_indices)):
+                    capture = capture_buffer[attn_pos]
                     cap_per_head = capture.reshape(
                         1, chunk_len, n_kv_heads, head_dim
                     ).transpose(0, 2, 1, 3)

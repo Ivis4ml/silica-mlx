@@ -896,6 +896,30 @@ captures the chunk's K_pre at chunk-forward time; reclaim's
 instead of slicing the live cache for K (V continues to come
 from cache, unchanged).
 
+**Gemma4 sliding-layer reconstruction (added 2026-04-26 after F.1
+landed)**: F.1 installs the K_pre capture proxy on every Gemma4
+attention layer (sliding and global) since both share the same
+`Attention` class with `k_proj` / `k_norm` / `rope`. F.2's
+scheduler integration must NOT then reconstruct sliding layers
+through the standard `BatchKVCache` admit seam — sliding layers
+use `BatchRotatingKVCache` and replacing a rotating cache with a
+fresh `BatchKVCache` would break the window invariants. Two
+viable fixes for F.2 to pick from:
+
+1. Gemma4-specific filter on the admit side: skip sliding layers
+   when assembling the seeded-cache replacement; sliding layers
+   recompute K from the prompt on hit-chunk forward (same as the
+   miss path today). Capture still runs on sliding layers but
+   the captured K_pre is unused for hit-path admit.
+2. Sliding-aware seeded-cache build: re-construct sliding layers
+   into a `BatchRotatingKVCache` with the seeded K + V, mirroring
+   the `make_batch_cache` factory's per-kind dispatch.
+
+Option 1 is simpler and matches the current Gemma4 behaviour
+under `prefix_cache=None` (sliding layers are not cached today).
+Option 2 is the long-term answer when sliding-window prefix
+cache becomes desirable. F.2 picks one and records the choice.
+
 **Commit count**: two (F.2a store-level, F.2b scheduler
 integration). F.2a is purely additive and small; F.2b touches
 the hot path and needs careful testing.

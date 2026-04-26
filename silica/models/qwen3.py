@@ -54,6 +54,11 @@ from silica.models.capabilities import (
     ModelCapabilities,
     capabilities_from_attention_pattern,
 )
+from silica.models.pre_norm_capture import (
+    _PreNormCaptureBufferHolder,
+    apply_k_norm_then_rope_to_block,
+    install_pre_norm_capture_proxies,
+)
 from silica.weights.provider import WeightProvider
 
 
@@ -74,6 +79,18 @@ class Qwen3Adapter:
         self.config = self._build_config(model, tokenizer)
         self._kv_layout = self._build_kv_layout(model)
         self._attention_pattern = self._build_attention_pattern(model)
+        # P-5-F F.1: install pre-norm K capture proxies on every
+        # attention layer. All Qwen3 layers are GLOBAL attention so
+        # the index list is the full range. The holder starts in the
+        # disarmed (buffer=None) state; ``install_pre_norm_capture``
+        # arms it for a specific forward.
+        self._attn_layer_indices: list[int] = list(range(len(model.layers)))
+        self._capture_holder = _PreNormCaptureBufferHolder()
+        install_pre_norm_capture_proxies(
+            model,
+            attn_layer_indices=self._attn_layer_indices,
+            holder=self._capture_holder,
+        )
 
     @classmethod
     def from_hf_repo(cls, repo: str) -> tuple[Qwen3Adapter, SimpleKVCache]:
@@ -132,6 +149,44 @@ class Qwen3Adapter:
         cache_list = self._kv_manager.cache_list(kv_handle.req_id)
         logits = forward(self._model, token, cache_list)
         return logits, StateDelta()
+
+    # --- P-5-F F.1: PreNormCaptureAdapter implementation ---
+
+    def install_pre_norm_capture(
+        self, buffer: dict[int, mx.array] | None
+    ) -> None:
+        """Arm or disarm the K_pre capture buffer for the next forward.
+
+        Sets ``self._capture_holder.buffer`` so every installed
+        ``_PreNormCaptureProxy`` reads the same value on its next call.
+        ``buffer=None`` disarms (proxies short-circuit, no write); a
+        non-None dict arms the proxies for a single forward.
+        """
+        self._capture_holder.buffer = buffer
+
+    def apply_k_norm_then_rope(
+        self,
+        attn_layer_pos: int,
+        k_pre_block: mx.array,
+        *,
+        offset: int,
+    ) -> mx.array:
+        """Reconstruct post-RoPE K for a pre-norm K block on layer
+        ``self._attn_layer_indices[attn_layer_pos]``.
+
+        Plain Qwen3 has all layers as attention so
+        ``attn_layer_pos == layer_idx``; the indirection still goes
+        through ``_attn_layer_indices`` to keep the contract uniform
+        with hybrid families (Qwen3.5).
+        """
+        layer_idx = self._attn_layer_indices[attn_layer_pos]
+        attn = self._model.layers[layer_idx].self_attn
+        return apply_k_norm_then_rope_to_block(
+            k_pre_block,
+            k_norm=attn.k_norm,
+            rope_instance=attn.rope,
+            offset=offset,
+        )
 
     # --- family-specific metadata extraction ---
 

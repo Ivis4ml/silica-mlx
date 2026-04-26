@@ -58,6 +58,11 @@ from silica.models.capabilities import (
     ModelCapabilities,
     capabilities_from_attention_pattern,
 )
+from silica.models.pre_norm_capture import (
+    _PreNormCaptureBufferHolder,
+    apply_k_norm_then_rope_to_block,
+    install_pre_norm_capture_proxies,
+)
 from silica.models.recurrent import (
     RecurrentSnapshot,
     _RecurrentLayerEntry,
@@ -82,6 +87,21 @@ class Qwen3_5Adapter:
         self.config = self._build_config(model, tokenizer)
         self._kv_layout = self._build_kv_layout(model)
         self._attention_pattern = self._build_attention_pattern(model)
+        # P-5-F F.1: install pre-norm K capture proxies on full-
+        # attention layers only. DeltaNet (``layer.is_linear``) layers
+        # have no k_proj surface to wrap — they participate in the
+        # recurrent-state path, not the prefix-cache K/V store.
+        self._attn_layer_indices: list[int] = [
+            i
+            for i, layer in enumerate(model.layers)
+            if not getattr(layer, "is_linear", False)
+        ]
+        self._capture_holder = _PreNormCaptureBufferHolder()
+        install_pre_norm_capture_proxies(
+            model,
+            attn_layer_indices=self._attn_layer_indices,
+            holder=self._capture_holder,
+        )
 
     @classmethod
     def from_hf_repo(cls, repo: str) -> tuple[Qwen3_5Adapter, SimpleKVCache]:
@@ -159,6 +179,44 @@ class Qwen3_5Adapter:
         logits = forward(self._model, token, cache_list)
         return logits, StateDelta(
             _recurrent_bytes=self._recurrent_state_bytes(cache_list)
+        )
+
+    # --- P-5-F F.1: PreNormCaptureAdapter implementation ---
+
+    def install_pre_norm_capture(
+        self, buffer: dict[int, mx.array] | None
+    ) -> None:
+        """Arm or disarm the K_pre capture buffer for the next forward.
+
+        Disarmed by default (``buffer is None``); decode forwards
+        through DeltaNet + GQA stack short-circuit on every full-
+        attention layer's proxy. DeltaNet layers have no proxy
+        installed and are unaffected either way.
+        """
+        self._capture_holder.buffer = buffer
+
+    def apply_k_norm_then_rope(
+        self,
+        attn_layer_pos: int,
+        k_pre_block: mx.array,
+        *,
+        offset: int,
+    ) -> mx.array:
+        """Reconstruct post-RoPE K on the absolute layer that
+        ``attn_layer_pos`` indexes into ``_attn_layer_indices``.
+
+        DeltaNet layers are skipped at install time; the layer this
+        method targets is always a full-attention (GLOBAL) layer with
+        ``self_attn.k_norm`` and ``self_attn.rope`` set up by mlx-lm's
+        Qwen3-Next attention block.
+        """
+        layer_idx = self._attn_layer_indices[attn_layer_pos]
+        attn = self._model.layers[layer_idx].self_attn
+        return apply_k_norm_then_rope_to_block(
+            k_pre_block,
+            k_norm=attn.k_norm,
+            rope_instance=attn.rope,
+            offset=offset,
         )
 
     def _recurrent_state_bytes(self, cache_list: list[Any]) -> int:
