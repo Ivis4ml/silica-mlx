@@ -782,10 +782,14 @@ _QWEN3_0_6B_TTFT_UNDER_CONCURRENCY = Scenario(
 # chunk >= 1 decodes the prior prefix blocks (codec hot path fires)
 # and encodes the newly-grown tail.
 #
-# Model pinned to Qwen3-0.6B for consistency with the A.3 / B.3
-# decode-speed rows — Qwen3.5-0.8B is hybrid-DeltaNet and
-# ``ContinuousBatcher`` refuses ``RadixPrefixCache`` on recurrent
-# adapters.
+# Originally pinned to Qwen3-0.6B because the pre-C5.4
+# ``ContinuousBatcher`` refused ``RadixPrefixCache`` on hybrid
+# adapters. P-3-C5.4 removed that guard; P-3-C5-step2-W made the
+# bench codec oracle hybrid-aware via heterogeneous cache assembly
+# and recurrent snapshot/restore at chunk boundaries. Hybrid
+# Qwen3.5 mirrors of these PPL rows live below at
+# ``_QWEN3_5_0_8B_WIKITEXT_PPL_*`` — same workload knobs, different
+# repo, no behaviour change on Qwen3-0.6B.
 # =============================================================================
 
 _WIKITEXT2_DEFAULT_PATH = str(
@@ -1001,6 +1005,126 @@ _QWEN3_0_6B_WIKITEXT_PPL_EXT_RABITQ_B4 = Scenario(
         "(``v_supported=False``) that cannot install via the "
         "symmetric ``kv_codec=`` shorthand, and its hypercube "
         "MSE is worse than BlockTQ at matching bit budget."
+    ),
+)
+
+
+# =============================================================================
+# P-3-C5-step2-D — WikiText-2 PPL rows on Qwen3.5-0.8B (hybrid).
+#
+# Mirror of the Qwen3-0.6B PPL block above. Same workload shape
+# (chunk_size=256, max_tokens=512, wikitext-2 raw test split) so
+# that running both rows on the same input gives a head-to-head
+# comparison between pure-attention (Qwen3) and hybrid-DeltaNet
+# (Qwen3.5) under the same K/V codec configuration. Pre-C5.4 this
+# combination raised the recurrent-state ctor guard; pre-step2-W
+# the codec oracle crashed on the heterogeneous cache shape. Both
+# gates landed; these scenarios are the consumer.
+#
+# Skipped scenarios on the hybrid side (compared to the Qwen3-0.6B
+# block):
+#  - tq_mse_b4: pre-vqbench codec, lower priority for the hybrid
+#    comparison.
+#  - vqbench-aligned (P-5-D.2a): the pre-RoPE projection-patch
+#    path lives in ``teacher_forced_chunked_nll_vqbench_aligned``,
+#    which is a separate codepath from the production-store
+#    oracle and has not been hybrid-adapted at this sub-unit. The
+#    cross-method comparison vs vqbench's own Qwen3-0.6B numbers
+#    therefore relies on the post-RoPE production-store rows
+#    here.
+#
+# C.6 ``vqbench_xcheck`` is also dropped on the hybrid side: the
+# referenced ``reproduce.py`` script in the vqbench repo predates
+# Qwen3.5 hybrid models and may not run on this architecture.
+# Adding the cross-check after confirming vqbench's hybrid support
+# is a follow-up.
+# =============================================================================
+
+
+_QWEN3_5_0_8B_WIKITEXT_PPL_FP16 = Scenario(
+    id="qwen3.5-0.8b-wikitext-ppl-fp16",
+    repo="Qwen/Qwen3.5-0.8B",
+    workload=Workload(
+        name="wikitext-ppl-fp16",
+        prompts=(),
+        max_tokens=0,
+        max_batch_size=1,
+        prefix_cache=False,
+        temperature=0.0,
+        top_p=1.0,
+        kv_codec=None,
+    ),
+    oracle=OracleKind.PPL,
+    oracle_config=dict(_WIKITEXT_PPL_ORACLE_CONFIG),
+    gate_env_var=None,
+    description=(
+        "P-3-C5-step2-D fp16 baseline PPL row on Qwen3.5-0.8B "
+        "(hybrid-DeltaNet). Mirrors qwen3-0.6b-wikitext-ppl-fp16 "
+        "with the same chunk_size=256 / max_tokens=512 workload "
+        "knobs. Drives ``teacher_forced_chunked_nll`` against the "
+        "adapter's own heterogeneous cache (``ArraysCache`` for "
+        "DeltaNet layers + ``BatchKVCache`` for full-attention "
+        "layers); recurrent state accumulates naturally across "
+        "chunks. Cache-only gate plus WikiText cache file presence "
+        "at ~/.cache/silica/wikitext2-test.txt."
+    ),
+)
+
+
+_QWEN3_5_0_8B_WIKITEXT_PPL_BLOCK_TQ_B64_B4 = Scenario(
+    id="qwen3.5-0.8b-wikitext-ppl-block-tq-b64-b4",
+    repo="Qwen/Qwen3.5-0.8B",
+    workload=Workload(
+        name="wikitext-ppl-block-tq-b64-b4",
+        prompts=(),
+        max_tokens=0,
+        max_batch_size=1,
+        prefix_cache=True,
+        temperature=0.0,
+        top_p=1.0,
+        kv_codec="block_tq_b64_b4",
+    ),
+    oracle=OracleKind.PPL,
+    oracle_config=dict(_WIKITEXT_PPL_ORACLE_CONFIG),
+    gate_env_var=None,
+    description=(
+        "P-3-C5-step2-D BlockTurboQuantMSE B=64 4-bit K+V PPL row "
+        "on Qwen3.5-0.8B (hybrid-DeltaNet). Routes every chunk's "
+        "prior prefix through the C5-step2-W hybrid-aware codec "
+        "oracle: heterogeneous cache assembly at hit chunks plus "
+        "recurrent snapshot/restore at chunk boundaries. The codec "
+        "compresses K/V on full-attention layers only; DeltaNet "
+        "recurrent state passes through unchanged (snapshot/restore "
+        "preserves the fp16 trajectory across chunks). ΔPPL "
+        "against the fp16 baseline is the production codec's "
+        "quality cost on hybrid; cross-method comparison against "
+        "vqbench's own Qwen3-0.6B numbers is the discriminator the "
+        "user is after."
+    ),
+)
+
+
+_QWEN3_5_0_8B_WIKITEXT_PPL_EXT_RABITQ_B4 = Scenario(
+    id="qwen3.5-0.8b-wikitext-ppl-ext-rabitq-b4",
+    repo="Qwen/Qwen3.5-0.8B",
+    workload=Workload(
+        name="wikitext-ppl-ext-rabitq-b4",
+        prompts=(),
+        max_tokens=0,
+        max_batch_size=1,
+        prefix_cache=True,
+        temperature=0.0,
+        top_p=1.0,
+        kv_codec="ext_rabitq_b4",
+    ),
+    oracle=OracleKind.PPL,
+    oracle_config=dict(_WIKITEXT_PPL_ORACLE_CONFIG),
+    gate_env_var=None,
+    description=(
+        "P-3-C5-step2-D ExtRaBitQ 4-bit K+V PPL row on "
+        "Qwen3.5-0.8B (hybrid-DeltaNet). Same hybrid-aware codec "
+        "oracle path as the BlockTQ row; effective bits/coord = "
+        "4 + 48/head_dim (head_dim=256 → 4.1875)."
     ),
 )
 
@@ -1231,6 +1355,11 @@ BUILTIN_SCENARIOS: dict[str, Scenario] = {
         _QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4_VQBENCH_ALIGNED
     ),
     _QWEN3_0_6B_WIKITEXT_PPL_EXT_RABITQ_B4.id: _QWEN3_0_6B_WIKITEXT_PPL_EXT_RABITQ_B4,
+    _QWEN3_5_0_8B_WIKITEXT_PPL_FP16.id: _QWEN3_5_0_8B_WIKITEXT_PPL_FP16,
+    _QWEN3_5_0_8B_WIKITEXT_PPL_BLOCK_TQ_B64_B4.id: (
+        _QWEN3_5_0_8B_WIKITEXT_PPL_BLOCK_TQ_B64_B4
+    ),
+    _QWEN3_5_0_8B_WIKITEXT_PPL_EXT_RABITQ_B4.id: _QWEN3_5_0_8B_WIKITEXT_PPL_EXT_RABITQ_B4,
     _QWEN3_0_6B_COMPRESSION_FP16.id: _QWEN3_0_6B_COMPRESSION_FP16,
     _QWEN3_0_6B_COMPRESSION_TQ_MSE_B4.id: _QWEN3_0_6B_COMPRESSION_TQ_MSE_B4,
     _QWEN3_0_6B_COMPRESSION_BLOCK_TQ_B64_B4.id: _QWEN3_0_6B_COMPRESSION_BLOCK_TQ_B64_B4,
