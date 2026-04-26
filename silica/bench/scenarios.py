@@ -1196,6 +1196,61 @@ _QWEN3_5_4B_WIKITEXT_PPL_BLOCK_TQ_B64_B4 = Scenario(
 )
 
 
+_QWEN3_5_4B_WIKITEXT_PPL_EXT_RABITQ_B2 = Scenario(
+    id="qwen3.5-4b-wikitext-ppl-ext-rabitq-b2",
+    repo="Qwen/Qwen3.5-4B",
+    workload=Workload(
+        name="wikitext-ppl-ext-rabitq-b2",
+        prompts=(),
+        max_tokens=0,
+        max_batch_size=1,
+        prefix_cache=True,
+        temperature=0.0,
+        top_p=1.0,
+        kv_codec="ext_rabitq_b2",
+    ),
+    oracle=OracleKind.PPL,
+    oracle_config=dict(_WIKITEXT_PPL_ORACLE_CONFIG),
+    gate_env_var=None,
+    description=(
+        "P-5-F F.0a aggressive-codec ablation on Qwen3.5-4B "
+        "(hybrid-DeltaNet, 4B class). ExtRaBitQ 2-bit K+V — most "
+        "aggressive symmetric ext_rabitq variant currently "
+        "registered. Goal: surface the post-RoPE failure surface "
+        "on production-scale hybrid targets at low bit depth, "
+        "feeding the P-5-F priority decision (does pre-RoPE store "
+        "matter on 4B+ deployment, or only on small-model / "
+        "ultra-aggressive settings?). Read alongside the b3 row "
+        "as a bit-depth trend."
+    ),
+)
+
+
+_QWEN3_5_4B_WIKITEXT_PPL_EXT_RABITQ_B3 = Scenario(
+    id="qwen3.5-4b-wikitext-ppl-ext-rabitq-b3",
+    repo="Qwen/Qwen3.5-4B",
+    workload=Workload(
+        name="wikitext-ppl-ext-rabitq-b3",
+        prompts=(),
+        max_tokens=0,
+        max_batch_size=1,
+        prefix_cache=True,
+        temperature=0.0,
+        top_p=1.0,
+        kv_codec="ext_rabitq_b3",
+    ),
+    oracle=OracleKind.PPL,
+    oracle_config=dict(_WIKITEXT_PPL_ORACLE_CONFIG),
+    gate_env_var=None,
+    description=(
+        "P-5-F F.0a intermediate-bit-depth row on Qwen3.5-4B. "
+        "ExtRaBitQ 3-bit K+V; together with the b2 and b4 rows "
+        "this gives a three-point bit-depth trend on the "
+        "production-scale hybrid target."
+    ),
+)
+
+
 _QWEN3_5_4B_WIKITEXT_PPL_EXT_RABITQ_B4 = Scenario(
     id="qwen3.5-4b-wikitext-ppl-ext-rabitq-b4",
     repo="Qwen/Qwen3.5-4B",
@@ -1288,6 +1343,58 @@ _QWEN3_4B_WIKITEXT_PPL_BLOCK_TQ_B64_B4 = Scenario(
         "head_dim=128 same as Qwen3-0.6B, scaled to 4B size. "
         "ΔPPL against fp16 disambiguates whether the +20 PPL gap "
         "on Qwen3-0.6B was driven by model size."
+    ),
+)
+
+
+_QWEN3_4B_WIKITEXT_PPL_EXT_RABITQ_B2 = Scenario(
+    id="qwen3-4b-wikitext-ppl-ext-rabitq-b2",
+    repo="Qwen/Qwen3-4B",
+    workload=Workload(
+        name="wikitext-ppl-ext-rabitq-b2",
+        prompts=(),
+        max_tokens=0,
+        max_batch_size=1,
+        prefix_cache=True,
+        temperature=0.0,
+        top_p=1.0,
+        kv_codec="ext_rabitq_b2",
+    ),
+    oracle=OracleKind.PPL,
+    oracle_config=dict(_WIKITEXT_PPL_ORACLE_CONFIG),
+    gate_env_var=None,
+    description=(
+        "P-5-F F.0a aggressive-codec ablation on Qwen3-4B "
+        "(pure-attention, 4B class). ExtRaBitQ 2-bit K+V — most "
+        "aggressive symmetric ext_rabitq variant currently "
+        "registered. Pure-attention counterpart to the Qwen3.5-4B "
+        "b2 row; together they ablate codec aggressiveness against "
+        "architecture (attention vs hybrid) at the same 4B size."
+    ),
+)
+
+
+_QWEN3_4B_WIKITEXT_PPL_EXT_RABITQ_B3 = Scenario(
+    id="qwen3-4b-wikitext-ppl-ext-rabitq-b3",
+    repo="Qwen/Qwen3-4B",
+    workload=Workload(
+        name="wikitext-ppl-ext-rabitq-b3",
+        prompts=(),
+        max_tokens=0,
+        max_batch_size=1,
+        prefix_cache=True,
+        temperature=0.0,
+        top_p=1.0,
+        kv_codec="ext_rabitq_b3",
+    ),
+    oracle=OracleKind.PPL,
+    oracle_config=dict(_WIKITEXT_PPL_ORACLE_CONFIG),
+    gate_env_var=None,
+    description=(
+        "P-5-F F.0a intermediate-bit-depth row on Qwen3-4B. "
+        "ExtRaBitQ 3-bit K+V; together with the b2 and b4 rows "
+        "this gives a three-point bit-depth trend on the "
+        "production-scale pure-attention target."
     ),
 )
 
@@ -1552,11 +1659,15 @@ BUILTIN_SCENARIOS: dict[str, Scenario] = {
     _QWEN3_5_4B_WIKITEXT_PPL_BLOCK_TQ_B64_B4.id: (
         _QWEN3_5_4B_WIKITEXT_PPL_BLOCK_TQ_B64_B4
     ),
+    _QWEN3_5_4B_WIKITEXT_PPL_EXT_RABITQ_B2.id: _QWEN3_5_4B_WIKITEXT_PPL_EXT_RABITQ_B2,
+    _QWEN3_5_4B_WIKITEXT_PPL_EXT_RABITQ_B3.id: _QWEN3_5_4B_WIKITEXT_PPL_EXT_RABITQ_B3,
     _QWEN3_5_4B_WIKITEXT_PPL_EXT_RABITQ_B4.id: _QWEN3_5_4B_WIKITEXT_PPL_EXT_RABITQ_B4,
     _QWEN3_4B_WIKITEXT_PPL_FP16.id: _QWEN3_4B_WIKITEXT_PPL_FP16,
     _QWEN3_4B_WIKITEXT_PPL_BLOCK_TQ_B64_B4.id: (
         _QWEN3_4B_WIKITEXT_PPL_BLOCK_TQ_B64_B4
     ),
+    _QWEN3_4B_WIKITEXT_PPL_EXT_RABITQ_B2.id: _QWEN3_4B_WIKITEXT_PPL_EXT_RABITQ_B2,
+    _QWEN3_4B_WIKITEXT_PPL_EXT_RABITQ_B3.id: _QWEN3_4B_WIKITEXT_PPL_EXT_RABITQ_B3,
     _QWEN3_4B_WIKITEXT_PPL_EXT_RABITQ_B4.id: _QWEN3_4B_WIKITEXT_PPL_EXT_RABITQ_B4,
     _QWEN3_0_6B_COMPRESSION_FP16.id: _QWEN3_0_6B_COMPRESSION_FP16,
     _QWEN3_0_6B_COMPRESSION_TQ_MSE_B4.id: _QWEN3_0_6B_COMPRESSION_TQ_MSE_B4,

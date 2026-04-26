@@ -714,6 +714,52 @@ Out of scope (tracked separately):
 
 ## 10. Empirical findings (updated as sub-units land)
 
-(This section is empty in v1.0.0 of the doc by design; F.0 / F.1 /
-F.2 / F.3 record evidence here as they land. Reader checking
-implementation status: empty section means F.0 has not landed yet.)
+### 10.1 F.0a — Aggressive codec on 4B targets (2026-04-26, single-seed)
+
+Goal per §6.1: surface whether post-RoPE production path fails on
+4B+ targets at low bit depth (b2 / b3), so P-5-F's deployment
+priority is informed by data rather than extrapolation from the
+0.6B Qwen3 number.
+
+Method: bench scenarios `qwen3-4b-wikitext-ppl-ext-rabitq-{b2,b3,b4}`
+and `qwen3.5-4b-wikitext-ppl-ext-rabitq-{b2,b3,b4}` against fp16
+baselines. WikiText-2 raw test split, chunk_size=256, max_tokens=512,
+block_size=16, single seed=0 (multi-seed coverage moves to F.0b
+where the ΔPPL gate fires).
+
+Result table (post-RoPE production path):
+
+| Model | Arch | fp16 PPL | ΔPPL b4 | ΔPPL b3 | ΔPPL b2 |
+| --- | --- | --- | --- | --- | --- |
+| Qwen3-4B | pure-attn | 12.916 | +0.460 | +3.65 | **+62.73** |
+| Qwen3.5-4B | hybrid | 8.856 | +0.026 | +0.043 | +0.67 |
+
+Findings:
+
+1. **Pure-attention 4B at b2 completely breaks** under post-RoPE.
+   The +62.73 PPL is the same failure-mode signature as the
+   Qwen3-0.6B + b4 +20.83 PPL number — chunk-boundary cost
+   accumulates across prefix-cache refills until model output
+   degenerates. P-5-F has clear deployment ROI on pure-attention
+   targets at low bit depth.
+2. **Hybrid 4B at b2 stays workable** (+0.67 PPL — already inside
+   the D.2a oracle's empirical floor envelope of `+0.51 ± 0.35`).
+   P-5-F's marginal benefit on hybrid 4B+ at b2 is small.
+3. **Architecture × bit-depth interaction is the load-bearing
+   axis.** At b4 the pure-attn vs hybrid tolerance gap is ~17x
+   (0.460 vs 0.026); at b2 it widens to ~100x (62.73 vs 0.67).
+   The hybrid DeltaNet's recurrent state effectively buffers the
+   chunk-boundary cost that pure attention layers cannot absorb.
+
+P-5-F priority recalibration: deployment urgency is highest on
+pure-attention production targets aspiring to b3/b2 codec configs
+(future Qwen3-27B-class deployments under aggressive memory
+pressure). Hybrid targets at b3/b4 do not require P-5-F for
+quality reasons; they may still benefit architecturally
+(injection-space cleanliness, codec-oracle convergence) but the
+quality urgency is on pure-attention.
+
+### 10.2 F.0b — pending
+
+(F.0b lands the Option A minimum prototype + ΔPPL gate per
+§6.1 (b). Will be filled here when the prototype run completes.)
