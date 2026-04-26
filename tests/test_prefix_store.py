@@ -587,3 +587,54 @@ def test_resident_bytes_matches_shorthand_codec_arithmetic() -> None:
     per_side_bytes_one_block = block_size * n_kv_heads * head_dim * mx.float16.size
     expected = n_blocks * n_layers * 2 * per_side_bytes_one_block
     assert store.resident_bytes() == expected
+
+
+# --- P-5-F F.2a: pre_norm contract tag --------------------------------------
+
+
+def test_pre_norm_default_is_false() -> None:
+    """Default construction reflects the legacy post-RoPE contract."""
+    store = SyntheticPrefixBlockStore(block_size=16)
+    assert store.pre_norm is False
+
+
+def test_pre_norm_true_round_trip_is_unchanged() -> None:
+    """Setting ``pre_norm=True`` does not alter encode / decode behaviour.
+
+    The flag is a contract tag for downstream consumers, not a codec
+    knob. The same K / V tensors registered at ``pre_norm=True`` must
+    fetch back identically (no in-store transformation).
+    """
+    store = SyntheticPrefixBlockStore(block_size=4, pre_norm=True)
+    assert store.pre_norm is True
+    bid = store.allocate_id()
+    store.retain_source(bid)
+    k = mx.arange(32, dtype=mx.float16).reshape(1, 2, 4, 4)
+    v = mx.arange(32, dtype=mx.float16).reshape(1, 2, 4, 4) * 2
+    store.register_detached(bid, [(k, v)])
+    fetched = store.fetch_detached(bid)
+    assert len(fetched) == 1
+    fk, fv = fetched[0]
+    assert mx.array_equal(fk, k).item()
+    assert mx.array_equal(fv, v).item()
+
+
+def test_pre_norm_flag_is_independent_of_codec_path() -> None:
+    """``pre_norm`` composes with codec / k_codec / v_codec without conflict."""
+    from silica.kvcache.codec import IdentityCodec
+
+    store = SyntheticPrefixBlockStore(
+        block_size=4,
+        codec=IdentityCodec(block_size=4, n_kv_heads=2, head_dim=4),
+        pre_norm=True,
+    )
+    assert store.pre_norm is True
+    bid = store.allocate_id()
+    store.retain_source(bid)
+    k = mx.arange(32, dtype=mx.float16).reshape(1, 2, 4, 4)
+    v = mx.arange(32, dtype=mx.float16).reshape(1, 2, 4, 4) * 2
+    store.register_detached(bid, [(k, v)])
+    fk, fv = store.fetch_detached(bid)[0]
+    # IdentityCodec round-trips bit-faithfully regardless of pre_norm.
+    assert mx.array_equal(fk, k).item()
+    assert mx.array_equal(fv, v).item()

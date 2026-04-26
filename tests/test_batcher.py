@@ -553,6 +553,74 @@ def test_sliding_adapter_with_prefix_cache_raises_before_capability_gate() -> (
     assert "BatchRotatingKVCache" in msg
 
 
+# --- P-5-F F.2a: pre-norm store contract validation ------------------------
+
+
+def test_pre_norm_store_with_non_capture_adapter_rejected() -> None:
+    """F.2a: ``store.pre_norm=True`` requires the adapter to implement
+    ``PreNormCaptureAdapter``. The scripted test adapter does not
+    expose ``install_pre_norm_capture`` / ``apply_k_norm_then_rope``,
+    so the batcher must refuse to construct with a clear error.
+    """
+    adapter = _ScriptedAdapter(n_layers=2)  # pure GLOBAL, no Protocol mixin
+    pc = RadixPrefixCache(
+        block_size=16,
+        store=SyntheticPrefixBlockStore(block_size=16, pre_norm=True),
+    )
+    with pytest.raises(TypeError) as exc:
+        ContinuousBatcher(adapter, prefix_cache=pc)
+    msg = str(exc.value)
+    assert "pre_norm" in msg
+    assert "PreNormCaptureAdapter" in msg
+
+
+def test_pre_norm_store_with_capture_adapter_constructs() -> None:
+    """F.2a: an adapter that implements the Protocol passes the gate."""
+    from silica.models.pre_norm_capture import (
+        _PreNormCaptureBufferHolder,
+    )
+
+    class _ScriptedCaptureAdapter(_ScriptedAdapter):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self._capture_holder = _PreNormCaptureBufferHolder()
+
+        def install_pre_norm_capture(
+            self, buffer: dict[int, mx.array] | None
+        ) -> None:
+            self._capture_holder.buffer = buffer
+
+        def apply_k_norm_then_rope(
+            self,
+            attn_layer_pos: int,
+            k_pre_block: mx.array,
+            *,
+            offset: int,
+        ) -> mx.array:
+            del attn_layer_pos, offset
+            return k_pre_block
+
+    adapter = _ScriptedCaptureAdapter(n_layers=2)
+    pc = RadixPrefixCache(
+        block_size=16,
+        store=SyntheticPrefixBlockStore(block_size=16, pre_norm=True),
+    )
+    ContinuousBatcher(adapter, prefix_cache=pc)  # no raise
+
+
+def test_pre_norm_default_store_does_not_require_capture_adapter() -> None:
+    """``pre_norm=False`` (legacy default) does not gate adapter
+    Protocol conformance — existing post-RoPE consumers stay valid.
+    Regression guard.
+    """
+    adapter = _ScriptedAdapter(n_layers=2)
+    pc = RadixPrefixCache(
+        block_size=16,
+        store=SyntheticPrefixBlockStore(block_size=16),  # pre_norm=False
+    )
+    ContinuousBatcher(adapter, prefix_cache=pc)  # no raise
+
+
 def test_admit_miss_cohort_calls_adapter_make_batch_cache() -> None:
     """P-3-C3b: mid-run admission's fresh prefill now routes through
     ``adapter.make_batch_cache`` alongside the initial-cohort path

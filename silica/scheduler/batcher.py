@@ -54,6 +54,7 @@ from silica.core.sampling import SamplingParams
 from silica.kvcache.prefix import RadixPrefixCache
 from silica.mlx.runner import forward_batched
 from silica.models.adapter import AttentionKind, ModelAdapter
+from silica.models.pre_norm_capture import PreNormCaptureAdapter
 from silica.models.recurrent import RecurrentSnapshot, RecurrentStateAdapter
 from silica.scheduler.budget import (
     AdmitAfterEvictDecision,
@@ -237,6 +238,35 @@ class ContinuousBatcher:
                     "admission are not yet validated (P-3-D3 local "
                     "follow-up). Pass prefix_cache=None to run "
                     "sliding-bearing adapters under the miss-only path."
+                )
+            # P-5-F F.2a: pre-norm store contract. When the store
+            # declares ``pre_norm=True`` the K side of every detached
+            # payload is pre-k_norm K (the output of ``attn.k_proj``);
+            # the admit path must call
+            # ``adapter.apply_k_norm_then_rope`` per block per attn
+            # position before seeding the live cache. The adapter
+            # therefore must implement ``PreNormCaptureAdapter``. The
+            # check uses ``getattr`` with a default so legacy
+            # ``PagedPrefixBlockStore``-shaped stores (no ``pre_norm``
+            # attribute) keep behaving as the post-RoPE path.
+            store_is_pre_norm = bool(
+                getattr(prefix_cache.store, "pre_norm", False)
+            )
+            if store_is_pre_norm and not isinstance(
+                adapter, PreNormCaptureAdapter
+            ):
+                raise TypeError(
+                    "ContinuousBatcher: prefix_cache.store.pre_norm is "
+                    "True but the adapter does not implement "
+                    "silica.models.pre_norm_capture.PreNormCaptureAdapter "
+                    f"(adapter type: {type(adapter).__name__}). The "
+                    "pre-norm store path requires the adapter to expose "
+                    "install_pre_norm_capture / apply_k_norm_then_rope "
+                    "so the batcher can capture K_pre during prefill "
+                    "and reconstruct post-RoPE K on hit-path admit. "
+                    "Either pass an adapter that ships P-5-F F.1 or "
+                    "construct the store with pre_norm=False (legacy "
+                    "post-RoPE path)."
                 )
         self._enforce_capability_gate(adapter)
         self._adapter = adapter

@@ -238,6 +238,7 @@ class SyntheticPrefixBlockStore:
         k_codec: VectorCodec | None = None,
         v_codec: VectorCodec | None = None,
         codec: VectorCodec | None = None,
+        pre_norm: bool = False,
     ) -> None:
         if block_size <= 0:
             raise ValueError(f"block_size must be > 0, got {block_size}")
@@ -281,6 +282,22 @@ class SyntheticPrefixBlockStore:
         self.block_size = block_size
         self._k_codec = effective_k
         self._v_codec = effective_v
+        # P-5-F F.2a: ``pre_norm`` is a contract tag declaring how the
+        # K side of every ``register_detached`` payload was produced.
+        # ``False`` (default, legacy) — K is post-RoPE, the cache-
+        # extracted shape ``ContinuousBatcher`` slices today. ``True``
+        # — K is pre-k_norm, the output of ``attn.k_proj(x)`` captured
+        # via ``PreNormCaptureAdapter.install_pre_norm_capture``;
+        # consumers fetching K must apply ``adapter.apply_k_norm_then_rope``
+        # before seeding the live cache. The store does not encode /
+        # decode the K differently — the codec sees the same per-head
+        # tensor shape either way — but the flag lets a consumer that
+        # reads ``store.pre_norm`` branch on which reconstruction step
+        # is required, and ``RadixPrefixCache`` validates the flag
+        # against the active adapter's Protocol surface at construction
+        # time (an adapter without ``PreNormCaptureAdapter`` cannot
+        # operate against a ``pre_norm=True`` store).
+        self.pre_norm: bool = pre_norm
         self._next_id: int = 0
         self._source_refs: dict[int, int] = {}
         self._hit_refs: dict[int, int] = {}
