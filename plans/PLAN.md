@@ -4,7 +4,7 @@
 | ------------ | -------------------------------------------------------------------------- |
 | Version      | v1.7.14                                                                    |
 | Last updated | 2026-04-27                                                                 |
-| Status       | P-5 complete; P-5 Acceptance (1)–(4) closed at v1.7.4; (a-real) real-activation xcheck closed at v1.7.5; P-3-C5 closed in slice-prefill regime (C5.5 α-MVP); P-3-E4 batched MoE smoke + scheduler-glue parity closed at v1.7.9; P-5-F pre-RoPE production routing closed at v1.7.6 via the (3b) projection-output capture path (F.1-F.4); (b-static) Qwen3.5-4B PPL vs vqbench REPORT.md baseline closed at v1.7.7; slice-regime + pre_norm hybrid Qwen3.5-0.8B E2E discriminator closed at v1.7.8; per-head Haar rotation landed as opt-in (default OFF) at v1.7.8; per-head D.2a 3-seed re-measurement at v1.7.10 — \|mean_gap\| 0.150 → 0.066 PPL (56% reduction); per-head (b-static) Qwen3.5-4B production-path re-measurement at v1.7.11 — std 5.3× tighter, mean unchanged in SEM, default flip is now an administrative landing, not an empirical question; **P-6 re-scoped from "Weight Streaming" to "Performance Phase" at v1.7.13 per D-017 / D-018 / D-019 — dense Qwen3.5-27B-4bit ≥60 tok/s primary target + MoE Qwen3.5-35B-A3B-4bit ≥100 tok/s stretch validator on 48 GB M5 Pro; P-7 Speculative promoted from T2 to T1; dense layer-streaming deferred to v0.2; Track C speculative grows to five sub-units per D-020 (C.1 draft-target, C.2 ReDrafter, C.3 MTP, C.4 DFlash, C.5 DDTree); P-6.0 measurement gate landed at v1.7.13 (8 scenarios + REPORT in `plans/P6_0_BASELINE/`); **P-6 contract sync at v1.7.14 per D-021** — dense gate split into (1a) ≥40 tok/s engineering (must pass) + (1b) ≥60 tok/s stretch (contingent on C.4/C.5 ≥2.5×); execution order rewritten to foundation-first (P5.9 hardening → P-6.0.5 → Decision Gate 1 → spec foundation → C.4 spike → B → A); see `plans/P6_OPENING.md` and `plans/P6_REVIEW_HANDOFF.md`** |
+| Status       | P-5 complete; P-5 Acceptance (1)–(4) closed at v1.7.4; (a-real) real-activation xcheck closed at v1.7.5; P-3-C5 closed in slice-prefill regime (C5.5 α-MVP); P-3-E4 batched MoE smoke + scheduler-glue parity closed at v1.7.9; P-5-F pre-RoPE production routing closed at v1.7.6 via the (3b) projection-output capture path (F.1-F.4); (b-static) Qwen3.5-4B PPL vs vqbench REPORT.md baseline closed at v1.7.7; slice-regime + pre_norm hybrid Qwen3.5-0.8B E2E discriminator closed at v1.7.8; per-head Haar rotation landed as opt-in (default OFF) at v1.7.8; per-head D.2a 3-seed re-measurement at v1.7.10 — \|mean_gap\| 0.150 → 0.066 PPL (56% reduction); per-head (b-static) Qwen3.5-4B production-path re-measurement at v1.7.11 — std 5.3× tighter, mean unchanged in SEM, default flip is now an administrative landing, not an empirical question; **P-6 re-scoped from "Weight Streaming" to "Performance Phase" at v1.7.13 per D-017 / D-018 / D-019 — dense Qwen3.5-27B-4bit ≥60 tok/s primary target + MoE Qwen3.5-35B-A3B-4bit ≥100 tok/s stretch validator on 48 GB M5 Pro; P-7 Speculative promoted from T2 to T1; dense layer-streaming deferred to v0.2; Track C speculative grows to five sub-units per D-020 (C.1 draft-target, C.2 ReDrafter, C.3 MTP, C.4 DFlash, C.5 DDTree) and to six sub-units at v1.7.14 round-2 review (C.6 QuantSpec-like self-spec exploratory); P-6.0 measurement gate landed at v1.7.13 (8 scenarios + REPORT in `plans/P6_0_BASELINE/`); **P-6 contract sync at v1.7.14 per D-021** — dense gate split into (1a) ≥40 tok/s engineering (must pass) + (1b) ≥60 tok/s stretch (contingent on C.4/C.5 ≥2.5×); MoE acceptance split into (2a) ≥100 tok/s anchor (cleared at baseline) + (2b) ≥150 aggregate or ≥100 per-row stretch; execution order rewritten to foundation-first (P5.9 hardening → P-6.0.5 → Decision Gate 1 → spec foundation → C.4 spike → B → A); v1.7.14 round-3 review absorbed via stale-text cleanup (canonical §7 P-6 / §7 P-7 / §3.2 entry-point synchronisation); P5.9 step 2(a) probe double-load fix landed at commit `0bd931a` with 27B/31B peaks corrected from inflated ~30.5 GB to real ~15.3 GB / ~17.5 GB; see `plans/P6_OPENING.md` and `plans/P6_REVIEW_HANDOFF.md`** |
 | Maintainer   | Xin Zhou                                                                   |
 | Source       | `plans/PLAN.md` (single source of truth)                                    |
 
@@ -80,7 +80,7 @@ On a single Apple Silicon Mac, let developers run 27B–31B-class models locally
 - Full agent orchestration.
 - Explicitly excluded codecs: PQ, OPQ.
 - Compressed-domain attention fast path (see D-003, deferred to v0.2).
-- Complex speculative schemes (DFlash / EAGLE / Medusa) — deferred to v0.2.
+- Complex speculative schemes — partially in v0.1: **DFlash** (block-diffusion drafter, arxiv 2602.06036) is in scope as P-6 Track C.4 spike per D-020 / D-021; **DDTree** (DFlash + draft tree, arxiv 2604.12989) is in scope as Track C.5; **QuantSpec-like self-spec** is exploratory Track C.6. **EAGLE / Medusa**-style full ports stay deferred to v0.2 (no MLX implementation that meets the D-009 native-runtime constraint, and the porting cost exceeds v0.1's budget).
 - **PyTorch runtime dependency** (D-009): the inference hot path may not contain `torch.Tensor`; torch is allowed only as an optional dev dependency for offline weight conversion.
 - **CUDA / ROCm / XPU / TPU backends** (D-009): `csrc/`, CUDA kernels, and device-specific workers are out of scope.
 - **Multimodal input / output** (D-014): v0.1 runs the **text-only path** of multimodal checkpoints (Qwen3.5 family, Gemma4). Vision / audio / video encoder lifecycle, image / audio / video tokens, and non-text processors are v0.2. Multimodal checkpoints are expected to load with their vision / audio heads ignored or weight-skipped.
@@ -460,7 +460,7 @@ Each Phase uses the same structure: `ID / Goal / Scope / Strategy / Deliverables
     - `capabilities()` reports `attention_kinds={GLOBAL, HYBRID_DELTANET}`, `has_recurrent_state=True`, `has_moe=False`. Per-layer pattern is a strict 3:1 repeating `[D, D, D, G]` across all 64 layers — 48 HYBRID_DELTANET + 16 GLOBAL. Same hybrid architecture as Qwen3.5-0.8B, just wider and deeper.
     - Single-request `Engine.generate` runs end-to-end (greedy 4-token completion of "Hello" → `", I have a"` — plausible base-model continuation). First-forward kernel compile dominates TTFT (~2.4 s for a 1-token prompt), so prefill-tok/s on this single run is not a meaningful baseline — rerun after warmup when quantified bench data is needed.
     - Peak device memory ~30.5 GB (weights ~16 GB + MLX forward scratch ~14 GB) — leaves ~17 GB headroom on a 48 GB M5 Pro for KV growth and batch state. **Superseded at v1.7.14 by P5.9 step 2(a) — see 2026-04-27 correction below.** The 30.5 GB figure was inflated by the probe's double-load pattern (`_mlx_lm_load(repo)` followed by `adapter_for_repo(repo)` which loaded the same checkpoint a second time).
-    - At v1.6.1 this path was blocked by the D-016 capability gate (HYBRID_DELTANET → `has_recurrent_state=True`). As of P-3-C3c / P-3-C3d the shared Qwen3.5 hybrid scheduler is batch-enabled and **greedy parity is pinned on Qwen3.5-0.8B** (see the next bullet). Qwen3.5-27B re-uses the same scheduler code path, so no further Silica-side wiring is expected for batched execution — but **large-context batched validation on 27B remains pending a P-4 / dedicated bench round** because of the ~30.5 GB load-peak memory cost and decode-throughput runtime cost; landing it alongside a smoke here would mean downloading 16 GB and running multi-token batched generation on every test run.
+    - At v1.6.1 this path was blocked by the D-016 capability gate (HYBRID_DELTANET → `has_recurrent_state=True`). As of P-3-C3c / P-3-C3d the shared Qwen3.5 hybrid scheduler is batch-enabled and **greedy parity is pinned on Qwen3.5-0.8B** (see the next bullet). Qwen3.5-27B re-uses the same scheduler code path, so no further Silica-side wiring is expected for batched execution — but **large-context batched validation on 27B remains pending a P-4 / dedicated bench round** because of the decode-throughput runtime cost and the dedicated-bench cost of 16 GB checkpoint plus multi-token batched generation. (At the time this finding was written, the rationale also cited "~30.5 GB load-peak memory cost"; that figure was the double-load artefact and is not the actual bench cost — see the v1.7.14 supersede note above and the 2026-04-27 correction entry below.)
   - **2026-04-20 — Gemma4-31B-4bit load probe + mlx-lm source survey** (P-3-D0 / P-3-D0.2, `scripts/probe_gemma4_31b_load.py` on `mlx-community/gemma-4-31b-4bit`, structured notes in `plans/P3_GEMMA4_SURVEY.md`):
     - `mlx_lm.load` accepts the repo; outer `model_type='gemma4'`, inner `text_config.model_type='gemma4_text'`. mlx-lm has full Gemma4 support shipped; no vlm fallback is needed for text-only inference.
     - 60-layer dense model (31B class): strict 5:1 repeating `[S, S, S, S, S, F]` pattern → 50 `sliding_attention` + 10 `full_attention` layers. `sliding_window=1024`, two distinct KV shapes (sliding: `n_kv_heads=16, head_dim=256`; full: `n_kv_heads=4, head_dim=512` with `attention_k_eq_v=True`). Not MoE (`num_experts=None`, `enable_moe_block=False`); not per-layer-input (`hidden_size_per_layer_input=0`); `num_kv_shared_layers=0`.
@@ -602,19 +602,32 @@ Each Phase uses the same structure: `ID / Goal / Scope / Strategy / Deliverables
     checkpoints (precedent: `unsloth/Qwen3.6-27B-UD-MLX-3bit`); PPL
     cross-check oracle. Lifts the dense bandwidth ceiling 22.7 → 30.3
     tok/s if quality holds.
-  - **Track C — Speculative decoding (P-7 sub-units pulled in):**
-    draft-target with small-Qwen as draft (C.1, primary attempt),
-    Apple ReDrafter (C.2, stretch), Qwen3.5 MTP head as draft (C.3,
-    architecture-specific). Required to clear the dense-27B
-    bandwidth ceiling on autoregressive — see D-019.
+  - **Track C — Speculative decoding (P-7 sub-units pulled in):** six
+    sub-units measured independently; phase-exit picks the
+    highest-performing variant that lands cleanly. **C.1** draft-target
+    with small-Qwen as draft (primary baseline). **C.2** Apple
+    ReDrafter (RNN draft + dynamic tree attention; KD pass in scope
+    per Q-015 / D-020). **C.3** Qwen3.5 MTP head as draft. **C.4**
+    DFlash block-diffusion drafter (arxiv 2602.06036; MLX port at
+    `bstnxbt/dflash-mlx`) — the dense gate decider per D-021 step 6.
+    **C.5** DDTree (DFlash + draft tree; arxiv 2604.12989; MLX port
+    at `humanrouter/ddtree-mlx`). **C.6** QuantSpec-like same-model
+    self-spec (ICML 2025; exploratory, only pursued if C.4/C.5 land
+    below 2× silica-integrated speedup). Required to clear the
+    dense-27B bandwidth ceiling on autoregressive — see D-019 / D-020.
   - **Track D — TTFT levers:** Sarathi-style chunked prefill + decode
     merging (resolves Q-010 to "promoted to default for prompts ≥ 512
     tokens"); optional mlx-mfa long-prefill kernel.
-  - **Track E — Weight streaming (original P-6 scope) + SSD-tiered
-    prefix cache:** MoE per-expert residency (E.1, original P-6
-    deliverable preserved); SSD-tiered prefix cache for chat-session
-    cold prefixes (E.2, oMLX pattern); dense layer-streaming (E.3)
-    **deferred to v0.2 per D-018**.
+  - **Track E — Weight streaming (original P-6 scope) + active-fp16 +
+    cold-compressed prefix tier:** MoE per-expert residency (E.1,
+    original P-6 deliverable preserved); **E.2 two-tier prefix
+    cache** — recent / hot nodes resident at fp16; cold nodes pass
+    through `silica.vq` BlockTQ / RaBitQ on eviction (memory-mapped
+    SSD blob or compressed-resident depending on SSD speed) and
+    reconstruct on hit via the existing P-5-F (3b)
+    `apply_k_norm_then_rope` capture path; preserves D-003 (no
+    compressed-domain attention) and reuses existing infrastructure;
+    dense layer-streaming (E.3) **deferred to v0.2 per D-018**.
 - **Strategy:**
   - **Bandwidth physics first.** M5 Pro unified memory is 307 GB/s.
     Dense Qwen3.5-27B-4bit reads ~13.5 GB per autoregressive step,
@@ -675,6 +688,21 @@ Each Phase uses the same structure: `ID / Goal / Scope / Strategy / Deliverables
   - [ ] **B.2** — `qwen3.5-27b-3bit-vs-4bit-ppl` oracle row.
   - [ ] **C.1** — `silica.speculative.draft_target.DraftTargetEngine`
     (minimum P-7 deliverable from §7 P-7); greedy parity gate.
+    Serves as the spec baseline every later C.x is compared against.
+  - [ ] **C.4** — DFlash block-diffusion drafter integration
+    (`silica.speculative.dflash` against the existing
+    `bstnxbt/dflash-mlx` reference). Gate: ≥1.8× silica-integrated
+    speedup over C.1 baseline continues; ≥2.5× justifies pursuing
+    the (1b) ≥60 tok/s stretch; below 1.8× retires (1b) per D-021
+    step 6.
+  - [ ] **C.5** — DDTree tree-verification path on top of C.4's
+    DFlash drafter (`humanrouter/ddtree-mlx` reference; Metal
+    kernel for ancestor-only attention mask; integrates with
+    silica's paged KV).
+  - [ ] **C.6 (exploratory)** — QuantSpec-like same-model self-spec
+    composing Track B 3-bit weights with `silica.vq` quantized KV
+    against the full-precision target; only pursued if C.4 / C.5
+    land below 2× silica-integrated speedup (D-021 step 8).
   - [ ] **D.1** — chunked prefill + decode merging promoted from
     α-MVP slice-regime to default for prompts ≥ 512 tokens
     (`silica.scheduler.batcher`).
@@ -682,8 +710,12 @@ Each Phase uses the same structure: `ID / Goal / Scope / Strategy / Deliverables
     drop without phase impact if the kernel doesn't load).
   - [ ] **E.1** — `silica.weights.streaming.StreamingWeightProvider`
     (MoE per-expert mode only; dense mode deferred per D-018).
-  - [ ] **E.2** — SSD-tiered prefix cache (oMLX pattern;
-    `silica.kvcache.prefix` extension).
+  - [ ] **E.2** — two-tier prefix cache: active fp16 (recent / hot)
+    + cold compressed via `silica.vq` BlockTQ / RaBitQ on eviction,
+    reconstruct on hit via the P-5-F (3b) capture path; SSD-resident
+    or compressed-resident depending on storage speed
+    (`silica.kvcache.prefix` extension; reuses existing codec
+    infrastructure without violating D-003).
 - **Acceptance:** items 1, 3, 4, 5, 6 must pass; item 2 is the stretch
   validator (record in Decisions Log if missed; phase still exits).
   - [ ] **(1a) Dense engineering gate — Qwen3.5-27B-4bit ≥40 tok/s
@@ -763,7 +795,12 @@ Each Phase uses the same structure: `ID / Goal / Scope / Strategy / Deliverables
 - **Scope:** `NoopDraftEngine` (already in tree) + `DraftTargetEngine` (most basic version).
 - **Strategy:**
   - A small model drafts; the large model verifies.
-  - EAGLE / Medusa / DFlash complexity is deferred to v0.2.
+  - **EAGLE / Medusa** full-port complexity is deferred to v0.2.
+    **DFlash** (Track C.4 in P-6) and **DDTree** (Track C.5 in P-6)
+    are pulled forward into the P-6 performance phase per D-020 /
+    D-021; the standalone P-7 phase block exists for v0.2 EAGLE /
+    Medusa work and as the integration point for any speculative
+    variants beyond what P-6 Track C lands.
 - **Deliverables:**
   - [ ] `silica.speculative.draft_target.DraftTargetEngine`.
   - [ ] Integration with the decode loop.
@@ -775,7 +812,12 @@ Each Phase uses the same structure: `ID / Goal / Scope / Strategy / Deliverables
   - [ ] Baseline correctness is preserved (smoke tests pass with the switch in either position).
 - **Dependencies:** P-2 + P-3.
 - **Status:** planned.
-- **Notes:** DFlash / dflash-mlx are v0.2 candidates.
+- **Notes:** DFlash / dflash-mlx are **in v0.1 scope as P-6 Track
+  C.4** (D-020 / D-021); DDTree is Track C.5; QuantSpec-like
+  self-spec is exploratory Track C.6. The remaining v0.2 candidates
+  for the standalone P-7 phase are EAGLE / Medusa / Mirror-SD /
+  STree-class techniques whose MLX-native ports do not yet exist
+  or whose integration cost exceeds v0.1's budget.
 
 ### P-8 Phase 8 — Mini-SGLang Layer
 
@@ -1479,7 +1521,7 @@ Resolved questions are not deleted. Mark `Status: resolved` and append a `Resolu
 - **Next step:** decide after Phase 3 produces real residency numbers. The MoE path can close without waiting for Q-003.
 - **2026-04-21 progress (partial data, not a resolution):**
   - Qwen3.5-27B-4bit load probe (2026-04-19, logged under §7 P-3 empirical findings): originally reported ~30.5 GB peak. **Corrected at v1.7.14 P5.9 step 2(a) to ~15.3 GB** — the original figure was inflated by probe double-load (`_mlx_lm_load(repo)` followed by `adapter_for_repo(repo)`); see §7 P-3 Empirical findings 2026-04-27 entry. Gemma4-31B-4bit probe corrected to ~17.5 GB at the same revision. Both dense targets fit comfortably with **~32 GB headroom on dense 27B** for KV growth and batch state. The Q-003 resolution at v1.7.13 (closed via D-021) does not change — the bandwidth-physics framing was always the load-bearing argument; the headroom number tightens but the conclusion holds.
-  - The P-3 Acceptance Product memory-fit target requires **500 tokens of sustained generation** with headroom for KV growth + batch; neither probe validated that. With KV growing at ≈ bytes_per_token × seq_len × batch, a 500-token single-request run on 27B / 31B at the measured ≈ 17 GB headroom is credible but unvalidated.
+  - The P-3 Acceptance Product memory-fit target requires **500 tokens of sustained generation** with headroom for KV growth + batch; neither probe validated that. With KV growing at ≈ bytes_per_token × seq_len × batch, a 500-token single-request run on 27B / 31B at the v1.7.14-corrected headroom (~32 GB on dense 27B, ~30 GB on Gemma4-31B per the P5.9 step 2(a) re-run that supersedes the inflated 30.5 GB figure) is credible but **the 500-token sustained target itself remains unvalidated** — the P-6.0 baseline only validates 384 tokens. Adding a sustained 4K / 8K bench row is P5.9 step 2(d).
   - Q-003 therefore remains **open, leaning not-triggered**. The product-memory-fit validation is **not** a P-4.5 deliverable; it ships when either (a) a dedicated dense-long-inference bench row runs under `SILICA_REAL_QWEN3_5_27B=1` / `SILICA_REAL_GEMMA4_31B=1` and passes ≥ 500 tokens, or (b) a user running the chat REPL on either checkpoint hits an OOM and re-opens the question. **No immediate P-6 promotion is warranted.**
 
 ### Q-004 — `silica.core` vs `silica.engine` boundary

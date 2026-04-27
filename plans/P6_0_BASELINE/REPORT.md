@@ -197,40 +197,75 @@ That work belongs to Track D.1 (chunked prefill).
 
 ---
 
-## 7. Recommended Next Steps
+## 7. Recommended Next Steps (v1.7.14 contract — D-021 ten-step path)
 
-Given the baseline data:
+Given the baseline data, the recommended ordering follows the
+foundation-first sequence committed at v1.7.14 (D-021). C.4 is the
+dense-gate decider but it is **not** the first step — it lands at
+step 6, after the spec foundation (step 5) and P5.9 hardening
+(step 2):
 
-1. **Confirm or re-target the dense 60 tok/s gate before committing
-   significant Track work.** The bandwidth math says the gate is at
-   the edge; DFlash (C.4) is the cheapest test of whether speculative
-   buys enough headroom to clear it. Land C.4 first as a measurement,
-   then decide.
+1. **P5.9 hardening pass** (D-021 step 2). Eight bounded
+   deliverables: probe double-load fix, Q-012 affirmative
+   resolution, Qwen3.5 recurrent rollback, sustained 4K/8K
+   memory probe, D-009 hot-path audit, speculative metrics
+   schema, P-5 quality regression as P-6 per-track gate, and a
+   full toolchain re-run. No new optimization features; only
+   load-bearing crack repair.
 
-2. **Track A is high leverage on MoE, low leverage on dense.** If
-   Track A lands first, it will move MoE B=2 from ~121 to ~150-180
-   tok/s aggregate but barely move dense 27B from ~16. Order tracks
-   accordingly: A is a "free win" but not the dense-gate-cracker.
+2. **P-6.0.5 measurement expansion** (D-021 step 3). Add 27B B=2,
+   MoE B=3, 27B 4K-context peak, warm-TTFT scenario, and the
+   target-verification microbench (one target forward verifying
+   2 / 4 / 8 candidate tokens). The microbench is the
+   prerequisite for credible Track C ROI estimation.
 
-3. **Track B (3-bit) is the cheapest engine win for dense.** It
-   re-applies the bandwidth math at smaller bytes/step. If 3-bit
-   Qwen3.5-27B holds quality, it lifts the dense ceiling from 22.7
-   to ~30 tok/s at no engine cost — and combined with C.1 spec
-   (1.4-1.8×), reaches 40-50 tok/s on dense without C.4/C.5.
+3. **Decision Gate 1** (D-021 step 4). P-6.0.5 evidence either
+   confirms (1a) ≥40 tok/s and (1b) ≥60 tok/s remain in pursuit,
+   or records a re-target Decision Log entry. **No Track A-E PR
+   opens until this gate records its re-confirmation.**
 
-4. **Track C.4 (DFlash) is the gate-decider for dense 60 tok/s.**
-   The other C variants (C.1/C.2/C.3) cannot get dense to 60 alone.
-   Land C.4 measurement before deciding whether to re-target the gate.
+4. **Spec foundation + C.1** (D-021 step 5). DraftEngine wired
+   into the engine main loop with greedy spec-on / spec-off
+   parity gate; spec metadata schema populated; recurrent +
+   KV rollback bound by a dedicated test. C.1 draft-target serves
+   as the spec baseline every later C.x is compared against.
 
-5. **MoE stretch is met; raise the bar.** Phase exit on MoE is no
-   longer in question. Use MoE measurements as the "clean
-   demonstration" track for sync collapse / sampler fusion / spec
-   variants — every Track A-C win shows up cleanly on MoE because
-   the path has bandwidth slack.
+5. **C.4 DFlash spike** (D-021 step 6). **The dense gate decider —
+   but lands fifth, not first.** Minimal closed loop: drafter
+   wired, fixed P-6.0 prompt / scenario, output speedup +
+   acceptance + draft overhead + peak memory + quality parity.
+   Gate: ≥1.8× silica-integrated speedup over C.1 continues;
+   ≥2.5× justifies pursuing the (1b) ≥60 tok/s stretch; below
+   1.8× retires (1b) per D-021.
 
-6. **Defer Track D.1 measurement until concurrency scenarios exist.**
-   The TTFT-under-concurrency gate requires a new scenario shape
-   that doesn't exist yet; not a baseline gap.
+6. **Track B 3-bit** (D-021 step 7). Loader + PPL oracle first,
+   pass quality gate, then 27B 3-bit warm-decode. If 3-bit lifts
+   dense from 16 → 21-24 tok/s, stack with spec; otherwise ship
+   opt-in.
+
+7. **C.5 / C.2 / C.3 selection** (D-021 step 8). C.5 reuses the
+   DFlash drafter and adds tree verification; C.2 ReDrafter pursued
+   only if C.1 / C.4 are insufficient and (1b) is still in pursuit;
+   C.3 MTP head if architecture compatibility is favorable. C.6
+   QuantSpec-like self-spec is exploratory — only if C.4 / C.5
+   land below 2× silica-integrated speedup.
+
+8. **Track A sync collapse** (D-021 step 9). Repositioned as
+   "general efficiency + MoE amplifier" — small lift on dense
+   (bandwidth-bound), large lift on MoE B=2 (40% bandwidth slack).
+   Explicitly **not** the dense-gate cracker; lands here so its
+   wins are visible against an already-spec-running baseline.
+
+9. **Track D / E** (D-021 step 10). D.1 chunked prefill + decode
+   merging (resolves the TTFT-under-concurrency §6(3) gate);
+   D.2 mlx-mfa kernel measurement-gated; E.1 MoE per-expert
+   streaming preserves the original P-6 deliverable; E.2 active
+   fp16 + cold compressed prefix tier.
+
+**MoE stretch is met at baseline (120.93 tok/s aggregate at B=2);
+phase exit on MoE is no longer in question.** Use MoE measurements
+as the "clean demonstration" surface for every Track A-C win, since
+the path has bandwidth slack.
 
 ---
 

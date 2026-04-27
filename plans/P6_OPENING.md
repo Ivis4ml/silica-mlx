@@ -138,14 +138,19 @@ a number the chip cannot deliver.
 - **TTFT-under-concurrency:** the long-prompt request must not block
   short-prompt requests by more than 2× their solo TTFT — directly
   resolves Q-010 in PLAN.md (chunked prefill promotion).
-- **Peak resident memory (Qwen3.5-27B-4bit, B=1, 4K context):** ≤ 36 GB,
-  leaving 12 GB system headroom on a 48 GB machine. The v1.7.14
-  P5.9 step 2(a) corrected probe reports ~15.3 GB peak on a 1-token
-  forward (was ~30.5 GB at v1.6.1 due to probe double-load); P-6.0
-  warm-decode B=1 at 384-token gen reports peak 15.4 GB, confirming
-  sustained-decode peak matches the probe number. Real headroom at
-  the 4K-context gate is therefore ~21 GB, not the ~5 GB previously
-  assumed.
+- **Peak resident memory (Qwen3.5-27B-4bit, B=1, 4K context):** ≤ 36 GB.
+  The 36 GB ceiling itself leaves **12 GB system headroom** on a 48 GB
+  machine (48 − 36 = 12; this is the gate's stated system-headroom
+  invariant). The **separately-named "KV / scratch budget" inside the
+  36 GB ceiling** is now ~21 GB (= 36 GB ceiling − ~15.3 GB corrected
+  baseline peak from the v1.7.14 P5.9 step 2(a) probe re-run, which
+  supersedes the inflated ~30.5 GB v1.6.1 figure caused by probe
+  double-load). The two numbers are different things and should not
+  be conflated: 12 GB is the slack between the gate ceiling and total
+  machine memory; ~21 GB is the slack between the corrected baseline
+  forward peak and the gate ceiling. P-6.0 warm-decode B=1 at
+  384-token gen reports peak 15.4 GB, confirming sustained-decode
+  peak matches the corrected probe number.
 - **Concurrent request capacity (Qwen3.5-27B-4bit, mixed 512-token
   prompts):** ≥ 4 requests sustained, with admission-headroom-style
   evidence that BlockTQ KV codec actually translates into more admitted
@@ -313,9 +318,15 @@ holds.
 **Track B acceptance gates:**
 
 - B.1: 3-bit Qwen3.5-27B loads, runs `Engine.generate("Hello",
-  max_tokens=4)` cleanly, peak RAM ≤ 12 GB (vs ~15.3 GB at 4-bit
-  per the v1.7.14 corrected probe; the ~25% bytes/param reduction
-  from 4-bit to 3-bit applies proportionally).
+  max_tokens=4)` cleanly, peak RAM ≤ 13 GB **OR** ≥ 20% reduction vs
+  the corrected 4-bit baseline peak (~15.3 GB per the v1.7.14
+  P5.9 step 2(a) probe re-run). The looser of the two forms is the
+  pass criterion. The naive "25% bytes/param × 15.3 GB ≈ 11.5 GB"
+  derivation assumes weights are 100% of bytes/step, which is not
+  quite right (group-quant scale/zero metadata, embeddings, lm_head,
+  activations, and forward scratch do not all shrink linearly with
+  weight bits); the relative-reduction form avoids brittle gate
+  failure if the absolute number lands at 12-13 GB rather than 12.
 - B.2: ΔPPL gate above passes; the 3-bit row ships in the catalog.
 
 **Estimated impact:** Decode tok/s +20-30% on dense 27B / 31B due to
@@ -390,7 +401,7 @@ work to highest-claimed-speedup.)
 
 **Track C acceptance gates:**
 
-- **Cross-path correctness invariant:** for every variant C.1 .. C.5
+- **Cross-path correctness invariant:** for every variant C.1 .. C.6
   under greedy decoding, speculative-on must produce token sequences
   byte-equivalent to speculative-off under fixed seed. The
   correctness gate is the same across variants — speculative
@@ -612,22 +623,36 @@ the foundation. Within Track A, sub-units land in numerical order
 (A.1+A.2 ship as one PR, A.3 follows separately because it has its
 own correctness contract on snapshot equivalence).
 
-## 4a. Phase exit when?
+## 4a. Phase exit when? (v1.7.14 contract)
 
-The phase exits when **either** dual-target acceptance gates land
-(§1.3 / §6) **or** the user accepts a re-targeted exit at lower numbers
-based on Step 0 evidence. Concretely, P-6 is "done" when:
+The phase exits successfully when **§6 acceptance items (1a) + (3) +
+(4) + (5) + (6) all pass** (per the §6 contract committed at
+v1.7.14 / D-021). The MoE anchor (2a) is preserved baseline evidence;
+the stretch validators (1b) ≥60 tok/s and (2b) ≥150 / per-row 100
+tok/s are celebrated when met but explicitly **not** required for
+phase exit.
 
-- P-6.0 has a published baseline number for at least the dense 27B and
-  MoE 35B-A3B targets, AND
-- At least three of the five tracks (A/B/C/D/E) have shipped their
-  acceptance gates, AND
-- The phase-level dual targets in §1.3 are met **or** PLAN.md records a
-  user-confirmed re-target via a new Decision Log entry.
+Concretely, P-6 is "done" when **all** of the following are true:
 
-The intent is to avoid the trap where one track stalls (e.g. C.2
-ReDrafter KD training pass blocks indefinitely) and the rest of the
-phase cannot close.
+- P-6.0 has a published baseline number for the dense 27B and MoE
+  35B-A3B targets (already landed at v1.7.13).
+- §6 (1a) ≥40 tok/s engineering gate passes on dense Qwen3.5-27B-4bit
+  warm-decode B=1.
+- §6 (3) TTFT-under-concurrency, (4) RAM headroom, (5) MoE per-expert
+  streaming, and (6) P-5 quality regression all pass.
+- **At least three sub-units land cleanly** from the set
+  {A.1+A.2, A.3, B.1+B.2, C.1, C.4, C.5, D.1, E.1} (this is the
+  D-021 step-decomposed unit list, not the old per-track count;
+  C.6 is exploratory and does not count toward the three; D.2 is
+  measurement-gated and does not count).
+- PLAN.md records the §6 close attestation; if (1b) misses, a
+  Decision Log entry naming the measured C.4-spike speedup floor
+  closes the stretch slot.
+
+The intent is to avoid the trap where one sub-unit stalls
+(e.g. C.2 ReDrafter KD training pass blocks indefinitely, or
+C.4 / C.5 land below their gate thresholds and (1b) retires) and
+the rest of the phase cannot close.
 
 ---
 
@@ -635,10 +660,12 @@ phase cannot close.
 
 To keep the scope honest, the following are excluded:
 
-- **EAGLE-2 / EAGLE-3 port to MLX.** No public MLX port; porting the
-  training-time-test scheme is months of work. Defer to v0.2.
-- **DFlash-MLX.** Experimental block-diffusion drafting; revisit after
-  C.1 / C.2 land and we have a stable speculative baseline.
+- **EAGLE-2 / EAGLE-3 / Medusa full ports to MLX.** No public
+  MLX-native port that meets D-009; porting the training-time-test
+  scheme is months of work. Defer to v0.2 (the standalone P-7 phase
+  block in PLAN.md §7 P-7 is the integration point for these).
+- **Mirror-SD / STree-class techniques.** 2025-published; informational
+  only, MLX ports do not exist as of v1.7.14. v0.2 candidates.
 - **Custom Metal kernels.** PLAN.md non-goal §3.2 forbids hand-rolling
   kernels from scratch. mlx-mfa (existing kernel) is allowed; writing
   a new one is not.
@@ -752,11 +779,13 @@ beats moved goalposts.
   failing to actually run Step 0 and continuing to plan against a
   notional baseline.
 - **R-P6-7: Phase scope sprawl.** Five tracks is already a lot, and
-  Track C now has five sub-units of its own (C.1 .. C.5 per the Q-B
-  resolution). Mitigation: §4a phase-exit rules ("at least three of
-  five tracks") let the phase close cleanly without forcing every
-  sub-unit to ship; within Track C, phase-exit picks the
-  highest-performing variant that lands cleanly rather than requiring
+  Track C now has six sub-units of its own (C.1 .. C.6 per the Q-B
+  resolution + v1.7.14 round-2 C.6 exploratory addition).
+  Mitigation: §4a phase-exit rules ("at least three sub-units from
+  the v1.7.14 D-021 step decomposition") let the phase close cleanly
+  without forcing every sub-unit to ship; within Track C, phase-exit
+  picks the highest-performing variant that lands cleanly rather
+  than requiring
   all five.
 - **R-P6-8: Upstream stability of recently-published draft methods
   (C.4 DFlash, C.5 DDTree).** Both are 2026-published with active

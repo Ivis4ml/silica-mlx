@@ -132,7 +132,7 @@ streaming + SSD prefix tier preserving the original P-6 scope.
 | P-4.5 | Bridge (chunked-prefill + KV codec spike) | ✅ | `plans/P4_5_*.md`; slice-prefill regime α-MVP |
 | P-5 | VQ KV Compression | ✅ | `plans/P5_ACCEPTANCE_SWEEP/` (924-row codec sweep + 144-row real-activation Frobenius + b-static 3-seed) |
 | P-6 | Performance Phase | 🟡 | P-6.0 measurement gate landed (`plans/P6_0_BASELINE/REPORT.md`); Tracks A-E pending |
-| P-7 | Speculative Decoding | ⏸ | T1 priority; sub-units land under P-6 Track C (C.1 .. C.5 including DFlash and DDTree per D-020) |
+| P-7 | Speculative Decoding | ⏸ | T1 priority; sub-units land under P-6 Track C (C.1 .. C.6 — C.4 DFlash and C.5 DDTree per D-020; C.6 QuantSpec-like self-spec exploratory per v1.7.14 round-2 review). EAGLE / Medusa full-port stay v0.2 in the standalone P-7 phase. |
 | P-8 | Mini-SGLang HTTP server | ⏸ | T2; sits behind chat-CLI which is already in tree |
 
 ### 4.1 P-2 — what's load-bearing
@@ -720,7 +720,53 @@ revision rather than opening v1.7.15.
   user-facing latency story belongs in P-8 (HTTP server + session
   manager) and is not P-6 scope.
 
-The integration is **complete as of v1.7.14**. No further plan
-changes are needed before P5.9 work begins; the next code-touching
-PR is the P5.9 hardening pass with the eight deliverables enumerated
-in D-021 step 2.
+The integration is **complete as of v1.7.14**, **after the
+v1.7.14 stale-text cleanup** that absorbed Round 3 review findings
+(P6_OPENING.md §5 / §4a / Track C scope text; PLAN.md §3.2 + §7
+P-6 canonical block + §7 P-7 block; REPORT.md §7 recommended-order
+text; this HANDOFF self-recap row). The next code-touching PR is
+the P5.9 hardening pass with the eight deliverables enumerated in
+D-021 step 2; P5.9 step 2(a) (probe double-load fix) landed at
+commit `0bd931a` ahead of the cleanup.
+
+### Round 3 cleanup (2026-04-27, post-v1.7.14)
+
+GPT-5.5's review against `a670a1d` flagged six stale-text issues
+that survived v1.7.14 because the new decisions in D-021 / D-020
+were not propagated to all pre-existing entry points:
+
+- **High-1.** P6_OPENING.md §5 listed DFlash-MLX as "experimental;
+  revisit later" while Track C.4 (P6_OPENING.md §3) and D-021 step 6
+  already commit DFlash as the dense-gate-decider spike. Replaced
+  the §5 entry with a v0.2-EAGLE-Medusa-Mirror-SD-STree-only line
+  that no longer contradicts Track C.
+- **High-2.** PLAN.md §7 P-6 canonical Scope bullet only enumerated
+  C.1 / C.2 / C.3 (the v1.7.13 list) and the canonical Deliverables
+  list only had a C.1 checkbox. Both updated to the v1.7.14 scope:
+  C.1 .. C.6 in Scope, separate checkboxes for C.1 / C.4 / C.5 /
+  C.6 in Deliverables, and E.2 changed from "SSD-tiered prefix
+  cache" to "active fp16 + cold compressed two-tier" per Round 2.
+- **High-3.** PLAN.md §3.2 non-goals + §7 P-7 Strategy + §7 P-7
+  Notes still listed "DFlash deferred to v0.2." All three updated
+  to acknowledge DFlash (C.4) and DDTree (C.5) are pulled forward
+  into P-6, with EAGLE / Medusa / Mirror-SD / STree remaining the
+  v0.2 candidates that the standalone P-7 phase block exists to
+  catch.
+- **Medium-4.** P6_OPENING.md §4a phase-exit text still said
+  "exits when either dual-target gates land or user accepts
+  re-target." Rewritten to match §6's (1a)+(3)+(4)+(5)+(6) anchor
+  rule with the at-least-three-sub-units count; (1b)/(2b)
+  explicitly noted as stretch slots that do not gate phase exit.
+- **Medium-5.** REPORT.md §7 still recommended "land C.4 first as
+  a measurement." Rewritten to a 9-step ordered list matching
+  D-021's foundation-first sequence (P5.9 → P-6.0.5 → Decision
+  Gate 1 → spec foundation + C.1 → C.4 spike at step 5, **not**
+  step 1 → B → C.5/C.2/C.3 → A → D/E).
+- **Medium/Low-6.** This HANDOFF's §4 Phase Recap row for P-7
+  said "C.1 .. C.5"; updated to C.1 .. C.6 with C.6 explicitly
+  exploratory.
+
+The cleanup is doc-only and does not change any v1.7.14 technical
+decision — it propagates D-020 / D-021 to the entry points that
+v1.7.14 missed. v1.7.14 still names these contracts canonically;
+now every reader-facing entry point is consistent with them.
