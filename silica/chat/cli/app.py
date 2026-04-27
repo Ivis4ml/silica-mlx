@@ -69,6 +69,22 @@ def _model_basename(repo: str) -> str:
     return repo.split("/", 1)[-1]
 
 
+def _model_supports_implicit_thinking(model_basename: str) -> bool:
+    """Whether the model's chat template prepends ``<think>\\n`` to
+    the assistant generation slot when ``enable_thinking=True``.
+
+    True for the Qwen3 / Qwen3.5 / Qwen3.5-MoE families. Other
+    models (Gemma4, Qwen2.x, etc.) emit thinking blocks (when they
+    do at all) with explicit opening tags in the model output, so
+    the parser's default IDLE start-state is correct for them.
+
+    The match is case-insensitive on the basename's ``qwen3``
+    prefix; the family list extends naturally as more Qwen3
+    variants ship.
+    """
+    return model_basename.lower().startswith("qwen3")
+
+
 def _format_user_input(text: str, palette: Palette) -> str:
     """Render the echoed user line in the conversation log."""
     prefix = palette.colorize("You ›", "green", bold=True)
@@ -347,7 +363,20 @@ def run_chat(args: argparse.Namespace) -> int:
         state.max_tokens = int(state.config.get("max_tokens", 1024))
         state.last_turn_thinking = ""
         thinking_display = str(state.config.get("thinking", "auto"))
-        parser = ThinkingParser()
+        # Qwen3 / Qwen3.5 chat templates append ``<think>\n`` to the
+        # *prompt* when ``enable_thinking=True`` (the family default).
+        # The model's output therefore starts with raw reasoning text
+        # and ends with ``</think>`` — there is no opening tag in the
+        # stream. We initialise the parser in THINKING state so the
+        # first ``</think>`` correctly transitions out instead of
+        # leaking the entire reasoning block as a ReplyChunk.
+        implicit_thinking = (
+            bool(state.config.get("thinking_mode", True))
+            and _model_supports_implicit_thinking(state.model_name)
+        )
+        parser = ThinkingParser(
+            start_in_thinking=implicit_thinking
+        )
         thinking_started_at: list[float] = []  # mutable for closure write
         prefix_emitted: list[bool] = [False]
         _print_phase_indicator("prefilling", "yellow", palette)

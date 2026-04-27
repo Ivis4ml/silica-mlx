@@ -476,6 +476,47 @@ def test_finish_reason_parametrized(
     assert m.finish_reason == expected
 
 
+# ---------- TurnMetrics timing fallbacks ---------------------------
+
+
+def test_turn_metrics_compute_ttft_when_engine_snapshot_missing() -> None:
+    """The single-request engine path populates ``ttft_ms`` via
+    ``engine.metrics.set_metric``, but the prefix-cache /
+    batched path (Engine.generate_batch → ContinuousBatcher) does
+    not. ChatSession must compute TTFT from its own wall clock so
+    ``TurnMetrics.ttft_ms`` is populated regardless of which path
+    drove the turn."""
+    # _FakeMetrics's snapshot reports ttft_ms=12.3 by default, so
+    # the engine-supplied value wins. Override to None to force
+    # the fallback path.
+    session, engine, _ = _build_session(
+        engine_tokens=[65, 66, 67]
+    )
+    engine.metrics.snap = _FakeSnapshot(  # type: ignore[attr-defined]
+        ttft_ms=None,
+        prefill_tok_s=None,
+        decode_tok_s=None,
+        resident_mb=None,
+        logical_kv_bytes=None,
+    )
+    metrics = session.chat("hi")
+    # The fake engine yields all 3 tokens immediately; t_first ≈
+    # t_start so ttft_ms is small but non-None.
+    assert metrics.ttft_ms is not None
+    assert metrics.ttft_ms >= 0.0
+
+
+def test_turn_metrics_prefer_engine_snapshot_when_present() -> None:
+    """When the engine populates ttft_ms / decode_tok_s, those
+    values flow through unchanged — ChatSession's wall-clock
+    fallback is the alternative source, not a replacement."""
+    session, engine, _ = _build_session(engine_tokens=[65, 66, 67])
+    # Default _FakeSnapshot already has ttft_ms=12.3, decode_tok_s=120.0.
+    metrics = session.chat("hi")
+    assert metrics.ttft_ms == pytest.approx(12.3)
+    assert metrics.decode_tok_s == pytest.approx(120.0)
+
+
 # ---------- C-8 EOS-token suppression ------------------------------
 
 

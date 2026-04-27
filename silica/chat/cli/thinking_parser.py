@@ -132,9 +132,29 @@ class ThinkingParser:
     on each chat turn so the buffer is empty at the start.
     """
 
-    def __init__(self) -> None:
-        self._state: _State = _State.IDLE
+    def __init__(self, *, start_in_thinking: bool = False) -> None:
+        """Construct a parser.
+
+        Args:
+            start_in_thinking: when ``True``, the parser begins in
+                the ``THINKING`` state and emits an
+                :class:`EnterThinking` event on the first
+                :meth:`feed` call. Used by chat-CLI clients
+                running models whose chat template *appends*
+                ``<think>\\n`` to the prompt (Qwen3 / Qwen3.5 with
+                ``enable_thinking=True``) — in that case the
+                model's stream contains only the reasoning
+                content followed by ``</think>`` and the actual
+                reply, with NO opening ``<think>`` tag. Without
+                this flag the reasoning would stream verbatim as
+                ReplyChunks until the orphan ``</think>`` reset
+                the state.
+        """
+        self._state: _State = (
+            _State.THINKING if start_in_thinking else _State.IDLE
+        )
         self._buffer: str = ""
+        self._pending_enter_thinking: bool = start_in_thinking
 
     @property
     def state(self) -> str:
@@ -152,6 +172,9 @@ class ThinkingParser:
         multiple events when the delta crosses a tag boundary.
         """
         events: list[ParserEvent] = []
+        if self._pending_enter_thinking:
+            events.append(EnterThinking())
+            self._pending_enter_thinking = False
         self._buffer += text
         while True:
             if self._state is _State.IDLE:

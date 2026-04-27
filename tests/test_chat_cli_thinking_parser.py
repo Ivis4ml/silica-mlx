@@ -326,6 +326,59 @@ def test_finish_with_empty_buffer_returns_no_events() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Implicit thinking — Qwen3-style chat templates
+# ---------------------------------------------------------------------------
+
+
+def test_start_in_thinking_treats_initial_content_as_thinking() -> None:
+    """Qwen3 / Qwen3.5 chat templates with ``enable_thinking=True``
+    append ``<think>\\n`` to the *prompt*, so the model's stream
+    starts with raw reasoning text and ends with ``</think>`` —
+    no opening tag in the output. Parser constructed with
+    ``start_in_thinking=True`` correctly classifies that initial
+    content as thinking and the orphan close tag as the
+    transition out."""
+    p = ThinkingParser(start_in_thinking=True)
+    out = p.feed("internal reasoning</think>actual reply")
+    assert _kinds(out) == [
+        "EnterThinking",
+        "ThinkingChunk",
+        "ExitThinking",
+        "ReplyChunk",
+    ]
+    assert _thoughts(out) == "internal reasoning"
+    assert _replies(out) == "actual reply"
+
+
+def test_start_in_thinking_emits_enter_event_on_first_feed() -> None:
+    """The synthetic EnterThinking event is needed so the
+    chat-CLI's existing ``EnterThinking → magenta indicator``
+    handler fires symmetrically for explicit and implicit
+    thinking modes."""
+    p = ThinkingParser(start_in_thinking=True)
+    out = p.feed("")
+    # Empty feed still produces the synthetic enter event so the
+    # consumer transitions UI state at turn start, not later.
+    assert _kinds(out) == ["EnterThinking"]
+
+
+def test_start_in_thinking_only_emits_enter_once() -> None:
+    """The synthetic EnterThinking fires on the first feed call
+    only; subsequent feeds during the same thinking block do not
+    re-emit it."""
+    p = ThinkingParser(start_in_thinking=True)
+    e1 = p.feed("first chunk ")
+    e2 = p.feed("second chunk")
+    assert _kinds(e1).count("EnterThinking") == 1
+    assert _kinds(e2).count("EnterThinking") == 0
+
+
+def test_start_in_thinking_state_at_construction() -> None:
+    p = ThinkingParser(start_in_thinking=True)
+    assert p.state == "thinking"
+
+
+# ---------------------------------------------------------------------------
 # Multiple thinking blocks
 # ---------------------------------------------------------------------------
 

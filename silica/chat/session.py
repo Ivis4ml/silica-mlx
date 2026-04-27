@@ -260,9 +260,11 @@ class ChatSession:
 
         self._reset_peak()
         t_start = self._clock()
-        out_tokens, finish_reason_from_event = self._run_generation(
-            prompt_text, params, stream_to
-        )
+        (
+            out_tokens,
+            finish_reason_from_event,
+            t_first_token,
+        ) = self._run_generation(prompt_text, params, stream_to)
         wall_s = self._clock() - t_start
         peak_mb = self._read_peak_mb()
 
@@ -290,18 +292,64 @@ class ChatSession:
             {"role": "assistant", "content": reply_text}
         )
 
+        # Engine.generate populates ttft / decode_tok_s / resident_mb
+        # via _drive_one's metrics.set_metric calls. Engine.generate_batch
+        # does not (the prefix-cache path currently goes through the
+        # batched scheduler which does not own a per-request metrics
+        # record). To keep TurnMetrics populated regardless of which
+        # engine path drove the turn, ChatSession measures TTFT /
+        # decode tok-s itself from the wall clock, and reads the KV
+        # budget directly from the engine's kv_manager. The engine's
+        # metrics snapshot remains the preferred source when present
+        # (single-request path keeps the engine-level precision).
         snapshot = self._engine.metrics.snapshot()
+        ttft_ms_computed: float | None = None
+        decode_tok_s_computed: float | None = None
+        if t_first_token is not None:
+            ttft_ms_computed = (t_first_token - t_start) * 1000.0
+            decode_elapsed = wall_s - (t_first_token - t_start)
+            n_decoded = max(0, len(out_tokens) - 1)
+            if decode_elapsed > 0 and n_decoded > 0:
+                decode_tok_s_computed = n_decoded / decode_elapsed
+
+        ttft_ms = (
+            snapshot.ttft_ms
+            if snapshot.ttft_ms is not None
+            else ttft_ms_computed
+        )
+        decode_tok_s = (
+            snapshot.decode_tok_s
+            if snapshot.decode_tok_s is not None
+            else decode_tok_s_computed
+        )
+
+        # KV budget fields: prefer engine snapshot, fall back to
+        # reading the manager directly. Both code paths are cheap.
+        resident_mb = snapshot.resident_mb
+        logical_kv_bytes = snapshot.logical_kv_bytes
+        if resident_mb is None or logical_kv_bytes is None:
+            try:
+                budget = self._engine.kv_manager.budget()
+                if resident_mb is None:
+                    resident_mb = budget.resident_bytes / 1e6
+                if logical_kv_bytes is None:
+                    logical_kv_bytes = int(budget.logical_bytes)
+            except Exception:
+                # Defensive: kv_manager.budget() failing should not
+                # mask the rest of the turn metrics.
+                pass
+
         return TurnMetrics(
             reply=reply_text,
             prompt_tokens=len(prompt_ids),
             output_tokens=len(out_tokens),
             finish_reason=finish_reason,
-            ttft_ms=snapshot.ttft_ms,
+            ttft_ms=ttft_ms,
             prefill_tok_s=snapshot.prefill_tok_s,
-            decode_tok_s=snapshot.decode_tok_s,
-            resident_mb=snapshot.resident_mb,
+            decode_tok_s=decode_tok_s,
+            resident_mb=resident_mb,
             peak_memory_mb=peak_mb,
-            logical_kv_bytes=snapshot.logical_kv_bytes,
+            logical_kv_bytes=logical_kv_bytes,
             wall_s=wall_s,
             prefix_hit_blocks=prefix_hit_blocks,
             prefix_hit_tokens=prefix_hit_tokens,
@@ -312,24 +360,34 @@ class ChatSession:
         prompt_text: str,
         params: SamplingParams,
         stream_to: Callable[[str], None] | None,
-    ) -> tuple[list[int], str | None]:
+    ) -> tuple[list[int], str | None, float | None]:
         """Drive one turn's token stream.
 
         Routes through ``engine.generate_batch`` when a prefix
         cache is configured (so block-aligned KV from previous
         turns is reused), otherwise through ``engine.generate``
-        (the original single-request path). Returns the emitted
-        token list and the terminal ``finish_reason`` if the
-        batched event stream surfaced one — single-request path
-        returns ``None`` and lets ``_classify_finish`` infer.
+        (the original single-request path).
+
+        Returns ``(out_tokens, finish_reason, t_first_token)``.
+        ``finish_reason`` is the terminal ``BatchEvent``'s reason
+        when the batched path produced one, ``None`` otherwise.
+        ``t_first_token`` is the wall-clock at which the first
+        decoded token was emitted (via the streaming callback or
+        engine yield), or ``None`` if no token was produced — used
+        by :meth:`chat` to compute TTFT independently of the
+        engine's per-request metrics record (which the batched
+        path does not populate).
         """
         out_tokens: list[int] = []
         printed_prefix = ""
         stop_set = set(self._eos_ids)
+        t_first_token: float | None = None
 
         def _on_token(tok: int) -> None:
-            nonlocal printed_prefix
+            nonlocal printed_prefix, t_first_token
             out_tokens.append(tok)
+            if t_first_token is None:
+                t_first_token = self._clock()
             if stream_to is None:
                 return
             # Streaming output: skip the rendered text of stop
@@ -355,7 +413,7 @@ class ChatSession:
         if self._prefix_cache is None:
             for tok in self._engine.generate(prompt_text, params):
                 _on_token(tok)
-            return out_tokens, None
+            return out_tokens, None, t_first_token
 
         finish_reason: str | None = None
         # Drain the entire batched event stream. Breaking on the
@@ -385,7 +443,7 @@ class ChatSession:
                 # terminal event ever arrives.
                 if finish_reason is None:
                     finish_reason = event.finish_reason
-        return out_tokens, finish_reason
+        return out_tokens, finish_reason, t_first_token
 
     # --- internals ---------------------------------------------------
 
