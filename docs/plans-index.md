@@ -81,6 +81,16 @@ read in-editor while iterating.
 - [`P3_C5_STATE_INVENTORY/`](../plans/P3_C5_STATE_INVENTORY/) —
   Qwen3.5-{0.8B, 4B, 35B-A3B} state inventories.
 
+## Phase 6 — performance phase (re-scoped at v1.7.13)
+
+- [`P6_OPENING.md`](../plans/P6_OPENING.md) — re-scope opening:
+  bandwidth physics, Step 0 measurement gate, five orthogonal tracks
+  (A sync-barrier collapse, B 3-bit weights, C speculative decoding,
+  D TTFT levers, E weight streaming + SSD prefix tier), dual-target
+  acceptance (dense Qwen3.5-27B-4bit ≥60 tok/s primary + MoE
+  Qwen3.5-35B-A3B-4bit ≥100 tok/s stretch on 48 GB M5 Pro),
+  proposed PLAN.md edits applied via D-017 / D-018 / D-019.
+
 ## Side track: chat CLI redesign
 
 - [`CHAT_CLI_OPENING.md`](../plans/CHAT_CLI_OPENING.md) — the design

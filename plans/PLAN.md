@@ -2,9 +2,9 @@
 
 | Field        | Value                                                                      |
 | ------------ | -------------------------------------------------------------------------- |
-| Version      | v1.7.12                                                                    |
-| Last updated | 2026-04-26                                                                 |
-| Status       | P-5 complete; P-5 Acceptance (1)–(4) closed at v1.7.4; (a-real) real-activation xcheck closed at v1.7.5; P-3-C5 closed in slice-prefill regime (C5.5 α-MVP); P-3-E4 batched MoE smoke + scheduler-glue parity closed at v1.7.9; P-5-F pre-RoPE production routing closed at v1.7.6 via the (3b) projection-output capture path (F.1-F.4); (b-static) Qwen3.5-4B PPL vs vqbench REPORT.md baseline closed at v1.7.7; slice-regime + pre_norm hybrid Qwen3.5-0.8B E2E discriminator closed at v1.7.8; per-head Haar rotation landed as opt-in (default OFF) at v1.7.8; per-head D.2a 3-seed re-measurement at v1.7.10 — \|mean_gap\| 0.150 → 0.066 PPL (56% reduction); per-head (b-static) Qwen3.5-4B production-path re-measurement at v1.7.11 — std 5.3× tighter, mean unchanged in SEM, default flip is now an administrative landing, not an empirical question |
+| Version      | v1.7.13                                                                    |
+| Last updated | 2026-04-27                                                                 |
+| Status       | P-5 complete; P-5 Acceptance (1)–(4) closed at v1.7.4; (a-real) real-activation xcheck closed at v1.7.5; P-3-C5 closed in slice-prefill regime (C5.5 α-MVP); P-3-E4 batched MoE smoke + scheduler-glue parity closed at v1.7.9; P-5-F pre-RoPE production routing closed at v1.7.6 via the (3b) projection-output capture path (F.1-F.4); (b-static) Qwen3.5-4B PPL vs vqbench REPORT.md baseline closed at v1.7.7; slice-regime + pre_norm hybrid Qwen3.5-0.8B E2E discriminator closed at v1.7.8; per-head Haar rotation landed as opt-in (default OFF) at v1.7.8; per-head D.2a 3-seed re-measurement at v1.7.10 — \|mean_gap\| 0.150 → 0.066 PPL (56% reduction); per-head (b-static) Qwen3.5-4B production-path re-measurement at v1.7.11 — std 5.3× tighter, mean unchanged in SEM, default flip is now an administrative landing, not an empirical question; **P-6 re-scoped from "Weight Streaming" to "Performance Phase" at v1.7.13 per D-017 / D-018 / D-019 — dense Qwen3.5-27B-4bit ≥60 tok/s primary target + MoE Qwen3.5-35B-A3B-4bit ≥100 tok/s stretch validator on 48 GB M5 Pro; P-7 Speculative promoted from T2 to T1; dense layer-streaming deferred to v0.2; Track C speculative grows to five sub-units per D-020 (C.1 draft-target, C.2 ReDrafter, C.3 MTP, C.4 DFlash, C.5 DDTree); P-6.0 measurement gate started — P-6.0.1 / P-6.0.2 landed (WARM_DECODE oracle), P-6.0.3 / P-6.0.4 in-progress; see `plans/P6_OPENING.md`** |
 | Maintainer   | Xin Zhou                                                                   |
 | Source       | `plans/PLAN.md` (single source of truth)                                    |
 
@@ -576,27 +576,142 @@ Each Phase uses the same structure: `ID / Goal / Scope / Strategy / Deliverables
   **Production-path follow-up (v1.7.11, 2026-04-26):** `scripts/b_static_per_head_qwen35_4b_3seed.py` re-runs the (b-static) Qwen3.5-4B workload through `prefix_store_pre_norm` (P-5-F (3b)) with `per_head_rotation=True` across the same 3 seeds. silica per-seed ΔPPL `[+0.001, +0.009, +0.002]` → mean +0.0042, std 0.0044, SEM 0.0025. v1.7.7 shared-rotation baseline: mean +0.0016, std 0.0212, SEM 0.0122. **Mean shift +0.003 PPL is inside SEM (no quality signal); std is 5.3× tighter; SEM is 4.8× tighter.** (b-static) gate vs vqbench REPORT.md `+0.000%` continues to PASS (gate (i) ~1.2× — SEM band is now ~0.005 PPL; gate (ii) ~240×). Per-seed shape moved from straddling-zero `[+0.025, −0.017, −0.003]` to monotonically positive `[+0.001, +0.002, +0.009]`. **The D.2a-path +0.22 PPL absolute regression is path-specific** (D.2a's `attn.k_proj` projection-patch noise accumulates per layer × per head × per chunk; production-path noise is funneled through k_norm + RoPE per hit-path admit and partially absorbed). Evidence: `plans/P5_ACCEPTANCE_SWEEP/qwen35_4b_b_static_per_head_3seeds.{jsonl,md}`. **Default-flip status changes from "empirical question" to "administrative landing"** — the empirical case for `per_head_rotation=True` as default is now strong (production path: net-zero mean change + 5× variance decorrelation; D.2a path: 56% mean_gap reduction); the deferral reasons that remain (RaBitQ1Bit / ExtRaBitQ lack 3-seed parity-scale cross-checks; flipping default re-anchors the closed (4-b) gate text in §7) are administrative.
   - **Production `prefix_store_post_rope` prefix-cache quality cost — closed at P-5-F F.3 via the (3b) projection-output capture path.** At the same `BlockTurboQuantMSE B=64` 4-bit K+V codec config, the production-routing arm (`codec_quality_path="prefix_store_post_rope"`, scenario `qwen3-0.6b-wikitext-ppl-block-tq-b64-b4`) measured ΔPPL in the ~5–10 PPL range on Qwen3-0.6B WikiText-2 pre-P-5-F (chunk-boundary-dependent), while the D.2a `-vqbench-aligned` oracle arm on the same codec agreed with vqbench's subprocess ΔPPL within the (4-b) aggregated gate. The gap was **not algorithmic**: D.2a probes (`plans/P5_D2_INVESTIGATION/p5_d2_probe*.py`) confirmed silica MLX BlockTQ and vqbench NumPy BlockTQ produce bit-identical reconstructions on the same input, and silica's prefix-cache round-trip was numerically neutral. The production-path cost was that silica's prefix-cache store injected reconstruction noise in **post-RoPE** space, whereas vqbench's `_QuantizedProj` patch injects in **pre-RoPE** projection space; the post-RoPE injection paid an additional chunk-boundary cost (`plans/P5_D2_INVESTIGATION/README.md` §Root cause). **P-5-F closes this gap**: F.1 (commit `4fd9bf9`) added a runtime-checkable `PreNormCaptureAdapter` Protocol and per-family proxy on `attn.k_proj` that captures pre-k_norm K without modifying the in-flight forward; F.2a (`f943f94`) added the `pre_norm` contract flag on `SyntheticPrefixBlockStore` plus the `ContinuousBatcher` constructor gate; F.2b (`cc249e7`) wired the production hot path through the capture / extract / `apply_k_norm_then_rope` reconstruction; F.3 flips the default `codec_quality_path` on `_WIKITEXT_PPL_ORACLE_CONFIG` to `"prefix_store_pre_norm"` (the (3b) path verified at +0.015 PPL on the (4-b) anchor scenario, F.0b' §10.3 of `plans/P5_F_OPENING.md`). The (4-b) anchor row now measures ΔPPL +0.012 on a single seed (was +20.83 pre-F.3 on the legacy post-RoPE store), inside D.2a's `+0.51 ± 0.35 PPL` envelope — consistent with the F.0b' 3-seed verification. Legacy comparison row `qwen3-0.6b-wikitext-ppl-block-tq-b64-b4-post-rope` retained for §6.9 reading-order ablations. F.4 (legacy retention + doc sync) is the remaining P-5-F sub-unit.
 
-### P-6 Phase 6 — Weight Streaming
+### P-6 Phase 6 — Performance Phase (re-scoped at v1.7.13 per D-017)
 
-- **Goal:** weight streaming relieves residency pressure.
-- **Scope:** `ResidentWeightProvider` (already in tree) + `StreamingWeightProvider` + scheduler prefetch coordination.
+> **Re-scope notice (v1.7.13).** P-6 was originally "Weight Streaming"
+> (the body preserved as Track E below). At v1.7.13 it is re-scoped to
+> "Performance Phase" — five orthogonal tracks (A sync-barrier collapse,
+> B 3-bit weights, C speculative decoding pulled in from P-7, D TTFT
+> levers, E weight streaming + SSD prefix tier preserving the original
+> P-6 deliverables). See D-017 / D-018 / D-019 in §9 and the full
+> opening doc at `plans/P6_OPENING.md`.
+
+- **Goal:** engineer the platform to a dense primary of **≥60 tok/s on
+  Qwen3.5-27B-4bit** and a MoE stretch validator of **≥100 tok/s on
+  Qwen3.5-35B-A3B-4bit**, with TTFT-under-concurrency fairness on 48 GB
+  M5 Pro. The 100-tok/s figure is the validator the user asked for; the
+  honest dense-target reframing comes from the M5 Pro 307 GB/s
+  bandwidth ceiling analysis in `plans/P6_OPENING.md` §1.2.
+- **Scope:** five tracks (full breakdown in `plans/P6_OPENING.md` §3):
+  - **Track A — Sync-barrier collapse:** batched-categorical sampler
+    (defer per-token `.item()`), `mx.compile`-fused sampler chain,
+    lazy-graph snapshot capture for hybrid recurrent layers. Pure
+    Python / MLX-graph work; no new kernels or dependencies.
+  - **Track B — 3-bit weight option:** loader path for 3-bit
+    checkpoints (precedent: `unsloth/Qwen3.6-27B-UD-MLX-3bit`); PPL
+    cross-check oracle. Lifts the dense bandwidth ceiling 22.7 → 30.3
+    tok/s if quality holds.
+  - **Track C — Speculative decoding (P-7 sub-units pulled in):**
+    draft-target with small-Qwen as draft (C.1, primary attempt),
+    Apple ReDrafter (C.2, stretch), Qwen3.5 MTP head as draft (C.3,
+    architecture-specific). Required to clear the dense-27B
+    bandwidth ceiling on autoregressive — see D-019.
+  - **Track D — TTFT levers:** Sarathi-style chunked prefill + decode
+    merging (resolves Q-010 to "promoted to default for prompts ≥ 512
+    tokens"); optional mlx-mfa long-prefill kernel.
+  - **Track E — Weight streaming (original P-6 scope) + SSD-tiered
+    prefix cache:** MoE per-expert residency (E.1, original P-6
+    deliverable preserved); SSD-tiered prefix cache for chat-session
+    cold prefixes (E.2, oMLX pattern); dense layer-streaming (E.3)
+    **deferred to v0.2 per D-018**.
 - **Strategy:**
-  - Take cues from `mlx-flash`.
-  - While layer N computes, prefetch layer N+1 (dense path).
-  - **Exploit Apple unified memory** (Principle 2): this is not "GPU pulls weights from disk/CPU"; it is "lifetime management of different regions within the same memory pool".
-  - **Dense vs MoE residency granularity (D-011).** Dense streaming uses **layer** granularity (prefetch layer N+1 while computing layer N). MoE streaming uses **expert** granularity — keep only recently-active top-k experts resident; other experts' regions in unified memory may be overwritten. This is streaming's **primary payoff for MoE** (Qwen3.5-35B-A3B: total 35B, active 3B, resident set can shrink to roughly active size + non-FFN weights + headroom). MoE scheduler coordination: as soon as gate logits are available, fire `prefetch_experts(layer_idx, top_k_ids)`; do not wait until the expert FFN is actually invoked.
-- **Deliverables:**
-  - [ ] `silica.weights.streaming.StreamingWeightProvider` (dense + MoE dual mode).
-  - [ ] `silica.weights.prefetch`: scheduler prefetch coordination (layer-granular for dense; expert-granular for MoE).
-  - [ ] Unified-memory-aware residency policy (e.g. LRU-over-experts eviction for MoE).
-- **Acceptance:**
-  - [ ] Under an artificial memory budget (e.g. 24 GB), Qwen3.5-27B int4 does not OOM (dense path).
-  - [ ] **Decode tok/s ≥ 70% of the `ResidentWeightProvider` baseline** (dense), with fixed comparison conditions: same machine / same model / same scenario / same sampling config when taking the ratio. If resident cannot run under 24 GB at all (OOM), switch the baseline to an **"uncapped resident reference run"** (no budget, no streaming, same scenario, same decode tok/s) and take the ratio against that.
-  - [ ] **MoE per-expert residency takes effect (D-011).** For a MoE target (Qwen3.5-35B-A3B or gemma-4-26B-A4B) under a 24 GB budget, `StreamingWeightProvider.resident_bytes()` ≤ `active_experts × expert_size + non_FFN_weights + expert_residency_headroom` (quantitatively verifies per-expert residency is active rather than silently falling back to full residency). Headroom defaults to ≤ 20% of active size; tightened in P-4 bench after empirical measurement.
-  - [ ] MoE decode tok/s ≥ 60% of the MoE `ResidentWeightProvider` baseline — the threshold is below the dense 70%, acknowledging that expert-fetch miss stalls are inherent and the first cut of streaming does not optimize for them.
-- **Dependencies:** P-2 (scheduler) + P-3 (model adapter).
-- **Status:** planned.
-- **Notes:** may be pulled ahead of P-5 out of the T1 tier if P-3 shows 27B/31B won't fit at baseline (Q-003).
+  - **Bandwidth physics first.** M5 Pro unified memory is 307 GB/s.
+    Dense Qwen3.5-27B-4bit reads ~13.5 GB per autoregressive step,
+    yielding a ~22.7 tok/s ceiling. Speculative decoding is the only
+    lever that amortizes a single weight read across N accepted
+    tokens; 3-bit weights lift the ceiling proportionally.
+  - **Step 0 measurement gate (P-6.0).** Before any track lands:
+    warm-start sustained-decode bench scenarios on real Qwen3.5-27B,
+    Gemma4-31B, Qwen3.5-35B-A3B, gemma-4-26B-A4B (dual-gated as
+    today). Every later sub-unit's success criterion is a ratio
+    against the P-6.0 baseline, not an absolute number.
+  - **Five tracks run in parallel** after P-6.0; Track A ships first
+    because its wins are pure Python and unblock measurement of all
+    other tracks (see §4 of the opening doc for the dependency
+    graph).
+  - **Phase exits when at least three of five tracks ship** AND the
+    dual targets in Acceptance below are met OR the user accepts a
+    re-targeted exit via a new Decisions Log entry.
+- **Deliverables:** ride on the five tracks defined in
+  `plans/P6_OPENING.md` §3. Concretely:
+  - [ ] **P-6.0** — warm-start measurement scenarios for 27B / 31B /
+    MoE-35B-A3B / MoE-26B-A4B with `decode_tok_s_warm`,
+    `ttft_warm_ms`, `peak_mb`, `resident_mb_post_warmup` reported.
+  - [ ] **A.1 + A.2** — defer-and-batch sampler sync + `mx.compile`-
+    fused sampler chain (`silica.core.sampler` + `silica.scheduler.batcher`
+    + `silica.engine`).
+  - [ ] **A.3** — lazy-graph snapshot capture
+    (`silica.models.qwen3_5.snapshot_recurrent_state`).
+  - [ ] **B.1** — 3-bit loader path (`silica.weights.resident` /
+    `silica.mlx.runner` / `silica.models.factory`).
+  - [ ] **B.2** — `qwen3.5-27b-3bit-vs-4bit-ppl` oracle row.
+  - [ ] **C.1** — `silica.speculative.draft_target.DraftTargetEngine`
+    (minimum P-7 deliverable from §7 P-7); greedy parity gate.
+  - [ ] **D.1** — chunked prefill + decode merging promoted from
+    α-MVP slice-regime to default for prompts ≥ 512 tokens
+    (`silica.scheduler.batcher`).
+  - [ ] **D.2** — mlx-mfa long-prefill kernel (measurement-gated;
+    drop without phase impact if the kernel doesn't load).
+  - [ ] **E.1** — `silica.weights.streaming.StreamingWeightProvider`
+    (MoE per-expert mode only; dense mode deferred per D-018).
+  - [ ] **E.2** — SSD-tiered prefix cache (oMLX pattern;
+    `silica.kvcache.prefix` extension).
+- **Acceptance:** items 1, 3, 4, 5, 6 must pass; item 2 is the stretch
+  validator (record in Decisions Log if missed; phase still exits).
+  - [ ] **(1) Dense primary — Qwen3.5-27B-4bit ≥60 tok/s.** Sustained
+    warm-start `decode_tok_s` on `mlx-community/Qwen3.5-27B-4bit`,
+    B=1, 128-token prompt, 384-token generation, with C.1 speculative
+    enabled and B.1 3-bit option available as a flag. The 60 tok/s
+    figure rests on the full Track A + B + C stack (see
+    `plans/P6_OPENING.md` §1.3 arithmetic); on the 4-bit-only path
+    without speculative the bandwidth ceiling is ~22.7 tok/s with a
+    realistic envelope ~26 tok/s after engine fusion, so the gate
+    deliberately requires the speculative path. There is no
+    independent 4-bit-only floor — that would commit silica to a
+    number the bandwidth math says it cannot deliver without
+    speculative.
+  - [ ] **(2) MoE stretch — Qwen3.5-35B-A3B-4bit ≥100 tok/s.**
+    Sustained warm-start aggregate `decode_tok_s` on
+    `mlx-community/Qwen3.5-35B-A3B-4bit` ≥ 100 tok/s. **Primary
+    measurement at B=2** because B=2 is the largest MoE batch
+    validated to fit the 48 GB envelope (per
+    `tests/test_p3_qwen3_5_moe_batched_parity.py` at v1.7.9, peak
+    ~30 GB at B=2); **B=4 is opt-in stretch** (scenario
+    `qwen3.5-moe-35b-a3b-warm-decode-b4`) with explicit OOM-risk
+    documentation in the bench catalog. The gate clears whichever
+    batch size first lands ≥100 tok/s aggregate; if B=2 alone
+    clears the gate, B=4 is bonus information. Failure records a
+    Decision Log entry naming the measured engine-overhead floor;
+    does not fail the phase.
+  - [ ] **(3) TTFT under concurrency.** New
+    `qwen3.5-27b-ttft-under-concurrency-warm` scenario: short
+    requests' TTFT ≤ 2× their solo TTFT in the presence of one long
+    2048-token request.
+  - [ ] **(4) RAM headroom.** Qwen3.5-27B-4bit B=1 4K-context peak
+    ≤ 36 GB.
+  - [ ] **(5) MoE per-expert streaming verified.**
+    `StreamingWeightProvider.resident_bytes()` ≤ `active_experts ×
+    expert_size + non_FFN_weights + 20% headroom` on
+    Qwen3.5-35B-A3B at the original 24 GB budget (preserved from the
+    pre-re-scope acceptance).
+  - [ ] **(6) No quality regression.** P-5 acceptance row
+    `qwen3-0.6b-wikitext-ppl-block-tq-b64-b4-vqbench-aligned`
+    continues to pass the (4-b) two-part aggregated gate after each
+    track lands.
+- **Dependencies:** P-1 .. P-5 (all done); P-7 sub-units pulled in
+  under Track C per D-019 (P-7 phase block in §7 stays at status
+  "planned" but Track C deliverables land here).
+- **Status:** in-progress (P-6.0 measurement gate first; then five
+  parallel tracks per `plans/P6_OPENING.md` §4).
+- **Notes:** the original P-6 acceptance gate "Under 24 GB budget,
+  Qwen3.5-27B int4 does not OOM (dense path)" is **retired** per
+  D-018 — v0.1 commits to "27B-4bit fits within 48 GB unified memory"
+  rather than independently validating dense residency relief. The
+  Q-003 question (whether P-6 should be pulled forward) is now
+  partially answered: the bandwidth analysis means dense streaming
+  cannot relieve the pre-attention bandwidth wall, so the "pull
+  forward" framing no longer fits — Track B (3-bit) is the dense-
+  fit lever instead.
 
 ### P-7 Phase 7 — Speculative Decoding
 
@@ -647,13 +762,23 @@ Each Phase uses the same structure: `ID / Goal / Scope / Strategy / Deliverables
 
 Tier IDs use `T0 / T1 / T2` to avoid visual collision with phase IDs `P-0 / P-1 / P-2`.
 
-| Tier | Phases       | Meaning                                                        |
-| ---- | ------------ | -------------------------------------------------------------- |
-| T0   | P-0 .. P-4   | Skeleton + baseline engine + target models + bench             |
-| T1   | P-5 .. P-6   | VQ KV compression + weight streaming; make big models fit 48GB |
-| T2   | P-7 .. P-8   | Speculative + serving layer                                    |
+| Tier | Phases             | Meaning                                                                          |
+| ---- | ------------------ | -------------------------------------------------------------------------------- |
+| T0   | P-0 .. P-4         | Skeleton + baseline engine + target models + bench                               |
+| T1   | P-5 .. P-7         | VQ KV compression + performance phase + speculative; make big models fit and run fast on 48GB |
+| T2   | P-8                | Serving layer                                                                    |
 
-Whether Phase 8 floats in priority: see Q-002. Whether Phase 6 is pulled forward: see Q-003.
+P-7 promoted from T2 to T1 at v1.7.13 per D-019 — speculative decoding
+is required (not optional) to clear the dense Qwen3.5-27B-4bit
+bandwidth ceiling on autoregressive decode. P-7 sub-units land under
+the P-6 phase umbrella (Track C in `plans/P6_OPENING.md`). Q-002
+("Should Phase 8 priority float up?") is closed at v1.7.13 by leaving
+P-8 in T2; the priority promotion that mattered for v0.1 launch was
+P-7's, not P-8's. Q-003 ("Should Phase 6 be pulled forward?") is
+likewise closed at v1.7.13: the bandwidth analysis behind the P-6
+re-scope makes the original "pull forward" framing obsolete — Track B
+(3-bit weights) is the dense-fit lever instead of dense layer
+streaming, which is deferred to v0.2 per D-018.
 
 ### 8.2 Milestones
 
@@ -883,6 +1008,159 @@ Append-only. New decisions go at the end; old ones are not edited. Revocations /
   - MoE adapters landing later in P-3 set `has_moe=True` at the `capabilities_from_attention_pattern` call site; no second override path.
 - **References:** D-011, D-015, I-1, P-3, P-4, M-4.
 
+### D-017 — P-6 phase re-scoped from "Weight Streaming" to "Performance Phase"
+
+- **Date:** 2026-04-27.
+- **Status:** accepted.
+- **Decision:** PLAN.md §7 P-6 is re-scoped from "Weight Streaming"
+  alone to "the performance phase," organized into five orthogonal
+  tracks (A sync-barrier collapse, B 3-bit weights, C speculative
+  decoding pulled in from P-7, D TTFT levers, E weight streaming +
+  SSD prefix tier preserving the original P-6 deliverables). The
+  original P-6 body is preserved as Track E. Phase numbering is
+  preserved (no new P-9). Detailed opening doc:
+  `plans/P6_OPENING.md`.
+- **Rationale:** the user's TTFT / decode-tok/s / RAM goals
+  (2026-04-27 brief — "至少 Qwen3.5-27B 100+ tokens/sec on 48 GB
+  Mac Pro") cannot be addressed by weight streaming in isolation. The
+  M5 Pro 307 GB/s unified-memory bandwidth analysis in
+  `plans/P6_OPENING.md` §1.2 establishes a ~22.7 tok/s autoregressive
+  ceiling on dense Qwen3.5-27B-4bit, which means speculative decoding
+  is a required (not optional) lever to credibly approach the
+  100-tok/s figure. Bundling all five tracks under P-6 gives a single
+  measurable phase boundary and preserves PLAN.md's sequential
+  phase structure.
+- **Consequences:**
+  - PLAN.md §7 P-6 phase block rewritten with re-scoped Goal /
+    Scope / Strategy / Deliverables / Acceptance / Status / Notes.
+  - P-7 priority promoted from T2 to T1 (separate Decision D-019);
+    P-7 sub-units (C.1 / C.2 / C.3) land under the P-6 umbrella as
+    Track C.
+  - Phase-level acceptance becomes a dual-target form: dense
+    Qwen3.5-27B-4bit ≥60 tok/s primary + MoE Qwen3.5-35B-A3B-4bit
+    ≥100 tok/s stretch. Failing the stretch requires a Decisions
+    Log entry but does not fail the phase.
+  - Q-002 (Phase 8 priority) and Q-010 (chunked prefill promotion)
+    close at v1.7.13 — see §10.
+  - M-7 milestone narrows to "MoE streaming + 27B/31B fit-at-48GB
+    via Track B (3-bit) rather than dense streaming"; see D-018.
+- **References:** D-018, D-019, P-6, P-7, M-7, Q-002, Q-003, Q-010,
+  `plans/P6_OPENING.md`.
+
+### D-018 — Dense layer-streaming deferred to v0.2; original 24 GB budget gate retired
+
+- **Date:** 2026-04-27.
+- **Status:** accepted.
+- **Decision:** original P-6 layer-granular streaming for dense 27B /
+  31B is dropped from v0.1 scope. The pre-re-scope P-6 acceptance
+  gate "Under an artificial memory budget (e.g. 24 GB),
+  Qwen3.5-27B int4 does not OOM (dense path)" is **retired**. v0.1
+  commits instead to "Qwen3.5-27B-4bit fits within 48 GB unified
+  memory with measured headroom," anchored on the v1.7.x load-probe
+  number (~30.5 GB peak; see PLAN.md §7 P-3 Empirical findings
+  2026-04-19) and re-confirmed under P-6.0 with 4K-context decode.
+  MoE per-expert streaming (E.1) is **preserved**.
+- **Rationale:** layer-granular streaming cannot reduce the per-step
+  weight read below the unified-memory bandwidth ceiling
+  (`plans/P6_OPENING.md` §1.2). SSD-to-RAM streaming adds latency
+  without lifting the wall. The original 24 GB budget gate was a
+  proxy for "validate that residency relief mechanisms work on dense
+  models"; on M5 Pro 48 GB with 4-bit Qwen3.5-27B at ~30.5 GB peak,
+  the gate has no production-path consumer because the model fits.
+  Track B (3-bit) provides the pre-attention bytes/param lever that
+  layer streaming cannot.
+- **Consequences:**
+  - PLAN.md §7 P-6 acceptance bullet (1) ("Under an artificial
+    memory budget (e.g. 24 GB), Qwen3.5-27B int4 does not OOM (dense
+    path)") is **explicitly retired** at v1.7.13.
+  - Validation lost: independent evidence that a dense-streaming
+    fallback exists if a future checkpoint pushes peak above 48 GB.
+    Mitigations: Track B (3-bit) gives ~25% bytes/param reduction
+    before any streaming would be needed; the 30.5 GB peak
+    measurement carries the dense-fit assertion; a future v0.2
+    dense-streaming track can re-validate if the gap reappears.
+  - M-7 milestone narrows from "dense + MoE streaming" to "MoE
+    streaming + 27B/31B fit-at-48GB without streaming."
+  - The dense-fit assertion in M-4 / M-7 is now the responsibility
+    of Track B (3-bit) and the v1.7.x 27B-4bit ~30.5 GB peak
+    measurement rather than residency relief.
+- **References:** D-006, D-017, D-019, P-6, M-7, R-1, Q-003,
+  `plans/P6_OPENING.md` §1.2 / §3 Track E / §10 D-018.
+
+### D-019 — P-7 priority promoted from T2 to T1
+
+- **Date:** 2026-04-27.
+- **Status:** accepted.
+- **Decision:** PLAN.md §8.1 priority tiers — P-7 (Speculative
+  Decoding) moves from T2 to T1, joining P-5 / P-6 in the "make big
+  models fit + run fast at 48 GB" bucket. P-8 (Mini-SGLang) remains
+  T2.
+- **Rationale:** the bandwidth analysis behind D-017 shows that
+  speculative decoding is the only lever that amortizes a single
+  weight read across N accepted tokens, and is therefore required
+  (not optional) to credibly approach the user's
+  100-tokens/sec-class target on dense Qwen3.5-27B-4bit. The "should
+  speculative be pulled forward" question that pre-D-019 framed as
+  "open" is no longer open — the answer is yes, driven by
+  measurable physics rather than a discretionary priority call.
+- **Consequences:**
+  - P-7 phase block in §7 stays at status "planned" but its T1
+    placement enables P-7 sub-units (C.1 draft-target, C.2 Apple
+    ReDrafter, C.3 Qwen3.5 MTP head as draft) to land under the
+    P-6 phase umbrella as Track C.
+  - The P-7 deliverable list and acceptance gates are unchanged at
+    the §7 P-7 block level; the promotion is purely about priority
+    sequencing.
+  - Q-002 ("Should Phase 8 priority float up?") becomes
+    informational rather than blocking — see §10 Q-002 closure.
+- **References:** D-017, D-018, P-6, P-7, M-8, Q-002,
+  `plans/P6_OPENING.md` §3 Track C.
+
+### D-020 — Track C scope expanded to five speculative variants including DFlash and DDTree
+
+- **Date:** 2026-04-27.
+- **Status:** accepted (user confirmation 2026-04-27).
+- **Decision:** Track C in `plans/P6_OPENING.md` §3 grows from three
+  sub-units (C.1 draft-target, C.2 Apple ReDrafter, C.3 Qwen3.5 MTP
+  head as draft) to five sub-units, adding **C.4 DFlash** (block-
+  diffusion drafter; arxiv 2602.06036; MLX port at `bstnxbt/dflash-
+  mlx`) and **C.5 DDTree** (DFlash + draft tree under best-first
+  heap + ancestor-only attention mask; arxiv 2604.12989; MLX port
+  at `humanrouter/ddtree-mlx` with hybrid model support). All five
+  are measured independently; phase-exit picks the highest-
+  performing variant that lands cleanly without forcing the others
+  to land. The five form a comparison stack from cheapest-engine-
+  work to highest-claimed-speedup.
+- **Rationale:** the user's 2026-04-27 direction was
+  "speculative 都要测试，还有最近出来的 DFlash 和 DDTree" — measure
+  all five rather than gate later variants on earlier ones'
+  acceptance rates. The two new variants are 2026-published with
+  MLX ports already; their published claims (DFlash 6× over
+  autoregressive on Qwen3-class targets, DDTree 8.2× on Qwen3) are
+  the first MLX-native paths credibly approaching dense
+  Qwen3.5-27B-4bit at ≥100 tok/s on M5 Pro 48 GB. Measuring them
+  alongside the older variants establishes silica's
+  speculative-decoding evidence base; missing them would commit
+  the platform to a comparison that excludes the strongest known
+  candidates.
+- **Consequences:**
+  - Track C deliverable count grows from three to five sub-units.
+    Per-variant acceptance gates are listed in
+    `plans/P6_OPENING.md` §3 Track C.
+  - Phase-exit decision uses the highest-performing variant that
+    lands cleanly; the others remain in the bench catalog for
+    users with different workloads.
+  - Q-015 (ReDrafter KD as v0.1 scope) closes via this decision —
+    KD is in scope because the user opted to measure C.2 alongside
+    the others rather than gate it on C.1's acceptance rate.
+  - R-P6-8 (upstream stability for DFlash / DDTree MLX ports)
+    added to `plans/P6_OPENING.md` §7. The MLX ports are
+    independent community work, not Apple-blessed; mitigation is
+    that C.1 / C.2 / C.3 land in parallel and provide a known-good
+    baseline.
+- **References:** D-017, D-019, P-6, P-7, Q-015,
+  `plans/P6_OPENING.md` §3 Track C / §11 Q-B Resolution.
+
 ---
 
 ## 10. Open Questions
@@ -904,7 +1182,9 @@ Resolved questions are not deleted. Mark `Status: resolved` and append a `Resolu
 ### Q-002 — Should Phase 8 priority float up?
 
 - **Raised:** 2026-04-14.
-- **Status:** open (progress noted 2026-04-21; leaning Option B but not yet resolved).
+- **Status:** resolved (2026-04-27, v1.7.13) — P-8 stays at T2; the
+  priority promotion that mattered for v0.1 launch was P-7's, not
+  P-8's. Recorded in D-019.
 - **Question:** per D-006 (platform is the product), should Phase 8 (OpenAI API + session) float from T2 up to the tail of T1?
 - **Context:** if Phase 8 is the "product face", it should come earlier. But building a serving layer before the engine is stable is risky.
 - **Options:**
@@ -917,7 +1197,13 @@ Resolved questions are not deleted. Mark `Status: resolved` and append a `Resolu
 ### Q-003 — Should Phase 6 be pulled forward?
 
 - **Raised:** 2026-04-14.
-- **Status:** open (progress noted 2026-04-21; not yet resolved).
+- **Status:** resolved (2026-04-27, v1.7.13) — original framing
+  obsolete. The bandwidth analysis behind D-017 / D-018 shows dense
+  layer streaming cannot relieve the per-step bandwidth wall, and
+  Track B (3-bit weights) is the dense-fit lever instead. P-6 is
+  re-scoped as the performance phase (D-017); the original "pull
+  forward" question no longer applies. MoE per-expert streaming
+  (Track E.1) preserves the M-7 MoE memory-fit assertion.
 - **Question:** if Phase 3 finds Qwen3.5-27B / Gemma4-31B still don't fit at 4-bit on 48 GB, is Phase 6 (weight streaming) pulled ahead of Phase 5?
 - **Context (v1.5.0 update, D-011):** Q-003 is about **dense targets** (Qwen3.5-27B / Gemma4-31B, where total params = active params). **MoE targets** (Qwen3.5-35B-A3B / gemma-4-26B-A4B) have far lower 48 GB fit risk — active params are only 3–4B, fully resident is under half of a dense target, and it only gets easier with P-6 per-expert streaming. A MoE target can serve as an early scale demonstration while Q-003 is unresolved (the M-4 MoE smoke test is not Q-003-gated), but it does **not** substitute for Q-003 resolution — dense fit is still part of the product promise (D-006); users will reach for `Qwen3.5-27B` directly and will not be consoled by "we have MoE".
 - **Blocks:** Phase 5 / 6 ordering.
@@ -1014,6 +1300,11 @@ Resolved questions are not deleted. Mark `Status: resolved` and append a `Resolu
   - The dispositive signal is not the ratio magnitude but the structural one: **all four rows' first-token offsets are within ≤ 0.2 ms of each other**, confirming cohort-level prefill serializes short rows behind the long row's `T_max`. See `silica/scheduler/batcher.py::_prefill_phase` (`tokens = self._build_prefill_tokens()  # (B, T_max)`). Scaling the long prompt to 2000+ tokens makes the ratio unconditionally exceed 5×; the fairness defect is deterministic.
   - Promote chunked prefill to a new **P-4.5 bridge phase** (see §7 P-4.5 added in v1.6.4), not to a retroactive P-2 / P-3 deliverable. P-4.5 exits with: (i) TTFT-under-concurrency ratio `max(offsets_short) / smoke_ttft_ms < 3.5×` on the same scenario pair, short-row filter applied (amended down from the original `< 3×` lean after P-4.5-B.1 empirical measurement showed the option-(C) post-fix steady-state at ~3.0× floor; see §7 P-4.5 Amendment log 2026-04-21); (ii) chunked-prefill correctness verified under the three-layer criterion written at §7 P-4.5 Acceptance (event-taxonomy invariant + per-row token-count invariant + direct-mlx-lm-batched numerical reference on the sub-cohort scoped by the chosen option) — strict bit-identity against the unchunked Silica path is **not** part of the exit criterion because fp16 batched SDPA drift across different batch compositions is documented (P-2 / P-3-D3.1); (iii) the three-option opening doc is landed before the implementation so the scope decision is separable from the scope implementation.
 - **References:** P-4 empirical finding 2026-04-21; P-4.5; `plans/P2_OPENING.md` §"Model integration in three layers"; `silica/scheduler/batcher.py`.
+- **2026-04-27 follow-up (v1.7.13):** P-6 Track D.1 promotes chunked
+  prefill from the P-4.5 α-MVP slice-regime to the default scheduler
+  behavior on prompts ≥ 512 tokens, with decode merging on top. This
+  is the natural continuation of Q-010's resolution, not a re-opening.
+  See `plans/P6_OPENING.md` §3 Track D.
 
 ### Q-012 — Initial-cohort prefix-cache consultation
 
@@ -1041,6 +1332,102 @@ Resolved questions are not deleted. Mark `Status: resolved` and append a `Resolu
   - **C. Grammar state rides `state_delta`.** Consistent with D-015's framing (non-KV per-request state); weird conceptually because grammar is not part of the model.
 - **Blocks:** concrete structured-output implementation in v0.2 (not in v0.1 scope).
 - **Next step:** revisit when v0.2 planning begins; D-013 resolution leaves room for either framing.
+
+### Q-014 — Should the dense-target gate be tied to the bandwidth ceiling rather than a fixed tok/s number?
+
+- **Raised:** 2026-04-27 (v1.7.13, surfaced by `plans/P6_OPENING.md` §1.2 / §6).
+- **Status:** open.
+- **Question:** the P-6 dense-primary acceptance gate is currently
+  written as "Qwen3.5-27B-4bit ≥ 60 tok/s on M5 Pro 48 GB." A
+  hardware-aware alternative is "≥ 0.7 × the chip's measured
+  bandwidth-derived ceiling on the configured model." The latter
+  scales correctly across M5 Pro / M5 Max / future chips and across
+  3-bit / 4-bit / 8-bit configurations; the former is a single
+  number that becomes wrong when hardware or quantization changes.
+- **Context:** the 60 tok/s number was derived from the 22.7 tok/s
+  M5 Pro 4-bit ceiling × 1.6× speculative × 1.3× (3-bit option)
+  ≈ 47 tok/s under realistic stacking, with the 60 number including
+  some optimism for engine fusion. A bandwidth-relative gate would
+  formalize the same arithmetic without the constant.
+- **Options:**
+  - A. Keep the absolute 60 tok/s gate. Simple to communicate; needs
+    re-anchoring whenever the platform's hardware target moves.
+  - B. Switch to the relative ≥ 0.7 × ceiling gate. Robust to
+    hardware moves; harder to communicate to a casual reader.
+  - C. Do both: report the relative number and the absolute number
+    side by side in P-6.0 / phase-exit evidence.
+- **Blocks:** P-6 phase-exit gate text re-confirmation if the user
+  later picks Q-A option 2 (M5 Max hardware reset) from
+  `plans/P6_OPENING.md` §11.
+- **Next step:** decide at P-6 phase exit; not blocking.
+
+### Q-015 — Does the ReDrafter KD training pass count as v0.1 scope?
+
+- **Raised:** 2026-04-27 (v1.7.13, surfaced by `plans/P6_OPENING.md` §3 Track C).
+- **Status:** resolved (2026-04-27, v1.7.13) — Option A (KD is v0.1)
+  via D-020. The user opted to measure C.2 ReDrafter alongside
+  C.1 / C.3 / C.4 / C.5 rather than gate it on C.1's acceptance
+  rate, so the KD training pass is in scope. Phase-exit picks the
+  highest-performing variant that lands cleanly; if C.2 fails to
+  meet its acceptance gate the phase still closes via the others.
+- **Question:** Track C.2 (Apple ReDrafter as draft for Qwen3.5-27B)
+  requires a knowledge-distillation training pass to produce the
+  drafter weights. PLAN.md §3.2 non-goals does not address
+  draft-model training. Is the KD pass v0.1 work, v0.2 work, or
+  out-of-scope?
+- **Context:** if C.1 (draft-target with existing small Qwen) alone
+  meets the dense-primary 60 tok/s gate, Q-015 doesn't fire. If C.1
+  acceptance rate on dense 27B chat outputs is below ~50%, C.2
+  becomes the escape hatch and the KD cost has to be funded.
+  ReDrafter's MLX-native implementation lives at
+  `apple/ml-recurrent-drafter`; the published training time on a
+  comparable target model is on the order of a single GPU-day.
+- **Options:**
+  - A. KD is v0.1: budget for the training pass and ship the
+    distilled draft alongside the 4-bit / 3-bit checkpoints.
+  - B. KD is v0.2: ship C.1 only in v0.1; document the C.2 path as a
+    v0.2 capability.
+  - C. Out-of-scope: silica is an inference platform, not a model
+    distillation framework; defer to upstream / community drafters.
+- **Blocks:** Track C.2 deliverable in P-6.
+- **Next step:** decide after C.1 acceptance numbers land in P-6.0
+  / Track C measurement.
+
+### Q-016 — Is the MoE 100-tok/s stretch the right reframing, or should silica reset the v0.1 hardware target instead?
+
+- **Raised:** 2026-04-27 (v1.7.13, surfaced by `plans/P6_OPENING.md` §11 Q-A).
+- **Status:** resolved (2026-04-27, v1.7.13) — Option A (dual-target
+  reframing on M5 Pro 48 GB). Dense primary gate ≥60 tok/s on
+  Qwen3.5-27B-4bit; MoE stretch validator ≥100 tok/s on
+  Qwen3.5-35B-A3B-4bit. v0.1 hardware target stays at M5 Pro 48 GB
+  (PLAN.md §3.3 unchanged); D-006 platform positioning unchanged.
+  The MoE stretch validates the optimization stack without
+  committing to a number the bandwidth math says we cannot deliver
+  on dense 27B at 48 GB.
+- **Question:** the user asked for "≥ 100 tok/s on Qwen3.5-27B."
+  M5 Pro bandwidth math says this is not credibly reachable on
+  dense 27B-4bit. Two ways to honor the user's intent: (Q-A
+  option 1) keep M5 Pro 48 GB as the v0.1 hardware target, treat
+  dense-60 as the gate and MoE-100 as the stretch validator; (Q-A
+  option 2) reset the v0.1 hardware target to M5 Max 64+ GB so
+  100 tok/s on dense 27B becomes feasible.
+- **Context:** option 2 is **not** a number swap. It amends
+  PLAN.md §3.3 (Target Hardware), the D-006 platform-positioning
+  decision, and the README "M5 Pro 48 GB" framing. v0.1 is
+  currently positioned as the 48 GB price/perf tier; switching to
+  M5 Max moves it to a higher-priced, lower-volume audience.
+- **Options:**
+  - A. Dual-target reframing on M5 Pro 48 GB. Default; recorded in
+    D-017.
+  - B. Hardware-target reset to M5 Max 64+ GB. Requires explicit
+    user confirmation and follow-up edits to §3.3, D-006, README.
+  - C. Maintain the original "100 tok/s on dense 27B at 48 GB"
+    target and accept that P-6 will likely exit at a re-targeted
+    gate via Decisions Log entry under the §6 phase-exit clause.
+- **Blocks:** P-6 phase-entry contract with the user.
+- **Next step:** user decision recorded inline in
+  `plans/P6_OPENING.md` §11 Q-A. Until that lands, the dual-target
+  reframing (option A) is the working assumption per D-017.
 
 ---
 
@@ -1087,6 +1474,44 @@ Local reference implementations sit at the repo root. **Algorithm / architecture
 ---
 
 ## 13. Changelog
+
+- **v1.7.13** (2026-04-27): **P-6 re-scoped from "Weight Streaming"
+  to "Performance Phase" per D-017 / D-018 / D-019; user-confirmed
+  Q-A / Q-B / Q-C resolutions land in the same revision (D-020 +
+  Q-015 / Q-016 closures).** New target framing: dense
+  Qwen3.5-27B-4bit ≥60 tok/s primary + MoE Qwen3.5-35B-A3B-4bit
+  ≥100 tok/s stretch validator on M5 Pro 48 GB, derived from the
+  307 GB/s unified-memory bandwidth ceiling analysis in
+  `plans/P6_OPENING.md` §1.2. Five orthogonal tracks (A sync-barrier
+  collapse, B 3-bit weights, C speculative pulled in from P-7, D
+  TTFT levers, E weight streaming + SSD prefix tier preserving the
+  original P-6 scope). **Track C grows from three to five
+  sub-units** per D-020: C.1 draft-target, C.2 Apple ReDrafter,
+  C.3 Qwen3.5 MTP head, **C.4 DFlash** (block-diffusion drafter,
+  arxiv 2602.06036, MLX port `bstnxbt/dflash-mlx`), and **C.5
+  DDTree** (DFlash + draft tree, arxiv 2604.12989, MLX port
+  `humanrouter/ddtree-mlx`); all five measured independently,
+  phase-exit picks the highest-performing variant that lands
+  cleanly. P-7 priority promoted from T2 to T1 (D-019); dense
+  layer-streaming deferred to v0.2 with the original 24 GB budget
+  gate explicitly retired (D-018). Q-002 (P-8 priority float),
+  Q-003 (P-6 pull-forward), Q-015 (ReDrafter KD as v0.1), and
+  Q-016 (M5 Max hardware reset) all closed; Q-014 (bandwidth-
+  relative gate) remains open as a phase-exit consideration.
+
+  **What changed in PLAN.md.** Meta-header status field appended
+  with the re-scope summary; §7 P-6 phase block rewritten in place
+  (Goal / Scope / Strategy / Deliverables / Acceptance / Status /
+  Notes); §8.1 priority tiers table redrawn (T1 = P-5..P-7,
+  T2 = P-8); §9 appended D-017 / D-018 / D-019; §10 closed Q-002
+  and Q-003, added v1.7.13 follow-up note to Q-010, appended
+  Q-014 / Q-015 / Q-016. **No silica/* runtime change.** P-6.0
+  measurement-gate PR is the next code landing.
+
+  **References.** `plans/P6_OPENING.md` (full opening doc, 836
+  lines); `plans/PLAN.md` §7 P-6, §8.1, §9 D-017/D-018/D-019, §10
+  Q-002/Q-003/Q-010/Q-014/Q-015/Q-016; `docs/plans-index.md` (P-6
+  entry added).
 
 - **v1.7.12** (2026-04-26): **P-1..P-5 closure audit — stale-text cleanup + cross-doc consistency sweep.** The user-ordered "把 P1 到 P5 做做完整" sequence is now structurally closed (Items 1+2+3 at v1.7.7 / v1.7.8; A — P-3-E4 batched MoE scheduler-glue parity at v1.7.9; B — per-head D.2a re-measurement at v1.7.10; C₁ — per-head (b-static) Qwen3.5-4B production-path re-measurement at v1.7.11). This entry sweeps stale references across PLAN.md / README.md and runs the closure audit (lint + mypy + full test suite). No silica/* runtime change.
 
