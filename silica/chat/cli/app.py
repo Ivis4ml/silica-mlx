@@ -72,6 +72,29 @@ def _format_assistant_prefix(palette: Palette) -> str:
     return palette.colorize("silica ›", "orange", bold=True) + " "
 
 
+def _print_thinking_indicator(palette: Palette) -> None:
+    """Render the prefill-phase ``thinking...`` indicator inline.
+
+    Cleared by :func:`_clear_thinking_indicator` once the first
+    decoded token arrives. Provides the visual cue the chat REPL
+    was missing during long-prompt prefill (where the user types,
+    hits Enter, and otherwise sees a silent terminal for several
+    seconds while the engine consumes the prompt).
+    """
+    msg = palette.colorize("⠋ thinking...", "yellow", dim=True)
+    sys.stdout.write(msg)
+    sys.stdout.flush()
+
+
+def _clear_thinking_indicator() -> None:
+    """Remove the inline ``thinking...`` indicator from the current
+    line. ANSI: carriage-return + clear-to-end-of-line. Safe to
+    call when no indicator is present (becomes a no-op cursor
+    movement on most terminals)."""
+    sys.stdout.write("\r\x1b[K")
+    sys.stdout.flush()
+
+
 def _format_feedback(result: CommandResult, palette: Palette) -> list[str]:
     """Render command result feedback lines with appropriate colour.
 
@@ -294,21 +317,28 @@ def run_chat(args: argparse.Namespace) -> int:
                 )
             continue
 
-        # Regular chat turn.
+        # Regular chat turn. Defer the assistant prefix line until
+        # the first token actually arrives — that way long-prompt
+        # prefill shows a thinking indicator instead of a bare
+        # ``silica ›`` followed by silence.
         params = _sampling_params_from_state(state, adapter)
-        sys.stdout.write(_format_assistant_prefix(palette))
-        sys.stdout.flush()
 
         state.stream_state = StreamState.PREFILL
         state.tokens_generated = 0
         state.max_tokens = int(state.config.get("max_tokens", 1024))
+        _print_thinking_indicator(palette)
         try:
             metrics = chat_session.chat(
                 text,
                 sampling_params=params,
-                stream_to=lambda delta: _on_token(delta, state),
+                stream_to=lambda delta: _on_token(delta, state, palette),
             )
         except KeyboardInterrupt:
+            # If we never got past prefill, the thinking indicator
+            # is still on screen — clear it before the abort
+            # banner so the line does not have leftover text.
+            if state.stream_state is StreamState.PREFILL:
+                _clear_thinking_indicator()
             sys.stdout.write(
                 "\n"
                 + palette.colorize("[generation aborted]", "red")
@@ -318,6 +348,8 @@ def run_chat(args: argparse.Namespace) -> int:
             state.stream_state = StreamState.IDLE
             continue
         except Exception as exc:  # pragma: no cover — defensive
+            if state.stream_state is StreamState.PREFILL:
+                _clear_thinking_indicator()
             sys.stdout.write(
                 "\n"
                 + palette.colorize(f"[error: {exc}]", "red")
@@ -326,6 +358,19 @@ def run_chat(args: argparse.Namespace) -> int:
             sys.stdout.flush()
             state.stream_state = StreamState.IDLE
             continue
+        # Empty-reply edge case: generation ended without emitting
+        # a token. The indicator is still on screen; clear it and
+        # surface a placeholder so the conversation log is not
+        # bare.
+        if state.stream_state is StreamState.PREFILL:
+            _clear_thinking_indicator()
+            sys.stdout.write(
+                _format_assistant_prefix(palette)
+                + palette.colorize(
+                    "(no reply)", "grey", dim=True
+                )
+            )
+            sys.stdout.flush()
 
         # Newline closes the streamed assistant line.
         sys.stdout.write("\n")
@@ -412,19 +457,32 @@ def _build_prefix_cache(
     )
 
 
-def _on_token(delta: str, state: ChatCliState) -> None:
-    """Stream callback — write the decoded token delta to stdout
-    and update the lightweight tokens-generated counter.
+def _on_token(
+    delta: str, state: ChatCliState, palette: Palette
+) -> None:
+    """Stream callback — handle the prefill→decode transition and
+    write each decoded token delta to stdout.
 
-    ``ChatSession.chat`` calls this once per emitted token. C-5
-    will hook richer per-token bookkeeping (live tok/s, state
-    machine transitions to ``DECODE``); for C-3 the callback is
-    deliberately minimal so the streaming output is byte-for-byte
-    what the model produced.
+    ``ChatSession.chat`` calls this once per emitted token. The
+    first invocation per turn fires the prefill→decode state
+    transition and emits the assistant prefix line (deferred from
+    the main loop so the user sees the prefill indicator instead
+    of a bare ``silica ›`` for long-prompt prefill). Subsequent
+    invocations stream the token delta directly.
+
+    C-8 will interpose ``<think>``-tag detection here. The pure
+    streaming write is intentional in C-5 — adding live mid-token
+    UI redraw would require the full prompt_toolkit Application
+    layout (out of C-5 scope; the bottom toolbar refresh between
+    turns is sufficient for the ``tok/s`` and ``ttft`` numbers
+    the user is reading).
     """
     if state.stream_state is StreamState.PREFILL:
-        # First token observed → we are decoding. C-8 will
-        # interpose <think> detection here; C-3 just transitions.
+        # First token of the turn: clear the inline thinking
+        # indicator, emit the assistant prefix line, and flip the
+        # state-machine field. Subsequent calls bypass this branch.
+        _clear_thinking_indicator()
+        sys.stdout.write(_format_assistant_prefix(palette))
         state.stream_state = StreamState.DECODE
     state.tokens_generated += 1
     sys.stdout.write(delta)
