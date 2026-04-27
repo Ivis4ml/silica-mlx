@@ -48,6 +48,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from silica.core.events import BatchEvent
 from silica.core.sampling import SamplingParams
 from silica.models.adapter import ModelAdapter
 
@@ -60,6 +61,11 @@ class _EngineLike(Protocol):
     attributes. Kept at Protocol level so importing this module
     does not pull ``silica.engine`` when only the session
     dataclasses are needed.
+
+    ``generate_batch`` is only consumed when the session was
+    constructed with a ``prefix_cache``; engines that do not
+    support batched generation can still be used in single-request
+    mode (the tests' minimal fakes work without it).
     """
 
     metrics: Any
@@ -68,6 +74,31 @@ class _EngineLike(Protocol):
     def generate(
         self, prompt: str, params: SamplingParams | None = None
     ) -> Iterator[int]: ...
+
+    def generate_batch(
+        self,
+        prompts: Any,
+        params: SamplingParams | list[SamplingParams] | None = None,
+        *,
+        max_batch_size: int | None = None,
+        prefix_cache: Any = None,
+        length_spread_threshold: float = 2.0,
+    ) -> Iterator[BatchEvent]: ...
+
+
+class _PrefixCacheLike(Protocol):
+    """Narrow ``RadixPrefixCache`` surface the session reads.
+
+    Pulled out as a Protocol so the unit tests can inject a fake
+    cache without depending on the real ``silica.kvcache.prefix``
+    construction (which needs a store, codec, etc.). The session
+    only needs to peek at the hit count for one turn's prompt;
+    cache lifecycle (construction, replacement on ``/reset``)
+    lives with the caller — see ``set_prefix_cache``."""
+
+    block_size: int
+
+    def peek(self, tokens: Any) -> Any: ...
 
 
 @dataclass
@@ -99,6 +130,17 @@ class TurnMetrics:
     peak_memory_mb: float | None = None
     logical_kv_bytes: int | None = None
     wall_s: float | None = None
+    prefix_hit_blocks: int | None = None
+    """Number of prefix-cache blocks reused for this turn's
+    prompt. ``None`` when the session was constructed without a
+    prefix cache (single-request path); ``0`` when the cache is
+    present but the prompt did not match any cached prefix."""
+
+    prefix_hit_tokens: int | None = None
+    """Number of prompt tokens covered by ``prefix_hit_blocks``.
+    Equal to ``prefix_hit_blocks * cache.block_size`` for an
+    aligned hit. ``None`` mirrors the meaning of
+    ``prefix_hit_blocks``."""
 
 
 class ChatSession:
@@ -116,6 +158,7 @@ class ChatSession:
         engine: _EngineLike,
         *,
         system_prompt: str | None = None,
+        prefix_cache: _PrefixCacheLike | None = None,
         reset_peak_memory: Callable[[], None] | None = None,
         read_peak_memory_mb: Callable[[], float | None] | None = None,
         clock: Callable[[], float] = time.perf_counter,
@@ -134,6 +177,7 @@ class ChatSession:
         self._reset_peak = reset_peak_memory or _mlx_reset_peak_memory
         self._read_peak_mb = read_peak_memory_mb or _mlx_peak_memory_mb
         self._clock = clock
+        self._prefix_cache: _PrefixCacheLike | None = prefix_cache
 
     # --- observation -------------------------------------------------
 
@@ -146,13 +190,40 @@ class ChatSession:
     def eos_token_ids(self) -> tuple[int, ...]:
         return self._eos_ids
 
+    @property
+    def prefix_cache(self) -> _PrefixCacheLike | None:
+        """Active prefix cache, or ``None`` if the session is
+        single-request (``engine.generate``) only."""
+        return self._prefix_cache
+
     # --- mutation ----------------------------------------------------
 
     def reset(self) -> None:
-        """Drop every message except the original system prompt."""
+        """Drop every message except the original system prompt.
+
+        Note: the prefix cache itself is **not** cleared here —
+        ``RadixPrefixCache`` has no public ``clear()`` and replacing
+        the instance is the caller's responsibility (the chat-CLI
+        shell creates a fresh cache on ``/reset`` and assigns it
+        via :meth:`set_prefix_cache`). Leaving the previous cache
+        intact would leak prior-conversation tokens into the new
+        conversation; the shell is expected to swap it out.
+        """
         self._messages = [
             m for m in self._messages if m["role"] == "system"
         ]
+
+    def set_prefix_cache(
+        self, prefix_cache: _PrefixCacheLike | None
+    ) -> None:
+        """Replace the active prefix cache. ``None`` disables
+        prefix-cache routing (subsequent ``chat`` calls go through
+        ``engine.generate`` instead of ``engine.generate_batch``).
+
+        The chat-CLI shell calls this on ``/reset`` to swap in a
+        freshly-constructed cache, ensuring no token leakage from
+        the previous conversation."""
+        self._prefix_cache = prefix_cache
 
     def chat(
         self,
@@ -176,23 +247,34 @@ class ChatSession:
         prompt_text, prompt_ids = self._render_prompt()
         params = self._build_sampling_params(sampling_params)
 
+        # Prefix-hit measurement before the turn runs. ``peek`` is
+        # side-effect-free, so this number reflects the cache state
+        # at the start of the turn — the right signal for the
+        # toolbar's "how much of THIS turn's prompt was reused" field.
+        prefix_hit_blocks: int | None = None
+        prefix_hit_tokens: int | None = None
+        if self._prefix_cache is not None:
+            hit = self._prefix_cache.peek(prompt_ids)
+            prefix_hit_blocks = len(getattr(hit, "block_ids", ()))
+            prefix_hit_tokens = int(getattr(hit, "num_hit_tokens", 0))
+
         self._reset_peak()
         t_start = self._clock()
-        out_tokens: list[int] = []
-        printed_prefix = ""
-        for tok in self._engine.generate(prompt_text, params):
-            out_tokens.append(tok)
-            if stream_to is not None:
-                current = self._tokenizer.decode(out_tokens)
-                delta = current[len(printed_prefix):]
-                if delta:
-                    stream_to(delta)
-                    printed_prefix = current
+        out_tokens, finish_reason_from_event = self._run_generation(
+            prompt_text, params, stream_to
+        )
         wall_s = self._clock() - t_start
         peak_mb = self._read_peak_mb()
 
         reply_text = self._tokenizer.decode(out_tokens)
-        finish_reason = self._classify_finish(out_tokens, params)
+        # Prefix-cache path surfaces finish_reason directly via the
+        # batcher's terminal BatchEvent; single-request path infers
+        # it from the token sequence.
+        finish_reason = (
+            finish_reason_from_event
+            if finish_reason_from_event is not None
+            else self._classify_finish(out_tokens, params)
+        )
         self._messages.append(
             {"role": "assistant", "content": reply_text}
         )
@@ -210,7 +292,58 @@ class ChatSession:
             peak_memory_mb=peak_mb,
             logical_kv_bytes=snapshot.logical_kv_bytes,
             wall_s=wall_s,
+            prefix_hit_blocks=prefix_hit_blocks,
+            prefix_hit_tokens=prefix_hit_tokens,
         )
+
+    def _run_generation(
+        self,
+        prompt_text: str,
+        params: SamplingParams,
+        stream_to: Callable[[str], None] | None,
+    ) -> tuple[list[int], str | None]:
+        """Drive one turn's token stream.
+
+        Routes through ``engine.generate_batch`` when a prefix
+        cache is configured (so block-aligned KV from previous
+        turns is reused), otherwise through ``engine.generate``
+        (the original single-request path). Returns the emitted
+        token list and the terminal ``finish_reason`` if the
+        batched event stream surfaced one — single-request path
+        returns ``None`` and lets ``_classify_finish`` infer.
+        """
+        out_tokens: list[int] = []
+        printed_prefix = ""
+
+        def _on_token(tok: int) -> None:
+            nonlocal printed_prefix
+            out_tokens.append(tok)
+            if stream_to is not None:
+                current = self._tokenizer.decode(out_tokens)
+                delta = current[len(printed_prefix):]
+                if delta:
+                    stream_to(delta)
+                    printed_prefix = current
+
+        if self._prefix_cache is None:
+            for tok in self._engine.generate(prompt_text, params):
+                _on_token(tok)
+            return out_tokens, None
+
+        finish_reason: str | None = None
+        for event in self._engine.generate_batch(
+            [prompt_text],
+            params,
+            prefix_cache=self._prefix_cache,
+        ):
+            if event.kind == "token" and event.token_id is not None:
+                _on_token(event.token_id)
+            elif event.kind in ("done", "aborted"):
+                finish_reason = event.finish_reason
+                # Stream ends after the terminal event for our
+                # single-row request; no need to drain further.
+                break
+        return out_tokens, finish_reason
 
     # --- internals ---------------------------------------------------
 

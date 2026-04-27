@@ -474,3 +474,229 @@ def test_finish_reason_parametrized(
         ),
     )
     assert m.finish_reason == expected
+
+
+# ---------- C-4 prefix-cache integration ---------------------------
+
+
+@dataclass
+class _FakePrefixHit:
+    block_ids: tuple[int, ...] = ()
+    num_hit_tokens: int = 0
+
+
+class _FakePrefixCache:
+    """Minimal prefix-cache fake used by the C-4 tests.
+
+    Exposes ``peek(tokens) -> _FakePrefixHit`` returning whatever
+    the test pre-loaded via :meth:`set_hit`, plus ``block_size``
+    so the session's Protocol-conformance read still resolves.
+    Records every ``peek`` call so tests can assert the session
+    consults the cache exactly once per turn (before the engine
+    runs).
+    """
+
+    def __init__(self, block_size: int = 16) -> None:
+        self.block_size = block_size
+        self._hit = _FakePrefixHit()
+        self.peek_calls: list[list[int]] = []
+
+    def set_hit(
+        self, *, block_ids: tuple[int, ...], num_hit_tokens: int
+    ) -> None:
+        self._hit = _FakePrefixHit(
+            block_ids=block_ids, num_hit_tokens=num_hit_tokens
+        )
+
+    def peek(self, tokens: Any) -> _FakePrefixHit:
+        self.peek_calls.append(list(tokens))
+        return self._hit
+
+
+class _FakeBatchedEngine:
+    """Engine fake that supports both the single-request
+    ``generate`` path and the batched ``generate_batch`` path.
+
+    Yields a sequence of :class:`silica.core.events.BatchEvent` for
+    one row when ``generate_batch`` is called; mirrors the real
+    engine's terminal-event convention (one ``done`` after the
+    last token). Records the prefix_cache it received so tests
+    can assert routing.
+    """
+
+    def __init__(
+        self,
+        tokens: list[int],
+        *,
+        finish_reason: str = "done",
+    ) -> None:
+        self._tokens = list(tokens)
+        self._finish_reason = finish_reason
+        self.prompts_seen: list[str] = []
+        self.batched_prompts_seen: list[Any] = []
+        self.batched_prefix_cache_seen: list[Any] = []
+        self.metrics = _FakeMetrics()
+        self.kv_manager = _FakeKVManager()
+
+    def generate(
+        self, prompt: str, params: SamplingParams | None = None
+    ) -> Iterator[int]:
+        # Provide the single-request path too so tests can flip
+        # between paths on the same fake.
+        effective = params if params is not None else SamplingParams()
+        self.prompts_seen.append(prompt)
+        stop_ids = set(effective.stop_token_ids or ())
+        n = 0
+        for tok in self._tokens:
+            if n >= effective.max_tokens:
+                break
+            yield tok
+            n += 1
+            if tok in stop_ids:
+                break
+
+    def generate_batch(
+        self,
+        prompts: Any,
+        params: SamplingParams | list[SamplingParams] | None = None,
+        *,
+        max_batch_size: int | None = None,
+        prefix_cache: Any = None,
+        length_spread_threshold: float = 2.0,
+    ) -> Iterator[Any]:
+        from silica.core.events import BatchEvent
+
+        del max_batch_size, length_spread_threshold
+        self.batched_prompts_seen.append(list(prompts))
+        self.batched_prefix_cache_seen.append(prefix_cache)
+        # B=1 — one row, req_index=0.
+        for tok in self._tokens:
+            yield BatchEvent.token(req_index=0, token_id=tok)
+        yield BatchEvent.done(req_index=0, reason=self._finish_reason)
+
+
+def _build_session_with_cache(
+    *,
+    engine_tokens: list[int] | None = None,
+    cache: _FakePrefixCache | None = None,
+) -> tuple[ChatSession, _FakeBatchedEngine, _FakePrefixCache]:
+    tok = _FakeTokenizer(eos_token_ids={99})
+    adapter = _FakeAdapter(tok)
+    engine = _FakeBatchedEngine(
+        engine_tokens if engine_tokens is not None else [65, 66, 67]
+    )
+    pc = cache if cache is not None else _FakePrefixCache()
+    session = ChatSession(
+        adapter,
+        engine,
+        prefix_cache=pc,
+        reset_peak_memory=lambda: None,
+        read_peak_memory_mb=lambda: 256.0,
+    )
+    return session, engine, pc
+
+
+def test_prefix_cache_session_routes_through_generate_batch() -> None:
+    """When constructed with a prefix cache, ``chat()`` must use
+    ``engine.generate_batch`` and pass the cache through."""
+    session, engine, pc = _build_session_with_cache()
+    session.chat("hello")
+    # Single-request generate path should not have been touched.
+    assert engine.prompts_seen == []
+    # Batched path called exactly once with our cache.
+    assert len(engine.batched_prompts_seen) == 1
+    assert len(engine.batched_prefix_cache_seen) == 1
+    assert engine.batched_prefix_cache_seen[0] is pc
+
+
+def test_prefix_cache_session_peeks_before_turn() -> None:
+    """``peek`` is called exactly once per turn, before the engine
+    runs — surfacing the hit count on ``TurnMetrics``."""
+    session, _, pc = _build_session_with_cache()
+    pc.set_hit(block_ids=(7, 8, 9), num_hit_tokens=48)
+    metrics = session.chat("hello world")
+    assert len(pc.peek_calls) == 1
+    assert metrics.prefix_hit_blocks == 3
+    assert metrics.prefix_hit_tokens == 48
+
+
+def test_prefix_cache_session_zero_hit_recorded() -> None:
+    """When the cache is present but the prompt is a miss, hit
+    fields should be 0 (not None) so the toolbar distinguishes
+    "cache present, no match" from "no cache configured"."""
+    session, _, pc = _build_session_with_cache()
+    metrics = session.chat("first turn")
+    assert metrics.prefix_hit_blocks == 0
+    assert metrics.prefix_hit_tokens == 0
+
+
+def test_no_prefix_cache_leaves_hit_fields_none() -> None:
+    """The single-request path leaves prefix-hit fields at None
+    so the toolbar renders ``prefix_hit=—`` instead of ``0/0``."""
+    session, _, _ = _build_session(engine_tokens=[65, 66, 67])
+    metrics = session.chat("hi")
+    assert metrics.prefix_hit_blocks is None
+    assert metrics.prefix_hit_tokens is None
+
+
+def test_prefix_cache_session_finish_reason_from_event() -> None:
+    """The batched path must use the terminal BatchEvent's
+    ``finish_reason`` rather than reclassifying from tokens."""
+    tok = _FakeTokenizer(eos_token_ids={99})
+    adapter = _FakeAdapter(tok)
+    engine = _FakeBatchedEngine([65, 66], finish_reason="max_tokens")
+    pc = _FakePrefixCache()
+    session = ChatSession(
+        adapter,
+        engine,
+        prefix_cache=pc,
+        reset_peak_memory=lambda: None,
+        read_peak_memory_mb=lambda: 256.0,
+    )
+    metrics = session.chat("hi")
+    assert metrics.finish_reason == "max_tokens"
+
+
+def test_set_prefix_cache_swaps_active_cache() -> None:
+    """``set_prefix_cache`` replaces the active instance — the
+    chat-CLI shell calls this on /reset to invalidate the
+    previous conversation's cached blocks."""
+    session, _, pc1 = _build_session_with_cache()
+    assert session.prefix_cache is pc1
+    pc2 = _FakePrefixCache()
+    session.set_prefix_cache(pc2)
+    assert session.prefix_cache is pc2
+    # Subsequent peek lands on the new cache, not the old one.
+    session.chat("after swap")
+    assert len(pc1.peek_calls) == 0
+    assert len(pc2.peek_calls) == 1
+
+
+def test_set_prefix_cache_to_none_disables_routing() -> None:
+    """Passing None to ``set_prefix_cache`` reverts to the
+    single-request path."""
+    session, engine, _ = _build_session_with_cache()
+    session.chat("with cache")
+    assert len(engine.batched_prompts_seen) == 1
+    session.set_prefix_cache(None)
+    session.chat("without cache")
+    # batched count unchanged; single-request count incremented.
+    assert len(engine.batched_prompts_seen) == 1
+    assert engine.prompts_seen == [
+        # The second turn went through the single-request path.
+        engine.prompts_seen[0]
+    ]
+
+
+def test_prefix_cache_session_reset_does_not_clear_cache() -> None:
+    """``reset()`` clears messages only — the cache instance is
+    held until the caller swaps it via ``set_prefix_cache``.
+    Documents the contract that the chat-CLI shell is responsible
+    for invalidating cache on /reset (avoids a leak of prior-
+    conversation tokens but lets non-REPL callers keep cache
+    across reset boundaries if they choose)."""
+    session, _, pc = _build_session_with_cache()
+    session.chat("turn one")
+    session.reset()
+    # Cache reference unchanged.
+    assert session.prefix_cache is pc

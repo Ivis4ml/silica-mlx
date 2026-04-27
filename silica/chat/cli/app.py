@@ -108,11 +108,13 @@ def run_chat(args: argparse.Namespace) -> int:
     types Ctrl-D, or interrupts twice.
     """
     try:
-        from prompt_toolkit import PromptSession
-        from prompt_toolkit.formatted_text import ANSI
-        from prompt_toolkit.history import FileHistory
-        from prompt_toolkit.key_binding import KeyBindings
-        from prompt_toolkit.keys import Keys
+        from prompt_toolkit import PromptSession  # type: ignore[import-not-found]
+        from prompt_toolkit.formatted_text import ANSI  # type: ignore[import-not-found]
+        from prompt_toolkit.history import FileHistory  # type: ignore[import-not-found]
+        from prompt_toolkit.key_binding import (  # type: ignore[import-not-found]
+            KeyBindings,
+        )
+        from prompt_toolkit.keys import Keys  # type: ignore[import-not-found]
     except ImportError:
         print(
             "silica chat requires prompt_toolkit. Install with:\n"
@@ -123,8 +125,11 @@ def run_chat(args: argparse.Namespace) -> int:
 
     # Defer engine + session imports so a `--help` on this module
     # does not pay the MLX warm-up cost.
+    from silica.bench.codec_registry import get_codec_spec
     from silica.chat.session import ChatSession
     from silica.engine import Engine
+    from silica.kvcache.prefix import RadixPrefixCache
+    from silica.kvcache.store import SyntheticPrefixBlockStore
     from silica.models.factory import adapter_for_repo
 
     palette = detect_palette()
@@ -134,12 +139,32 @@ def run_chat(args: argparse.Namespace) -> int:
     sys.stdout.flush()
     adapter, kv = adapter_for_repo(args.model)
     engine = Engine(adapter, kv)
+
+    # --- Build prefix cache (Tier 2 architectural showcase) ---
+    # The session-scoped RadixPrefixCache is what makes multi-turn
+    # chat reuse the conversation history's KV — silica-mlx's
+    # equivalent of SGLang's RadixAttention. Without it every turn
+    # would re-prefill the full history, defeating the framework's
+    # signature optimisation in its own client.
+    prefix_cache = _build_prefix_cache(
+        adapter,
+        codec_id=getattr(args, "kv_codec", None),
+        get_codec_spec=get_codec_spec,
+        store_cls=SyntheticPrefixBlockStore,
+        cache_cls=RadixPrefixCache,
+    )
+
     # mypy variance limitation: ChatSession's _EngineLike Protocol
     # treats kv_manager as a settable attribute, while Engine
     # exposes it as a read-only property; the runtime contract is
     # satisfied (Protocol member access works either way), only
     # the structural type-check trips.
-    chat_session = ChatSession(adapter, engine, system_prompt=args.system)  # type: ignore[arg-type]
+    chat_session = ChatSession(
+        adapter,
+        engine,  # type: ignore[arg-type]
+        system_prompt=args.system,
+        prefix_cache=prefix_cache,
+    )
 
     # --- Build state ---
     state = ChatCliState(
@@ -209,8 +234,21 @@ def run_chat(args: argparse.Namespace) -> int:
                 break
             if result.request_reset:
                 chat_session.reset()
+                # Swap the prefix cache so prior-conversation
+                # tokens cannot leak into the new session — see
+                # ChatSession.reset() docstring for the contract.
+                fresh_cache = _build_prefix_cache(
+                    adapter,
+                    codec_id=getattr(args, "kv_codec", None),
+                    get_codec_spec=get_codec_spec,
+                    store_cls=SyntheticPrefixBlockStore,
+                    cache_cls=RadixPrefixCache,
+                )
+                chat_session.set_prefix_cache(fresh_cache)
                 state.turn = 0
                 state.last_turn_thinking = ""
+                state.prefix_hit_blocks = None
+                state.prefix_hit_max = None
             if result.request_expand_thinking:
                 expanded = palette.colorize(
                     "── thinking ──\n" + state.last_turn_thinking,
@@ -305,6 +343,13 @@ def run_chat(args: argparse.Namespace) -> int:
             state.kv_logical_mb = metrics.logical_kv_bytes / 1e6
         if metrics.decode_tok_s is not None:
             state.tok_per_sec = metrics.decode_tok_s
+        # Tier 2 prefix-hit signal: surface block-aligned cache
+        # reuse on the toolbar. Denominator is the prompt's total
+        # token count so users see "256/640" — i.e. "256 tokens of
+        # the 640-token prompt were fetched from the cache".
+        if metrics.prefix_hit_blocks is not None:
+            state.prefix_hit_blocks = metrics.prefix_hit_tokens
+            state.prefix_hit_max = metrics.prompt_tokens
 
         # Codec hint (toolbar-adjacent, post-turn).
         threshold = float(state.config.get("kv_codec_hint_mb", 200.0))
@@ -318,6 +363,53 @@ def run_chat(args: argparse.Namespace) -> int:
         _print_separator(palette)
 
     return 0
+
+
+_PREFIX_CACHE_BLOCK_SIZE = 16
+"""Matches the block size used in :func:`silica.bench.runner._maybe_build_prefix_cache`
+so chat-CLI prefix caches share the size convention with bench rows."""
+
+
+def _build_prefix_cache(
+    adapter: Any,
+    *,
+    codec_id: str | None,
+    get_codec_spec: Any,
+    store_cls: Any,
+    cache_cls: Any,
+) -> Any:
+    """Construct a session-scoped ``RadixPrefixCache`` for the chat REPL.
+
+    When ``codec_id`` is ``None`` the cache is fp16 (no compression);
+    otherwise the named codec from
+    ``silica.bench.codec_registry`` is instantiated against the
+    adapter's KV layout and installed on a
+    :class:`SyntheticPrefixBlockStore`.
+
+    Helper-injected arguments mirror the imports inside
+    :func:`run_chat` so this builder stays pure-Python and can be
+    unit-tested without the heavy MLX / engine warm-up — see
+    ``tests/test_chat_cli_app_prefix_cache_factory.py`` (planned
+    follow-up; for now the function is exercised end-to-end via
+    the live REPL smoke).
+    """
+    layout = adapter.kv_layout()
+    codec: Any = None
+    if codec_id is not None:
+        spec = get_codec_spec(codec_id)
+        codec = spec.factory(
+            block_size=_PREFIX_CACHE_BLOCK_SIZE,
+            n_kv_heads=layout.n_kv_heads,
+            head_dim=layout.head_dim,
+            dtype=layout.dtype,
+            seed=42,
+        )
+    store = store_cls(
+        block_size=_PREFIX_CACHE_BLOCK_SIZE, codec=codec
+    )
+    return cache_cls(
+        block_size=_PREFIX_CACHE_BLOCK_SIZE, store=store
+    )
 
 
 def _on_token(delta: str, state: ChatCliState) -> None:
