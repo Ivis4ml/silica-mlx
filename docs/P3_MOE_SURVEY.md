@@ -495,7 +495,7 @@ Out of scope for E:
   need only to expose the `(layer_idx, expert_id)` dispatch seam;
   real streaming lands later.
 
-### 5.1 E4 closure (smoke-only, parity deferred) — 2026-04-25
+### 5.1 E4 closure (smoke + scheduler-glue parity) — 2026-04-25 / 2026-04-26 v1.7.9
 
 E4 lands as a capability-gate lift plus per-family B=2 smoke. The
 load-bearing audit finding from §5: mlx-lm's `SwitchGLU` +
@@ -527,19 +527,35 @@ FFN does not interact with KV cache shape.
   fallback path documented if peak memory exceeds the 48 GB
   target on the 35B-A3B-4bit checkpoint (~20 GB on disk).
 
-**Explicitly deferred (not in E4 scope):**
+**Closed at v1.7.9 (2026-04-26):**
 
-- Token parity. Per-row top-k expert indices under different
-  right-padding lengths through the quantized SwitchGLU is its
-  own definition exercise — what counts as "the same routing"
-  when row-A's token-7 pads differently from row-B's token-7 is
-  not obvious, and the survey's original "smoke + parity" framing
-  conflated two concerns. Mirror the E3 close: structural
-  correctness under batched dispatch is sufficient to claim E4
-  done; HF-vs-mlx-lm parity is post-P-5 alongside (b-static).
-- B>1 across the full activation set the dense families' C3d /
-  D3.1 lock down. MoE-specific parity needs the deferred
-  definition above.
+- B>1 across the full activation set, mirroring the dense
+  families' C3d / D3.1. Lands as
+  `tests/test_p3_qwen3_5_moe_batched_parity.py` and
+  `tests/test_p3_gemma4_moe_batched_parity.py`, each with the
+  same 4-test pattern as `tests/test_p3_gemma4_batched_parity.py`:
+  B=1 batched == single-request hard gate, identical-prompt B=2
+  symmetry, **Silica B=2 batched matches a direct mlx-lm batched
+  reference driven with `make_batch_cache(left_padding)`**, and
+  unequal-length row-lifecycle smoke. All 8 tests pass on real
+  weights; the load-bearing claim is the same as D3.1 — Silica's
+  scheduler glue produces the same per-row token streams as a
+  direct mlx-lm batched forward through the adapter's
+  `make_batch_cache`-produced cache list.
+
+**Out-of-scope by definition (no longer tracked as E4 follow-up):**
+
+- "Per-row top-k expert indices stability under different
+  right-padding lengths through the quantized SwitchGLU" remains
+  an ill-defined open question because right-padding shifts a
+  row's content positions inside the batched activation tensor,
+  and the routing-equality definition under that shift is
+  non-obvious. The v1.7.9 token-level parity subsumes the
+  practical question — if the direct mlx-lm batched reference
+  reaches the same tokens as Silica, both must have routed
+  through compatible top-k expert sets at every position. The
+  harder routing-equality definition is not blocking any P-1..P-5
+  work and is not being chased.
 
 ## 6. Open questions (local to E track)
 
