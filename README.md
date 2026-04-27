@@ -505,10 +505,22 @@ P-4.5 bridges both.
   re-measurement** (`scripts/d2a_per_head_3seed.py`) verifies
   empirically that engaging `per_head_rotation=True` shrinks the
   silica-vs-vqbench `mean_gap` from 0.150 to 0.066 PPL (~56%
-  reduction) on Qwen3-0.6B WikiText-2; default OFF stays in force,
-  flipping is a separate decision (see
-  `docs/P5_D2_INVESTIGATION/per_head_rotation_3seeds.md`). The single
-  intentionally-deferred Deliverable remains
+  reduction) on Qwen3-0.6B WikiText-2 — at the cost of a +0.22 PPL
+  absolute regression in silica's own codec ΔPPL on the D.2a path.
+  **v1.7.11 production-path follow-up**
+  (`scripts/b_static_per_head_qwen35_4b_3seed.py`) re-runs (b-static)
+  on Qwen3.5-4B through `prefix_store_pre_norm` with per-head
+  rotation: mean ΔPPL stays inside SEM noise (+0.003 PPL shift on a
+  0.012 PPL band), but std is 5.3× tighter and SEM is 4.8× tighter
+  than the shared-rotation v1.7.7 baseline. The D.2a-path absolute
+  regression does NOT carry over to the production path — per-head
+  is empirically net-positive on production routing. Default OFF
+  stays in force; flip status moves from "empirical question" to
+  "administrative landing" (cross-codec measurement coverage +
+  (4-b) gate re-anchor pending). Evidence:
+  `docs/P5_D2_INVESTIGATION/per_head_rotation_3seeds.md`,
+  `docs/P5_ACCEPTANCE_SWEEP/qwen35_4b_b_static_per_head_3seeds.md`.
+  The single intentionally-deferred Deliverable remains
   `PagedPrefixBlockStore` codec injection (`NotImplementedError`
   stub per D-003 no-compressed-domain-attention scope; lands when
   the paged-attention kernel track advances).
