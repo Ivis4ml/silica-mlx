@@ -1036,6 +1036,242 @@ def admission_headroom_oracle(
     return (True, None, metadata)
 
 
+def warm_decode_oracle(
+    scenario: Scenario, collected: Any, context: Any
+) -> tuple[bool, str | None, dict[str, Any]]:
+    """P-6.0 oracle: sustained warm-start ``decode_tok_s`` on a
+    long-running generation, with first-forward kernel-compile cost
+    excluded by a two-stage warm-up rule.
+
+    See :class:`OracleKind.WARM_DECODE` for the full workload contract,
+    ``oracle_config`` keys, and the rationale for the two-stage
+    warm-up rule. The oracle reports the measurement; it does not
+    enforce a target. Phase-level acceptance gates compare the
+    reported number against the dense-60 / MoE-100 targets in
+    ``plans/P6_OPENING.md`` §6.
+
+    Steady-state per-row metric:
+
+      ``decode_tok_s_warm[row] = 1000.0 / mean_meas_interval_ms``
+
+    where ``mean_meas_interval_ms`` is the mean of inter-token
+    intervals (in ms) across the post-warm-up measurement window.
+    Equivalent to ``N_meas / total_meas_s`` but more numerically
+    stable across short windows.
+
+    Aggregate metric (B>1) — intersection of per-row warm windows:
+
+      Let ``[t_overlap_start, t_overlap_end] = [max_row(t_first_meas),
+      min_row(t_last)]``. This is the window during which **every**
+      row is simultaneously in steady-state measurement. Within that
+      window, count tokens emitted by any row:
+
+      ``decode_tok_s_warm_aggregate = overlap_decodes / overlap_s``
+
+    where ``overlap_s = (t_overlap_end - t_overlap_start) / 1000.0``.
+    Counting *only* tokens that fall inside the intersection avoids
+    the systematic inflation a union-window denominator would cause
+    when per-row warm-up boundaries differ — e.g. row 0's warm-up
+    ends at step 32 while row 1's ends at step 50; the 18 steps of
+    row-1 warm-up time would otherwise be in the denominator without
+    any corresponding decodes in the numerator. This is the number
+    directly comparable to vllm-mlx's "127 tok/s on Qwen3-30B-A3B-4bit
+    M4 Max" headline (which itself is a steady-state-overlap
+    measurement on a homogeneous batch).
+
+    If the intersection is empty (e.g. row 0 finishes before row 1
+    enters measurement), the oracle fails with a structured reason
+    rather than reporting a meaningless aggregate.
+    """
+    if not isinstance(context, dict) or "vocab_size" not in context:
+        return (False, "warm_decode_missing_context_vocab_size", {})
+    required = (
+        "warmup_min_steps",
+        "warmup_rolling_window",
+        "warmup_rel_std_threshold",
+        "measurement_steps_min",
+    )
+    for key in required:
+        if key not in context:
+            return (
+                False,
+                f"warm_decode_context_missing_required_key:{key}",
+                {"keys_present": sorted(context)},
+            )
+    vocab_size = int(context["vocab_size"])
+    warmup_min_steps = int(context["warmup_min_steps"])
+    warmup_rolling_window = int(context["warmup_rolling_window"])
+    warmup_rel_std_threshold = float(context["warmup_rel_std_threshold"])
+    measurement_steps_min = int(context["measurement_steps_min"])
+
+    if (
+        not isinstance(collected, tuple)
+        or len(collected) != 2
+        or not isinstance(collected[0], dict)
+        or not isinstance(collected[1], dict)
+    ):
+        return (False, "warm_decode_collected_shape_mismatch", {})
+    tokens, token_ts_ms = collected
+
+    # Per-row vocab + length validation. Fail-fast on out-of-vocab
+    # ids before doing any window math.
+    for row_idx in sorted(tokens):
+        row_tokens = tokens[row_idx]
+        for i, tok in enumerate(row_tokens):
+            if not isinstance(tok, int):
+                return (
+                    False,
+                    f"warm_decode_row_{row_idx}_token_{i}_not_int:"
+                    f"{type(tok).__name__}",
+                    {},
+                )
+            if tok < 0 or tok >= vocab_size:
+                return (
+                    False,
+                    f"warm_decode_row_{row_idx}_token_{i}_out_of_vocab:"
+                    f"{tok}",
+                    {},
+                )
+
+    per_row: dict[int, dict[str, float]] = {}
+    for row_idx in sorted(token_ts_ms):
+        ts = token_ts_ms[row_idx]
+        # ts[i] = wall-clock ms from generate_batch start to token i.
+        # We need ``warmup_min_steps`` decode intervals (= ``warmup_min_steps + 1``
+        # tokens), then ``warmup_rolling_window`` more intervals to
+        # evaluate the std/mean rule, then ``measurement_steps_min``
+        # intervals in the measurement window.
+        min_required_tokens = (
+            warmup_min_steps + warmup_rolling_window + measurement_steps_min + 1
+        )
+        if len(ts) < min_required_tokens:
+            return (
+                False,
+                f"warm_decode_row_{row_idx}_too_few_tokens:"
+                f"got={len(ts)}_required={min_required_tokens}",
+                {
+                    "row_lengths": {
+                        r: len(token_ts_ms[r]) for r in token_ts_ms
+                    }
+                },
+            )
+
+        intervals_ms = [ts[i + 1] - ts[i] for i in range(len(ts) - 1)]
+        # Two-stage warm-up: skip ``warmup_min_steps`` first, then
+        # advance until the rolling window stabilises. Whichever
+        # finishes later defines the boundary.
+        boundary = warmup_min_steps
+        while boundary + warmup_rolling_window <= len(intervals_ms):
+            window = intervals_ms[
+                boundary : boundary + warmup_rolling_window
+            ]
+            mean = sum(window) / len(window)
+            if mean <= 0.0:
+                # Pathological zero-interval window; advance and
+                # retry. Should not happen on real hardware but
+                # protects against a clock-resolution edge case
+                # masquerading as instant-stabilisation.
+                boundary += 1
+                continue
+            var = sum((x - mean) ** 2 for x in window) / len(window)
+            std = math.sqrt(var)
+            if std / mean < warmup_rel_std_threshold:
+                break
+            boundary += 1
+        if boundary + measurement_steps_min > len(intervals_ms):
+            return (
+                False,
+                f"warm_decode_row_{row_idx}_warmup_did_not_stabilize:"
+                f"boundary={boundary}_intervals={len(intervals_ms)}",
+                {
+                    "row_intervals_total": len(intervals_ms),
+                    "warmup_rel_std_threshold": warmup_rel_std_threshold,
+                },
+            )
+        meas_intervals = intervals_ms[boundary:]
+        meas_mean = sum(meas_intervals) / len(meas_intervals)
+        meas_var = sum((x - meas_mean) ** 2 for x in meas_intervals) / len(
+            meas_intervals
+        )
+        meas_std = math.sqrt(meas_var)
+        decode_tok_s = 1000.0 / meas_mean if meas_mean > 0.0 else float("inf")
+        per_row[row_idx] = {
+            "decode_tok_s_warm": decode_tok_s,
+            "warmup_steps_used": float(boundary),
+            "measurement_steps": float(len(meas_intervals)),
+            "decode_interval_ms_mean": meas_mean,
+            "decode_interval_ms_std": meas_std,
+            "decode_interval_rel_std": (
+                meas_std / meas_mean if meas_mean > 0.0 else float("inf")
+            ),
+            "row_first_meas_ms": ts[boundary],
+            "row_last_ms": ts[-1],
+            "cold_ttft_ms": ts[0],
+        }
+
+    if not per_row:
+        return (False, "warm_decode_no_rows_collected", {})
+
+    # Intersection of per-row warm windows: the time span during which
+    # every row is simultaneously in steady-state measurement. Tokens
+    # emitted by any row within this span are the ones the aggregate
+    # rate is meant to describe; tokens outside it (one row's warm-up
+    # while another's already measuring) are excluded from both
+    # numerator and denominator.
+    t_overlap_start = max(
+        r["row_first_meas_ms"] for r in per_row.values()
+    )
+    t_overlap_end = min(r["row_last_ms"] for r in per_row.values())
+    overlap_s = (t_overlap_end - t_overlap_start) / 1000.0
+    if overlap_s <= 0.0:
+        return (
+            False,
+            "warm_decode_warm_windows_do_not_overlap",
+            {
+                "t_overlap_start_ms": t_overlap_start,
+                "t_overlap_end_ms": t_overlap_end,
+                "per_row_first_meas_ms": {
+                    row: per_row[row]["row_first_meas_ms"]
+                    for row in per_row
+                },
+                "per_row_last_ms": {
+                    row: per_row[row]["row_last_ms"]
+                    for row in per_row
+                },
+            },
+        )
+    overlap_decodes = sum(
+        sum(
+            1
+            for t in token_ts_ms[row]
+            if t_overlap_start <= t <= t_overlap_end
+        )
+        for row in per_row
+    )
+    decode_tok_s_warm_aggregate = overlap_decodes / overlap_s
+    decode_tok_s_warm_per_row_mean = sum(
+        r["decode_tok_s_warm"] for r in per_row.values()
+    ) / len(per_row)
+
+    metadata: dict[str, Any] = {
+        "decode_tok_s_warm_aggregate": decode_tok_s_warm_aggregate,
+        "decode_tok_s_warm_per_row_mean": decode_tok_s_warm_per_row_mean,
+        "aggregate_overlap_window_ms": (
+            t_overlap_end - t_overlap_start
+        ),
+        "aggregate_overlap_decodes": overlap_decodes,
+        "warmup_min_steps": warmup_min_steps,
+        "warmup_rolling_window": warmup_rolling_window,
+        "warmup_rel_std_threshold": warmup_rel_std_threshold,
+        "measurement_steps_min": measurement_steps_min,
+        "rows": [
+            {"row": row_idx, **per_row[row_idx]}
+            for row_idx in sorted(per_row)
+        ],
+    }
+    return (True, None, metadata)
+
+
 ORACLES: dict[OracleKind, OracleFn] = {
     OracleKind.SMOKE: smoke_oracle,
     OracleKind.B1_PARITY_VS_SINGLE: b1_parity_oracle,
@@ -1045,6 +1281,7 @@ ORACLES: dict[OracleKind, OracleFn] = {
     OracleKind.PPL: ppl_oracle,
     OracleKind.STORAGE: storage_oracle,
     OracleKind.ADMISSION_HEADROOM: admission_headroom_oracle,
+    OracleKind.WARM_DECODE: warm_decode_oracle,
 }
 
 
@@ -1057,5 +1294,6 @@ __all__ = [
     "ppl_oracle",
     "storage_oracle",
     "admission_headroom_oracle",
+    "warm_decode_oracle",
     "ORACLES",
 ]

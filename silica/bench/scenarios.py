@@ -1758,6 +1758,241 @@ _QWEN3_0_6B_ADMISSION_HEADROOM_PREFIX_HEAVY = Scenario(
 )
 
 
+# --- P-6.0 warm-decode measurement gate ----------------------------------
+#
+# The eight scenarios below are the P-6.0 measurement gate (see
+# plans/P6_OPENING.md §2). Three are cache-only (run on every dev
+# box with the small Qwen3 / Qwen3.5 checkpoints already pulled);
+# five are dual-gated on the existing SILICA_REAL_* env vars and
+# produce the dense-27B / Gemma4-31B / MoE-35B-A3B / MoE-26B-A4B
+# baselines that the dual-target acceptance gates (§6) compare
+# against.
+#
+# All eight share the same prompt + warm-up rule defaults so
+# cross-scenario comparison is meaningful: ~120-word English prompt
+# (~150-180 tokens depending on tokenizer), 384-token generation
+# for real-model rows (256-token for cache-only to keep dev cycles
+# fast), and the WARM_DECODE oracle's default warm-up rule
+# (warmup_min_steps=32, rolling_window=16, rel_std_threshold=0.05,
+# measurement_steps_min=64). The warm-up rule's 32-step floor was
+# calibrated against the v1.7.x 27B-4bit load probe's ~2.4 s
+# first-forward kernel-compile cost; it is overkill for the 0.6B /
+# 0.8B cache-only rows but keeps the configuration uniform across
+# the catalog so the same `--scenario qwen3.5-27b-warm-decode-b1`
+# invocation pattern works the same way at every model size.
+_WARM_DECODE_PROMPT = (
+    "The development of language models has progressed significantly "
+    "over the past decade. From early statistical approaches to modern "
+    "transformer architectures, the field has seen rapid advancement. "
+    "Today, large language models can perform a wide variety of tasks "
+    "including text generation, summarization, translation, and code "
+    "completion. Apple Silicon hardware, with its unified memory "
+    "architecture and dedicated neural acceleration, presents a unique "
+    "platform for local inference. The MLX framework provides "
+    "MLX-native primitives that exploit this architecture, making it "
+    "possible to run substantial models on consumer hardware. This "
+    "benchmark measures sustained decode throughput on real workloads, "
+    "with kernel-compile overhead and first-forward latency excluded "
+    "by a two-stage warm-up rule, to establish a credible baseline."
+)
+
+
+def _warm_decode_workload(
+    *, max_batch_size: int, max_tokens: int
+) -> Workload:
+    """Build a homogeneous-prompt warm-decode workload.
+
+    The same prompt is replicated ``max_batch_size`` times so per-row
+    decode tok/s is directly comparable across rows; the WARM_DECODE
+    oracle's per-row aggregation then produces a clean
+    decode_tok_s_warm_aggregate that mirrors vllm-mlx's headline.
+    """
+    return Workload(
+        name=f"warm-decode-b{max_batch_size}",
+        prompts=tuple([_WARM_DECODE_PROMPT] * max_batch_size),
+        max_tokens=max_tokens,
+        max_batch_size=max_batch_size,
+        prefix_cache=False,
+        temperature=0.0,
+        top_p=1.0,
+    )
+
+
+_QWEN3_0_6B_WARM_DECODE_B1 = Scenario(
+    id="qwen3-0.6b-warm-decode-b1",
+    repo="Qwen/Qwen3-0.6B",
+    workload=_warm_decode_workload(max_batch_size=1, max_tokens=256),
+    oracle=OracleKind.WARM_DECODE,
+    gate_env_var=None,
+    description=(
+        "P-6.0 cache-only baseline on plain Qwen3-0.6B. Validates the "
+        "WARM_DECODE oracle end-to-end without requiring any 16+ GB "
+        "checkpoint download — every dev box that has run the older "
+        "`qwen3-0.6b-smoke` scenarios already has this checkpoint "
+        "pulled. The 256-token max_tokens leaves ~207 decodes after "
+        "the default 32 + 16 warm-up window, well above the "
+        "measurement_steps_min=64 floor."
+    ),
+)
+
+
+_QWEN3_0_6B_WARM_DECODE_B2 = Scenario(
+    id="qwen3-0.6b-warm-decode-b2",
+    repo="Qwen/Qwen3-0.6B",
+    workload=_warm_decode_workload(max_batch_size=2, max_tokens=256),
+    oracle=OracleKind.WARM_DECODE,
+    gate_env_var=None,
+    description=(
+        "P-6.0 cache-only B>1 path validation. Same prompt replicated "
+        "twice through `Engine.generate_batch` exercises the per-row "
+        "timestamp collector (`_collect_warm_decode_batched`) and the "
+        "oracle's aggregate-window math without the 16 GB load cost "
+        "real-model batched scenarios pay."
+    ),
+)
+
+
+_QWEN3_5_0_8B_WARM_DECODE_B1 = Scenario(
+    id="qwen3.5-0.8b-warm-decode-b1",
+    repo="Qwen/Qwen3.5-0.8B",
+    workload=_warm_decode_workload(max_batch_size=1, max_tokens=256),
+    oracle=OracleKind.WARM_DECODE,
+    gate_env_var=None,
+    description=(
+        "P-6.0 cache-only baseline on Qwen3.5-0.8B (hybrid DeltaNet). "
+        "Validates the WARM_DECODE oracle on the hybrid DeltaNet + "
+        "GQA architecture that Qwen3.5-27B inherits. Dense-27B "
+        "behaves like a wider/deeper version of this model on the "
+        "warm-decode path, so a working measurement here is a "
+        "necessary (not sufficient) condition for the gated 27B row "
+        "to produce credible numbers."
+    ),
+)
+
+
+_QWEN3_5_27B_WARM_DECODE_B1 = Scenario(
+    id="qwen3.5-27b-warm-decode-b1",
+    repo="mlx-community/Qwen3.5-27B-4bit",
+    workload=_warm_decode_workload(max_batch_size=1, max_tokens=384),
+    oracle=OracleKind.WARM_DECODE,
+    gate_env_var="SILICA_REAL_QWEN3_5_27B",
+    description=(
+        "**P-6 dense primary baseline.** Sustained warm-start "
+        "decode_tok_s on Qwen3.5-27B-4bit; the §6 dense-primary "
+        "acceptance gate (≥60 tok/s) compares the highest-performing "
+        "Track A/B/C/D combination's measurement against the number "
+        "this scenario establishes. Bandwidth math (P6_OPENING §1.2) "
+        "predicts a ceiling of ~22.7 tok/s with a realistic upper "
+        "bound near 20 tok/s; if this row comes in materially below "
+        "that, the phase pauses for a re-target Decision Log entry "
+        "before any Track work begins (Q-C resolution, P6_OPENING "
+        "§11). Dual-gated on SILICA_REAL_QWEN3_5_27B because the "
+        "checkpoint is ~16 GB on disk and peak device memory during "
+        "the forward is ~30 GB on M5 Pro 48 GB."
+    ),
+)
+
+
+_GEMMA4_31B_WARM_DECODE_B1 = Scenario(
+    id="gemma4-31b-warm-decode-b1",
+    repo="mlx-community/gemma-4-31b-4bit",
+    workload=_warm_decode_workload(max_batch_size=1, max_tokens=384),
+    oracle=OracleKind.WARM_DECODE,
+    gate_env_var="SILICA_REAL_GEMMA4_31B",
+    description=(
+        "P-6 dense secondary baseline. Gemma4-31B-4bit is the second "
+        "dense production target (PLAN.md §3.4); the §6 acceptance "
+        "gate sets ≥55 tok/s here. Hybrid sliding + full attention "
+        "layout (50 sliding + 10 full) makes the warm-decode path "
+        "different from Qwen3.5-27B's hybrid DeltaNet — running both "
+        "rows pins whether the WARM_DECODE oracle is robust across "
+        "attention-pattern variants. Dual-gated on "
+        "SILICA_REAL_GEMMA4_31B; ~18 GB checkpoint."
+    ),
+)
+
+
+_QWEN3_5_MOE_WARM_DECODE_B1 = Scenario(
+    id="qwen3.5-moe-35b-a3b-warm-decode-b1",
+    repo="mlx-community/Qwen3.5-35B-A3B-4bit",
+    workload=_warm_decode_workload(max_batch_size=1, max_tokens=384),
+    oracle=OracleKind.WARM_DECODE,
+    gate_env_var="SILICA_REAL_QWEN3_5_MOE",
+    description=(
+        "P-6 MoE B=1 baseline on Qwen3.5-35B-A3B-4bit (active 3B). "
+        "Bandwidth math (P6_OPENING §1.2) gives a ceiling of "
+        "~200 tok/s on M5 Pro 48 GB; the published vllm-mlx number "
+        "for the same family on M4 Max is 127.7 tok/s, so a B=1 "
+        "result in the 40-80 tok/s range is consistent with the "
+        "published reference. Dual-gated on SILICA_REAL_QWEN3_5_MOE; "
+        "~20 GB checkpoint."
+    ),
+)
+
+
+_QWEN3_5_MOE_WARM_DECODE_B2 = Scenario(
+    id="qwen3.5-moe-35b-a3b-warm-decode-b2",
+    repo="mlx-community/Qwen3.5-35B-A3B-4bit",
+    workload=_warm_decode_workload(max_batch_size=2, max_tokens=384),
+    oracle=OracleKind.WARM_DECODE,
+    gate_env_var="SILICA_REAL_QWEN3_5_MOE",
+    description=(
+        "**P-6 MoE stretch validator — primary B=2 measurement.** "
+        "Qwen3.5-35B-A3B-4bit at B=2 (the largest MoE batch validated "
+        "on M5 Pro 48 GB to date — see "
+        "tests/test_p3_qwen3_5_moe_batched_parity.py at v1.7.9). The "
+        "§6 stretch gate is ≥100 tok/s aggregate; the B=2 row is the "
+        "primary path because B=4 has not been validated to fit the "
+        "48 GB envelope (peak at B=2 was already ~30 GB on the test). "
+        "If this row clears 100 tok/s aggregate the phase exits the "
+        "MoE stretch validator successfully whether or not B=4 also "
+        "lands."
+    ),
+)
+
+
+_QWEN3_5_MOE_WARM_DECODE_B4 = Scenario(
+    id="qwen3.5-moe-35b-a3b-warm-decode-b4",
+    repo="mlx-community/Qwen3.5-35B-A3B-4bit",
+    workload=_warm_decode_workload(max_batch_size=4, max_tokens=384),
+    oracle=OracleKind.WARM_DECODE,
+    gate_env_var="SILICA_REAL_QWEN3_5_MOE",
+    description=(
+        "**P-6 MoE stretch — opt-in B=4 (OOM risk).** Same checkpoint "
+        "as the B=2 primary row but pushes batched activation state "
+        "into the 40 GB+ regime, uncomfortably close to the 48 GB "
+        "system envelope. **B=4 has not been validated on real "
+        "hardware**: existing MoE batched tests "
+        "(tests/test_p3_qwen3_5_moe_batched_parity.py at v1.7.9) "
+        "pin B=2 only, with a `_release_mlx_state` between forwards. "
+        "If this scenario OOMs the user sees an opaque MLX error "
+        "mid-decode; treat it as opt-in stretch and fall back to the "
+        "B=2 row for the §6 gate. Run sequence: validate B=2 first; "
+        "only then run B=4 on a freshly booted Mac with no other "
+        "GPU consumers, ideally with `mx.metal.set_memory_limit` "
+        "set to ~42 GB to fail fast rather than letting macOS swap."
+    ),
+)
+
+
+_GEMMA4_MOE_WARM_DECODE_B1 = Scenario(
+    id="gemma4-moe-26b-a4b-warm-decode-b1",
+    repo="mlx-community/gemma-4-26b-a4b-4bit",
+    workload=_warm_decode_workload(max_batch_size=1, max_tokens=384),
+    oracle=OracleKind.WARM_DECODE,
+    gate_env_var="SILICA_REAL_GEMMA4_MOE",
+    description=(
+        "P-6 second MoE family baseline on gemma-4-26b-a4b-4bit "
+        "(active 4B). Different shape from Qwen3.5-MoE: 128 experts "
+        "× top-8 (vs 256 × 8), always-on dense MLP plus "
+        "ungated top-k experts (Gemma4-MoE pattern, see "
+        "plans/P3_MOE_SURVEY.md §3.2). Tests whether the "
+        "WARM_DECODE oracle is robust across MoE routing variants. "
+        "Dual-gated on SILICA_REAL_GEMMA4_MOE; ~16 GB checkpoint."
+    ),
+)
+
+
 BUILTIN_SCENARIOS: dict[str, Scenario] = {
     _QWEN3_0_6B_SMOKE.id: _QWEN3_0_6B_SMOKE,
     _QWEN3_0_6B_B1_PARITY.id: _QWEN3_0_6B_B1_PARITY,
@@ -1817,6 +2052,17 @@ BUILTIN_SCENARIOS: dict[str, Scenario] = {
     _GEMMA4_31B_B1_PARITY.id: _GEMMA4_31B_B1_PARITY,
     _GEMMA4_31B_BGT1_PARITY.id: _GEMMA4_31B_BGT1_PARITY,
     _GEMMA4_MOE_SMOKE.id: _GEMMA4_MOE_SMOKE,
+    # P-6.0 warm-decode measurement gate (cache-only).
+    _QWEN3_0_6B_WARM_DECODE_B1.id: _QWEN3_0_6B_WARM_DECODE_B1,
+    _QWEN3_0_6B_WARM_DECODE_B2.id: _QWEN3_0_6B_WARM_DECODE_B2,
+    _QWEN3_5_0_8B_WARM_DECODE_B1.id: _QWEN3_5_0_8B_WARM_DECODE_B1,
+    # P-6.0 warm-decode measurement gate (dual-gated, real models).
+    _QWEN3_5_27B_WARM_DECODE_B1.id: _QWEN3_5_27B_WARM_DECODE_B1,
+    _GEMMA4_31B_WARM_DECODE_B1.id: _GEMMA4_31B_WARM_DECODE_B1,
+    _QWEN3_5_MOE_WARM_DECODE_B1.id: _QWEN3_5_MOE_WARM_DECODE_B1,
+    _QWEN3_5_MOE_WARM_DECODE_B2.id: _QWEN3_5_MOE_WARM_DECODE_B2,
+    _QWEN3_5_MOE_WARM_DECODE_B4.id: _QWEN3_5_MOE_WARM_DECODE_B4,
+    _GEMMA4_MOE_WARM_DECODE_B1.id: _GEMMA4_MOE_WARM_DECODE_B1,
 }
 
 

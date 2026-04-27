@@ -62,6 +62,9 @@ Run on any dev box that has pulled `Qwen/Qwen3-0.6B`.
 | `qwen3-0.6b-ttft-under-concurrency` | SMOKE | 1 long + 3 short prompts, B=4 (Q-010 signal) |
 | `qwen3-0.6b-teacher-forced-argmax` | TEACHER_FORCED_ARGMAX | silica vs direct mlx-lm positional argmax, ≥0.98 agreement |
 | `qwen3.5-0.8b-b1-parity` | B1_PARITY_VS_SINGLE | Qwen3.5 hybrid DeltaNet, 1 prompt |
+| `qwen3-0.6b-warm-decode-b1` | WARM_DECODE | sustained decode_tok_s, B=1, 256-token gen (P-6.0 oracle validation) |
+| `qwen3-0.6b-warm-decode-b2` | WARM_DECODE | same, B=2 (validates batched timestamp collector) |
+| `qwen3.5-0.8b-warm-decode-b1` | WARM_DECODE | hybrid-DeltaNet warm-decode validation |
 
 ### Dual-gated rows
 
@@ -70,11 +73,46 @@ Cache + `SILICA_REAL_<family>=1`.
 | id | gate env var | shape |
 | --- | --- | --- |
 | `qwen3.5-27b-smoke` | `SILICA_REAL_QWEN3_5_27B` | SMOKE, ~16 GB checkpoint |
+| `qwen3.5-27b-warm-decode-b1` | `SILICA_REAL_QWEN3_5_27B` | **P-6 dense primary baseline**, 384-token gen |
 | `qwen3.5-moe-smoke` | `SILICA_REAL_QWEN3_5_MOE` | MoE SMOKE, ~20 GB checkpoint, ~30 GB peak |
+| `qwen3.5-moe-35b-a3b-warm-decode-b1` | `SILICA_REAL_QWEN3_5_MOE` | MoE B=1 warm-decode |
+| `qwen3.5-moe-35b-a3b-warm-decode-b4` | `SILICA_REAL_QWEN3_5_MOE` | **P-6 MoE stretch validator** (≥100 tok/s aggregate gate) |
 | `gemma4-31b-smoke` | `SILICA_REAL_GEMMA4_31B` | SMOKE, ~18 GB checkpoint |
 | `gemma4-31b-b1-parity` | `SILICA_REAL_GEMMA4_31B` | B=1 parity on dense 31B |
 | `gemma4-31b-bgt1-parity` | `SILICA_REAL_GEMMA4_31B` | B=2 parity vs direct mlx-lm |
+| `gemma4-31b-warm-decode-b1` | `SILICA_REAL_GEMMA4_31B` | dense Gemma4-31B warm-decode baseline |
 | `gemma4-moe-smoke` | `SILICA_REAL_GEMMA4_MOE` | MoE SMOKE, ~16 GB checkpoint |
+| `gemma4-moe-26b-a4b-warm-decode-b1` | `SILICA_REAL_GEMMA4_MOE` | second-MoE-family warm-decode baseline |
+
+### Warm-decode oracle (P-6.0 measurement gate)
+
+The `WARM_DECODE` oracle measures sustained warm-start
+`decode_tok_s` on a long-running generation, with first-forward
+kernel-compile latency excluded by a two-stage warm-up rule:
+
+1. Discard at least `warmup_min_steps` decode steps (default 32 —
+   covers MLX kernel-compile cost on a 64-layer 27B first forward).
+2. Continue discarding until the rolling-window of
+   `warmup_rolling_window` (default 16) inter-token interval
+   std/mean falls below `warmup_rel_std_threshold` (default 5%).
+3. Whichever finishes later defines the warm-up boundary; the
+   remaining decodes form the measurement window.
+
+Reported metrics in `ScenarioResult.metadata`:
+
+- `decode_tok_s_warm_aggregate` — total measurement decodes across
+  all rows / aggregate measurement-window wall (also promoted to
+  `ScenarioResult.decode_tok_s`); directly comparable to
+  vllm-mlx-style headline numbers.
+- `decode_tok_s_warm_per_row_mean` — average of per-row steady-state
+  rates.
+- `rows[].decode_tok_s_warm` / `warmup_steps_used` /
+  `measurement_steps` / `decode_interval_ms_{mean,std,rel_std}` /
+  `cold_ttft_ms` — per-row diagnostic detail.
+
+The oracle reports the measurement; it does not enforce a target.
+Phase-level acceptance (`plans/P6_OPENING.md` §6) compares the
+reported numbers against the dense-60 / MoE-100 gates.
 
 ### KV codec sweep
 

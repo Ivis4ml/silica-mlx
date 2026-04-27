@@ -731,7 +731,7 @@ class BenchRunner:
             )
 
         workload_error = _validate_workload_for_oracle(
-            scenario.oracle, scenario.workload
+            scenario.oracle, scenario.workload, scenario.oracle_config
         )
         if workload_error is not None:
             return ScenarioResult(
@@ -791,6 +791,18 @@ class BenchRunner:
                 oracle_input = prefix_hit_collected
                 tokens_dict, _ = prefix_hit_collected
                 total_tokens = sum(len(row) for row in tokens_dict.values())
+            elif scenario.oracle == OracleKind.WARM_DECODE:
+                # P-6.0 measurement gate. Drive engine.generate /
+                # generate_batch, collecting per-row per-token wall-
+                # clock timestamps so the oracle can apply the two-
+                # stage warm-up rule. Same shape as the prefix-hit
+                # decode collector (tokens, token_ts_ms tuple).
+                warm_decode_collected, oracle_context = _run_warm_decode(
+                    scenario, engine, adapter
+                )
+                oracle_input = warm_decode_collected
+                wd_tokens, _ = warm_decode_collected
+                total_tokens = sum(len(row) for row in wd_tokens.values())
             elif scenario.oracle == OracleKind.PPL:
                 # PPL bypasses engine.generate_batch entirely — the
                 # oracle is teacher-forced and needs positional logits,
@@ -915,6 +927,32 @@ class BenchRunner:
             row1_first = metadata.get("row1_first_token_ms")
             if isinstance(row1_first, (int, float)):
                 ttft_ms = float(row1_first)
+        if (
+            ok
+            and scenario.oracle == OracleKind.WARM_DECODE
+        ):
+            # P-6.0 measurement gate: promote the warm aggregate into
+            # ScenarioResult.decode_tok_s so JSONL consumers do not
+            # need to special-case this oracle's metadata bucket.
+            # ``ttft_ms`` deliberately stays at the engine's own
+            # cold value (not promoted from metadata) — the rows[]
+            # cold_ttft_ms field is the per-row diagnostic; warm
+            # TTFT is a separate scenario shape (P-6.0 follow-up).
+            warm_aggregate = metadata.get("decode_tok_s_warm_aggregate")
+            if isinstance(warm_aggregate, (int, float)):
+                decode_tok_s = float(warm_aggregate)
+            # Engine.generate_batch does not populate
+            # MetricsRegistry today (same caveat the prefix-hit
+            # promotion above documents). For B>1 warm-decode rows,
+            # snap.ttft_ms is therefore None; surface the row-0 cold
+            # TTFT from oracle metadata so the JSONL row carries a
+            # number rather than a hole.
+            if ttft_ms is None and isinstance(metadata.get("rows"), list):
+                rows_meta = metadata["rows"]
+                if rows_meta:
+                    cold = rows_meta[0].get("cold_ttft_ms")
+                    if isinstance(cold, (int, float)):
+                        ttft_ms = float(cold)
 
         # Runner-injected execution-dimension keys (``seed``,
         # ``codec_id``) win if an oracle accidentally writes them:
@@ -1047,7 +1085,9 @@ class BenchRunner:
 
 
 def _validate_workload_for_oracle(
-    oracle: OracleKind, wl: Workload
+    oracle: OracleKind,
+    wl: Workload,
+    oracle_config: dict[str, Any] | None = None,
 ) -> str | None:
     """Return an authoring-error reason string, or ``None`` if OK.
 
@@ -1150,6 +1190,55 @@ def _validate_workload_for_oracle(
                 f"oracle {oracle.value!r} requires kv_codec to be set "
                 f"explicitly (fp16 baseline vs compressed codec is the "
                 f"whole point of the measurement); got kv_codec=None"
+            )
+    elif oracle == OracleKind.WARM_DECODE:
+        # P-6.0 measurement gate. Validation rules mirror the
+        # contract in OracleKind.WARM_DECODE's docstring: prompts
+        # match max_batch_size, prefix_cache=False, kv_codec=None,
+        # max_tokens large enough that the warm-up + measurement
+        # window fits with room to spare.
+        if wl.max_batch_size < 1:
+            return (
+                f"oracle {oracle.value!r} requires max_batch_size >= 1, "
+                f"got {wl.max_batch_size}"
+            )
+        if len(wl.prompts) != wl.max_batch_size:
+            return (
+                f"oracle {oracle.value!r} requires len(prompts) == "
+                f"max_batch_size; got {len(wl.prompts)} prompts vs "
+                f"max_batch_size={wl.max_batch_size} — workload pins "
+                f"one prompt per row so per-row decode tok/s is "
+                f"directly comparable"
+            )
+        if wl.prefix_cache:
+            return (
+                f"oracle {oracle.value!r} requires prefix_cache=False — "
+                f"warm-decode measures the codec-free steady-state hot "
+                f"path; hit-path measurements use "
+                f"DECODE_TOK_S_WITH_PREFIX_HIT instead"
+            )
+        if wl.kv_codec is not None:
+            return (
+                f"oracle {oracle.value!r} requires kv_codec=None — "
+                f"codec-on warm-decode is an orthogonal lever; the "
+                f"baseline this oracle measures is the codec-free path"
+            )
+        cfg = oracle_config or {}
+        warmup_min_steps = int(cfg.get("warmup_min_steps", 32))
+        warmup_rolling_window = int(cfg.get("warmup_rolling_window", 16))
+        measurement_steps_min = int(cfg.get("measurement_steps_min", 64))
+        # ``+1`` because the oracle indexes inter-token intervals,
+        # which need n+1 timestamps to produce n intervals.
+        min_required_tokens = (
+            warmup_min_steps + warmup_rolling_window + measurement_steps_min + 1
+        )
+        if wl.max_tokens < min_required_tokens:
+            return (
+                f"oracle {oracle.value!r} requires max_tokens >= "
+                f"{min_required_tokens} (warmup_min_steps={warmup_min_steps}"
+                f" + warmup_rolling_window={warmup_rolling_window} + "
+                f"measurement_steps_min={measurement_steps_min} + 1), "
+                f"got max_tokens={wl.max_tokens}"
             )
     elif oracle == OracleKind.STORAGE:
         # Pre-load validation mirrors DECODE_TOK_S_WITH_PREFIX_HIT
@@ -1487,6 +1576,127 @@ def _run_prefix_hit_decode(
         "prefix_cache_hits": int(prefix_cache.hits),
     }
     return collected, context
+
+
+def _run_warm_decode(
+    scenario: Scenario,
+    engine: Engine,
+    adapter: ModelAdapter,
+) -> tuple[
+    tuple[dict[int, list[int]], dict[int, list[float]]],
+    dict[str, Any],
+]:
+    """Drive the P-6.0 ``WARM_DECODE`` workload.
+
+    Workload-shape validation already happened in
+    ``_validate_workload_for_oracle``; here we just resolve the
+    oracle_config defaults and dispatch to the B=1 / B>1 collector.
+    Both paths capture per-row per-token wall-clock timestamps so the
+    oracle can apply the two-stage warm-up rule.
+    """
+    wl = scenario.workload
+    cfg = scenario.oracle_config
+    warmup_min_steps = int(cfg.get("warmup_min_steps", 32))
+    warmup_rolling_window = int(cfg.get("warmup_rolling_window", 16))
+    warmup_rel_std_threshold = float(
+        cfg.get("warmup_rel_std_threshold", 0.05)
+    )
+    measurement_steps_min = int(cfg.get("measurement_steps_min", 64))
+
+    params = _build_sampling_params(wl, adapter)
+    if wl.max_batch_size == 1:
+        tokens_list, ts_list = _collect_warm_decode_b1(
+            engine, wl.prompts[0], params
+        )
+        tokens: dict[int, list[int]] = {0: tokens_list}
+        token_ts_ms: dict[int, list[float]] = {0: ts_list}
+    else:
+        tokens, token_ts_ms = _collect_warm_decode_batched(
+            engine, list(wl.prompts), params, wl.max_batch_size
+        )
+
+    context: dict[str, Any] = {
+        "vocab_size": adapter.config.vocab_size,
+        "warmup_min_steps": warmup_min_steps,
+        "warmup_rolling_window": warmup_rolling_window,
+        "warmup_rel_std_threshold": warmup_rel_std_threshold,
+        "measurement_steps_min": measurement_steps_min,
+    }
+    return (tokens, token_ts_ms), context
+
+
+def _collect_warm_decode_b1(
+    engine: Engine,
+    prompt: str,
+    params: SamplingParams,
+) -> tuple[list[int], list[float]]:
+    """Drive ``Engine.generate``, capturing per-token wall-clock ms.
+
+    ts_ms[i] is the elapsed time from the moment ``generate`` was
+    invoked to the moment token ``i`` was yielded — token 0 includes
+    prefill + first sample (cold TTFT, kernel-compile-included);
+    inter-token intervals i..i+1 are decode-step latencies. The
+    oracle's two-stage warm-up rule discards the cold prefix.
+    """
+    tokens: list[int] = []
+    ts_ms: list[float] = []
+    t_start = time.perf_counter()
+    for tok in engine.generate(prompt, params):
+        ts_ms.append((time.perf_counter() - t_start) * 1000.0)
+        tokens.append(int(tok))
+    return tokens, ts_ms
+
+
+def _collect_warm_decode_batched(
+    engine: Engine,
+    prompts: list[str],
+    params: SamplingParams,
+    max_batch_size: int,
+) -> tuple[dict[int, list[int]], dict[int, list[float]]]:
+    """Drive ``Engine.generate_batch`` with per-row per-token timestamps.
+
+    Same event-stream invariants as ``_collect_smoke_batched_tokens``
+    and ``_collect_prefix_hit_decode``: aborted events and unexpected
+    ``req_index`` values raise so the outer ``run_scenario`` collapses
+    them to ``status="failed"`` with a structured ``warm_decode_*``
+    reason before the oracle runs.
+    """
+    expected_rows = set(range(len(prompts)))
+    tokens: dict[int, list[int]] = {row: [] for row in expected_rows}
+    token_ts_ms: dict[int, list[float]] = {row: [] for row in expected_rows}
+    done_rows: set[int] = set()
+    t_start = time.perf_counter()
+
+    for event in engine.generate_batch(
+        prompts, params, max_batch_size=max_batch_size
+    ):
+        if event.req_index not in expected_rows:
+            raise RuntimeError(
+                f"warm_decode_unexpected_req_index:{event.req_index}"
+            )
+        if event.kind == "aborted":
+            raise RuntimeError(
+                f"warm_decode_aborted:row={event.req_index}_"
+                f"reason={event.finish_reason}"
+            )
+        if event.kind == "token":
+            if event.token_id is None:
+                raise RuntimeError(
+                    f"warm_decode_token_event_missing_id:"
+                    f"row={event.req_index}"
+                )
+            ms = (time.perf_counter() - t_start) * 1000.0
+            token_ts_ms[event.req_index].append(ms)
+            tokens[event.req_index].append(event.token_id)
+        elif event.kind == "done":
+            done_rows.add(event.req_index)
+
+    missing = expected_rows - done_rows
+    if missing:
+        raise RuntimeError(
+            f"warm_decode_rows_never_completed:{sorted(missing)}"
+        )
+    return tokens, token_ts_ms
 
 
 def _collect_prefix_hit_decode(

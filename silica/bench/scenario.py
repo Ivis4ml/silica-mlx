@@ -133,6 +133,77 @@ class OracleKind(str, Enum):
     # "n_delta": int, "resident_bytes_fp16": int,
     # "resident_bytes_block": int, "warmup_blocks": int}``.
     ADMISSION_HEADROOM = "admission_headroom"
+    # P-6.0 (the P-6 measurement gate). Sustained warm-start
+    # decode_tok_s on a single long-running generation, with kernel-
+    # compile + first-forward latency excluded by a two-stage warm-up
+    # rule: discard at least ``warmup_min_steps`` decode steps, then
+    # continue discarding until the rolling-``warmup_rolling_window``
+    # inter-token interval std/mean falls below
+    # ``warmup_rel_std_threshold`` (later wins). The remaining decodes
+    # form the measurement window from which decode_tok_s_warm,
+    # decode_tok_s_warm_per_row_mean, and decode_tok_s_warm_aggregate
+    # are computed (aggregate = total measurement decodes across all
+    # rows / aggregate measurement-window wall, comparable to
+    # vllm-mlx's headline number).
+    #
+    # Workload contract (validated at scenario-author time by
+    # ``_validate_workload_for_oracle`` and at run time by
+    # ``_run_warm_decode``):
+    #
+    #   * ``max_batch_size`` >= 1.
+    #   * ``len(prompts)`` == ``max_batch_size`` — one prompt per row.
+    #     Identical-prompt B>1 workloads make per-row decode tok/s
+    #     directly comparable; differing-length prompts are allowed
+    #     but the per-row tok/s is then driven partly by prefill
+    #     length, not steady-state decode.
+    #   * ``max_tokens`` >= ``warmup_min_steps + measurement_steps_min
+    #     + 1`` (default ``32 + 64 + 1 = 97``; production scenarios
+    #     use 384 to leave plenty of headroom).
+    #   * ``prefix_cache=False`` and ``kv_codec=None`` — codec / hit-
+    #     path measurements are orthogonal levers handled by
+    #     ``DECODE_TOK_S_WITH_PREFIX_HIT``; this oracle measures the
+    #     codec-free steady-state decode hot path so its number is
+    #     the reference for every later P-6 track ratio.
+    #
+    # ``oracle_config`` keys (all optional, with defaults):
+    #
+    #   * ``warmup_min_steps`` (int, default 32) — minimum decode
+    #     steps to discard before the rolling-stability rule applies.
+    #     32 covers the MLX kernel-compile cost on a 64-layer 27B
+    #     first forward (already observed in the v1.7.x 27B load
+    #     probe at ~2.4 s for a 1-token prompt).
+    #   * ``warmup_rolling_window`` (int, default 16) — rolling-window
+    #     length for the std/mean stability check.
+    #   * ``warmup_rel_std_threshold`` (float, default 0.05) — exit
+    #     warm-up when rolling-window std/mean drops below this.
+    #   * ``measurement_steps_min`` (int, default 64) — minimum number
+    #     of decode steps that must remain after the warm-up
+    #     boundary. The oracle fails with a structured reason if a
+    #     row's warm-up never stabilises within ``max_tokens``.
+    #
+    # ``collected`` shape: ``(tokens, token_ts_ms)`` per row, same
+    # structure as ``DECODE_TOK_S_WITH_PREFIX_HIT``. ``tokens`` is
+    # ``dict[int, list[int]]``; ``token_ts_ms`` is
+    # ``dict[int, list[float]]`` keyed by row index.
+    #
+    # Oracle metadata (on success):
+    #
+    #   * ``decode_tok_s_warm_aggregate`` (float) — promoted to
+    #     ``ScenarioResult.decode_tok_s`` for JSONL homogeneity.
+    #   * ``decode_tok_s_warm_per_row_mean`` (float).
+    #   * ``rows`` (list[dict]) — per-row ``decode_tok_s_warm``,
+    #     ``warmup_steps_used``, ``measurement_steps``,
+    #     ``decode_interval_ms_{mean,std,rel_std}``, ``cold_ttft_ms``.
+    #   * ``warmup_*`` and ``measurement_steps_min`` echo back so the
+    #     JSONL row is self-describing.
+    #
+    # Note on ``ttft_warm_ms``: warm TTFT (post-kernel-compile first
+    # forward) is not measured by this oracle's single-pass workload —
+    # the only TTFT it sees is the cold one (compile-included), which
+    # is recorded as ``cold_ttft_ms`` in per-row metadata. A separate
+    # warm-TTFT scenario shape (two consecutive prompts, second's TTFT
+    # measured) is a P-6.0 follow-up; not blocking the gate.
+    WARM_DECODE = "warm_decode"
 
 
 @dataclass(frozen=True)
