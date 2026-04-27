@@ -21,6 +21,19 @@ and unit-testable; only :mod:`silica.chat.cli.app` carries a
 prompt_toolkit dependency, isolated for manual validation.
 """
 
+from silica.chat.cli.commands import (
+    COMMANDS,
+    Command,
+    CommandResult,
+    dispatch_command,
+    is_slash_command,
+)
+from silica.chat.cli.config import (
+    CONFIG_SCHEMA,
+    ConfigError,
+    initial_config,
+    parse_config_assignment,
+)
 from silica.chat.cli.palette import (
     Palette,
     detect_palette,
@@ -29,12 +42,22 @@ from silica.chat.cli.state import (
     ChatCliState,
     StreamState,
 )
-from silica.chat.cli.toolbar import render_toolbar
+from silica.chat.cli.toolbar import render_codec_hint, render_toolbar
 
 __all__ = [
+    "COMMANDS",
+    "CONFIG_SCHEMA",
     "ChatCliState",
+    "Command",
+    "CommandResult",
+    "ConfigError",
     "Palette",
     "StreamState",
     "detect_palette",
+    "dispatch_command",
+    "initial_config",
+    "is_slash_command",
+    "parse_config_assignment",
+    "render_codec_hint",
     "render_toolbar",
 ]
