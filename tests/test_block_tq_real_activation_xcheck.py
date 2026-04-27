@@ -51,9 +51,7 @@ from silica.kvcache.codec import IdentityCodec
 from silica.kvcache.manager import KVHandle
 from silica.vq import BlockTurboQuantMSE
 from silica.vq._calibration import haar_rotation, lloyd_max_codebook
-
 from tests.test_block_tq_vqbench_xcheck import _numpy_block_tq_round_trip
-
 
 _REPO = "Qwen/Qwen3.5-0.8B"
 

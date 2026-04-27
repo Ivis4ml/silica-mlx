@@ -291,7 +291,7 @@ run under its own Python. Output is a `VqbenchBaselineResult` with
 | Plain Qwen3 family adapter (0.6B / 4B / 7B / 14B / 32B) | ✅ | `silica.models.qwen3.Qwen3Adapter` |
 | Qwen3.5 hybrid DeltaNet family (0.8B, 27B) — single-request + batched | ✅ | `silica.models.qwen3_5.Qwen3_5Adapter`; B>1 greedy parity on 0.8B in `tests/test_p3_hybrid_batched_parity.py` |
 | Gemma4-31B dense — single-request + batched miss-only path; B=1 parity + B>1 direct mlx-lm reference | ✅ (dual-gated) | `silica.models.gemma4.Gemma4Adapter`; strict B>1 batched-vs-single greedy parity not claimed |
-| Qwen3.5-35B-A3B MoE / Gemma4-26B-A4B MoE — single-request only | ✅ (dual-gated) | `silica.models.qwen3_5_moe`, `silica.models.gemma4_moe`; option-(c) dispatch-observation seam; batched MoE pending P-3-E4 |
+| Qwen3.5-35B-A3B MoE / Gemma4-26B-A4B MoE — single-request + batched smoke + scheduler-glue parity | ✅ (dual-gated) | `silica.models.qwen3_5_moe`, `silica.models.gemma4_moe`; option-(c) dispatch-observation seam; batched MoE smoke + parity at v1.7.9 (`tests/test_p3_*_moe_batched_{smoke,parity}.py`, scheduler-glue parity vs direct mlx-lm batched reference) |
 | Per-kind KV budget for heterogeneous attention (Gemma4 sliding+full) | ✅ | `KVLayout.bytes_per_token_total` |
 | DeltaNet recurrent state + `state_delta` plumbing (single + batched) | ✅ | `Qwen3_5Adapter.make_batch_cache` interleaves `ArraysCache` / `BatchKVCache` per layer |
 | Unified bench runner (SMOKE / B=1 parity / B>1 direct-reference / teacher-forced-argmax oracles) | ✅ | `silica.bench.BenchRunner` + `scripts/bench.py`; 15 registered scenarios (see below) |
@@ -299,9 +299,9 @@ run under its own Python. Output is a `VqbenchBaselineResult` with
 | Bench: per-row first-token offset for B>1 SMOKE (TTFT-under-concurrency signal for Q-010) | ✅ | `metadata.rows[].first_token_ms_offset` in the JSONL row |
 | Bench: vqbench subprocess PPL reference column | ✅ | `silica.bench.vqbench_baseline` + `scripts/vqbench_baseline.py` |
 | CLI: `python -m silica run` (single-shot) + `scripts/chat.py` (REPL) | ✅ | `silica.server.cli`, `scripts/chat.py` |
-| Preempt/replay with recurrent state snapshot | ⏳ | P-3-C5 |
-| Batched MoE | ⏳ | P-3-E4 |
-| VQ KV compression (BlockTQ / RaBitQ) | Stub | P-5 (`IdentityCodec` today) |
+| Preempt/replay with recurrent state snapshot | ✅ slice-prefill regime (α-MVP) | P-3-C5 closed at C5.5 (`silica/scheduler/batcher.py` recurrent snapshot capture/restore on the slice-prefill path) |
+| Batched MoE | ✅ smoke + scheduler-glue parity | P-3-E4 closed at v1.7.9 (`tests/test_p3_*_moe_batched_parity.py`) |
+| VQ KV compression (BlockTQ / RaBitQ) | ✅ shipped (default `IdentityCodec` retained for fp16 baseline) | P-5 closed at v1.7.4; P-5-F (3b) capture closed at v1.7.6; (b-static) closed at v1.7.7; per-head opt-in at v1.7.8 + measurements at v1.7.10/v1.7.11 |
 | Weight streaming | Stub | P-6 (`ResidentWeightProvider` today) |
 | Speculative decoding (DraftTarget / EAGLE / Medusa) | Stub | P-7 (`NoopDraftEngine` today) |
 | OpenAI-compatible HTTP server + session layer | ⏳ | P-8 |
