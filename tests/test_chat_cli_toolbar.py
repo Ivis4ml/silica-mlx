@@ -4,7 +4,7 @@ Pure-Python coverage of ``silica.chat.cli.{palette,state,toolbar}``.
 No prompt_toolkit, no Engine, no MLX — every test constructs
 :class:`Palette` and :class:`ChatCliState` directly. Verifies the
 documented field rendering rules in
-``docs/CHAT_CLI_OPENING.md`` §4 and §6.2.
+``plans/CHAT_CLI_OPENING.md`` §4 and §6.2.
 """
 
 from __future__ import annotations

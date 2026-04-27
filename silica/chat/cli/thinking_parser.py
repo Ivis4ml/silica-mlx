@@ -8,7 +8,7 @@ collapse it into a single-line indicator and stream the actual
 reply afterwards. This module owns the state-machine parser the
 chat CLI uses to do that.
 
-Design contract per ``docs/CHAT_CLI_OPENING.md`` §3.2.1:
+Design contract per ``plans/CHAT_CLI_OPENING.md`` §3.2.1:
 
 - Streaming state: ``IDLE`` (no opening tag seen) and ``THINKING``
   (between ``<think>`` and ``</think>``).

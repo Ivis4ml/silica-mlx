@@ -5,7 +5,7 @@ Synthetic-adapter coverage of the batched slice-prefill helper
 clamped slice-prefill to ``len(rows) == 1``; B>1 cohorts under
 slice regime fell back to contiguous prefill with zero captures.
 C5.5 lifts that clamp under the α MVP scope (per
-``docs/P3_C5_3_DESIGN.md`` §5.2 addendum):
+``plans/P3_C5_3_DESIGN.md`` §5.2 addendum):
 
 - **Pad-aligned rows** (``pad_i ≡ 0 (mod block_size)``) get
   captures at every full block boundary during prefill, matching

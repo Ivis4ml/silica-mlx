@@ -36,7 +36,7 @@ Three entry points, one per P-5-C / P-5-D oracle sub-unit:
   the codec in pre-RoPE space on every forward. Shape unchanged —
   the wrapped projection still returns the ``(B, L, nkv*hd)`` layout
   the downstream RoPE + cache expect. This entry point exists because
-  the P-5-D.2 investigation (see ``docs/P5_D2_INVESTIGATION``) found
+  the P-5-D.2 investigation (see ``plans/P5_D2_INVESTIGATION``) found
   that post-RoPE noise injection gives a ΔPPL roughly 20× larger than
   the pre-RoPE vqbench baseline at the same Frobenius, even though
   the raw K Frobenius is bit-identical between the two spaces. The
@@ -606,7 +606,7 @@ def _extract_aligned_blocks_from_seeded_cache(
 # encode seam and a forward-RoPE re-application at the decode seam
 # so the codec sees pre-RoPE K. RoPE is orthogonal, so injecting
 # noise in pre-RoPE space is mathematically equivalent to vqbench's
-# ``_QuantizedProj`` injection (per ``docs/P5_F_OPENING.md`` §3.1).
+# ``_QuantizedProj`` injection (per ``plans/P5_F_OPENING.md`` §3.1).
 # Persistence and block-grained encoding match the production
 # store, unlike the D.2a oracle which re-encodes per chunk.
 #
@@ -633,10 +633,10 @@ def _apply_rope_to_k_block(
     Inverse path: ``mx.fast.rope(..., freqs=-freqs)`` (or ``scale=-1.0``
     on the freqs path), verified to match identity round-trip at
     Frobenius ratio 9.6e-8 fp32 / 1.36e-4 fp16 in the F.0b numerical
-    readiness probe (``docs/P5_F_OPENING.md`` §5.1).
+    readiness probe (``plans/P5_F_OPENING.md`` §5.1).
 
     Supports two RoPE classes that silica's adapters actually
-    instantiate (F.1 inventory in ``docs/P5_F_OPENING.md`` §4):
+    instantiate (F.1 inventory in ``plans/P5_F_OPENING.md`` §4):
 
     - ``nn.RoPE`` — exposes ``dims`` / ``base`` / ``scale`` /
       ``traditional``; freqs is reconstructed as
@@ -669,9 +669,9 @@ def _apply_rope_to_k_block(
         raise NotImplementedError(
             f"F.0b prototype does not handle RoPE class {cls_name!r} "
             f"(only nn.RoPE and ProportionalRoPE are in use on "
-            f"silica's targets per docs/P5_F_OPENING.md §4); "
+            f"silica's targets per plans/P5_F_OPENING.md §4); "
             f"add explicit dispatch in F.1 if a new family routes "
-            f"here. See docs/P5_F_OPENING.md §6.2 for the F.1 "
+            f"here. See plans/P5_F_OPENING.md §6.2 for the F.1 "
             f"in-use vs forward-compat coverage policy."
         )
     if inverse:
@@ -976,7 +976,7 @@ def teacher_forced_chunked_nll_with_codec_pre_rope(
 # pre-k_norm space vqbench's ``_QuantizedProj`` injects in, so the
 # same +0.51 PPL D.2a achieves is reachable under persistent block-
 # grained encoding (F.0b' verified +0.015 PPL — even better; see
-# ``docs/P5_F_OPENING.md`` §10.3).
+# ``plans/P5_F_OPENING.md`` §10.3).
 #
 # Difference vs (3a) / D.2a: the proxy does NOT modify the in-flight
 # forward. ``_PreNormCaptureProxy.__call__`` returns ``k_proj(x)``
@@ -1009,7 +1009,7 @@ def teacher_forced_chunked_nll_with_codec_pre_norm(
     Codec noise lives in pre-k_norm space, identical to vqbench's
     ``_QuantizedProj`` injection point. F.0b' verification reached
     +0.015 PPL on Qwen3-0.6B + BlockTQ b64 b4 — better than D.2a's
-    +0.51 (see ``docs/P5_F_OPENING.md`` §10.3).
+    +0.51 (see ``plans/P5_F_OPENING.md`` §10.3).
 
     Buffer disarm: the buffer pointer is reset to ``None`` in a
     try/finally so an exception during forward leaves the adapter
@@ -1408,7 +1408,7 @@ def _install_vqbench_wrappers(
     from vqbench's ``methods.common.monkey_patch._QuantizedProj``,
     which runs ``quant_dequant_tensor`` with a *per-head* seed.
     Probe 2 of the D.2 investigation
-    (``docs/P5_D2_INVESTIGATION/p5_d2_probe2.py``) found the
+    (``plans/P5_D2_INVESTIGATION/p5_d2_probe2.py``) found the
     shared-vs-per-head rotation split gives a 0.977× Frobenius
     ratio on real Qwen3-0.6B post-RoPE K — below the measurement
     floor of the ΔPPL signal we are matching. Staying on silica's

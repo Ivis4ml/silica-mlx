@@ -204,7 +204,7 @@ class Engine:
         admissions by prompt length when the batch is heterogeneous
         enough to stall short-row TTFT behind long-row prefill. See
         ``length_spread_threshold`` below and
-        ``docs/P4_5_CHUNKED_PREFILL_OPENING.md``.
+        ``plans/P4_5_CHUNKED_PREFILL_OPENING.md``.
 
         Args:
             prompts: one or more prompts. Empty strings are skipped
@@ -330,7 +330,7 @@ class Engine:
         # when the last sample phase terminates every row — the step()
         # after the last active row handles deferred reclaim, which
         # empties ``self._rows`` and flips has_work to False. See
-        # ``docs/P2_UNIT_16C_PREP.md`` §1 I-5.
+        # ``plans/P2_UNIT_16C_PREP.md`` §1 I-5.
         while batcher.has_work():
             for event in batcher.step():
                 yield event
@@ -345,7 +345,7 @@ def _sort_admissions_by_length(
     original order. ``req_index`` stays on its tuple — the original
     user-facing index the event stream must emit — and only the
     *admission order* (which prompts go pre-step vs queue) changes.
-    P-4.5-B.1 / `docs/P4_5_CHUNKED_PREFILL_OPENING.md` §6.1.
+    P-4.5-B.1 / `plans/P4_5_CHUNKED_PREFILL_OPENING.md` §6.1.
     """
     return sorted(admissions, key=lambda a: len(a[1]))
 
@@ -357,7 +357,7 @@ def _initial_cohort_cap(
 ) -> int:
     """How many leading (shortest) admissions go into the initial cohort.
 
-    P-4.5-B.1 / `docs/P4_5_CHUNKED_PREFILL_OPENING.md` §6.1 spec.
+    P-4.5-B.1 / `plans/P4_5_CHUNKED_PREFILL_OPENING.md` §6.1 spec.
 
     Preconditions enforced at call time:
       - ``admissions_sorted`` is length-ASC (caller's responsibility;

@@ -1,6 +1,6 @@
 """P-3-C5.3.0 — RadixPrefixCache recurrent-snapshot surface unit tests.
 
-Covers the C5.3.0 acceptance gates per ``docs/P3_C5_3_DESIGN.md`` §4.1:
+Covers the C5.3.0 acceptance gates per ``plans/P3_C5_3_DESIGN.md`` §4.1:
 
 - ``_Node`` carries a ``recurrent_snapshot`` slot (default ``None``,
   assignable).

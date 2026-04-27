@@ -2170,7 +2170,7 @@ def _run_ppl(
     #   to the ``vqbench_aligned`` injection space (RoPE is
     #   orthogonal) but with persistent block-grained encoding,
     #   matching what the production store would do once F.1+ ships.
-    #   See ``docs/P5_F_OPENING.md`` §3.1.
+    #   See ``plans/P5_F_OPENING.md`` §3.1.
     #
     # fp16 rows ignore this key — they never hit either codec branch.
     codec_quality_path = str(cfg.get("codec_quality_path", "prefix_store_post_rope"))

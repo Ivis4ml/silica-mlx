@@ -1,7 +1,7 @@
 """(a-real) — real Qwen3.5-0.8B K / V activation BlockTQ cross-check.
 
 Closes the real-activation half of P-5 §7(a) via a standalone test
-gated on the HF cache. Design doc: docs/P5_A_REAL_OPENING.md.
+gated on the HF cache. Design doc: plans/P5_A_REAL_OPENING.md.
 
 Full sweep form (step 3):
 
@@ -12,7 +12,7 @@ Full sweep form (step 3):
 - Loops over ``(vq_block_size, num_bits) ∈ {32, 64} × {3, 4}``,
   ``seed ∈ {42, 43, 44}``, every GLOBAL layer, and ``side ∈ {"K", "V"}``.
 - Produces
-  ``docs/P5_ACCEPTANCE_SWEEP/real_activation_xcheck.jsonl`` with
+  ``plans/P5_ACCEPTANCE_SWEEP/real_activation_xcheck.jsonl`` with
   one row per ``(layer_idx, side, vq_block_size, num_bits, seed)``.
 - Asserts per-row gates (§2.5):
   - ``|silica_frob - numpy_frob|`` tolerance: ``< 1e-3`` for the

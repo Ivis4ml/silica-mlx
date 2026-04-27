@@ -8,7 +8,7 @@ Shared scaffolding for the (3b) production prefix-cache:
   when the active capture buffer is non-None, it side-effects a write
   to ``buffer[attn_layer_pos]``. When the buffer is None the proxy
   short-circuits and skips the write entirely (decode-step overhead
-  must stay at zero per ``docs/P5_F_OPENING.md`` §6.6).
+  must stay at zero per ``plans/P5_F_OPENING.md`` §6.6).
 - ``_PreNormCaptureBufferHolder`` is a mutable, single-attribute holder
   every proxy reads on every call. Swapping the active buffer is a
   single attribute write on the holder; proxies are not re-installed.
@@ -31,7 +31,7 @@ Why a shared module: the F.0b' bench oracle in
 during F.0b' verification. F.1 lifts it onto the adapter Protocol so
 the production hot path (``ContinuousBatcher`` / ``RadixPrefixCache``)
 and the bench oracle exercise the same code (per
-``docs/P5_F_OPENING.md`` §6.6).
+``plans/P5_F_OPENING.md`` §6.6).
 """
 
 from __future__ import annotations

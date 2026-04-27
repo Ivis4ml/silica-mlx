@@ -20,7 +20,7 @@ value the rest of the chat code expects. Validation errors raise
 dispatcher catches these and surfaces them to the chat log as a
 red error line.
 
-Defaults match ``docs/CHAT_CLI_OPENING.md`` §6: sampling defaults
+Defaults match ``plans/CHAT_CLI_OPENING.md`` §6: sampling defaults
 in the chat-app sense (temperature 0.7, top_p 0.9, top_k off,
 max_tokens 1024); ``kv_codec`` defaults to None (fp16) per §6.1;
 ``thinking`` defaults to ``auto`` (collapse during stream, expand

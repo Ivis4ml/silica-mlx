@@ -37,7 +37,7 @@ freshly-seeded ``BatchKVCache`` at admission time. Lifetime rule:
 detached storage must be released **before the final source release**,
 so a ``release_source`` transition to zero fails loudly if detached K/V
 is still registered. This enforces the L-3 ⊆ L-1 invariant from
-docs/P2_UNIT_16C_2_PREP.md §2 and prevents silent leaks on eviction.
+plans/P2_UNIT_16C_2_PREP.md §2 and prevents silent leaks on eviction.
 
 The Paged backend stubs ``register_detached`` / ``fetch_detached`` /
 ``release_detached`` with ``NotImplementedError`` — the paged-attention
@@ -103,7 +103,7 @@ the store will accept; encode / decode behaviour is unchanged.
   freshly-built ``BatchKVCache``. Codec noise enters at chunk-
   boundary RoPE phase, paying an additional cost relative to the
   pre-RoPE injection vqbench's ``_QuantizedProj`` uses (see
-  ``docs/P5_D2_INVESTIGATION/README.md`` §Root cause).
+  ``plans/P5_D2_INVESTIGATION/README.md`` §Root cause).
 
 - ``pre_norm=True`` (P-5-F default after F.3): K is pre-k_norm —
   the output of ``attn.k_proj(x)`` captured via the
@@ -125,7 +125,7 @@ the gate keeps the contract honest at the production-deployment
 boundary.
 
 The three codec_quality_path arms retained as bench-only opt-ins
-(``docs/P5_F_OPENING.md`` §6.9 reading order):
+(``plans/P5_F_OPENING.md`` §6.9 reading order):
 
 1. ``prefix_store_post_rope`` — the cost of NOT shipping P-5-F.
    K sliced from the live cache after RoPE; chunk-boundary cost
@@ -715,7 +715,7 @@ class PagedPrefixBlockStore:
         raise NotImplementedError(
             "PagedPrefixBlockStore does not store detached K/V; the "
             "paged-attention kernel track owns that model (see "
-            "docs/P2_OPENING.md — trigger-gated future track)."
+            "plans/P2_OPENING.md — trigger-gated future track)."
         )
 
     def fetch_detached(

@@ -1,9 +1,9 @@
 """P-3-C5.1 — adapter-owned recurrent state snapshot / restore.
 
-Per ``docs/P3_C5_OPENING.md`` §5: snapshot / restore are
+Per ``plans/P3_C5_OPENING.md`` §5: snapshot / restore are
 **adapter-owned** hooks; the batcher owns ``self._batch_cache``
 and the adapter interprets which slots are recurrent. Per
-``docs/P3_C5_OPENING.md`` §5.3: lean is Option A, a
+``plans/P3_C5_OPENING.md`` §5.3: lean is Option A, a
 ``runtime_checkable`` Protocol mixin so ``ContinuousBatcher``
 can ``isinstance``-dispatch without knowing the concrete adapter
 class.
@@ -15,7 +15,7 @@ implement the mixin; ``isinstance(adapter, RecurrentStateAdapter)``
 returns ``False`` and callers fall back to the
 "lose-state-on-preempt" semantics that hold today.
 
-Storage / interpretation split (per ``docs/P3_C5_OPENING.md``
+Storage / interpretation split (per ``plans/P3_C5_OPENING.md``
 §5.1): the snapshot / restore methods take the **batcher-supplied**
 ``cache_list`` plus a ``row_idx``; they do NOT consult any
 adapter-local request-keyed store. The adapter walks DeltaNet
@@ -41,7 +41,7 @@ Out of C5.1 scope (will land in later sub-units):
 Inventory pointers:
 
 - DeltaNet ``ArraysCache(size=2)`` slot layout per Qwen3.5 target
-  is documented in ``docs/P3_C5_STATE_INVENTORY/README.md`` §2/§3.
+  is documented in ``plans/P3_C5_STATE_INVENTORY/README.md`` §2/§3.
 - Silica today never calls ``ArraysCache.prepare(lengths=...)``
   (verified by ``rg -n '\\.prepare\\(|prepare\\(lengths' silica/``
   → zero matches; see inventory README §5), so the
@@ -96,7 +96,7 @@ class RecurrentSnapshot:
     whole snapshots; they do not inspect individual entries.
 
     Memory bytes are reported via ``nbytes`` for the C5.3
-    per-block-boundary memory budget (``docs/P3_C5_STATE_INVENTORY/README.md``
+    per-block-boundary memory budget (``plans/P3_C5_STATE_INVENTORY/README.md``
     §6 expects ~19.5 MB on Qwen3.5-0.8B, ~51.5 MB on 4B,
     ~64.4 MB on 35B-A3B at B=1).
     """

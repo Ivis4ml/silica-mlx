@@ -13,7 +13,7 @@ Covers:
 - Error cases: bad ``num_bits``, non-uint8 input, ``d`` not a multiple of 8,
   mismatched ``packed`` last-axis size on unpack.
 
-See ``docs/P5_OPENING.md`` §4.1 (payload schemas), §5 (codec catalogue),
+See ``plans/P5_OPENING.md`` §4.1 (payload schemas), §5 (codec catalogue),
 and §4 (D-009 MLX-native constraint) for how this helper is consumed.
 """
 

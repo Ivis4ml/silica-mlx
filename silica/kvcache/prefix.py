@@ -5,7 +5,7 @@ node holds one block id; edges are always exactly ``block_size`` tokens
 long. Inspired by mini-sglang's prefix tree — no cross-reference to
 runtime mini-sglang code (D-009: no non-MLX runtime imports).
 
-**Physical semantics — option B (copy-on-admit), per docs/P2_OPENING.md v2.1:**
+**Physical semantics — option B (copy-on-admit), per plans/P2_OPENING.md v2.1:**
 
 A prefix hit means: on admission, the batcher copies the source blocks'
 K/V into the new request's fresh batch row, skipping that prefix's
@@ -446,7 +446,7 @@ class RadixPrefixCache:
         Per-node eviction order: ``release_detached`` (if any) THEN
         ``release_source``. The store's transition-to-zero guards
         enforce this order — reversing would raise in the synthetic
-        backend. See ``docs/P2_UNIT_16C_2_PREP.md`` §2 (L-3 ⊆ L-1).
+        backend. See ``plans/P2_UNIT_16C_2_PREP.md`` §2 (L-3 ⊆ L-1).
         """
         freed = 0
         while freed < n_blocks:

@@ -116,7 +116,7 @@ class _PendingAdmit:
     path because ``composite_prompt`` is ``prompt + generated`` (i.e.
     ``T + len(generated)`` tokens) and the post-prefill cache lands
     at ``T + len(generated)`` consumed — one token past the snapshot
-    boundary. See ``docs/P3_C5_DRIFT_EXPERIMENT/README.md``
+    boundary. See ``plans/P3_C5_DRIFT_EXPERIMENT/README.md``
     "C5.2 acceptance" for the boundary derivation. C5.3 will enable
     restore only on admission paths whose post-prefill boundary
     matches the snapshot boundary (e.g. prefix-hit replay where the
@@ -179,7 +179,7 @@ class _BatchRow:
     real token (not pad). Stays ``0`` for rows admitted via contiguous
     prefill — the decode-step capture path uses a ``> 0`` precondition
     to skip those rows so cross-regime snapshots never reach the radix
-    tree (P-3-C5.3.1 finding C, see ``docs/P3_C5_3_DESIGN.md`` §4.2).
+    tree (P-3-C5.3.1 finding C, see ``plans/P3_C5_3_DESIGN.md`` §4.2).
     """
 
     req_index: int
@@ -423,7 +423,7 @@ class ContinuousBatcher:
 
         Covers three distinct states: an active row, a terminal row
         that has not yet been reclaimed (deferred reclaim — see
-        ``docs/P2_UNIT_16C_PREP.md`` §1 I-5), or a pending request in
+        ``plans/P2_UNIT_16C_PREP.md`` §1 I-5), or a pending request in
         the waiting queue. ``Engine.generate_batch`` will loop on this
         once 16c.1 step 2 lands reclaim, so the cohort drains cleanly
         even when the last sample phase terminates every row.
@@ -509,7 +509,7 @@ class ContinuousBatcher:
     def _reclaim_terminated(self) -> None:
         """Drop terminal rows from the batch before the forward phase.
 
-        Per ``docs/P2_UNIT_16C_PREP.md`` §4 Reclaim flow:
+        Per ``plans/P2_UNIT_16C_PREP.md`` §4 Reclaim flow:
 
           - If no row is terminal, no-op (cheap path; most steps).
           - Otherwise compute ``kept`` and either (a) ``filter(kept)`` on
@@ -1131,7 +1131,7 @@ class ContinuousBatcher:
         running with a ``RadixPrefixCache`` so the producer (whose
         snapshots get stored) and the consumer (the prefix-hit
         admission path in ``_admit_single_hit_row``) operate in the
-        same trajectory regime — see ``docs/P3_C5_3_DESIGN.md``
+        same trajectory regime — see ``plans/P3_C5_3_DESIGN.md``
         §2.2 / §3.2 for why same-regime is required for byte-exact
         cooperation.
 
@@ -1564,7 +1564,7 @@ class ContinuousBatcher:
         """Phase 2 — drain up to ``max_batch_size − len(self._rows)``
         requests from ``_waiting_queue``.
 
-        Two phases (prep doc docs/P2_UNIT_16D_PREP.md §4.2):
+        Two phases (prep doc plans/P2_UNIT_16D_PREP.md §4.2):
 
           **Phase A — decide + apply (per-pending, pop-one-at-a-time).**
           Per pending popped from the queue, consult
@@ -1810,7 +1810,7 @@ class ContinuousBatcher:
     ) -> list[BatchEvent]:
         """Per-row admission via prefix-cache hit (16c.2 step 4 sub-commit 3).
 
-        Sequence (docs/P2_UNIT_16C_2_STEP_4_SKELETON.md §3.2):
+        Sequence (plans/P2_UNIT_16C_2_STEP_4_SKELETON.md §3.2):
 
           1. lookup retains hits in the store.
           2. try: assert S-1, fetch detached K/V, build seeded
@@ -2165,7 +2165,7 @@ class ContinuousBatcher:
         # prefill boundary equals the snapshot boundary, e.g. prefix-
         # hit paths where the prefill ends at the prefix-block edge
         # the snapshot was captured against. See
-        # docs/P3_C5_DRIFT_EXPERIMENT/README.md "C5.2 acceptance" for
+        # plans/P3_C5_DRIFT_EXPERIMENT/README.md "C5.2 acceptance" for
         # the full boundary derivation.
 
         if self._batch_cache is None:

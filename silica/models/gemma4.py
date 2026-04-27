@@ -18,7 +18,7 @@ misconfiguration cannot slip into production:
 Gemma4-31B has two coexisting KV shapes — sliding layers use
 ``(n_kv_heads=16, head_dim=256)``, full layers use
 ``(n_kv_heads=4, head_dim=512)`` with ``attention_k_eq_v=True`` (see
-``docs/P3_GEMMA4_SURVEY.md`` §3.4). ``KVLayout``'s four primary fields
+``plans/P3_GEMMA4_SURVEY.md`` §3.4). ``KVLayout``'s four primary fields
 stay as a single-shape summary; per D-open-1 option (a) we populate
 them from the sliding (majority) layer and record the full per-kind
 detail in ``ModelConfig.extra`` under explicit keys plus a
@@ -77,7 +77,7 @@ _KV_LAYOUT_CAVEAT = (
     "Gemma4 has two coexisting KV shapes (sliding_attention + "
     "full_attention). KVLayout here is a summary populated from the "
     "sliding-layer fields; per-kind details are in ModelConfig.extra. "
-    "See docs/P3_GEMMA4_SURVEY.md §5.1."
+    "See plans/P3_GEMMA4_SURVEY.md §5.1."
 )
 
 _DTYPE_BY_NAME: dict[str, mx.Dtype] = {
@@ -167,7 +167,7 @@ class Gemma4Adapter:
         Sliding layers get ``BatchRotatingKVCache(max_size=sliding_window,
         left_padding=...)``; full-attention layers get ``BatchKVCache(
         left_padding=...)``. Both primitives already ship in mlx-lm
-        (``mlx_lm.models.cache``); see ``docs/P3_BATCH_ROTATING_KV_SURVEY.md``.
+        (``mlx_lm.models.cache``); see ``plans/P3_BATCH_ROTATING_KV_SURVEY.md``.
 
         The per-layer ordering follows ``self._attention_pattern.per_layer``,
         which was built from ``config.text_config['layer_types']`` under
@@ -385,7 +385,7 @@ class Gemma4Adapter:
         layers are actually capped at ``sliding_window`` tokens of KV,
         so very long sequences over-estimate sliding contributions and
         under-estimate the fixed per-request sliding footprint. See
-        ``docs/P3_BATCH_ROTATING_KV_SURVEY.md`` §4.4. The D4 single
+        ``plans/P3_BATCH_ROTATING_KV_SURVEY.md`` §4.4. The D4 single
         scalar is still strictly better than the pre-D4 "sliding
         shape × all 60 layers" over-count by ~9% on Gemma4-31B.
         """

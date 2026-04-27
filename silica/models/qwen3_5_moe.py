@@ -22,7 +22,7 @@ mlx-lm. Silica contributes:
     cover (``num_experts <= 0``, ``num_experts_per_tok <= 0``,
     ``num_experts_per_tok > num_experts``, or non-empty
     ``mlp_only_layers`` — see E-open-2 in
-    ``docs/P3_MOE_SURVEY.md``; the 35B-A3B probe found this list
+    ``plans/P3_MOE_SURVEY.md``; the 35B-A3B probe found this list
     empty, but guarding makes the adapter refuse checkpoints
     that would trip the mlx-lm qwen3_5 DecoderLayer's silent
     MoE-onto-dense-MLP behaviour).
@@ -205,7 +205,7 @@ class Qwen3_5MoeAdapter(Qwen3_5Adapter):
           field (only ``qwen3_next.Qwen3NextDecoderLayer`` does), so
           a non-empty list would mean mlx-lm silently wires MoE onto
           layers the checkpoint author intended to be dense MLP.
-          E-open-2 in ``docs/P3_MOE_SURVEY.md`` tracks this; on the
+          E-open-2 in ``plans/P3_MOE_SURVEY.md`` tracks this; on the
           probed 35B-A3B-4bit checkpoint the list is empty.
         """
         tc = Qwen3_5MoeAdapter._text_config_dict(model)
@@ -243,7 +243,7 @@ class Qwen3_5MoeAdapter(Qwen3_5Adapter):
                 "SparseMoeBlock onto layers the config intends to "
                 "be dense MLP — refusing rather than accepting a "
                 "silently-wrong wiring. See E-open-2 in "
-                "docs/P3_MOE_SURVEY.md; the probed 35B-A3B-4bit "
+                "plans/P3_MOE_SURVEY.md; the probed 35B-A3B-4bit "
                 "checkpoint has this list empty."
             )
 

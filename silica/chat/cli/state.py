@@ -8,7 +8,7 @@ Keeping the data plain-Python and side-effect-free here means the
 formatter unit tests can drive any state combination without
 spinning up the engine or the UI.
 
-Field semantics match ``docs/CHAT_CLI_OPENING.md`` §4 (toolbar
+Field semantics match ``plans/CHAT_CLI_OPENING.md`` §4 (toolbar
 field list) and §3.2.1 (thinking-mode state machine).
 """
 

@@ -12,7 +12,7 @@ Runtime enforcement: every other module under ``silica.vq.*``
 (``silica.vq.core.packing``, ``silica.vq.block_tq``, ``silica.vq.turboquant``,
 ``silica.vq.rabitq``) must pass a "no NumPy on the hot path" grep — the
 leading underscore on ``_calibration`` and its "calibration" suffix are
-the documented exception. See ``docs/P5_OPENING.md`` §4.6.
+the documented exception. See ``plans/P5_OPENING.md`` §4.6.
 
 Contents:
 

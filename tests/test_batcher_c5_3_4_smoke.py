@@ -1,7 +1,7 @@
 """P-3-C5.3.4 — vertical slice + smoke convergence (synthetic).
 
 Closes the C5.3.0-.3 chain on the synthetic-adapter side. Two
-acceptance gates from ``docs/P3_C5_3_DESIGN.md`` §4.5 are pinned
+acceptance gates from ``plans/P3_C5_3_DESIGN.md`` §4.5 are pinned
 here; the third (real-model end-to-end smoke) lives in
 ``tests/test_p3_hybrid_batched_smoke.py`` as a sibling to the
 existing pre-cache hybrid smoke.

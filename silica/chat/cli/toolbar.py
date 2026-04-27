@@ -2,7 +2,7 @@
 
 Pure function from a :class:`ChatCliState` snapshot to a string.
 The string is the concatenation of toolbar fields in the order
-defined in ``docs/CHAT_CLI_OPENING.md`` §4, with optional ANSI
+defined in ``plans/CHAT_CLI_OPENING.md`` §4, with optional ANSI
 colour escapes from a :class:`Palette`. No side effects, no I/O
 — suitable for unit testing without the prompt_toolkit event loop.
 
@@ -150,7 +150,7 @@ def render_toolbar(
     ``palette.mode is PaletteMode.PLAIN``. The trailing newline is
     *not* included — the prompt_toolkit Window inserts that itself.
 
-    Field order and content match ``docs/CHAT_CLI_OPENING.md`` §4
+    Field order and content match ``plans/CHAT_CLI_OPENING.md`` §4
     plus the brand ``MLX`` badge. The order is stable so users
     pinning their gaze to a column index always see the same field.
 

@@ -10,7 +10,7 @@ Covers:
 - Round-trip shape + dtype preservation: input
   ``(1, n_kv_heads, kv_block_size, head_dim)`` fp16 round-trips to an
   identically-shaped fp16 tensor after encode → decode.
-- **Scalar equivalence invariant** (docs/P5_OPENING.md §4.5 +
+- **Scalar equivalence invariant** (plans/P5_OPENING.md §4.5 +
   vqbench's ``tests/test_block_quant.py::test_block_equals_scalar_when_B_equals_d``):
   ``BlockTurboQuantMSE(vq_block_size=head_dim)`` and
   ``TurboQuantMSE(...)`` with matching ``(head_dim, num_bits, seed)``

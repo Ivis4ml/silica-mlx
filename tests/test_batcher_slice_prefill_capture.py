@@ -9,7 +9,7 @@ bypassing the ctor guard, while ``isinstance(...,
 RecurrentStateAdapter)`` returns ``True`` so the slice-regime
 predicate fires).
 
-Acceptance shape per ``docs/P3_C5_3_DESIGN.md`` §4.2:
+Acceptance shape per ``plans/P3_C5_3_DESIGN.md`` §4.2:
 
 - B=1 prefill of ``N * block_size`` tokens captures one snapshot at
   every full-block boundary; ``recurrent_snapshots_per_block.keys()``

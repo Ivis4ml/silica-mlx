@@ -128,7 +128,7 @@ Legend: ✅ shipped · Stub = wired as the baseline implementation
 behind the frozen interface, swappable in P-6 / P-7 · ⏳ = not started.
 
 Single-source-of-truth for the roadmap and decisions log:
-[`docs/PLAN.md`](docs/PLAN.md).
+[`plans/PLAN.md`](plans/PLAN.md).
 
 ---
 
@@ -498,7 +498,7 @@ the same interface.
 
 Core:
 
-- [`docs/PLAN.md`](docs/PLAN.md) — single source of truth for
+- [`plans/PLAN.md`](plans/PLAN.md) — single source of truth for
   phases, deliverables, acceptance criteria, decisions log, open
   questions, and empirical findings per sub-commit.
 - [`docs/API.md`](docs/API.md) — per-module function and class
@@ -506,35 +506,35 @@ Core:
 
 Phase-specific context:
 
-- [`docs/P2_OPENING.md`](docs/P2_OPENING.md) — why
+- [`plans/P2_OPENING.md`](plans/P2_OPENING.md) — why
   `ContinuousBatcher` looks the way it does.
-- [`docs/P2_UNIT_16D_PREP.md`](docs/P2_UNIT_16D_PREP.md) —
+- [`plans/P2_UNIT_16D_PREP.md`](plans/P2_UNIT_16D_PREP.md) —
   preemption + replay prep, including the B-1 through B-9
   invariants enforced by the batcher's tests.
-- [`docs/P3_DELTANET_SURVEY.md`](docs/P3_DELTANET_SURVEY.md) —
+- [`plans/P3_DELTANET_SURVEY.md`](plans/P3_DELTANET_SURVEY.md) —
   Qwen3.5 hybrid DeltaNet architecture survey.
-- [`docs/P3_GEMMA4_SURVEY.md`](docs/P3_GEMMA4_SURVEY.md) —
+- [`plans/P3_GEMMA4_SURVEY.md`](plans/P3_GEMMA4_SURVEY.md) —
   Gemma4-31B source-code survey (sliding + full hybrid).
-- [`docs/P3_BATCH_ROTATING_KV_SURVEY.md`](docs/P3_BATCH_ROTATING_KV_SURVEY.md)
+- [`plans/P3_BATCH_ROTATING_KV_SURVEY.md`](plans/P3_BATCH_ROTATING_KV_SURVEY.md)
   — mlx-lm's `BatchRotatingKVCache` audit for the batched sliding
   path.
-- [`docs/P3_MOE_SURVEY.md`](docs/P3_MOE_SURVEY.md) — Qwen3.5-MoE
+- [`plans/P3_MOE_SURVEY.md`](plans/P3_MOE_SURVEY.md) — Qwen3.5-MoE
   and Gemma4-MoE architecture differences + D-011 "per-expert at
   dispatch, fused at fetch" decision.
 
 Gate docs (for historical context):
 
-- [`docs/P1_ACCEPTANCE.md`](docs/P1_ACCEPTANCE.md),
-  [`docs/P2_GATE_0.md`](docs/P2_GATE_0.md),
-  [`docs/P2_GATE_0_5.md`](docs/P2_GATE_0_5.md),
-  [`docs/P2_UNIT_16C_PREP.md`](docs/P2_UNIT_16C_PREP.md),
-  [`docs/P2_UNIT_16C_2_PREP.md`](docs/P2_UNIT_16C_2_PREP.md).
+- [`plans/P1_ACCEPTANCE.md`](plans/P1_ACCEPTANCE.md),
+  [`plans/P2_GATE_0.md`](plans/P2_GATE_0.md),
+  [`plans/P2_GATE_0_5.md`](plans/P2_GATE_0_5.md),
+  [`plans/P2_UNIT_16C_PREP.md`](plans/P2_UNIT_16C_PREP.md),
+  [`plans/P2_UNIT_16C_2_PREP.md`](plans/P2_UNIT_16C_2_PREP.md).
 
 ---
 
 ## Roadmap
 
-Immediate next units (see `docs/PLAN.md` for the full plan). The P-4
+Immediate next units (see `plans/PLAN.md` for the full plan). The P-4
 exit surfaced two signals that reshuffle the near-term order:
 (1) Q-010 chunked-prefill promotion triggered — cohort-level prefill
 drags short-row TTFT behind the long-row `T_max`; (2) the
@@ -542,7 +542,7 @@ drags short-row TTFT behind the long-row `T_max`; (2) the
 needs a runtime-integration spike before any BlockTQ coding starts.
 P-4.5 bridges both.
 
-- **P-4.5** — P-4 exit bridge (three sub-units, see `docs/PLAN.md`
+- **P-4.5** — P-4 exit bridge (three sub-units, see `plans/PLAN.md`
   §7 P-4.5):
   - **P-4.5-A** — PLAN / README decision sync (this revision).
   - **P-4.5-B** — chunked prefill minimal: three-option opening
@@ -551,7 +551,7 @@ P-4.5 bridges both.
     → TTFT-under-concurrency ratio `< 3×` and greedy-output
     bit-identity regression lock.
   - **P-4.5-C** — VectorCodec runtime integration spike (complete,
-    v1.6.9): `docs/P4_5_C_KVCODEC_OPENING.md` enumerated the three
+    v1.6.9): `plans/P4_5_C_KVCODEC_OPENING.md` enumerated the three
     integration points (active `BatchKVCache` / detached prefix store
     / cache wrapper) and landed Option (B); `IdentityCodec` is wired
     through `SyntheticPrefixBlockStore.register_detached` /
@@ -561,17 +561,17 @@ P-4.5 bridges both.
   2026-04-24); **§7 P-5 Acceptance items (1) / (2) / (3) / (4)
   all closed at v1.7.4**. (1) codec-swap neutrality by inspection
   (zero concrete-codec dispatch across scheduler / model adapters;
-  evidence in `docs/P5_ACCEPTANCE_SWEEP/codec_swap_neutrality.md`).
+  evidence in `plans/P5_ACCEPTANCE_SWEEP/codec_swap_neutrality.md`).
   (2) `scripts/bench.py --all --all-kv-codecs --seeds 42,43,44`
   produces a coherent 924-row report covering 28 scenarios × 11
   codecs × 3 seeds; all 564 failed rows classified into three
   expected compatibility classes (`codec_override_invalid`,
   K-only `rabitq_b1`, vqbench-aligned symmetric-codec guard);
-  evidence in `docs/P5_ACCEPTANCE_SWEEP/all_kv_codecs.{jsonl,md}`.
+  evidence in `plans/P5_ACCEPTANCE_SWEEP/all_kv_codecs.{jsonl,md}`.
   (3) `qwen3-0.6b-admission-headroom-prefix-heavy` passes
   `n_block > n_fp16` (`7 > 4`, `admit_ratio ≈ 1.75`,
   `residency_ratio ≈ 0.266`, ≈ 1 / 3.76 per vqbench §3.1);
-  evidence in `docs/P5_ACCEPTANCE_SWEEP/admission_headroom.{jsonl,md}`.
+  evidence in `plans/P5_ACCEPTANCE_SWEEP/admission_headroom.{jsonl,md}`.
   (4) vqbench cross-check closed at v1.7.3 via the D.2a
   vqbench-aligned oracle (mean-over-seeds gate on the
   `qwen3-0.6b-wikitext-ppl-block-tq-b64-b4-vqbench-aligned` row:
@@ -589,7 +589,7 @@ P-4.5 bridges both.
   legacy post-RoPE store), inside D.2a's `+0.51 ± 0.35 PPL`
   envelope. Three legacy comparison arms (`prefix_store_post_rope`,
   `prefix_store_pre_rope`, `vqbench_aligned`) retained as bench-
-  only opt-ins per `docs/P5_F_OPENING.md` §6.9 reading order.
+  only opt-ins per `plans/P5_F_OPENING.md` §6.9 reading order.
   **(b-static) closed at v1.7.7:** the originally v1.5.1-named
   Qwen3.5-4B PPL gate vs `vqbench/REPORT.md` static baseline
   closed on the production hot path via the same (3b) capture
@@ -597,7 +597,7 @@ P-4.5 bridges both.
   reported `+0.000% ± 0.000%` lossless-at-measurement-precision
   envelope; ~16x SEM headroom on the (4-b)-style aggregated
   gate). Evidence:
-  `docs/P5_ACCEPTANCE_SWEEP/qwen35_4b_b_static_close.md`.
+  `plans/P5_ACCEPTANCE_SWEEP/qwen35_4b_b_static_close.md`.
   **v1.7.8 closes the remaining v1.7.6 follow-up trail:** Item 1
   — slice-regime + `pre_norm=True` end-to-end on hybrid
   Qwen3.5-0.8B (`tests/test_p5_f_pre_norm_e2e_hybrid.py`,
@@ -622,8 +622,8 @@ P-4.5 bridges both.
   stays in force; flip status moves from "empirical question" to
   "administrative landing" (cross-codec measurement coverage +
   (4-b) gate re-anchor pending). Evidence:
-  `docs/P5_D2_INVESTIGATION/per_head_rotation_3seeds.md`,
-  `docs/P5_ACCEPTANCE_SWEEP/qwen35_4b_b_static_per_head_3seeds.md`.
+  `plans/P5_D2_INVESTIGATION/per_head_rotation_3seeds.md`,
+  `plans/P5_ACCEPTANCE_SWEEP/qwen35_4b_b_static_per_head_3seeds.md`.
   The single intentionally-deferred Deliverable remains
   `PagedPrefixBlockStore` codec injection (`NotImplementedError`
   stub per D-003 no-compressed-domain-attention scope; lands when

@@ -1,6 +1,6 @@
 """silica.vq.turboquant — Scalar TurboQuantMSE (alias for ``BlockTQ(B=d)``).
 
-Per ``docs/P5_OPENING.md`` §4.5 + §5.1, the scalar TurboQuantMSE
+Per ``plans/P5_OPENING.md`` §4.5 + §5.1, the scalar TurboQuantMSE
 algorithm from the TurboQuant paper (arXiv 2504.19874, Algorithm 1) is
 the ``vq_block_size = head_dim`` special case of
 ``BlockTurboQuantMSE`` — one per-vector fp16 scale, block-local

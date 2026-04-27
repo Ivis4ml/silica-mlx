@@ -24,7 +24,7 @@ that the ``cache.state`` setter route is equivalent to driving
 
 This helper does NOT:
   - extend into the main batch cache; that is the caller's job (§4
-    step 6 of docs/P2_UNIT_16C_2_PREP.md).
+    step 6 of plans/P2_UNIT_16C_2_PREP.md).
   - release hits in the radix cache; the caller owns the
     ``radix.release`` call once the copy is complete (§4 step 5).
   - prefill suffix tokens; the caller drives the model forward pass

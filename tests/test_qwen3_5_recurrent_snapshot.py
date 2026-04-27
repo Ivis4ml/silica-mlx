@@ -15,7 +15,7 @@ Covers the four C5.1 review points:
    ``row_idx=k`` must not change rows ``!= k``.
 
 All tests gate on the Qwen3.5-0.8B HF cache (single skip gate
-per ``docs/P3_C5_OPENING.md`` §2.6 / §3.1).
+per ``plans/P3_C5_OPENING.md`` §2.6 / §3.1).
 
 Tests do NOT exercise:
 

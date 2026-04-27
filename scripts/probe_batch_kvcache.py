@@ -1,7 +1,7 @@
 """Gate-0 probe — mlx-lm BatchKVCache batched injection smoke test.
 
 P-2 analogue of Gate A (D-010 external cache injection). Required by the
-P-2 opening proposal (``docs/P2_OPENING.md``) before any unit work begins:
+P-2 opening proposal (``plans/P2_OPENING.md``) before any unit work begins:
 the entire P-2 scheduler, paged cache, and prefix bookkeeping are built on
 top of ``mlx_lm.models.cache.BatchKVCache`` as the physical storage layer.
 If its batched semantics drift, every P-2 deliverable drifts with it.

@@ -1,6 +1,6 @@
 """Tests for silica.bench.codec_registry — CodecSpec schema + registry entries.
 
-Covers the P-5-A.1b deliverable from ``docs/P5_OPENING.md`` §6.1 +
+Covers the P-5-A.1b deliverable from ``plans/P5_OPENING.md`` §6.1 +
 §8 P-5-A.1:
 
 - Registry schema: every entry's ``id`` matches its dict key; ids are

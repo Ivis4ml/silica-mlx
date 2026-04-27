@@ -3,7 +3,7 @@
 Setup and usage notes for the chat REPL (`silica chat`). Side track 2
 adds a prompt_toolkit-based interactive shell with persistent bottom
 toolbar (tok/s, KV memory, compression ratio, prefix-cache hit count
-— see `docs/CHAT_CLI_OPENING.md` for the full design).
+— see `plans/CHAT_CLI_OPENING.md` for the full design).
 
 This README captures the install path that survives macOS Sequoia's
 iCloud-Drive interaction with editable Python installs. Read this
@@ -121,7 +121,7 @@ Slash commands available out of the box:
 Sampling knobs (temperature, top_p, top_k, max_tokens) are
 intentionally **not** CLI flags — they live behind `/config`
 inside the REPL. Launch surface stays minimal: `--model`,
-`--system`, `--kv-codec`. See `docs/CHAT_CLI_OPENING.md` §6 for the
+`--system`, `--kv-codec`. See `plans/CHAT_CLI_OPENING.md` §6 for the
 rationale.
 
 ## Background — why the venv lives outside iCloud

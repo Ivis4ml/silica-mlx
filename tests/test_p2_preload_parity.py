@@ -4,7 +4,7 @@ Skipped when the Qwen3-0.6B checkpoint is not cached locally (fresh
 clones, minimal CI). Run ``python scripts/probe_p2_preload.py`` once to
 populate the cache.
 
-The oracle token sequence is the one recorded in docs/P2_PRELOAD.md.
+The oracle token sequence is the one recorded in plans/P2_PRELOAD.md.
 When mlx-lm upgrades drift greedy output, this test fails loud — that
 is the intended regression guard (see the §"Unit 16a oracle
 specification" block in the preload doc for why storing rather than
@@ -26,7 +26,7 @@ REPO = "Qwen/Qwen3-0.6B"
 PROMPT = "The capital of France is"
 MAX_TOKENS = 16
 
-# Recorded in docs/P2_PRELOAD.md §"Unit 16a oracle specification".
+# Recorded in plans/P2_PRELOAD.md §"Unit 16a oracle specification".
 EXPECTED_TOKENS: tuple[int, ...] = (
     12095, 13, 576, 6722, 315, 15344, 374, 21718, 13,
     576, 6722, 315, 17689, 374, 24081, 13,

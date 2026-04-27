@@ -1,7 +1,7 @@
 """Tests for silica.vq._calibration — Haar rotation + Lloyd-Max codebook.
 
 Covers the NumPy-quarantined offline helpers that codec ``__init__``
-bodies consume once at construction time (see ``docs/P5_OPENING.md``
+bodies consume once at construction time (see ``plans/P5_OPENING.md``
 §4.6 + §5.2):
 
 - ``haar_rotation``: orthogonality, determinism under ``(d, seed)``,

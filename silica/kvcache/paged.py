@@ -7,7 +7,7 @@ session:
     batched K / V tensor for its entire lifetime. Row assignment is
     ``slot_table: req_id → int`` with lifecycle tracked in ``row_state``.
     Row *fixed for lifetime*, no compaction (P-2 design, see
-    ``docs/P2_OPENING.md`` Layer A invariant).
+    ``plans/P2_OPENING.md`` Layer A invariant).
   - **Layer B (logical page table).** Over the rows we lay a logical block
     map: ``page_table: req_id → list[block_id]`` plus a shared
     ``refcount`` and ``free_blocks`` list. Block ids are abstract

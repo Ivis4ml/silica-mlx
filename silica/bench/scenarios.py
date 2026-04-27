@@ -334,7 +334,7 @@ _QWEN3_5_0_8B_B1_PARITY = Scenario(
 # =True``), and ``ContinuousBatcher`` refuses ``RadixPrefixCache`` on
 # models with recurrent state because DeltaNet's running accumulation
 # cannot be sliced into block-aligned prefix K/V (see
-# ``docs/P3_DELTANET_SURVEY.md`` C-open-3). Qwen3-0.6B is the
+# ``plans/P3_DELTANET_SURVEY.md`` C-open-3). Qwen3-0.6B is the
 # immediate alternative: plain dense GLOBAL attention, 28 layers,
 # head_dim=128, no recurrent state. The BlockTQ-vs-identity ratio
 # the §7(d) gate asserts is head-dim / layer-count independent in
@@ -809,7 +809,7 @@ _WIKITEXT_PPL_ORACLE_CONFIG: dict[str, int | str] = {
     # through ``teacher_forced_chunked_nll_with_codec_pre_norm`` —
     # the (3b) projection-output capture path verified at +0.015
     # PPL on Qwen3-0.6B + BlockTQ b64 b4 (F.0b', see §10.3 of
-    # docs/P5_F_OPENING.md). Override to ``prefix_store_post_rope``
+    # plans/P5_F_OPENING.md). Override to ``prefix_store_post_rope``
     # on legacy comparison rows; ``prefix_store_pre_rope`` /
     # ``vqbench_aligned`` for diagnostic ablations.
     "codec_quality_path": "prefix_store_pre_norm",
@@ -940,7 +940,7 @@ _QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4 = Scenario(
 # acceptable, whether the existing per-row epsilon gate
 # (_compute_gap_fields / _VQBENCH_PCT_EPSILON) applies as-is —
 # is owned by P-5-D.3, NOT by this scenario. D.2a's verification
-# (docs/P5_D2_INVESTIGATION) recorded per-row |gap| ≈ 0.45–0.61 PPL
+# (plans/P5_D2_INVESTIGATION) recorded per-row |gap| ≈ 0.45–0.61 PPL
 # against vqbench while mean-over-seeds agrees to ~0.15 PPL, so the
 # per-row epsilon gate as currently coded will still fire the
 # divergence warning on this row. That is expected and part of the
@@ -982,7 +982,7 @@ _QWEN3_0_6B_WIKITEXT_PPL_BLOCK_TQ_B64_B4_VQBENCH_ALIGNED = Scenario(
         "(both sides inject noise in pre-RoPE space). The post-RoPE "
         "store row is preserved as a separate observable of the "
         "production path's quality cost. See "
-        "docs/P5_D2_INVESTIGATION/ for the probe scripts that "
+        "plans/P5_D2_INVESTIGATION/ for the probe scripts that "
         "established this split."
     ),
     vqbench_xcheck=VqbenchXcheckSpec(

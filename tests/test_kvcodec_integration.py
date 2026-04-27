@@ -1,7 +1,7 @@
 """P-4.5-C.1 VectorCodec runtime-integration tests (side-level API after P-5-A.0.4).
 
 Verifies that the Option (B) hook in ``SyntheticPrefixBlockStore``
-(see docs/P4_5_C_KVCODEC_OPENING.md §3.2 / §6 / §8) turns
+(see plans/P4_5_C_KVCODEC_OPENING.md §3.2 / §6 / §8) turns
 ``IdentityCodec.encode_tensor`` / ``decode_tensor`` into runtime callers
 on the real Qwen3-0.6B forward path. Five assertions, matching the
 opening doc's §8 acceptance specification:

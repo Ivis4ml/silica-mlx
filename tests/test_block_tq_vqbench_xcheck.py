@@ -6,7 +6,7 @@ in ``tests/test_block_tq_real_activation_xcheck.py``, which reuses
 this file's ``_numpy_block_tq_round_trip`` reference and runs it on
 pre-RoPE K / V activations extracted from a Qwen3.5-0.8B prefill
 pass (the v1.5.1 "vqbench venv subprocess" design was superseded
-by the inline-NumPy idiom — see ``docs/P5_A_REAL_OPENING.md`` §2.3).
+by the inline-NumPy idiom — see ``plans/P5_A_REAL_OPENING.md`` §2.3).
 
 What this test does:
 

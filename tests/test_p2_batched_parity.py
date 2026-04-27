@@ -270,7 +270,7 @@ def test_shared_prefix_reduces_forward_tokens() -> None:
     amount. Drives ``ContinuousBatcher`` directly — Engine.generate_batch
     hides the batcher so the counter would not be reachable through it.
 
-    Setup (per docs/P2_UNIT_16C_2_PREP.md §5 edge 5):
+    Setup (per plans/P2_UNIT_16C_2_PREP.md §5 edge 5):
       block_size   = 16
       prefix_len   = 128  (8 aligned blocks)
       suffix_len   = 16   (1 aligned block, unique per request)

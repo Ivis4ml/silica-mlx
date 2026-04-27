@@ -1,7 +1,7 @@
 """P-3-E2: option (c) dispatch-observation contract for MoE adapters.
 
 Pins the E-open-1 resolution (recorded 2026-04-20 in
-``docs/P3_MOE_SURVEY.md`` §4.1 / §6) as executable tests: when a
+``plans/P3_MOE_SURVEY.md`` §4.1 / §6) as executable tests: when a
 MoE adapter's ``install_dispatch_proxy(observer)`` seam is wired,
 the observer sees ``(layer_idx, indices)`` for every sparse-MLP
 forward, and mapping those indices to ``WeightProvider.get_expert``
@@ -262,7 +262,7 @@ def test_dispatch_proxy_observer_calls_get_expert_for_unique_ids() -> None:
     """Manual switch_mlp call with a hand-crafted indices array
     produces one ``get_expert`` call per unique expert id on that
     layer — NOT one per occurrence. Pins the "unique ids cover"
-    semantic from docs/P3_MOE_SURVEY.md §4.1."""
+    semantic from plans/P3_MOE_SURVEY.md §4.1."""
     adapter, model = _make_adapter(num_layers=4)
     provider = _ObservingMockProvider()
     wrapped = adapter.install_dispatch_proxy(_make_get_expert_observer(provider))

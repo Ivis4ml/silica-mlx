@@ -4,7 +4,7 @@ Scope: SyntheticPrefixBlockStore — the PrefixBlockStore implementation
 that 16c.2's ContinuousBatcher installs. RadixPrefixCache-level tests
 (peek side-effect-freeness, evict-on-dead-leaf, etc.) live elsewhere.
 
-Covers the three lifetime invariants from docs/P2_UNIT_16C_2_PREP.md §2:
+Covers the three lifetime invariants from plans/P2_UNIT_16C_2_PREP.md §2:
   L-1 source: retain/release pair, allocate_id monotonic, reuse-free ids.
   L-2 hit ⊆ source: retain_hit requires live source; release_hit loud-fail.
   L-3 detached ⊆ source: register requires live source; release_source

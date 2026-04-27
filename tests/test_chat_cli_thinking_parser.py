@@ -1,7 +1,7 @@
 """C-8 unit tests for the ``<think>``-stream parser.
 
 Pure-Python coverage of ``silica.chat.cli.thinking_parser``. Verifies
-the documented contract from ``docs/CHAT_CLI_OPENING.md`` §3.2.1
+the documented contract from ``plans/CHAT_CLI_OPENING.md`` §3.2.1
 including the tag-fragmentation robustness that resolves Q-CHAT-4.
 """
 

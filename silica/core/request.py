@@ -1,6 +1,6 @@
 """Request and request lifecycle types for Silica engine.
 
-``RequestState`` is a **pure FSM** (P-2 design, see ``docs/P2_OPENING.md``):
+``RequestState`` is a **pure FSM** (P-2 design, see ``plans/P2_OPENING.md``):
 ``transition`` validates the target against an allow-list and mutates
 ``status`` + ``_history`` + (on terminal) ``finish_reason``. It does **not**
 release KV blocks, pin prefix-cache sources, zero batch rows, or touch any

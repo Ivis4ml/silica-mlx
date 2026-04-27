@@ -20,7 +20,7 @@ them into pass/fail gates **before** any 16c.2 code change.
         the row cache was seeded rather than accumulated via
         update_and_fetch) produces the same extended state as the
         reference path where both main and row were accumulated
-        naturally. This is Open-Q Q1 from docs/P2_UNIT_16C_2_PREP.md
+        naturally. This is Open-Q Q1 from plans/P2_UNIT_16C_2_PREP.md
         §9 — a hard gate. If extend requires `other._idx == 0`,
         option-B prefix reuse collapses to "seed + replay prefill",
         which defeats the whole compute-saving point.

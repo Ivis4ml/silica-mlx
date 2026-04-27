@@ -1,6 +1,6 @@
 """silica.kvcache.codec — side-level VectorCodec[P] Protocol + IdentityCodec baseline.
 
-I-3 interface definition (see ``docs/PLAN.md`` §6, updated at P-5-A.0.4).
+I-3 interface definition (see ``plans/PLAN.md`` §6, updated at P-5-A.0.4).
 
 A ``VectorCodec`` operates on one tensor at a time — either K or V from
 one block of one layer; pair-level dispatch lives in

@@ -18,7 +18,7 @@ the multi-bit extension from P-5-B.2a:
 - ``VectorCodec`` is ``@runtime_checkable`` and detects method presence
   across the four required members.
 
-See ``docs/P5_OPENING.md`` §4.3 for the resident_bytes-honesty rule,
+See ``plans/P5_OPENING.md`` §4.3 for the resident_bytes-honesty rule,
 §4.1 for the VectorCodec[P] Protocol shape, and §5.4 for the
 ``ExtRaBitQPayload`` schema + its ``offset`` omission amendment.
 """

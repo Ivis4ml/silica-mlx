@@ -6,7 +6,7 @@ oracle batcher that runs the same trajectory regime (slice-prefill)
 but doesn't carry a seeded radix tree. Same model, two independent
 batchers + caches.
 
-Acceptance per ``docs/P3_C5_3_DESIGN.md`` §4.4 (post-C5.4 wording):
+Acceptance per ``plans/P3_C5_3_DESIGN.md`` §4.4 (post-C5.4 wording):
 
 - **Subject**: ``prefix_cache=RadixPrefixCache(block_size=B)``. Slice
   regime active via the production predicate

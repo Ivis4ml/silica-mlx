@@ -21,7 +21,7 @@ Model target amendment: opening §7(d) originally named Qwen3.5-0.8B,
 but that checkpoint is hybrid-DeltaNet (``has_recurrent_state=True``)
 and ``ContinuousBatcher`` refuses ``RadixPrefixCache`` on recurrent
 adapters (DeltaNet running accumulation cannot be sliced into
-block-aligned prefix K/V — see ``docs/P3_DELTANET_SURVEY.md``
+block-aligned prefix K/V — see ``plans/P3_DELTANET_SURVEY.md``
 C-open-3). Amended to Qwen3-0.6B (plain GLOBAL attention, 28 layers,
 head_dim=128, no recurrent state). The codec-vs-identity ratio
 is head-dim / layer-count independent, so the 0.85× threshold

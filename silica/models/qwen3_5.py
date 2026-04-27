@@ -30,7 +30,7 @@ Qwen3.5-specific traits this adapter handles:
   relies on — one of the reasons Silica borrows mlx-lm's loader).
 - P-1 runs single-request through ``SimpleKVCache`` (verified at M-2).
 - P-2 batched path for hybrid DeltaNet is deferred to P-3 via an
-  adapter-owned ``BatchRecurrentStateStore`` (see ``docs/P2_OPENING.md``
+  adapter-owned ``BatchRecurrentStateStore`` (see ``plans/P2_OPENING.md``
   scope statement). The P-2 ``ContinuousBatcher`` will refuse to accept
   this adapter at construction time.
 """
@@ -305,7 +305,7 @@ class Qwen3_5Adapter:
         specifically, so we conservatively return ``None`` for all
         prefix-reuse requests. DeltaNet's recurrent hidden state is a
         running accumulation over the entire sequence (see
-        ``docs/P3_DELTANET_SURVEY.md`` §3.2) — unlike per-token K/V it
+        ``plans/P3_DELTANET_SURVEY.md`` §3.2) — unlike per-token K/V it
         cannot be sliced to a partial prefix, so "always None" is the
         only correct P-3 behaviour.
 
@@ -344,7 +344,7 @@ class Qwen3_5Adapter:
 
         GLOBAL (full-attention) layers are skipped — their K/V is
         owned by ``SyntheticPrefixBlockStore`` and is not part of the
-        recurrent snapshot surface (per ``docs/P3_C5_OPENING.md`` §3.1).
+        recurrent snapshot surface (per ``plans/P3_C5_OPENING.md`` §3.1).
 
         Lazy-allocation case (``cache.cache[i] is None`` because no
         forward has populated this slot yet on this row) is preserved

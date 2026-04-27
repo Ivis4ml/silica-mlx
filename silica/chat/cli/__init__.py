@@ -1,6 +1,6 @@
 """silica.chat.cli — chat CLI assembly (Side track 2).
 
-Module layout per ``docs/CHAT_CLI_OPENING.md`` §7:
+Module layout per ``plans/CHAT_CLI_OPENING.md`` §7:
 
 - :mod:`silica.chat.cli.palette` — ANSI colour constants + capability
   detection (24-bit / 8-colour / NO_COLOR fallback).

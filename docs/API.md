@@ -2,7 +2,7 @@
 
 Per-module reference for every public class, function, and method in the
 `silica` package. Organized by subpackage. For the project overview and
-roadmap see [`PLAN.md`](PLAN.md); for quickstart see [`../README.md`](../README.md).
+roadmap see [`PLAN.md`](../plans/PLAN.md); for quickstart see [`../README.md`](../README.md).
 
 Symbols are marked:
 - **public** — re-exported from the subpackage's `__init__` or the top-level `silica`.
@@ -1162,11 +1162,11 @@ skipping `None` fields.
 
 ## See also
 
-- [`PLAN.md`](PLAN.md) — phases, decisions, open questions.
-- [`P2_OPENING.md`](P2_OPENING.md) — architectural opening doc for the
+- [`PLAN.md`](../plans/PLAN.md) — phases, decisions, open questions.
+- [`P2_OPENING.md`](../plans/P2_OPENING.md) — architectural opening doc for the
   `ContinuousBatcher` / `RadixPrefixCache` / `MemoryBudgeter` stack.
-- [`P2_UNIT_16C_PREP.md`](P2_UNIT_16C_PREP.md), [`P2_UNIT_16C_2_PREP.md`](P2_UNIT_16C_2_PREP.md),
-  [`P2_UNIT_16D_PREP.md`](P2_UNIT_16D_PREP.md) — per-unit prep docs with
+- [`P2_UNIT_16C_PREP.md`](../plans/P2_UNIT_16C_PREP.md), [`P2_UNIT_16C_2_PREP.md`](../plans/P2_UNIT_16C_2_PREP.md),
+  [`P2_UNIT_16D_PREP.md`](../plans/P2_UNIT_16D_PREP.md) — per-unit prep docs with
   the invariant tables (S-1..S-7, B-1..B-9, L-1..L-3) that the batcher's
   tests enforce.
 - `tests/` — the authoritative behaviour spec. `test_batcher.py`,

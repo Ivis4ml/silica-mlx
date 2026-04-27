@@ -38,7 +38,7 @@ C5.2 acceptance gates (verified by tests in this file):
 Tests do NOT exercise:
 
 - Bit-exact restore vs no-preempt oracle — impossible at C5.2's
-  natural boundaries (see ``docs/P3_C5_DRIFT_EXPERIMENT/README.md``
+  natural boundaries (see ``plans/P3_C5_DRIFT_EXPERIMENT/README.md``
   "C5.2 acceptance" for the boundary derivation). C5.3 owns
   boundary-aligned restore.
 - ``RadixPrefixCache`` cooperation — C5.3.

@@ -1,6 +1,6 @@
 """Tests for P-4.5-B.1 admission-reorder under Q-010 fairness fix.
 
-Split into five sections, matching `docs/P4_5_CHUNKED_PREFILL_OPENING.md` §8:
+Split into five sections, matching `plans/P4_5_CHUNKED_PREFILL_OPENING.md` §8:
 
   1. `_sort_admissions_by_length` stability + req_index preservation.
   2. `_initial_cohort_cap` preconditions + worked reverse examples from

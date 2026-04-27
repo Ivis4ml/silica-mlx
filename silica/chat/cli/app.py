@@ -29,7 +29,7 @@ Ctrl-C semantics:
   inside ``engine.generate`` — pressing Ctrl-C aborts the current
   turn and returns to the prompt.
 
-Manual smoke checklist — see ``docs/CHAT_CLI_OPENING.md`` §10.
+Manual smoke checklist — see ``plans/CHAT_CLI_OPENING.md`` §10.
 """
 
 from __future__ import annotations

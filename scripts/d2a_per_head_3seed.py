@@ -1,7 +1,7 @@
 """Measurement-only D.2a re-run with ``per_head_rotation=True``.
 
 Item B follow-up to v1.7.8: the (4-b) D.2a 3-seed cross-check
-(`docs/P5_D2_INVESTIGATION/d2a_verification_3seeds.jsonl`) measured
+(`plans/P5_D2_INVESTIGATION/d2a_verification_3seeds.jsonl`) measured
 ``mean_gap = silica.ΔPPL − vqbench.ΔPPL = -0.150 PPL`` at the
 ``qwen3-0.6b-wikitext-ppl-block-tq-b64-b4-vqbench-aligned`` row, and
 both the (4-b) two-part aggregated gate and silica's per-row
@@ -24,7 +24,7 @@ seed in {42, 43, 44} install the per-head BlockTQ codec on
 ΔPPL.
 
 Output: writes
-``docs/P5_D2_INVESTIGATION/per_head_rotation_3seeds.jsonl`` (one
+``plans/P5_D2_INVESTIGATION/per_head_rotation_3seeds.jsonl`` (one
 row per seed) and prints the aggregated mean / std / SEM plus the
 new mean_gap vs vqbench's locked baseline (0.661 ± 0.347, SEM
 0.200) so the (4-b) close decision can compare apples-to-apples.
@@ -72,7 +72,7 @@ OUT_PATH = (
 )
 
 # Vqbench-locked baseline from
-# ``docs/P5_D2_INVESTIGATION/d2a_verification_3seeds.jsonl`` —
+# ``plans/P5_D2_INVESTIGATION/d2a_verification_3seeds.jsonl`` —
 # vqbench's ΔPPL on the same workload at seeds 42/43/44 with its
 # native per-head rotation. mean = 0.661, std = 0.347 (Bessel n-1),
 # SEM = std / sqrt(3) = 0.200.

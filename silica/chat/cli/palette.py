@@ -1,6 +1,6 @@
 """silica.chat.cli.palette — ANSI colour palette and capability detection.
 
-Encodes the colour scheme defined in ``docs/CHAT_CLI_OPENING.md``
+Encodes the colour scheme defined in ``plans/CHAT_CLI_OPENING.md``
 §4.1. Three rendering modes:
 
 - **24-bit** — full RGB ANSI escapes, used when the terminal

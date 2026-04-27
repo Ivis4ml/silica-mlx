@@ -13,7 +13,7 @@ at P-3-C5.4 — the production predicate
 ``RecurrentStateAdapter + prefix_cache is not None`` is now the only
 gate, and tests construct hybrid + prefix_cache directly.
 
-Acceptance shape per ``docs/P3_C5_3_DESIGN.md`` §4.4 + the C5.3.3
+Acceptance shape per ``plans/P3_C5_3_DESIGN.md`` §4.4 + the C5.3.3
 recon findings:
 
 - Phase-B classifier consults ``peek_with_node(prompt[:usable])`` —

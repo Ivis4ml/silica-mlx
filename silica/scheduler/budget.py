@@ -6,7 +6,7 @@ single place that applies decisions. Separating decide / apply keeps
 this unit testable without wiring up real caches.
 
 **16d-1 refactor:** the budgeter originally took ``kv: PagedKVCache`` for
-its ``block_size``. Under Option B (docs/P2_OPENING.md v2.1), the
+its ``block_size``. Under Option B (plans/P2_OPENING.md v2.1), the
 batcher uses ``BatchKVCache`` not ``PagedKVCache``, and the budgeter
 never actually queried kv residency at decision time — it only needed
 ``block_size``. We now take ``block_size: int`` directly, keep
@@ -14,7 +14,7 @@ never actually queried kv residency at decision time — it only needed
 and offer a ``for_adapter`` convenience factory so callers do not
 recompute ``bytes_per_token``.
 
-Two accountings (docs/P2_OPENING.md v2.1 §MemoryBudgeter):
+Two accountings (plans/P2_OPENING.md v2.1 §MemoryBudgeter):
 
   - **resident_bytes** — D-012 canonical; a non-normative reference for
     what the kv backend actually holds. Not read at decision time.

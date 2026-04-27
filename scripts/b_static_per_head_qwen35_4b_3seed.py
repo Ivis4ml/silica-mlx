@@ -27,7 +27,7 @@ Workload knobs match `qwen35_4b_b_static_close.md` exactly:
     the F.3 production default.
 
 Output: writes
-``docs/P5_ACCEPTANCE_SWEEP/qwen35_4b_b_static_per_head_3seeds.jsonl``
+``plans/P5_ACCEPTANCE_SWEEP/qwen35_4b_b_static_per_head_3seeds.jsonl``
 (per-seed rows + aggregate) and prints comparison vs the v1.7.7
 shared-rotation baseline + the vqbench REPORT.md target.
 
@@ -73,7 +73,7 @@ OUT_PATH = (
 )
 
 # v1.7.7 (b-static) close baseline — shared rotation, same workload.
-# From docs/P5_ACCEPTANCE_SWEEP/qwen35_4b_b_static_3seeds.{jsonl,md}.
+# From plans/P5_ACCEPTANCE_SWEEP/qwen35_4b_b_static_3seeds.{jsonl,md}.
 SHARED_ROTATION_PER_SEED_DELTA = (0.024785, -0.016742, -0.003374)
 SHARED_ROTATION_FP16_PPL = 8.855978965984526
 
