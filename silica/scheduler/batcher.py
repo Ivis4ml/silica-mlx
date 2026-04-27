@@ -449,8 +449,17 @@ class ContinuousBatcher:
              ran admissions this step (prefill T vs decode T=1 can't
              mix; existing DECODE rows idle this step).
         """
+        cohort_events: list[BatchEvent] = []
         if not self._cohort_prepared:
-            self._prepare_cohort()
+            cohort_events = self._prepare_cohort()
+        if cohort_events:
+            # Q-012 / D-021 step 2(b): when ``_prepare_cohort`` ran the
+            # prefix-classified hit + miss admissions, it already did
+            # the cohort's prefill forward and emitted token events.
+            # Skip Phase 1 / Phase 3 to mirror the post-Phase-2 early
+            # return semantics: prefill-T and decode-T=1 cannot mix in
+            # the same step.
+            return cohort_events
 
         # Phase 1: reclaim deferred terminals.
         self._reclaim_terminated()
@@ -471,7 +480,7 @@ class ContinuousBatcher:
 
     # --- phase methods ---
 
-    def _prepare_cohort(self) -> None:
+    def _prepare_cohort(self) -> list[BatchEvent]:
         """Seal the initial cohort; allocate per-layer cache with per-row
         left_padding.
 
@@ -494,17 +503,110 @@ class ContinuousBatcher:
 
         After this runs, subsequent ``add_request`` calls go to the
         waiting queue (mid-run admission path, see Phase 2).
+
+        **Q-012 / D-021 step 2(b) (v1.7.14):** when a prefix cache is
+        installed, the initial cohort is classified the same way
+        ``_admit_waiting_requests`` classifies mid-run admissions:
+        each row is ``peek``-ed; full-hit rows are routed through
+        ``_admit_single_hit_row`` (per-row seeded admission, suffix-
+        only prefill); miss rows are routed through
+        ``_admit_miss_cohort`` (batched prefill of just the miss
+        cohort). Without this branch, two consecutive
+        ``Engine.generate_batch([prompt], prefix_cache=shared_pc, ...)``
+        calls would each pay full-prefill on the second call's
+        initial cohort, defeating cross-call prefix reuse for chat
+        REPL / HTTP-server workloads. Returns the events emitted by
+        the seeded-admission and miss-cohort forwards; an empty
+        list under the legacy (no-prefix-cache or empty-cohort) path
+        preserves byte-identical behaviour for the
+        ``prefix_cache=None`` case.
         """
         self._cohort_prepared = True
         if not self._rows:
-            return
-        max_prompt_len = max(len(r.prompt_ids) for r in self._rows)
-        left_padding = [
-            max_prompt_len - len(r.prompt_ids) for r in self._rows
+            return []
+
+        if self._prefix_cache is None:
+            # Pre-Q-012 path: build batch cache for the whole cohort
+            # and transition every row to PREFILL. The forward runs
+            # in ``_prefill_phase`` in this same ``step()``.
+            max_prompt_len = max(len(r.prompt_ids) for r in self._rows)
+            left_padding = [
+                max_prompt_len - len(r.prompt_ids) for r in self._rows
+            ]
+            self._batch_cache = _make_batch_cache(self._adapter, left_padding)
+            for row in self._rows:
+                row.state.transition(
+                    RequestStatus.PREFILL, reason="admit-cohort"
+                )
+            return []
+
+        # Q-012 affirmative resolution: classify the initial cohort
+        # against the prefix cache, then delegate to the same hit /
+        # miss admission paths the mid-run queue uses.
+        pending_admits = [
+            _PendingAdmit(
+                req_index=row.req_index,
+                prompt_ids=tuple(row.prompt_ids),
+                params=row.params,
+            )
+            for row in self._rows
         ]
-        self._batch_cache = _make_batch_cache(self._adapter, left_padding)
-        for row in self._rows:
-            row.state.transition(RequestStatus.PREFILL, reason="admit-cohort")
+        # Drain ``_rows``; ``_admit_single_hit_row`` and
+        # ``_admit_miss_cohort`` re-append the rows they admit so
+        # the post-classification ``self._rows`` order matches the
+        # canonical (hit-first, miss-second) sequence the mid-run
+        # path produces.
+        self._rows = []
+        block_size = self._prefix_cache.block_size
+        needs_recurrent_snapshot = isinstance(
+            self._adapter, RecurrentStateAdapter
+        )
+        hit_rows: list[tuple[_PendingAdmit, int]] = []
+        miss_rows: list[_PendingAdmit] = []
+        for pending in pending_admits:
+            raw = self._prefix_cache.peek(pending.prompt_ids)
+            # S-5 edge 1: reserve at least one token for suffix
+            # prefill so first-token logits are available. Mirrors
+            # ``_admit_waiting_requests``.
+            if len(pending.prompt_ids) <= 1:
+                max_aligned = 0
+            else:
+                max_aligned = (
+                    (len(pending.prompt_ids) - 1) // block_size
+                ) * block_size
+            usable = min(raw.num_hit_tokens, max_aligned)
+            if usable == 0:
+                miss_rows.append(pending)
+                continue
+            if needs_recurrent_snapshot:
+                # P-3-C5.3.3: hybrid recurrent adapters require the
+                # deepest USABLE node to carry a recurrent_snapshot
+                # before routing to the hit path. Same predicate the
+                # mid-run classifier applies.
+                _, deepest_usable = self._prefix_cache.peek_with_node(
+                    pending.prompt_ids[:usable]
+                )
+                if (
+                    deepest_usable is None
+                    or deepest_usable.recurrent_snapshot is None
+                ):
+                    miss_rows.append(pending)
+                    continue
+            hit_rows.append((pending, usable))
+
+        events: list[BatchEvent] = []
+        # Phase 1: hit rows go through per-row seeded admission.
+        for pending, usable in hit_rows:
+            events.extend(self._admit_single_hit_row(pending, usable))
+        # Phase 2: miss rows go through one batched prefill.
+        if miss_rows:
+            events.extend(self._admit_miss_cohort(miss_rows))
+
+        # Mirror ``_admit_waiting_requests``'s end-of-phase rebuild —
+        # ``_admit_*`` only append; the slot table is rebuilt once
+        # after both phases mutate ``self._rows``.
+        self._rebuild_slot_table()
+        return events
 
     def _reclaim_terminated(self) -> None:
         """Drop terminal rows from the batch before the forward phase.

@@ -1620,7 +1620,32 @@ Resolved questions are not deleted. Mark `Status: resolved` and append a `Resolu
 ### Q-012 — Initial-cohort prefix-cache consultation
 
 - **Raised:** 2026-04-21 (surfaced during P-4.5-C.1 test authoring).
-- **Status:** open — deferred; v0.1 behavior intentional, revisit for v0.2.
+- **Status:** resolved (2026-04-27, v1.7.14, P5.9 step 2(b) per
+  D-021) — Option B (consult prefix cache in `_prepare_cohort`).
+  ``ContinuousBatcher._prepare_cohort`` now classifies the initial
+  cohort the same way ``_admit_waiting_requests`` classifies
+  mid-run admissions: each row is ``peek``-ed; full-hit rows
+  route through ``_admit_single_hit_row`` (per-row seeded
+  admission, suffix-only prefill); miss rows route through
+  ``_admit_miss_cohort`` (batched prefill of the miss cohort).
+  ``_prepare_cohort`` returns the events emitted by both paths;
+  ``step()`` early-returns those events to mirror the
+  post-Phase-2 prefill/decode-T-mix invariant. The
+  ``prefix_cache=None`` path is preserved bit-identical (no
+  classification branch reached). Recurrent-snapshot guard
+  (``RecurrentStateAdapter`` + ``deepest_usable.recurrent_snapshot
+  is None`` → miss) is the same predicate the mid-run classifier
+  applies.
+  **Evidence:** ``tests/test_batcher_initial_cohort_prefix_consult.py``
+  (6 tests covering full-hit, no-hit-with-cache, no-cache, mixed
+  hit+miss B>1, and the cross-call generate_batch motivating
+  case at max_batch_size ∈ {1, 2}). Full non-real-model suite
+  2032 passed / 25 skipped at the landing commit (was 2026
+  pre-fix; +6 new). Net effect on P-8 / chat REPL: cross-call
+  prefix reuse now works end-to-end without caller
+  workarounds — the chat REPL's apply_chat_template prefix is
+  reused across turns through ``shared_pc``, and the future
+  HTTP server gets the same lever for free.
 - **Question:** should `ContinuousBatcher._prepare_cohort` (the initial cohort seal) consult `RadixPrefixCache` for prefix hits, or continue to run miss-path prefill unconditionally on every pre-step admission?
 - **Context:** As of P-2 Option B + 16c.2 step 4, prefix-cache lookup only fires inside `_admit_waiting_requests` (mid-run admission) via `peek` → `_admit_single_hit_row`. The initial cohort prepared by `_prepare_cohort` runs miss-path prefill for every row it admits, even when the prefix cache already holds a full aligned prefix for that prompt. Consequence at the user-visible layer: two consecutive `Engine.generate_batch([p], params, prefix_cache=shared_pc, ...)` calls — e.g. a REPL chatbot where each turn is a separate `generate_batch` call on the same `shared_pc` — each run a miss-path prefill on prompt `p`, so cross-call prefix reuse is effectively zero. Within a single `generate_batch([p, q], ...)` call where `p` is longer than `max_batch_size`, prompt `q` does get mid-run admission via the waiting queue and benefits from prefix reuse.
 - **Options:**
