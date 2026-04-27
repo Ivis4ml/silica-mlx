@@ -40,6 +40,12 @@ import time
 from pathlib import Path
 from typing import Any
 
+from silica.chat.cli.code_fence import (
+    CodeFenceParser,
+    EnterFence,
+    ExitFence,
+    PlainText,
+)
 from silica.chat.cli.commands import (
     CommandResult,
     dispatch_command,
@@ -126,6 +132,51 @@ def _clear_phase_indicator() -> None:
     movement on most terminals)."""
     sys.stdout.write("\r\x1b[K")
     sys.stdout.flush()
+
+
+def _highlight_code(code: str, language: str) -> str:
+    """Run pygments syntax highlighting on a code block, returning
+    ANSI-colourised text suitable for stdout.
+
+    Falls back to monochrome (the original ``code`` unchanged)
+    when:
+
+    - pygments is not installed (chat extras not active);
+    - the language identifier does not resolve to a known lexer
+      (and ``guess_lexer`` also fails — rare but possible for
+      pseudo-languages or fenced-but-unfenced content).
+
+    Returns the highlighted string with a trailing newline; the
+    caller writes it as-is to stdout. Style is ``monokai`` per
+    design doc §4.1 (dark-terminal-friendly, common default in
+    chat apps).
+    """
+    try:
+        from pygments import highlight  # type: ignore[import-untyped]
+        from pygments.formatters import (  # type: ignore[import-untyped]
+            Terminal256Formatter,
+        )
+        from pygments.lexers import (  # type: ignore[import-untyped]
+            get_lexer_by_name,
+            guess_lexer,
+        )
+        from pygments.util import ClassNotFound  # type: ignore[import-untyped]
+    except ImportError:
+        return code
+    lexer: Any = None
+    if language:
+        try:
+            lexer = get_lexer_by_name(language, stripnl=False)
+        except ClassNotFound:
+            lexer = None
+    if lexer is None:
+        try:
+            lexer = guess_lexer(code, stripnl=False)
+        except (ClassNotFound, Exception):
+            return code
+    formatter = Terminal256Formatter(style="monokai")
+    result: str = highlight(code, lexer, formatter)
+    return result
 
 
 def _format_feedback(result: CommandResult, palette: Palette) -> list[str]:
@@ -379,6 +430,8 @@ def run_chat(args: argparse.Namespace) -> int:
         )
         thinking_started_at: list[float] = []  # mutable for closure write
         prefix_emitted: list[bool] = [False]
+        fence_parser = CodeFenceParser()
+        in_fence: list[bool] = [False]
         _print_phase_indicator("prefilling", "yellow", palette)
 
         def _emit_assistant_prefix_once() -> None:
@@ -387,6 +440,43 @@ def run_chat(args: argparse.Namespace) -> int:
                 sys.stdout.write(_format_assistant_prefix(palette))
                 sys.stdout.flush()
                 prefix_emitted[0] = True
+
+        def _emit_reply_text(text: str) -> None:
+            """Send reply text through the code-fence parser and
+            render its events. Plain text writes through; code
+            inside a fence is buffered until the closing fence
+            arrives, at which point it goes through pygments and
+            emits as one highlighted block. While buffering, an
+            inline ``writing code (lang)...`` indicator is
+            visible (cyan) so the user knows the model is
+            producing code that will appear shortly."""
+            for fevent in fence_parser.feed(text):
+                if isinstance(fevent, PlainText):
+                    if fevent.text:
+                        sys.stdout.write(fevent.text)
+                        sys.stdout.flush()
+                elif isinstance(fevent, EnterFence):
+                    in_fence[0] = True
+                    label = (
+                        f"writing code ({fevent.language})"
+                        if fevent.language
+                        else "writing code"
+                    )
+                    _print_phase_indicator(label, "cyan", palette)
+                elif isinstance(fevent, ExitFence):
+                    in_fence[0] = False
+                    _clear_phase_indicator()
+                    highlighted = _highlight_code(
+                        fevent.code, fevent.language
+                    )
+                    # Frame the block with a leading newline so
+                    # the indicator's line break is preserved.
+                    sys.stdout.write(
+                        "\n" + highlighted
+                    )
+                    if not highlighted.endswith("\n"):
+                        sys.stdout.write("\n")
+                    sys.stdout.flush()
 
         def _stream_callback(delta: str) -> None:
             # One stream_to call == one decoded token; track the
@@ -429,8 +519,7 @@ def run_chat(args: argparse.Namespace) -> int:
                     if state.stream_state is StreamState.PREFILL:
                         state.stream_state = StreamState.DECODE
                     _emit_assistant_prefix_once()
-                    sys.stdout.write(event.text)
-                    sys.stdout.flush()
+                    _emit_reply_text(event.text)
 
         try:
             metrics = chat_session.chat(
@@ -473,7 +562,24 @@ def run_chat(args: argparse.Namespace) -> int:
                 state.last_turn_thinking += event.text
             elif isinstance(event, ReplyChunk):
                 _emit_assistant_prefix_once()
-                sys.stdout.write(event.text)
+                _emit_reply_text(event.text)
+        # Drain any text the fence parser held back. A truncated
+        # fence yields a final ExitFence so the highlighter still
+        # gets to emit; a held-back partial-open marker becomes
+        # plain text and flushes out untouched.
+        for fevent in fence_parser.finish():
+            if isinstance(fevent, PlainText):
+                if fevent.text:
+                    sys.stdout.write(fevent.text)
+                    sys.stdout.flush()
+            elif isinstance(fevent, ExitFence):
+                _clear_phase_indicator()
+                highlighted = _highlight_code(
+                    fevent.code, fevent.language
+                )
+                sys.stdout.write("\n" + highlighted)
+                if not highlighted.endswith("\n"):
+                    sys.stdout.write("\n")
                 sys.stdout.flush()
 
         # Empty-reply edge case: generation ended without emitting
