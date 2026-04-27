@@ -100,6 +100,68 @@ tracks 3..6, sequenced after P-6/7/8/9.
   the user sees prefill TTFT drop visibly turn-over-turn — the
   silica-mlx vs. mlx-lm difference made visible at the user surface.
 
+### 3.2.1 Thinking-mode interaction
+
+Qwen3 / Qwen3.5 family models emit `<think>...</think>` blocks
+before the actual reply when reasoning mode is on (the default for
+those families). Streamed verbatim, the thinking text floods the
+conversation log with internal chain-of-thought; the user sees
+multi-paragraph deliberation before any usable answer arrives.
+Modern chat apps (Claude, ChatGPT) collapse this into a single-line
+"Thinking..." indicator and stream the actual reply afterwards. The
+silica chat CLI should match this behaviour.
+
+Streaming state machine (extends §4 toolbar's state field):
+
+  - `idle → prefill → thinking → replying → idle`
+  - The transition from `prefill` to `thinking` triggers when the
+    first streamed token is or is followed by `<think>`.
+  - The transition from `thinking` to `replying` triggers when
+    `</think>` appears in the stream. Tokens after that flow into
+    the assistant reply normally.
+  - A model with no `<think>` tag (e.g. thinking disabled, or a
+    non-reasoning family) skips `thinking` entirely:
+    `prefill → replying`.
+
+Conversation log rendering:
+
+  - During `thinking`: a single line `silica › ⠋ thinking... 4.2s`
+    (Braille spinner + elapsed seconds) replaces what would be
+    streamed text. Thinking tokens are buffered to `ChatCliState.
+    last_turn_thinking` but not rendered into the main log.
+  - On `</think>`: the spinner line is rewritten as
+    `silica › thought for 6.3s` (or removed entirely under
+    `thinking_display=hidden`) and the actual reply begins
+    streaming below.
+  - Slash command `/expand` reprints the previous turn's thinking
+    text with a dimmed-italic style so the user can inspect what
+    the model reasoned through. `/expand <turn_idx>` for older
+    turns.
+
+Config and control:
+
+  - `/config thinking=auto` (default) — collapse during stream,
+    `/expand` available afterwards.
+  - `/config thinking=show` — render thinking text inline as it
+    streams, dimmed italic.
+  - `/config thinking=hidden` — collapse during stream, do not even
+    show the elapsed-time line; thinking is silent.
+  - `/config thinking_mode=on|off` — passes `enable_thinking=True/
+    False` into the chat template (Qwen3 / Qwen3.5 honour the
+    flag). Off makes the model skip reasoning entirely; faster
+    TTFT and shorter total tokens, at the cost of reasoning depth.
+
+Edge cases:
+
+  - Thinking interrupted by `max_tokens`: show
+    `[thinking truncated at N tokens]` before any partial reply.
+  - Model with no thinking support: `<think>` never appears, state
+    machine never enters `thinking`, no behaviour change.
+  - Nested `<think>` tags: not produced by Qwen3 in practice;
+    unspecified — buffer all and exit on first `</think>`.
+
+This is implemented in C-8 of §8 sub-units below.
+
 ### 3.3 Out of scope (deferred to side track 3+)
 
 - Tool calling / file edits / bash execution / web fetch.
@@ -121,7 +183,7 @@ sticky-rendered between turns. Fields, left to right:
 
 | Field | Source | Meaning |
 | --- | --- | --- |
-| `state` | scheduler state machine | one of `idle` / `prefill` / `decode` / `paused` — what the engine is doing right now |
+| `state` | scheduler state machine + stream parser | one of `idle` / `prefill` / `thinking` / `decode` / `paused` — what the engine + parser is doing right now |
 | `model` | `--model` / `/model` | basename of the currently-loaded HF repo (e.g. `Qwen3-0.6B`) |
 | `MLX` badge | always | static "MLX" marker (the silica-mlx-vs-everything-else signal) |
 | `tok/s` | `engine.metrics` | live decode tok/s during the decode phase; "—" otherwise |
@@ -152,7 +214,8 @@ the entire layer.
 | Assistant streamed text | default foreground | readable on any terminal |
 | Toolbar `MLX` badge | bright orange + bold | brand affordance |
 | Toolbar `state=decode` | bright green | "we're producing tokens right now" |
-| Toolbar `state=prefill` | yellow | "thinking" — informs user the wait is normal |
+| Toolbar `state=thinking` | bright magenta | "model is reasoning inside `<think>...</think>`" |
+| Toolbar `state=prefill` | yellow | "consuming prompt tokens" — informs user the wait is normal |
 | Toolbar `state=idle` | dim gray | resting |
 | Toolbar `tok/s` | cyan | the headline performance number |
 | Toolbar `compr=Xx` | bright orange | KV codec savings (silica-only signal) |
@@ -210,13 +273,84 @@ difference.
 Launch surface intentionally minimal:
 
 ```text
-silica-chat --model Qwen/Qwen3-0.6B
-silica-chat --model Qwen/Qwen3-0.6B --kv-codec block_tq_b64_b4
-silica-chat --model Qwen/Qwen3-0.6B --system "You are concise."
+silica                                              # chat with all defaults (Qwen3-0.6B + fp16)
+silica --model Qwen/Qwen3-4B                         # bare silica accepts chat flags
+silica --kv-codec block_tq_b64_b4                    # bare silica accepts codec flag
+silica --kv-codec block_tq_b64_b4 --model Qwen/Qwen3-4B
+silica chat --model Qwen/Qwen3-0.6B                  # explicit subcommand form, equivalent
+silica chat --kv-codec block_tq_b64_b4 --system "You are concise."
+silica run --prompt "..."                            # single-shot path, unchanged from today
 ```
+
+Bare `silica` and `silica chat` are equivalent. Implementation: in
+`silica/server/cli.py:main`, pre-process `argv` — if `argv[0]` is
+not a known subcommand (`run` / `chat` / `--help` / `--version`),
+prepend `chat` so all chat flags land on the chat subparser. This
+is the same pattern `pytest`, `cargo`, and many CLIs use; it keeps
+the root parser simple (single source of truth for chat flags
+lives on the chat subparser).
 
 Everything else lives behind `/config` so the launch flow feels
 like opening a chat app, not configuring a tool.
+
+### 6.1 Codec default — why fp16
+
+The `kv_codec` row above defaults to `none (fp16)`, not to
+`block_tq_b64_b4`, even though the v1.7.7 (b-static) close gate
+shows BlockTQ b64 b4 is statistically indistinguishable from fp16
+on Qwen3.5-4B WikiText-2. Three reasons:
+
+1. **Cross-model safety.** The lossless-at-measurement-precision
+   result is on Qwen3.5-4B. On Qwen3-0.6B (the default bare-launch
+   model) the D.2a 3-seed measurement showed mean ΔPPL = +0.51 PPL
+   — small but visible. Codec losses scale inversely with model
+   size (smaller models are more sensitive to KV reconstruction
+   noise). Defaulting to codec would silently change quality on
+   the default model without user consent.
+2. **Single-user short-chat economics.** The codec compresses what
+   sits in the prefix store, not what flows through active
+   `BatchKVCache`. For a single user's short chat, prefix store
+   size is typically 10-100 MB; 3.8× compression saves tens of MB
+   on a 48 GB machine — small absolute. The TTFT / quality / "feel"
+   trade-off does not break even at this scale.
+3. **No silent quality changes.** Codec activation is a meaningful
+   architectural choice; the user should opt in knowingly via
+   `--kv-codec` or `/config kv_codec=...`. Toolbar exposes
+   `compr=—` by default so the feature is discoverable.
+
+### 6.2 When codec actually pays off
+
+| Workload | Prefix store size | fp16 footprint | Codec footprint | Absolute savings | Worth opting in? |
+| --- | --- | --- | --- | --- | --- |
+| Short chat (5-10 turns, brief prompts) | ~1-2K tokens | ~20-40 MB | ~5-10 MB | ~15-30 MB | No — under noise |
+| Long chat (50+ turns, code / writing) | ~10-30K tokens | ~200-600 MB | ~50-150 MB | ~150-450 MB | Marginal |
+| Single-user RAG / agent (long-doc context) | ~50-200K tokens | 1-4 GB | 0.25-1 GB | 0.75-3 GB | Yes |
+| Multi-user serving (shared system prompt / few-shot) | cross-user accumulated | 5-20 GB | 1.3-5 GB | 4-15 GB | Required |
+| 48 GB tight deployment (27B model + long session) | any | overflow | fits | enables run | Required |
+
+The chat CLI's primary user is the first or second row. The codec
+is structurally available from C-7 onward but **not the default**.
+The toolbar surfaces a soft hint when prefix store growth crosses
+a threshold (default 200 MB):
+
+```text
+tip: --kv-codec block_tq_b64_b4 would compress prefix store ~3.8x
+```
+
+This makes the feature discoverable without forcing it. The
+threshold is `/config kv_codec_hint_mb=<value>`. For workloads
+that consistently sit in row 3 or below (RAG, agents, multi-user),
+the user opts in once at launch and toolbar shows live `compr=`
+ratio.
+
+### 6.3 Codec under multi-user serving (post P-8)
+
+When the OpenAI HTTP server (P-8) lands, the multi-user case
+becomes the default deployment shape, and the economics flip:
+shared prefix across users, prefix store size dominated by
+session count. At that point silica-server may default to codec on
+(or auto-tune based on residency pressure) — out of scope for
+side track 2 chat CLI but recorded as the trajectory.
 
 ## 7. Module layout
 
@@ -301,10 +435,25 @@ plus session, dispatch into `silica.chat.cli.app.run_chat`.
    closing fence arrives.
 7. **C-7 — `--kv-codec` and showcase polish.** Wire `--kv-codec`
    on the chat CLI launcher (today only `scripts/bench.py` carries
-   it). `/showcase` prints the session narrative.
+   it). Bare-`silica` argv preprocessing in `silica/server/cli.py`
+   lands here. `/showcase` prints the session narrative. Toolbar
+   200 MB prefix-store-size hint that suggests
+   `--kv-codec block_tq_b64_b4` lands here.
+8. **C-8 — Thinking-mode interaction.** Stream parser tracks
+   `<think>` / `</think>` boundaries; state machine extends to
+   `prefill → thinking → replying`; conversation log collapses
+   thinking into a single spinner line by default; `/expand` shows
+   the buffered thinking from a previous turn; `/config thinking=
+   {auto,show,hidden}` toggles visibility; `/config thinking_mode=
+   {on,off}` propagates `enable_thinking` through the chat
+   template. Unit-tested for the parser (in
+   `tests/test_chat_cli_thinking_parser.py`) — fed a stream with
+   and without `<think>` tags, asserts state transitions and
+   buffer contents. UI integration validated manually.
 
-C-1, C-2, C-4 are pure-Python and testable. C-3, C-5, C-6 are
-interactive-only and validated manually.
+C-1, C-2, C-4, C-8 (parser portion) are pure-Python and testable.
+C-3, C-5, C-6, C-8 (UI portion) are interactive-only and validated
+manually.
 
 ## 9. Dependencies added
 
@@ -317,30 +466,48 @@ Python API or `silica run` single-shot do not pay the import cost.
 
 ## 10. Acceptance — when is side track 2 done
 
-- [ ] C-1..C-7 all landed.
+- [ ] C-1..C-8 all landed.
 - [ ] **Bare `silica` opens the chat REPL** (claude-style) on a
       sensible default model with no subcommand and no flags.
+- [ ] **Bare-silica accepts chat flags:**
+      `silica --kv-codec block_tq_b64_b4 --model Qwen/Qwen3-4B`
+      is equivalent to the explicit `silica chat ...` form.
+- [ ] **Default codec is fp16.** Toolbar shows `compr=—` on a
+      bare launch; codec only activates when `--kv-codec` is
+      supplied at launch or `/config kv_codec=...` is issued.
 - [ ] `silica chat --model Qwen/Qwen3-0.6B` launches into a chat
       with persistent bottom toolbar, no sampling-knob flags
       required.
 - [ ] **Colour identity visible:** `You ›` rendered in bright
       green, `silica ›` and the toolbar `MLX` badge in bright
-      orange. `NO_COLOR=1` flips both to plain text.
+      orange. `state=thinking` shows in bright magenta when the
+      model emits a `<think>` block. `NO_COLOR=1` flips all of
+      these to plain text.
 - [ ] First user message → `prefill` → first token visible →
       `decode` → finished, with toolbar live-updating throughout.
+- [ ] **Thinking-mode collapse:** on a Qwen3 family model with
+      reasoning enabled, the conversation log shows
+      `silica › ⠋ thinking... 4.2s` during the `<think>...</think>`
+      block, then the actual reply streams below. `/expand` reprints
+      the buffered thinking from the previous turn.
 - [ ] Three back-to-back turns with `RadixPrefixCache` active →
       `prefix_hit` toolbar field grows turn-over-turn → `ttft`
       drops correspondingly. Visible to the eye, not just in
       logs.
-- [ ] `silica-chat --model Qwen/Qwen3-0.6B --kv-codec block_tq_b64_b4`
+- [ ] `silica --kv-codec block_tq_b64_b4 --model Qwen/Qwen3-4B`
       → `compr=3.8x` (or similar) appears in toolbar, `kv_resident`
       stays small as conversation grows.
+- [ ] **Hint surface:** under fp16 default, when prefix store size
+      crosses 200 MB the toolbar shows a one-line hint suggesting
+      `--kv-codec block_tq_b64_b4`. Hint disappears once codec is
+      engaged.
 - [ ] `/help` lists all commands; each command's behaviour matches
       its docstring.
-- [ ] `NO_COLOR=1 silica-chat ...` produces colour-free output.
+- [ ] `NO_COLOR=1 silica ...` produces colour-free output.
 - [ ] Existing `tests/` suite still 1781 passed (no runtime engine
-      regressions); new chat-CLI tests cover toolbar formatter +
-      command dispatch + config parser.
+      regressions); new chat-CLI tests cover palette + toolbar
+      formatter + command dispatch + config parser + thinking
+      parser.
 
 ## 11. Non-goals
 
@@ -369,3 +536,11 @@ Python API or `silica run` single-shot do not pay the import cost.
   be dropped or fully invalidated; preserving it across `/reset`
   would leak prior-conversation tokens into the new conversation.
   Resolved at C-4 implementation time.
+- **Q-CHAT-4**: `<think>` tag detection robustness. Streamed tokens
+  may split the literal `<think>` across multiple chunks (e.g.
+  `<th` and `ink>` in separate decode iterations). The C-8 parser
+  must accumulate a tag-fragment buffer until a complete tag is
+  matched; otherwise transitions are missed. Resolved at C-8
+  implementation time. Test coverage in
+  `tests/test_chat_cli_thinking_parser.py` includes
+  per-character feeds to expose any fragmentation issue.
