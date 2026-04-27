@@ -1,20 +1,30 @@
-"""silica.server.cli — P-1 command-line driver.
+"""silica.server.cli — command-line driver.
 
 Invocation:
 
-    python -m silica run --model Qwen/Qwen3.5-0.8B --prompt "The capital of France is"
+    silica run --model Qwen/Qwen3.5-0.8B --prompt "The capital of France is"
+    silica chat --model Qwen/Qwen3-0.6B
+    silica chat --model Qwen/Qwen3.5-4B --kv-codec block_tq_b64_b4
 
-Or, if the ``silica`` console script is installed (``pip install -e .``):
+Two subcommands:
 
-    silica run --model Qwen/Qwen3.5-0.8B --prompt "..."
+- ``run`` — single-shot generation. P-1 acceptance surface: pulls
+  EOS from the tokenizer's ``eos_token_ids`` automatically, prints
+  the concatenated prompt + decoded generation to stdout, one-line
+  metrics row to stderr.
+- ``chat`` — interactive REPL via :mod:`silica.chat.cli.app` (Side
+  track 2, C-3+). Persistent bottom toolbar surfacing the
+  silica-mlx USP signals (tok/s, KV compression ratio, prefix-cache
+  hit count). Slash commands (``/help``, ``/config key=value``,
+  ``/system``, ``/reset``, ...) for mid-session control. Sampling
+  knobs are intentionally not CLI flags here — the chat-app default
+  is "open and use", power users override mid-session via
+  ``/config``.
 
-Minimal for P-1 acceptance:
-  - One subcommand (``run``).
-  - EOS is pulled from the tokenizer's ``eos_token_ids`` and fed into
-    ``SamplingParams.stop_token_ids`` automatically.
-  - Output is the prompt concatenated with the decoded generation; no
-    incremental streaming yet (clean incremental decoding needs the
-    ``BPEStreamingDetokenizer`` plumbing which is a polish item).
+Bare-``silica`` argv preprocessing (claude-style: typing ``silica``
+with no subcommand opens the chat REPL) is C-7 — for now both
+``silica chat`` and the explicit ``silica run`` subcommand-required
+form are honoured.
 """
 
 from __future__ import annotations
@@ -27,6 +37,8 @@ from typing import Any
 from silica.core.sampling import SamplingParams
 from silica.engine import Engine
 from silica.models.factory import adapter_for_repo
+
+_DEFAULT_CHAT_MODEL = "Qwen/Qwen3-0.6B"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -50,6 +62,37 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--top-p", type=float, default=None)
     run.add_argument("--top-k", type=int, default=None)
     run.add_argument("--seed", type=int, default=None)
+
+    chat = sub.add_parser(
+        "chat",
+        help="open the interactive chat REPL with bottom status bar",
+    )
+    chat.add_argument(
+        "--model",
+        default=_DEFAULT_CHAT_MODEL,
+        help=(
+            "HuggingFace repo id (default: "
+            f"{_DEFAULT_CHAT_MODEL}). Sampling knobs (temperature, "
+            "top_p, top_k, max_tokens) are NOT CLI flags here — "
+            "set them mid-session via /config inside the REPL."
+        ),
+    )
+    chat.add_argument(
+        "--system",
+        default=None,
+        help="system prompt prepended to the conversation (optional)",
+    )
+    chat.add_argument(
+        "--kv-codec",
+        default=None,
+        choices=(None, "block_tq_b64_b4"),
+        help=(
+            "KV codec id; default is fp16 (no compression). Use "
+            "'block_tq_b64_b4' for 3.8x KV compression — best on "
+            "long sessions / RAG / multi-doc workloads. See "
+            "design doc §6 for when this is worth opting into."
+        ),
+    )
     return root
 
 
@@ -94,6 +137,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.cmd == "run":
         return _run(args)
+    if args.cmd == "chat":
+        from silica.chat.cli.app import run_chat
+
+        return run_chat(args)
     parser.error(f"unknown command: {args.cmd!r}")
     return 2  # unreachable — parser.error raises SystemExit, kept for mypy
 
