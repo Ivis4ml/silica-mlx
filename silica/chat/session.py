@@ -331,6 +331,19 @@ class ChatSession:
             return out_tokens, None
 
         finish_reason: str | None = None
+        # Drain the entire batched event stream. Breaking on the
+        # ``done`` event would abort the generator before the
+        # batcher runs its deferred reclaim step — and that
+        # reclaim is what calls ``_extract_and_insert_prefix``
+        # (silica/scheduler/batcher.py §reclaim_terminated, which
+        # registers block-aligned K/V into the prefix cache for
+        # subsequent turns to reuse). Aborting early leaves the
+        # cache empty and turns prefix_hit=N/M permanently into
+        # 0/N regardless of how long the conversation runs.
+        # Token + done events are emitted in the same step(); the
+        # next step() drains terminal rows. We must let the engine
+        # keep iterating so its ``while has_work()`` loop reaches
+        # that next step.
         for event in self._engine.generate_batch(
             [prompt_text],
             params,
@@ -339,10 +352,12 @@ class ChatSession:
             if event.kind == "token" and event.token_id is not None:
                 _on_token(event.token_id)
             elif event.kind in ("done", "aborted"):
-                finish_reason = event.finish_reason
-                # Stream ends after the terminal event for our
-                # single-row request; no need to drain further.
-                break
+                # Capture the first terminal event's reason. The
+                # generator continues to drain (no break) so the
+                # batcher's reclaim runs. For B=1 only one
+                # terminal event ever arrives.
+                if finish_reason is None:
+                    finish_reason = event.finish_reason
         return out_tokens, finish_reason
 
     # --- internals ---------------------------------------------------

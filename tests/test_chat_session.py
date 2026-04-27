@@ -700,3 +700,95 @@ def test_prefix_cache_session_reset_does_not_clear_cache() -> None:
     session.reset()
     # Cache reference unchanged.
     assert session.prefix_cache is pc
+
+
+class _DrainProbeEngine:
+    """Engine fake that records whether the consumer drained the
+    full ``generate_batch`` stream.
+
+    The real ``ContinuousBatcher`` runs prefix-cache insertion in a
+    DEFERRED reclaim step that fires on the iteration AFTER the
+    terminal ``done`` event. If ChatSession breaks out of the
+    event loop on ``done``, the generator is closed before the
+    reclaim step runs and ``_extract_and_insert_prefix`` never
+    fires — silica/scheduler/batcher.py §reclaim_terminated. The
+    cache stays empty and ``prefix_hit=N/M`` permanently reads
+    0/N regardless of conversation length.
+
+    This fake yields a ``post_done_marker`` event AFTER the
+    terminal ``done``, simulating the deferred-reclaim step's
+    final yield. If ChatSession drains correctly,
+    ``self.fully_drained`` becomes True; if it breaks early it
+    stays False — a one-bit signal for this regression.
+    """
+
+    def __init__(self, tokens: list[int]) -> None:
+        self._tokens = list(tokens)
+        self.metrics = _FakeMetrics()
+        self.kv_manager = _FakeKVManager()
+        self.fully_drained = False
+
+    def generate(
+        self, prompt: str, params: SamplingParams | None = None
+    ) -> Iterator[int]:
+        # Single-request path not exercised by the regression
+        # test; keep the method present for Protocol conformance.
+        del prompt, params
+        yield from self._tokens
+
+    def generate_batch(
+        self,
+        prompts: Any,
+        params: SamplingParams | list[SamplingParams] | None = None,
+        *,
+        max_batch_size: int | None = None,
+        prefix_cache: Any = None,
+        length_spread_threshold: float = 2.0,
+    ) -> Iterator[Any]:
+        from silica.core.events import BatchEvent
+
+        del prompts, params, max_batch_size, prefix_cache
+        del length_spread_threshold
+        for tok in self._tokens:
+            yield BatchEvent.token(req_index=0, token_id=tok)
+        yield BatchEvent.done(req_index=0, reason="stop_token")
+        # Simulated post-terminal yield representing the batcher's
+        # next-step reclaim phase. If the consumer broke on
+        # ``done``, this never gets reached.
+        self.fully_drained = True
+
+
+def test_prefix_cache_session_drains_after_terminal_event() -> None:
+    """Regression: ChatSession must not break on ``done`` — the
+    real batcher's prefix-cache insertion runs in a deferred
+    reclaim step that fires after the terminal event. Breaking
+    early aborts the generator before reclaim, leaving the cache
+    empty (the bug observed during C-4 manual smoke; fixed here).
+
+    This test does not exercise the full batcher; it pins the
+    consumer-side contract via :class:`_DrainProbeEngine` whose
+    ``fully_drained`` flag flips True only when the entire
+    generator is iterated to completion.
+    """
+    tok = _FakeTokenizer(eos_token_ids={99})
+    adapter = _FakeAdapter(tok)
+    engine = _DrainProbeEngine([65, 66, 67])
+    pc = _FakePrefixCache()
+    session = ChatSession(
+        adapter,
+        engine,
+        prefix_cache=pc,
+        reset_peak_memory=lambda: None,
+        read_peak_memory_mb=lambda: 256.0,
+    )
+    metrics = session.chat("hi")
+    assert engine.fully_drained is True, (
+        "ChatSession broke out of the batched event stream before "
+        "the generator completed; the batcher's deferred "
+        "_extract_and_insert_prefix would never fire and the "
+        "prefix cache would stay empty across turns."
+    )
+    # Sanity: tokens were collected and the finish reason from
+    # the terminal event still reached TurnMetrics.
+    assert metrics.output_tokens == 3
+    assert metrics.finish_reason == "stop_token"
