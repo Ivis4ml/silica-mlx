@@ -476,6 +476,65 @@ def test_finish_reason_parametrized(
     assert m.finish_reason == expected
 
 
+# ---------- C-8 EOS-token suppression ------------------------------
+
+
+def test_reply_text_does_not_include_trailing_eos_token() -> None:
+    """vLLM / mlx-lm convention yields the EOS token before
+    terminating. Including it in the stored assistant message
+    leaks ``<|im_end|>`` (or whatever the EOS decodes to) into
+    every reply. ChatSession must strip the trailing EOS before
+    decoding for the message log."""
+    session, engine, tok = _build_session(
+        eos_token_ids={99}, engine_tokens=[65, 66, 99]
+    )
+    metrics = session.chat("hi")
+    # 65/66/99 → "AB" + decoded EOS char. Stored reply must be
+    # just "AB" — no trailing EOS character.
+    assert metrics.reply == tok.decode([65, 66])
+    assert metrics.reply == "AB"
+    # Message history mirror of the same constraint.
+    assert session.messages[-1]["content"] == "AB"
+
+
+def test_streaming_callback_does_not_emit_eos_token_text() -> None:
+    """Streamed deltas must omit the EOS token's decoded bytes so
+    the chat REPL does not show ``<|im_end|>`` at the end of
+    every assistant turn."""
+    session, _, _ = _build_session(
+        eos_token_ids={99}, engine_tokens=[65, 66, 99]
+    )
+    streamed: list[str] = []
+    session.chat("hi", stream_to=streamed.append)
+    joined = "".join(streamed)
+    assert joined == "AB"  # no EOS character at the end
+
+
+def test_eos_only_reply_yields_empty_string() -> None:
+    """If the model emits the EOS token immediately (no real
+    reply tokens), the stored reply must be the empty string —
+    not the EOS character."""
+    session, _, _ = _build_session(
+        eos_token_ids={99}, engine_tokens=[99]
+    )
+    metrics = session.chat("hi")
+    assert metrics.reply == ""
+
+
+def test_non_eos_finish_keeps_full_decoded_text() -> None:
+    """When generation ends by max_tokens (no EOS yielded), the
+    reply text retains every emitted token. Strip-trailing-EOS is
+    conditional on the last token actually being in the EOS set."""
+    session, _, tok = _build_session(
+        eos_token_ids={99}, engine_tokens=[65, 66, 67]
+    )
+    metrics = session.chat(
+        "hi", sampling_params=SamplingParams(max_tokens=3)
+    )
+    assert metrics.reply == tok.decode([65, 66, 67])
+    assert metrics.reply == "ABC"
+
+
 # ---------- C-4 prefix-cache integration ---------------------------
 
 

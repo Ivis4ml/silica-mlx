@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +48,13 @@ from silica.chat.cli.commands import (
 from silica.chat.cli.config import initial_config
 from silica.chat.cli.palette import ColorName, Palette, detect_palette
 from silica.chat.cli.state import ChatCliState, StreamState
+from silica.chat.cli.thinking_parser import (
+    EnterThinking,
+    ExitThinking,
+    ReplyChunk,
+    ThinkingChunk,
+    ThinkingParser,
+)
 from silica.chat.cli.toolbar import render_codec_hint, render_toolbar
 
 
@@ -72,24 +80,33 @@ def _format_assistant_prefix(palette: Palette) -> str:
     return palette.colorize("silica ›", "orange", bold=True) + " "
 
 
-def _print_thinking_indicator(palette: Palette) -> None:
-    """Render the prefill-phase ``thinking...`` indicator inline.
+def _print_phase_indicator(
+    label: str, color: ColorName, palette: Palette
+) -> None:
+    """Render an inline phase indicator (``⠋ <label>...``) on the
+    current line.
 
-    Cleared by :func:`_clear_thinking_indicator` once the first
-    decoded token arrives. Provides the visual cue the chat REPL
-    was missing during long-prompt prefill (where the user types,
-    hits Enter, and otherwise sees a silent terminal for several
-    seconds while the engine consumes the prompt).
+    Two callers:
+
+    - C-5: ``label="prefilling"``, ``color="yellow"`` — the engine
+      is consuming the prompt before producing any token.
+    - C-8: ``label="thinking"``, ``color="magenta"`` — the model
+      emitted ``<think>`` and is reasoning before producing the
+      visible reply.
+
+    Cleared by :func:`_clear_phase_indicator` once the phase
+    transitions (first decoded reply token for prefill;
+    ``</think>`` close tag for thinking).
     """
-    msg = palette.colorize("⠋ thinking...", "yellow", dim=True)
+    msg = palette.colorize(f"⠋ {label}...", color, dim=True)
     sys.stdout.write(msg)
     sys.stdout.flush()
 
 
-def _clear_thinking_indicator() -> None:
-    """Remove the inline ``thinking...`` indicator from the current
-    line. ANSI: carriage-return + clear-to-end-of-line. Safe to
-    call when no indicator is present (becomes a no-op cursor
+def _clear_phase_indicator() -> None:
+    """Remove the inline phase indicator from the current line.
+    ANSI: carriage-return + clear-to-end-of-line. Safe to call
+    when no indicator is present (becomes a no-op cursor
     movement on most terminals)."""
     sys.stdout.write("\r\x1b[K")
     sys.stdout.flush()
@@ -318,27 +335,86 @@ def run_chat(args: argparse.Namespace) -> int:
             continue
 
         # Regular chat turn. Defer the assistant prefix line until
-        # the first token actually arrives — that way long-prompt
-        # prefill shows a thinking indicator instead of a bare
-        # ``silica ›`` followed by silence.
+        # the first reply token actually arrives — that way long-
+        # prompt prefill shows a thinking indicator instead of a
+        # bare ``silica ›`` followed by silence. C-8: a separate
+        # ``<think>`` parser collapses the model's reasoning block
+        # into a magenta indicator.
         params = _sampling_params_from_state(state, adapter)
 
         state.stream_state = StreamState.PREFILL
         state.tokens_generated = 0
         state.max_tokens = int(state.config.get("max_tokens", 1024))
-        _print_thinking_indicator(palette)
+        state.last_turn_thinking = ""
+        thinking_display = str(state.config.get("thinking", "auto"))
+        parser = ThinkingParser()
+        thinking_started_at: list[float] = []  # mutable for closure write
+        prefix_emitted: list[bool] = [False]
+        _print_phase_indicator("prefilling", "yellow", palette)
+
+        def _emit_assistant_prefix_once() -> None:
+            if not prefix_emitted[0]:
+                _clear_phase_indicator()
+                sys.stdout.write(_format_assistant_prefix(palette))
+                sys.stdout.flush()
+                prefix_emitted[0] = True
+
+        def _stream_callback(delta: str) -> None:
+            # One stream_to call == one decoded token; track the
+            # token counter once per call regardless of how the
+            # parser splits the delta into events.
+            state.tokens_generated += 1
+            for event in parser.feed(delta):
+                if isinstance(event, EnterThinking):
+                    # Whatever indicator is currently up (prefill
+                    # yellow OR a stale thinking line from a
+                    # previous block in the same turn) gets cleared.
+                    _clear_phase_indicator()
+                    state.stream_state = StreamState.THINKING
+                    thinking_started_at.append(time.monotonic())
+                    if thinking_display != "hidden":
+                        _print_phase_indicator(
+                            "thinking", "magenta", palette
+                        )
+                elif isinstance(event, ThinkingChunk):
+                    state.last_turn_thinking += event.text
+                    if thinking_display == "show":
+                        sys.stdout.write(
+                            palette.colorize(event.text, "grey", dim=True)
+                        )
+                        sys.stdout.flush()
+                elif isinstance(event, ExitThinking):
+                    _clear_phase_indicator()
+                    if thinking_started_at and thinking_display != "hidden":
+                        elapsed = time.monotonic() - thinking_started_at[-1]
+                        sys.stdout.write(
+                            palette.colorize(
+                                f"thought for {elapsed:.1f}s\n",
+                                "grey",
+                                dim=True,
+                            )
+                        )
+                    state.stream_state = StreamState.DECODE
+                    _emit_assistant_prefix_once()
+                elif isinstance(event, ReplyChunk):
+                    if state.stream_state is StreamState.PREFILL:
+                        state.stream_state = StreamState.DECODE
+                    _emit_assistant_prefix_once()
+                    sys.stdout.write(event.text)
+                    sys.stdout.flush()
+
         try:
             metrics = chat_session.chat(
                 text,
                 sampling_params=params,
-                stream_to=lambda delta: _on_token(delta, state, palette),
+                stream_to=_stream_callback,
             )
         except KeyboardInterrupt:
-            # If we never got past prefill, the thinking indicator
-            # is still on screen — clear it before the abort
-            # banner so the line does not have leftover text.
-            if state.stream_state is StreamState.PREFILL:
-                _clear_thinking_indicator()
+            if state.stream_state in (
+                StreamState.PREFILL,
+                StreamState.THINKING,
+            ):
+                _clear_phase_indicator()
             sys.stdout.write(
                 "\n"
                 + palette.colorize("[generation aborted]", "red")
@@ -348,8 +424,11 @@ def run_chat(args: argparse.Namespace) -> int:
             state.stream_state = StreamState.IDLE
             continue
         except Exception as exc:  # pragma: no cover — defensive
-            if state.stream_state is StreamState.PREFILL:
-                _clear_thinking_indicator()
+            if state.stream_state in (
+                StreamState.PREFILL,
+                StreamState.THINKING,
+            ):
+                _clear_phase_indicator()
             sys.stdout.write(
                 "\n"
                 + palette.colorize(f"[error: {exc}]", "red")
@@ -358,16 +437,30 @@ def run_chat(args: argparse.Namespace) -> int:
             sys.stdout.flush()
             state.stream_state = StreamState.IDLE
             continue
+        # Drain any text the parser held back as a partial-tag
+        # candidate (e.g. ``<th`` at end of stream without follow-up).
+        for event in parser.finish():
+            if isinstance(event, ThinkingChunk):
+                state.last_turn_thinking += event.text
+            elif isinstance(event, ReplyChunk):
+                _emit_assistant_prefix_once()
+                sys.stdout.write(event.text)
+                sys.stdout.flush()
+
         # Empty-reply edge case: generation ended without emitting
-        # a token. The indicator is still on screen; clear it and
-        # surface a placeholder so the conversation log is not
-        # bare.
-        if state.stream_state is StreamState.PREFILL:
-            _clear_thinking_indicator()
+        # a single reply token (everything was thinking, or no
+        # tokens at all). Surface a placeholder so the log line
+        # still shows ``silica ›`` for visual consistency.
+        if not prefix_emitted[0]:
+            _clear_phase_indicator()
             sys.stdout.write(
                 _format_assistant_prefix(palette)
                 + palette.colorize(
-                    "(no reply)", "grey", dim=True
+                    "(no reply — try /expand to see the model's reasoning)"
+                    if state.last_turn_thinking
+                    else "(no reply)",
+                    "grey",
+                    dim=True,
                 )
             )
             sys.stdout.flush()
@@ -455,38 +548,6 @@ def _build_prefix_cache(
     return cache_cls(
         block_size=_PREFIX_CACHE_BLOCK_SIZE, store=store
     )
-
-
-def _on_token(
-    delta: str, state: ChatCliState, palette: Palette
-) -> None:
-    """Stream callback — handle the prefill→decode transition and
-    write each decoded token delta to stdout.
-
-    ``ChatSession.chat`` calls this once per emitted token. The
-    first invocation per turn fires the prefill→decode state
-    transition and emits the assistant prefix line (deferred from
-    the main loop so the user sees the prefill indicator instead
-    of a bare ``silica ›`` for long-prompt prefill). Subsequent
-    invocations stream the token delta directly.
-
-    C-8 will interpose ``<think>``-tag detection here. The pure
-    streaming write is intentional in C-5 — adding live mid-token
-    UI redraw would require the full prompt_toolkit Application
-    layout (out of C-5 scope; the bottom toolbar refresh between
-    turns is sufficient for the ``tok/s`` and ``ttft`` numbers
-    the user is reading).
-    """
-    if state.stream_state is StreamState.PREFILL:
-        # First token of the turn: clear the inline thinking
-        # indicator, emit the assistant prefix line, and flip the
-        # state-machine field. Subsequent calls bypass this branch.
-        _clear_thinking_indicator()
-        sys.stdout.write(_format_assistant_prefix(palette))
-        state.stream_state = StreamState.DECODE
-    state.tokens_generated += 1
-    sys.stdout.write(delta)
-    sys.stdout.flush()
 
 
 def _sampling_params_from_state(

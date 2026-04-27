@@ -266,7 +266,18 @@ class ChatSession:
         wall_s = self._clock() - t_start
         peak_mb = self._read_peak_mb()
 
-        reply_text = self._tokenizer.decode(out_tokens)
+        # Strip a trailing stop token before decoding for the
+        # stored reply text. mlx-lm / vLLM convention yields the
+        # stop token before terminating; including it in the
+        # message text would leave a literal ``<|im_end|>`` (or
+        # equivalent) appended to every reply, polluting both the
+        # rendered conversation log and any downstream chat
+        # template that re-tokenises the assistant content for
+        # the next turn's prompt.
+        reply_tokens = out_tokens
+        if reply_tokens and reply_tokens[-1] in self._eos_ids:
+            reply_tokens = reply_tokens[:-1]
+        reply_text = self._tokenizer.decode(reply_tokens)
         # Prefix-cache path surfaces finish_reason directly via the
         # batcher's terminal BatchEvent; single-request path infers
         # it from the token sequence.
@@ -314,16 +325,32 @@ class ChatSession:
         """
         out_tokens: list[int] = []
         printed_prefix = ""
+        stop_set = set(self._eos_ids)
 
         def _on_token(tok: int) -> None:
             nonlocal printed_prefix
             out_tokens.append(tok)
-            if stream_to is not None:
-                current = self._tokenizer.decode(out_tokens)
-                delta = current[len(printed_prefix):]
-                if delta:
-                    stream_to(delta)
-                    printed_prefix = current
+            if stream_to is None:
+                return
+            # Streaming output: skip the rendered text of stop
+            # tokens. mlx-lm / vLLM convention yields the stop
+            # token before terminating; without this guard the
+            # decoded ``<|im_end|>`` (or equivalent) ends up on
+            # screen as literal text, which has no value to the
+            # user.
+            if tok in stop_set:
+                # Reset printed_prefix to the pre-stop-token text
+                # so the assistant message text we feed downstream
+                # does not include the stop bytes either.
+                printed_prefix = self._tokenizer.decode(
+                    out_tokens[:-1]
+                )
+                return
+            current = self._tokenizer.decode(out_tokens)
+            delta = current[len(printed_prefix):]
+            if delta:
+                stream_to(delta)
+                printed_prefix = current
 
         if self._prefix_cache is None:
             for tok in self._engine.generate(prompt_text, params):
