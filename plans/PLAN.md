@@ -1296,15 +1296,22 @@ Append-only. New decisions go at the end; old ones are not edited. Revocations /
        prompts are not shared) but on real session workloads the
        gap is structural.
      - **(c) Qwen3.5 recurrent rollback (and snapshot pre-draft).**
-       `silica/models/qwen3_5.py:rollback_state` currently raises
-       `NotImplementedError` (intentionally — the docstring says
-       "real rollback semantics land with P-7"). P5.9 takes the
-       snapshot half: a pre-draft snapshot pathway plus
-       `rollback_state` honoring it. Without this, every C.x
-       speculative variant (especially C.4 DFlash and C.5 DDTree
-       which have higher reject rates than autoregressive draft
-       on hybrid stacks) will silently corrupt recurrent state
-       on rejection.
+       Closed at P5.9 step 2(c): `Qwen3_5Adapter` now exposes
+       `snapshot_pre_draft_state(req_id)` and `rollback_state`
+       restores that saved recurrent snapshot when `n_reject > 0`;
+       `commit_state` / `free_state` clear pending snapshots. This
+       is the target-side recurrent rollback primitive every C.x
+       speculative variant needs before C.4 DFlash / C.5 DDTree can
+       safely tolerate rejected draft tokens on hybrid stacks.
+       Scope note: P5.9 restores the pre-draft boundary; partial-
+       accept verifier policy (snapshot at accepted boundary vs
+       restore + replay accepted tokens) remains a C.1 / C.4
+       integration responsibility.
+       Evidence: `tests/test_qwen3_5_adapter.py` adds the pre-draft
+       snapshot lifecycle coverage (restore-on-rollback, commit
+       collapse, nested-window rejection, free cleanup, no-snapshot
+       failure); full non-real-model suite at landing: 2037 passed /
+       25 skipped.
      - **(d) Sustained 4K / 8K context memory probe.** Extend the
        P-6.0 warm-decode rows with one new row each on dense
        Qwen3.5-27B-4bit and Gemma4-31B-4bit at 4K and 8K
@@ -1866,9 +1873,10 @@ Local reference implementations sit at the repo root. **Algorithm / architecture
   `scripts/probe_gemma4_31b_load.py:151` — switch from
   `_mlx_lm_load` + `adapter_for_repo` to the single-load
   `adapter_from_loaded_model` at `silica/models/factory.py:108`),
-  Qwen3.5 recurrent rollback (currently `NotImplementedError` at
-  `silica/models/qwen3_5.py:rollback_state`), Q-012 affirmative
-  resolution, sustained 4K/8K context memory probe, D-009 hot-path
+  Qwen3.5 recurrent rollback (closed at P5.9 step 2(c) via
+  `Qwen3_5Adapter.snapshot_pre_draft_state(req_id)` plus
+  `rollback_state` restore), Q-012 affirmative resolution,
+  sustained 4K/8K context memory probe, D-009 hot-path
   audit lock-in, speculative-metrics schema definition, P-5
   quality regression as fixed P-6 per-track gate, and a full
   toolchain re-run; (iii) D-021 step 8 adds **C.6 QuantSpec-like

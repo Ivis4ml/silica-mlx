@@ -638,12 +638,16 @@ revision rather than opening v1.7.15.
     (`scripts/probe_qwen3_5_27b_load.py:107` /
     `scripts/probe_gemma4_31b_load.py:151`).
   - (c) Qwen3.5 recurrent rollback path landed at P5.9 instead of
-    deferred to spec-foundation step. `silica/models/qwen3_5.py:rollback_state`
-    today raises `NotImplementedError` intentionally; without it,
-    every C.x speculative variant (especially C.4 / C.5 with
-    higher reject rates than vanilla autoregressive draft) silently
-    corrupts recurrent state on rejection. Snapshot pathway at
-    pre-draft and rollback honoring it both land in P5.9.
+    deferred to spec-foundation step. `Qwen3_5Adapter` now exposes
+    `snapshot_pre_draft_state(req_id)` and `rollback_state` restores
+    that snapshot when `n_reject > 0`; `commit_state` / `free_state`
+    clear pending snapshots. This prevents C.x speculative variants
+    (especially C.4 / C.5 with higher reject rates than vanilla
+    autoregressive draft) from corrupting recurrent state on rejection.
+    P5.9 restores the pre-draft boundary; partial-accept verifier
+    policy remains a C.1 / C.4 integration responsibility.
+    Evidence lives in `tests/test_qwen3_5_adapter.py`; full
+    non-real-model suite at landing: 2037 passed / 25 skipped.
   - (d) sustained 4K/8K context memory probe — moved up from
     P-6.0.5 to P5.9 because the §6(4) RAM headroom gate currently
     rests on inference from the 384-token P-6.0 baseline rather

@@ -66,13 +66,14 @@ Current consequence:
 - **Preempt/replay bit-exactness on hybrid adapters.** The
   recurrent side gets the same round-trip guarantee that the
   full-attention side has had since P-2.
-- **P-7 precedent.** `Qwen3_5Adapter.rollback_state` currently
-  raises `NotImplementedError` and hints that the "pre-draft
-  snapshot of the recurrent state" pathway lands with P-7
-  speculative decoding (`silica/models/qwen3_5.py:224-233`). C5's
-  snapshot/restore surface, if designed right, can be the single
-  adapter-owned API that serves both preempt (this unit) and
-  draft-snapshot (P-7).
+- **P-7 precedent.** At C5 opening time, `Qwen3_5Adapter.rollback_state`
+  still raised `NotImplementedError` and pointed at a future
+  "pre-draft snapshot of the recurrent state" pathway. That future
+  hook landed early in P5.9 step 2(c): `snapshot_pre_draft_state(req_id)`
+  stores the adapter-owned rollback point and `rollback_state` restores
+  it on draft rejection. C5's snapshot/restore surface therefore did
+  become the shared primitive for both preempt (this unit) and
+  draft-snapshot (P-6 / Track C foundation).
 
 ### 1.3 Why this is a large unit, not a quick fix
 
@@ -226,12 +227,11 @@ restore that snapshot into the supplied cache row."
 
 ### 3.2 Out of scope (stays in later phases / units)
 
-- **P-7 speculative draft-rollback snapshot pathway.** C5's
-  snapshot API should be **shape-compatible** with draft-rollback
-  (i.e. not paint P-7 into a corner) but the actual wiring lands
-  at P-7. `rollback_state` continues to raise
-  `NotImplementedError` for `n_reject > 0` — C5 only fixes the
-  "adapter has no way to snapshot at all" precondition.
+- **P-7 speculative draft-rollback snapshot pathway.** Historical
+  C5 scope note: C5 kept this out of scope and only guaranteed
+  shape compatibility. Superseded by P5.9 step 2(c), which landed
+  the Qwen3.5 target-side pre-draft snapshot + rollback primitive
+  before the full speculative engine work.
 - **Partial-prefix recurrent-state reconstruction.** D-015's
   "full prefix only" rule stays. If a request's prompt matches a
   block-aligned prefix in `RadixPrefixCache`, we restore state at
@@ -488,16 +488,18 @@ concrete shape that must accompany the flip.
 ### 5.4 P-7 speculative-rollback compatibility check
 
 `Qwen3_5Adapter.rollback_state(self, req_id: str, n_reject: int)`
-today raises for any `n_reject > 0` and points at P-7. C5's
-`RecurrentSnapshot` must be shape-reusable by P-7's "pre-draft
-snapshot then collapse on commit" pattern:
+raised for any `n_reject > 0` when C5 opened and pointed at P-7.
+Superseded by P5.9 step 2(c): Qwen3.5 now uses the same
+`RecurrentSnapshot` value object for the "pre-draft snapshot then
+collapse on commit" pattern:
 
-- Snapshot taken before the draft rollout → same API call as C5.2
-  preempt snapshot.
-- Restore on draft reject → same API call as C5.2 replay restore.
-- Accept on commit → discard the snapshot (no restore needed); P-7
-  does not need a distinct "commit" method because discarding the
-  snapshot is a no-op on the adapter side.
+- Snapshot taken before the draft rollout →
+  `snapshot_pre_draft_state(req_id)` stores a detached snapshot.
+- Restore on draft reject → `rollback_state(req_id, n_reject)` restores
+  that snapshot for recurrent layers; the caller still pairs it with
+  KV rollback.
+- Accept on commit → `commit_state(req_id, n_accepted)` discards the
+  pending snapshot and leaves the live recurrent cache as source of truth.
 
 C5.1 writes the API accordingly; P-7 consumes it without
 modification. If P-7 finds a genuinely different requirement, P-7

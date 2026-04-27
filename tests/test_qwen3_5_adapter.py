@@ -259,8 +259,9 @@ def test_capabilities_carry_hybrid_deltanet_and_set_recurrent_state() -> None:
 # --- D-015 adapter-local state helpers (P-3-C1) ---
 
 
-def test_commit_state_is_a_noop_returning_none() -> None:
-    """Under mlx-lm's in-place forward, commit_state has nothing to do.
+def test_commit_state_without_snapshot_is_a_noop_returning_none() -> None:
+    """Under mlx-lm's in-place forward, commit_state has nothing to do
+    when no speculative pre-draft snapshot is pending.
 
     ``-> None`` is implicit in the signature, so we only have to check
     that the call does not raise on a variety of ``n_accepted`` values.
@@ -270,14 +271,19 @@ def test_commit_state_is_a_noop_returning_none() -> None:
     adapter.commit_state("req-0", 7)
 
 
-def test_rollback_state_raises_not_implemented_naming_p7() -> None:
-    """Rollback requires a pre-draft snapshot that P-3 does not take;
-    raising is intentional so a caller that wires in a draft source
-    without the snapshot pathway fails loudly rather than silently
-    corrupting decoding."""
+def test_rollback_state_requires_pre_draft_snapshot_when_rejecting() -> None:
+    """Rollback is now implemented, but a rejecting draft window must
+    have called snapshot_pre_draft_state first."""
     adapter, _, _ = _make_adapter_and_kv()
-    with pytest.raises(NotImplementedError, match="P-7"):
+    with pytest.raises(RuntimeError, match="snapshot_pre_draft_state"):
         adapter.rollback_state("req-0", 3)
+
+
+def test_rollback_state_zero_reject_without_snapshot_is_noop() -> None:
+    """``n_reject <= 0`` mirrors KV rollback semantics: no rejected
+    target steps means there is nothing to restore."""
+    adapter, _, _ = _make_adapter_and_kv()
+    adapter.rollback_state("req-0", 0)
 
 
 def test_state_from_prefix_returns_none_for_any_input() -> None:
@@ -311,12 +317,16 @@ def test_helpers_signatures_match_d015_pairing() -> None:
     adapter, _, _ = _make_adapter_and_kv()
     commit_params = list(inspect.signature(adapter.commit_state).parameters)
     rollback_params = list(inspect.signature(adapter.rollback_state).parameters)
+    pre_draft_params = list(
+        inspect.signature(adapter.snapshot_pre_draft_state).parameters
+    )
     state_prefix_params = list(
         inspect.signature(adapter.state_from_prefix).parameters
     )
     free_params = list(inspect.signature(adapter.free_state).parameters)
     assert commit_params == ["req_id", "n_accepted"]
     assert rollback_params == ["req_id", "n_reject"]
+    assert pre_draft_params == ["req_id"]
     assert state_prefix_params == ["req_id", "token_ids"]
     assert free_params == ["req_id"]
 
@@ -342,6 +352,107 @@ def _make_adapter_with_hybrid_cache() -> (
     )
     adapter = Qwen3_5Adapter(model, _FakeTokenizer(), kv_manager=kv)
     return adapter, kv, model
+
+
+def _populate_recurrent_slots(cache_list: list[Any], marker: float) -> None:
+    """Populate both fake DeltaNet layers with marker-filled tensors."""
+    for linear_idx in (0, 1):
+        conv_state = mx.full(
+            (1, 3, 16), marker + linear_idx, dtype=mx.float16
+        )
+        recurrent_state = mx.full(
+            (1, 4, 8, 8), marker + linear_idx, dtype=mx.float32
+        )
+        mx.eval(conv_state, recurrent_state)
+        cache_list[linear_idx].cache[0] = conv_state
+        cache_list[linear_idx].cache[1] = recurrent_state
+
+
+def _assert_recurrent_slots_marker(
+    adapter: Qwen3_5Adapter, cache_list: list[Any], marker: float
+) -> None:
+    snapshot = adapter.snapshot_recurrent_state(cache_list, row_idx=0)
+    assert len(snapshot.entries) == 2
+    for entry_pos, entry in enumerate(snapshot.entries):
+        assert entry.conv_state is not None
+        assert entry.recurrent_state is not None
+        conv_expected = mx.full(
+            entry.conv_state.shape, marker + entry_pos, dtype=mx.float16
+        )
+        recurrent_expected = mx.full(
+            entry.recurrent_state.shape,
+            marker + entry_pos,
+            dtype=mx.float32,
+        )
+        assert mx.array_equal(entry.conv_state, conv_expected)
+        assert mx.array_equal(entry.recurrent_state, recurrent_expected)
+
+
+def test_snapshot_pre_draft_state_then_rollback_restores_recurrent_slots() -> None:
+    """P5.9 step 2(c): target recurrent state can return to its
+    pre-draft value after rejected speculative tokens mutate the live
+    cache."""
+    adapter, kv, _ = _make_adapter_with_hybrid_cache()
+    kv.reserve_for_prefill("req-a", [1, 2, 3])
+    cache_list = kv.cache_list("req-a")
+    _populate_recurrent_slots(cache_list, marker=1.0)
+
+    snapshot = adapter.snapshot_pre_draft_state("req-a")
+    assert snapshot.nbytes > 0
+
+    _populate_recurrent_slots(cache_list, marker=9.0)
+    _assert_recurrent_slots_marker(adapter, cache_list, marker=9.0)
+
+    adapter.rollback_state("req-a", n_reject=2)
+    _assert_recurrent_slots_marker(adapter, cache_list, marker=1.0)
+
+    # The draft window is closed by rollback; a second rejection
+    # without a fresh pre-draft snapshot must fail loudly.
+    with pytest.raises(RuntimeError, match="snapshot_pre_draft_state"):
+        adapter.rollback_state("req-a", n_reject=1)
+
+
+def test_commit_state_closes_pre_draft_snapshot_without_restoring() -> None:
+    """Accepted draft tokens keep the live recurrent cache as source of
+    truth and discard the saved rollback point."""
+    adapter, kv, _ = _make_adapter_with_hybrid_cache()
+    kv.reserve_for_prefill("req-a", [1, 2, 3])
+    cache_list = kv.cache_list("req-a")
+    _populate_recurrent_slots(cache_list, marker=2.0)
+    adapter.snapshot_pre_draft_state("req-a")
+
+    _populate_recurrent_slots(cache_list, marker=8.0)
+    adapter.commit_state("req-a", n_accepted=3)
+    _assert_recurrent_slots_marker(adapter, cache_list, marker=8.0)
+    with pytest.raises(RuntimeError, match="snapshot_pre_draft_state"):
+        adapter.rollback_state("req-a", n_reject=1)
+
+
+def test_snapshot_pre_draft_state_rejects_nested_windows() -> None:
+    """Taking a second pre-draft snapshot before closing the first
+    would overwrite the only rollback point, so it is rejected."""
+    adapter, kv, _ = _make_adapter_with_hybrid_cache()
+    kv.reserve_for_prefill("req-a", [1])
+    cache_list = kv.cache_list("req-a")
+    _populate_recurrent_slots(cache_list, marker=3.0)
+
+    adapter.snapshot_pre_draft_state("req-a")
+    with pytest.raises(RuntimeError, match="already exists"):
+        adapter.snapshot_pre_draft_state("req-a")
+
+
+def test_free_state_drops_pending_pre_draft_snapshot() -> None:
+    """Request cleanup must not leave a stale rollback point keyed by
+    req_id after the KV manager frees the cache separately."""
+    adapter, kv, _ = _make_adapter_with_hybrid_cache()
+    kv.reserve_for_prefill("req-a", [1])
+    cache_list = kv.cache_list("req-a")
+    _populate_recurrent_slots(cache_list, marker=4.0)
+
+    adapter.snapshot_pre_draft_state("req-a")
+    adapter.free_state("req-a")
+    with pytest.raises(RuntimeError, match="snapshot_pre_draft_state"):
+        adapter.rollback_state("req-a", n_reject=1)
 
 
 def test_recurrent_state_bytes_empty_cache_returns_zero() -> None:

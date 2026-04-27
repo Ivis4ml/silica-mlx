@@ -87,6 +87,11 @@ class Qwen3_5Adapter:
         self.config = self._build_config(model, tokenizer)
         self._kv_layout = self._build_kv_layout(model)
         self._attention_pattern = self._build_attention_pattern(model)
+        # P5.9 step 2(c): speculative verification needs a recurrent
+        # rollback point before the target consumes draft tokens. The
+        # concrete state still lives in ``SimpleKVCache``; this dict
+        # only stores detached value snapshots keyed by request id.
+        self._pre_draft_snapshots: dict[str, RecurrentSnapshot] = {}
         # P-5-F F.1: install pre-norm K capture proxies on full-
         # attention layers only. DeltaNet (``layer.is_linear``) layers
         # have no k_proj surface to wrap — they participate in the
@@ -255,45 +260,73 @@ class Qwen3_5Adapter:
     # are stabilised here so engine and scheduler wiring can be written
     # against them without further churn.
 
+    def snapshot_pre_draft_state(self, req_id: str) -> RecurrentSnapshot:
+        """Capture the recurrent rollback point before a draft window.
+
+        P5.9 step 2(c) intentionally lands only the target-side
+        recurrent rollback primitive needed by later Track C speculative
+        variants. The concrete recurrent tensors remain in the
+        request's ``SimpleKVCache`` cache list; this helper records a
+        detached B=1 snapshot under ``req_id`` so
+        :meth:`rollback_state` can restore it if verification rejects
+        one or more draft tokens. This is deliberately a pre-draft
+        rollback point, not a per-token snapshot stack; a verifier
+        that accepts a draft prefix and rejects a suffix must either
+        snapshot at the accepted boundary or replay accepted tokens
+        after restoring this point.
+
+        Nested draft windows for the same request are rejected rather
+        than silently overwriting the only rollback point. Call
+        ``commit_state`` or ``rollback_state`` to close the active
+        window before taking another snapshot.
+        """
+        if req_id in self._pre_draft_snapshots:
+            raise RuntimeError(
+                f"pre-draft recurrent snapshot already exists for "
+                f"{req_id!r}; commit_state or rollback_state must close "
+                "the active draft window before taking another snapshot"
+            )
+        cache_list = self._kv_manager.cache_list(req_id)
+        snapshot = self.snapshot_recurrent_state(cache_list, row_idx=0)
+        self._pre_draft_snapshots[req_id] = snapshot
+        return snapshot
+
     def commit_state(self, req_id: str, n_accepted: int) -> None:
         """Mark ``n_accepted`` recurrent-state updates as committed.
 
-        In mlx-lm's ``ArraysCache`` model the state is updated in place
-        on every forward and there is no separate staging buffer —
-        ``decode_step`` has already written the committed state by the
-        time ``commit_state`` is called. So this is a no-op under the
-        current forward contract. P-7 speculative decoding changes that
-        (snapshot before draft, collapse on commit); at that point this
-        body gains real behaviour.
+        In mlx-lm's ``ArraysCache`` model the recurrent state is
+        already updated in place by the target forward. Commit therefore
+        collapses the draft window by discarding any pre-draft snapshot
+        for ``req_id``; the live cache remains the source of truth.
 
-        ``n_accepted`` is unused here but retained in the signature
-        because D-015 pairs it with ``KVManager.commit(req_id,
-        n_accepted)`` — the engine treats the KV and recurrent-state
-        commit as a pair and passes the same count to both.
+        ``n_accepted`` is retained in the signature because D-015 pairs
+        this helper with ``KVManager.commit(req_id, n_accepted)``.
         """
-        del req_id, n_accepted
+        del n_accepted
+        self._pre_draft_snapshots.pop(req_id, None)
 
     def rollback_state(self, req_id: str, n_reject: int) -> None:
-        """Roll back the last ``n_reject`` recurrent-state steps.
+        """Restore the pre-draft recurrent snapshot after rejection.
 
-        The current forward path updates ``cache[1]`` (recurrent state)
-        in place via ``gated_delta_update``, so rolling back requires a
-        pre-draft snapshot that P-1 through P-3 does not take. Raising
-        here (rather than silently returning) is intentional: if a
-        caller reaches this, they have wired in a draft source without
-        the matching snapshot logic, and a silent no-op would corrupt
-        decoding.
-
-        Real rollback semantics land with P-7 (speculative decoding)
-        alongside ``KVManager.rollback(req_id, n_reject)``.
+        ``rollback_state`` only owns DeltaNet / recurrent tensors. The
+        caller must still pair it with ``KVManager.rollback`` so K/V
+        attention state trims by the same ``n_reject`` count. P5.9's
+        primitive restores the pre-draft boundary whenever
+        ``n_reject > 0``; partial-accept boundary handling belongs to
+        the verifier that owns the accepted token sequence.
         """
-        del req_id
-        raise NotImplementedError(
-            f"Qwen3_5Adapter.rollback_state requires a pre-draft "
-            f"snapshot of the recurrent state; that snapshot pathway "
-            f"lands with P-7 speculative decoding. Got n_reject="
-            f"{n_reject}."
-        )
+        if n_reject <= 0:
+            return
+        snapshot = self._pre_draft_snapshots.pop(req_id, None)
+        if snapshot is None:
+            raise RuntimeError(
+                f"Qwen3_5Adapter.rollback_state({req_id!r}, "
+                f"n_reject={n_reject}) requires a pre-draft recurrent "
+                "snapshot. Call snapshot_pre_draft_state(req_id) before "
+                "target verification consumes draft tokens."
+            )
+        cache_list = self._kv_manager.cache_list(req_id)
+        self.restore_recurrent_state(cache_list, row_idx=0, snapshot=snapshot)
 
     def state_from_prefix(
         self, req_id: str, token_ids: list[int]
@@ -320,12 +353,11 @@ class Qwen3_5Adapter:
         Under ``SimpleKVCache`` the per-request cache list is owned by
         the KV manager and released by ``KVManager.free(req_id)`` — the
         ArraysCache slots (conv_state + recurrent state) are freed
-        there. So the adapter has no separate tenant to release today,
-        and this method is a no-op. When P-3-C3 introduces a batched
-        recurrent-state store owned by the adapter, this helper is the
-        hook where per-row state is evicted.
+        there. The adapter-owned tenant today is only the optional
+        pre-draft snapshot from P5.9 step 2(c), so freeing a request
+        drops that pending rollback point if present.
         """
-        del req_id
+        self._pre_draft_snapshots.pop(req_id, None)
 
     # --- P-3-C5.1: adapter-owned recurrent state snapshot / restore ---
 
