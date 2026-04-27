@@ -38,16 +38,40 @@ Symbols are marked:
     - [`silica.scheduler.seed_kv`](#silicaschedulerseed_kv)
 5. [`silica.models`](#silicamodels)
     - [`silica.models.adapter`](#silicamodelsadapter)
+    - [`silica.models.capabilities`](#silicamodelscapabilities)
     - [`silica.models.qwen3`](#silicamodelsqwen3)
     - [`silica.models.qwen3_5`](#silicamodelsqwen3_5)
+    - [`silica.models.qwen3_5_moe`](#silicamodelsqwen3_5_moe)
+    - [`silica.models.gemma4`](#silicamodelsgemma4)
+    - [`silica.models.gemma4_moe`](#silicamodelsgemma4_moe)
+    - [`silica.models.recurrent`](#silicamodelsrecurrent)
+    - [`silica.models.pre_norm_capture`](#silicamodelspre_norm_capture)
     - [`silica.models.factory`](#silicamodelsfactory)
 6. [`silica.weights`](#silicaweights)
     - [`silica.weights.provider`](#silicaweightsprovider)
     - [`silica.weights.resident`](#silicaweightsresident)
-7. [`silica.mlx`](#silicamlx)
-8. [`silica.speculative`](#silicaspeculative)
-9. [`silica.engine`](#silicaengine)
-10. [`silica.server`](#silicaserver)
+7. [`silica.vq`](#silicavq)
+    - [`silica.vq.block_tq`](#silicavqblock_tq)
+    - [`silica.vq.turboquant`](#silicavqturboquant)
+    - [`silica.vq.rabitq`](#silicavqrabitq)
+    - [`silica.vq._calibration`](#silicavq_calibration)
+8. [`silica.mlx`](#silicamlx)
+9. [`silica.speculative`](#silicaspeculative)
+10. [`silica.engine`](#silicaengine)
+11. [`silica.bench`](#silicabench)
+    - [`silica.bench.scenario`](#silicabenchscenario)
+    - [`silica.bench.scenarios`](#silicabenchscenarios)
+    - [`silica.bench.runner`](#silicabenchrunner)
+    - [`silica.bench.codec_registry`](#silicabenchcodec_registry)
+    - [`silica.bench.oracles`](#silicabenchoracles)
+    - [`silica.bench.ppl_oracle`](#silicabenchppl_oracle)
+    - [`silica.bench.report`](#silicabenchreport)
+    - [`silica.bench.wikitext`](#silicabenchwikitext)
+    - [`silica.bench.vqbench_baseline`](#silicabenchvqbench_baseline)
+12. [`silica.chat`](#silicachat)
+    - [`silica.chat.session`](#silicachatsession)
+    - [`silica.chat.cli`](#silicachatcli)
+13. [`silica.server`](#silicaserver)
 
 ---
 
@@ -460,34 +484,71 @@ tracked by `MemoryBudgeter`, not here.
 
 ### `silica.kvcache.codec`
 
-#### `CodedBlock` *(public, dataclass)*
+P-5-A.0.4 rewrite. The interface is now **side-level** — one
+`VectorCodec[P]` instance encodes either K or V (not both at once),
+and the K and V codecs are held independently on
+`SyntheticPrefixBlockStore.k_codec` / `.v_codec`. The legacy block-level
+`KVCodec` Protocol and the `CodedBlock` wrapper are removed.
 
-Codec-produced encoded form of one block's K/V. Fields:
-- `k: mx.array`, `v: mx.array` — unencoded in v0.1 (`IdentityCodec`);
-  quantized payload in P-5.
-- `resident_bytes: int` — physical footprint per D-012.
+#### Payload hierarchy *(public dataclasses)*
 
-#### `KVCodec` *(protocol, I-3)*
+`CodedPayload` is the root. Concrete subclasses add per-codec
+`mx.array` fields and call `_verify_resident_bytes` from
+`__post_init__` so D-012 honesty (resident_bytes equals the sum of
+`.nbytes` across `mx.array` fields) is enforced at construction.
 
-Per-layer encode / decode. Class attributes: `block_size`, `k_dtype`,
-`v_dtype`. Methods:
+- **`CodedPayload`** — base. Field: `resident_bytes: int`.
+- **`RawFp16Payload(CodedPayload)`** — Identity-codec payload.
+  Field: `t: mx.array`. Shape matches the input tensor (typically
+  `(1, n_kv_heads, kv_block_size, head_dim)` for one side of one
+  detached block).
+- **`BlockTQPayload(CodedPayload)`** — BlockTurboQuantMSE payload.
+  Fields: `packed_indices: mx.array (uint8)`, `scales: mx.array
+  (fp16)`. Shapes per `(n_vectors = n_kv_heads × kv_block_size, d =
+  head_dim, B = vq_block_size, b = num_bits)`: indices
+  `(n_vectors, ceil(d × b / 8))`, scales `(n_vectors, d // B)`.
+- **`RaBitQPayload(CodedPayload)`** — RaBitQ-1 1-bit payload (P-5-B
+  core shape). Fields: `packed_indices: mx.array (uint8, (n_vectors,
+  d/8))`, `norm_o: mx.array (fp16, (n_vectors,))`, `ip_coeff:
+  mx.array (fp16, (n_vectors,))`. Centroid is held on the codec
+  instance, not the payload.
+- **`ExtRaBitQPayload(RaBitQPayload)`** — ExtRaBitQ multi-bit payload
+  (P-5-B.2). Adds a per-vector fp16 `scale: mx.array (n_vectors,)`
+  used as a dequantization factor. The vqbench reference's `offset`
+  field is dropped intentionally — opening §5.4 Amendment.
 
-- **`encode_block(k, v) -> CodedBlock`**
-- **`decode_block(block) -> tuple[mx.array, mx.array]`** — returns fp16
-  K, V (compressed-domain attention deliberately excluded from v0.1 per
-  D-003).
-- **`logical_bytes(num_tokens: int) -> int`** — fp16-baseline KV bytes.
-- **`resident_bytes(num_blocks: int) -> int`** — actual per D-012.
+#### `VectorCodec` *(protocol, I-3)*
 
-#### `IdentityCodec` *(public, stub + baseline)*
+Side-level, `@runtime_checkable Protocol[P]` parametrised on a
+`CodedPayload` subclass. Class attributes: `block_size: int`,
+`dtype: mx.Dtype`. Methods:
 
-Pass-through: encoded == raw, resident == logical. Stays in tree after P-5
+- **`encode_tensor(x: mx.array) -> P`** — encode one fp16 tensor
+  (one side of one block of one layer) into the codec-specific
+  payload.
+- **`decode_tensor(payload: P) -> mx.array`** — reconstruct an fp16
+  tensor (D-003: output is fp16; no compressed-domain attention in
+  v0.1).
+- **`logical_bytes(num_tokens: int) -> int`** — fp16-baseline-equivalent
+  bytes for `num_tokens` tokens of this side.
+- **`resident_bytes(num_blocks: int) -> int`** — physical bytes held
+  for `num_blocks` blocks of this side (D-012 canonical).
+
+Pair-level dispatch lives in
+[`SyntheticPrefixBlockStore`](#silicakvcachestore), which holds the K
+and V codec separately and encodes / decodes independently per side
+— resolution of Q-008 per the side-level Protocol shipped at P-5-A.0.
+
+#### `IdentityCodec` *(public, baseline)*
+
+Pass-through `VectorCodec[RawFp16Payload]`. Encoded payload wraps the
+input tensor unchanged; `resident == logical`. Stays in tree after P-5
 as the fp16 baseline on a `--kv-codec` switch.
 
-Constructor: `IdentityCodec(*, block_size, n_kv_heads, head_dim,
-k_dtype=mx.float16, v_dtype=mx.float16)`.
+Constructor: `IdentityCodec(*, block_size: int, n_kv_heads: int,
+head_dim: int, dtype=mx.float16)`.
 
-Implements all four I-3 methods trivially.
+Implements all four `VectorCodec` methods trivially.
 
 ### `silica.kvcache.prefix`
 
@@ -900,6 +961,34 @@ runnable model.
 Constructor (kwargs): `model_name="stub"`, `num_layers=2`, `hidden_size=32`,
 `vocab_size=8`, `n_kv_heads=2`, `head_dim=16`.
 
+### `silica.models.capabilities`
+
+P-3 capability gate (D-016). The scheduler reads
+`adapter.capabilities()` once at construction time and refuses to admit
+adapters whose declared needs the current batcher cannot honour.
+
+#### `ModelCapabilities` *(public, frozen dataclass)*
+
+Typed summary of what an adapter needs from the scheduler. Fields:
+
+- **`attention_kinds: frozenset[AttentionKind]`** — every kind that
+  appears in the model's `AttentionPattern`. Used by the batcher to
+  pick KV layouts.
+- **`has_recurrent_state: bool`** — true for hybrid families (Qwen3.5
+  DeltaNet) where `StateDelta._payload` carries non-KV runtime state.
+  `ContinuousBatcher` refuses adapters with this flag set in v0.1
+  unless paired with `BatchRecurrentStateStore` (P-3-C5).
+- **`has_moe: bool`** — true when at least one layer routes through a
+  mixture-of-experts MLP (Qwen3.5-MoE, Gemma4-MoE). The continuous
+  batcher rejects MoE adapters with a P-3-E4 pointer until the
+  batched MoE smoke gate lifts.
+
+#### `capabilities_from_attention_pattern(pattern, *, has_moe=False) -> ModelCapabilities` *(public function)*
+
+Derive `ModelCapabilities` from an `AttentionPattern`. Sets
+`has_recurrent_state=True` when `HYBRID_DELTANET` appears in the
+pattern; `has_moe` is passed through.
+
 ### `silica.models.qwen3`
 
 #### `Qwen3Adapter` *(public class)*
@@ -934,6 +1023,116 @@ P-2 `ContinuousBatcher` refuses this adapter at construction time
 
 Constructor + `from_hf_repo` mirror `Qwen3Adapter`.
 
+### `silica.models.qwen3_5_moe`
+
+#### `Qwen3_5MoeAdapter` *(public class)*
+
+I-1 `ModelAdapter` for the Qwen3.5-MoE family
+(Qwen3.5-35B-A3B — `model_type == "qwen3_5_moe"`). Thin wrapper around
+the dense `Qwen3_5Adapter` — silica does not reimplement MoE math; the
+upstream `mlx_lm` `SwitchGLU` / `gather_mm` path owns expert dispatch.
+Silica contributes:
+
+- the `has_moe=True` capability so the scheduler refuses batched
+  execution at admission;
+- variant guards on `num_experts`, `num_experts_per_tok`,
+  `mlp_only_layers`;
+- `MoeExtra`-style metadata under `config.extra` (`num_experts`,
+  `num_experts_per_tok`, `moe_intermediate_size`,
+  `shared_expert_intermediate_size`, `norm_topk_prob_runtime`,
+  `attn_output_gate_config`, `attn_output_gate_mlx_lm_honors`);
+- an opt-in dispatch-observation seam:
+  **`install_dispatch_proxy(observer) -> None`** wraps each MoE
+  layer's `switch_mlp` with a forwarding proxy reporting
+  `(layer_idx, indices)` before delegating to the real `SwitchGLU`.
+  Not installed by default.
+
+Constructor + `from_hf_repo` mirror `Qwen3Adapter`. Per-expert MoE
+streaming under D-011 lands in P-6.
+
+### `silica.models.gemma4`
+
+#### `Gemma4Adapter` *(public class)*
+
+I-1 `ModelAdapter` for the Gemma4-31B dense family — sliding +
+full-attention layers in a `5:1` ratio
+(`AttentionPattern` mixes `SLIDING(window=4096)` and `GLOBAL`). Loaded
+via `mlx_lm.utils.load`, with weight-loading sanitize for the Gemma4
+multimodal heads. The MoE branch (Gemma4-26B-A4B) is rejected at
+construction; see `silica.models.gemma4_moe`.
+
+KV layout reports the per-kind sum via
+`KVLayout.bytes_per_token_total` so the budgeter sees the real
+heterogeneous footprint (sliding 16×256 + full 4×512 mix).
+
+Constructor + `from_hf_repo` mirror `Qwen3Adapter`. Batched execution
+delegates to `mlx_lm`'s `BatchRotatingKVCache` for sliding layers and
+`BatchKVCache` for full layers (P-3-D2 close).
+
+### `silica.models.gemma4_moe`
+
+`Gemma4MoeAdapter` — variant of `Gemma4Adapter` for the
+Gemma4-26B-A4B MoE branch. Branch-selected by an `enable_moe_block`
+flag inside the factory's `_build_gemma4` helper because Gemma4-MoE
+shares `model_type == "gemma4"` with the dense family. Like
+Qwen3.5-MoE, sets `has_moe=True` and is rejected at the batcher
+admission gate until P-3-E4 lifts.
+
+Unique to Gemma4-MoE: the dense MLP branch is **not** replaced — the
+MoE-mode forward sums `h = h_dense_mlp + h_experts`. KV layout
+inherits from `Gemma4Adapter` (sliding + full mix).
+
+### `silica.models.recurrent`
+
+P-3-C5 recurrent-state snapshot interface.
+
+#### `RecurrentSnapshot` *(public class, opaque)*
+
+Read-only snapshot of one batch row's recurrent state at slice-prefill
+boundaries. Adapter-defined payload; the scheduler treats it as
+opaque. Single public method **`recurrent_bytes() -> int`** for
+memory accounting.
+
+#### `RecurrentStateAdapter` *(public, mixin)*
+
+Marker mixin implemented by adapters that carry recurrent state across
+slice boundaries (Qwen3.5 hybrid families). Adds:
+
+- **`snapshot_recurrent(batch_row: int) -> RecurrentSnapshot`** —
+  capture state at a slice boundary.
+- **`restore_recurrent(batch_row: int, snap: RecurrentSnapshot) -> None`**
+  — restore at slice resume.
+
+`ContinuousBatcher` calls these only when
+`adapter.capabilities().has_recurrent_state` is true and the slice-
+prefill regime is active (C5.5 α-MVP).
+
+### `silica.models.pre_norm_capture`
+
+P-5-F (3b) pre-RoPE production routing — stores keys at the
+projection-output stage *before* RMSNorm and RoPE so the prefix store
+holds normalisation- and rotation-free K, matching the (b-static)
+codec quality target.
+
+#### `install_pre_norm_capture_proxies(model) -> None` *(public function)*
+
+Wrap every attention layer's `k_proj` with a `_PreNormCaptureProxy`
+that captures the projection output (pre-norm, pre-RoPE) into a
+per-layer slot. Installed once per `build()`; idempotent.
+
+#### `apply_k_norm_then_rope_to_block(k_block, *, layer, position_ids, sin, cos) -> mx.array` *(public function)*
+
+Reconstruct post-RoPE K from a pre-norm K block on demand. Called by
+`SyntheticPrefixBlockStore.fetch_detached` when the codec is
+configured for the (3b) production-store path. Output matches the
+shape contract `build_seeded_batch_kv` expects.
+
+#### `PreNormCaptureAdapter` *(public, mixin)*
+
+Marker mixin for adapters that ship the (3b) prefix-cache store
+path. Implemented by `Qwen3_5Adapter`. Adds the per-layer
+`PreNormSlot` slot list so the proxies have a write target.
+
 ### `silica.models.factory`
 
 #### `adapter_for_repo(repo: str) -> tuple[ModelAdapter, SimpleKVCache]` *(public function)*
@@ -941,7 +1140,10 @@ Constructor + `from_hf_repo` mirror `Qwen3Adapter`.
 Load `repo` via mlx-lm, build matching family adapter.
 
 - Dispatches on `model.model_type`.
-- Supported: `"qwen3"` → `Qwen3Adapter`, `"qwen3_5"` → `Qwen3_5Adapter`.
+- Supported: `"qwen3"` → `Qwen3Adapter`, `"qwen3_5"` →
+  `Qwen3_5Adapter`, `"qwen3_5_moe"` → `Qwen3_5MoeAdapter`,
+  `"gemma4"` → `Gemma4Adapter` or `Gemma4MoeAdapter` depending on
+  `enable_moe_block`.
 - Unknown `model_type` raises `NotImplementedError` listing supported
   families and pointing at the registry.
 
@@ -1002,6 +1204,99 @@ Constructor: `ResidentWeightProvider(layers: dict[int, LayerWeights] | None = No
   implemented.
 - `get_expert` / `prefetch_experts` / `release_expert` raise
   `NotImplementedError` with message `"dense provider has no per-expert path"`.
+
+---
+
+## `silica.vq`
+
+P-5 KV codec implementations. The codecs satisfy the
+[`VectorCodec`](#silicakvcachecodec) Protocol and are wired into the
+prefix-block store via `SyntheticPrefixBlockStore.k_codec` /
+`.v_codec`. All hot-path bodies are MLX-native (D-009 — no NumPy /
+torch in runtime).
+
+Re-exports (via `silica/vq/__init__.py`):
+
+| Name | Origin | Kind |
+| --- | --- | --- |
+| `BlockTurboQuantMSE` | block_tq | public class |
+| `TurboQuantMSE` | turboquant | public function (factory) |
+| `RaBitQ1Bit` | rabitq.rabitq_1bit | public class |
+| `ExtRaBitQ` | rabitq.rabitq_ext | public class |
+
+### `silica.vq.block_tq`
+
+#### `BlockTurboQuantMSE` *(public class)*
+
+Block-wise TurboQuant with per-vq-block fp16 scales. Each vector
+(one head's slice of one token) is split into `d / B` contiguous spans
+of length `B = vq_block_size`; each span is normalised by its own L2
+norm (scale) and quantised against a Lloyd-Max codebook of width
+`b = num_bits` bits. Decode multiplies the scalar-quantised
+codebook value by the saved scale.
+
+Constructor:
+
+```python
+BlockTurboQuantMSE(
+    *,
+    block_size: int,           # number of tokens per detached block
+    n_kv_heads: int,
+    head_dim: int,
+    vq_block_size: int,        # B; head_dim must be a multiple
+    num_bits: int,             # b; one of {2, 3, 4}
+    seed: int = 42,
+    per_head_rotation: bool = False,
+    norm_correction: bool = True,
+    dtype: mx.Dtype = mx.float16,
+)
+```
+
+Implements `VectorCodec[BlockTQPayload]`. The `per_head_rotation`
+flag (D.2a finding, opt-in at v1.7.8 default-off) draws an
+independent Haar rotation per head; default tightens variance
+across seeds without changing the mean (P-5 acceptance evidence in
+`plans/P5_ACCEPTANCE_SWEEP/`).
+
+### `silica.vq.turboquant`
+
+#### `TurboQuantMSE(*, block_size, n_kv_heads, head_dim, num_bits, seed=42, norm_correction=True, dtype=mx.float16) -> BlockTurboQuantMSE` *(public factory)*
+
+Scalar TurboQuantMSE — `BlockTurboQuantMSE(vq_block_size=head_dim)`.
+Kept as a separate symbol for catalogue clarity: when `B == d` there
+is exactly one scale per vector, and the codec collapses to the
+classical TurboQuant scheme.
+
+### `silica.vq.rabitq`
+
+Subpackage with the RaBitQ codec family — vector-level rotated
+sign-bit quantisation.
+
+#### `RaBitQ1Bit` *(public class)*
+
+`VectorCodec[RaBitQPayload]`. 1-bit (sign-bit) quantisation against a
+fixed Haar rotation, with per-vector `||x - centroid||` and inner-
+product coefficient saved on the payload. P-5-B opening §5.3 pins
+the centroid at zero. Symmetric in K / V.
+
+#### `ExtRaBitQ` *(public class)*
+
+`VectorCodec[ExtRaBitQPayload]`. Multi-bit extension of `RaBitQ1Bit`
+(`num_bits ∈ {2, 3, 4}`). Adds a per-vector fp16 dequantisation
+scale to the payload. Symmetric in K / V.
+
+### `silica.vq._calibration`
+
+Underscore-prefixed helper module that hosts NumPy-side calibration
+routines (centroid fitting, Haar-rotation sampling, codebook
+fitting). Held under `_calibration` because v0.1 codecs do not
+calibrate at runtime — calibration data is loaded from pickled
+artifacts produced offline by vqbench-equivalent scripts. D-009 keeps
+the runtime hot path MLX-native; calibration is the documented
+exception.
+
+Public surface is intentionally thin: helpers are imported by codec
+constructors, not re-exported via `silica.vq.__init__`.
 
 ---
 
@@ -1128,23 +1423,371 @@ first `effective_batch_size` admits pre-step → the rest queue via
 
 ---
 
+## `silica.bench`
+
+P-4 unified benchmark harness. The runner walks a scenario catalogue,
+holds an oracle stack (smoke / B=1 parity / teacher-forced argmax /
+PPL / storage / admission-headroom), and emits JSONL + Markdown
+reports. The harness drives `Engine` directly — no special path; the
+same configuration produced by the CLI runs the bench.
+
+Re-exports (via `silica/bench/__init__.py`):
+
+| Name | Origin | Kind |
+| --- | --- | --- |
+| `Scenario`, `ScenarioResult`, `OracleKind`, `OracleFn`, `Workload`, `VqbenchXcheckSpec`, `hf_cache_path_for_repo` | scenario | public |
+| `BUILTIN_SCENARIOS`, `get_scenario`, `list_scenario_ids` | scenarios | public |
+| `BenchRunner`, `EngineFactory`, `DirectBatchedReferenceFn`, `TeacherForcedSilicaFn`, `TeacherForcedReferenceFn` | runner | public |
+| `VqbenchBaselineResult`, `default_reproduce_script_path`, `parse_headline_row`, `run_vqbench_baseline` | vqbench_baseline | public |
+| `render_markdown_report` | report | public |
+
+Oracle implementations are an internal concern of the runner and are
+**not** re-exported at the package level; authors of new oracles
+import from `silica.bench.oracles` directly.
+
+### `silica.bench.scenario`
+
+#### `OracleKind` *(public, str enum)*
+
+How a scenario decides pass / fail. Values: `SMOKE`,
+`B1_PARITY_VS_SINGLE`, `BGT1_DIRECT_BATCHED_REFERENCE`,
+`TEACHER_FORCED_ARGMAX`, `DECODE_TOK_S_WITH_PREFIX_HIT`, `PPL`,
+`STORAGE`, `ADMISSION_HEADROOM`.
+
+#### `Workload` *(public, frozen dataclass)*
+
+Prompt set + decoding parameters. Fields: `name`, `prompts`,
+`max_tokens`, `max_batch_size=1`, `prefix_cache=False`,
+`temperature=0.0`, `top_p=1.0`, `kv_codec=None`.
+
+#### `VqbenchXcheckSpec` *(public, frozen dataclass)*
+
+Declarative spec for a `--vqbench-xcheck` cross-check arm. Fields:
+`script_path`, `method`, `bits`, `extra_args=()`. The runner
+materialises this into a subprocess invocation when
+`bench.py --vqbench-xcheck` is set.
+
+#### `Scenario` *(public, frozen dataclass)*
+
+One bench row. Fields: `id`, `repo`, `workload`,
+`oracle=OracleKind.SMOKE`, `oracle_config={}`, `gate_env_var=None`,
+`description=""`, `vqbench_xcheck=None`. Scenarios with a non-None
+`gate_env_var` skip when the named env var is unset (cache-presence
+gates for HF-cache-bound rows).
+
+#### `ScenarioResult` *(public, dataclass)*
+
+Outcome of running one scenario. Fields: `scenario_id`, `status`,
+`reason`, `ttft_ms`, `prefill_tok_s`, `decode_tok_s`, `resident_mb`,
+`peak_memory_mb`, `total_tokens`, `wall_s`, `metadata`. Status
+values: `"ok"`, `"failed"`, `"skipped"`. The runner dumps these as
+JSONL rows and `render_markdown_report` aggregates them.
+
+#### `OracleFn` *(public type alias)*
+
+`Callable[[Scenario, Any, Any], tuple[bool, str | None, dict[str, Any]]]`.
+Oracle functions return `(passed, reason_if_failed, extra_metadata)`.
+
+#### `hf_cache_path_for_repo(repo: str) -> Path` *(public function)*
+
+Derive the HF hub cache directory for `repo`. Used by
+`gate_env_var=None` scenarios that gate on cache-presence by
+checking whether the directory exists.
+
+### `silica.bench.scenarios`
+
+Module-level scenario catalogue.
+
+#### `BUILTIN_SCENARIOS: dict[str, Scenario]` *(public, constant)*
+
+Canonical map of scenario id → `Scenario`. Curated to cover the
+P-4 / P-5 acceptance gates and the Qwen3-0.6B / Qwen3.5 dev loops.
+
+#### `get_scenario(scenario_id: str) -> Scenario` *(public function)*
+
+Look up a scenario by id; raises `KeyError` on unknown id.
+
+#### `list_scenario_ids() -> list[str]` *(public function)*
+
+Sorted list of known scenario ids — used by `bench.py --list`.
+
+### `silica.bench.runner`
+
+#### `BenchRunner` *(public class)*
+
+Drives scenarios and emits `ScenarioResult` rows.
+
+Constructor: `BenchRunner(engine_factory: EngineFactory | None = None,
+peak_memory_fn=None)`. Default `engine_factory` builds an `Engine`
+from the scenario's `repo`; tests inject mocks via the constructor.
+
+Key method: **`run(scenarios, output_path, *, report_md=None,
+all_kv_codecs=False, vqbench_xcheck=False, codec_overrides=None,
+seeds=(42,)) -> list[ScenarioResult]`** — runs each scenario, writes
+JSONL to `output_path`, optionally writes a Markdown report.
+`all_kv_codecs` expands every PPL / storage / admission-headroom row
+into the codec catalogue.
+
+#### `EngineFactory`, `DirectBatchedReferenceFn`, `TeacherForcedSilicaFn`, `TeacherForcedReferenceFn` *(public type aliases)*
+
+Type aliases capturing the runner's pluggable seams. See the runner
+source for signatures; all four are wired to default implementations
+inside `BenchRunner.__init__`.
+
+### `silica.bench.codec_registry`
+
+#### `CodecSpec` *(public, frozen dataclass)*
+
+Registry entry for one named codec configuration. Fields: `id`,
+`family`, `bits_per_value`, `k_supported`, `v_supported`,
+`requires_fit`, `payload_packed`, `production_recommended`,
+`factory: Callable[..., VectorCodec]`. The `factory` builds a side-
+level codec for either K or V given a `KVLayout`.
+
+#### `get_codec_spec(codec_id: str) -> CodecSpec` *(public function)*
+
+Look up a codec spec by id. Raises `KeyError` on unknown id.
+
+#### `list_codec_ids() -> list[str]` *(public function)*
+
+Sorted ids in registry order.
+
+### `silica.bench.oracles`
+
+Module-level oracle implementations called by `BenchRunner` based on
+`scenario.oracle`. All conform to `OracleFn`.
+
+- **`smoke_oracle`** — did the workload emit at least one valid
+  token?
+- **`b1_parity_oracle`** — `B=1` parity: batched token stream must
+  equal the single-request reference token-by-token.
+- **`bgt1_direct_batched_reference_oracle`** — `B>1` parity: silica
+  per-row output equals a direct mlx-lm batched reference call.
+- **`teacher_forced_argmax_oracle`** — silica adapter path's
+  positional-argmax outputs must match a teacher-forced reference at
+  every position.
+- **`decode_tok_s_with_prefix_hit_oracle`** — P-5-A.0 prefix-hit
+  decode-throughput gate.
+- **`ppl_oracle`** — P-5-C end-to-end PPL gate (vqbench-aligned
+  oracle path).
+- **`storage_oracle`** — P-5-C resident-bytes invariant gate.
+- **`admission_headroom_oracle`** — P-5-C admission-headroom gate
+  proving Principle 8 (codec on → more rows admitted at the same
+  cap).
+
+### `silica.bench.ppl_oracle`
+
+Teacher-forced perplexity primitives.
+
+- **`teacher_forced_chunked_nll(...)`** — cumulative teacher-forced
+  NLL over a token sequence.
+- **`teacher_forced_chunked_nll_with_codec(...)`** — same, but
+  routed through a `RadixPrefixCache` so codec encode / decode is
+  exercised on every chunk.
+- **`teacher_forced_chunked_nll_with_codec_pre_rope(...)`** — P-5-F
+  pre-RoPE production-store oracle.
+- **`teacher_forced_chunked_nll_with_codec_pre_norm(...)`** — P-5-F
+  (3b) production-store oracle: pre-norm K via projection-output
+  capture.
+- **`teacher_forced_chunked_nll_vqbench_aligned(...)`** — vqbench-
+  style pre-RoPE codec injection (D.2a oracle); the (4-b) PPL gate
+  measures against this path.
+- **`perplexity_from_nll(nll_sum, num_tokens) -> float`** — convert
+  cumulative NLL + token count to perplexity.
+
+### `silica.bench.report`
+
+#### `render_markdown_report(results) -> str` *(public function)*
+
+Return a Markdown report covering `results`. Used both by the runner
+(via `--report-md` flag) and by callers building ad-hoc reports.
+
+### `silica.bench.wikitext`
+
+WikiText loading helpers used by the PPL oracles.
+
+- **`load_wikitext_text(path) -> str`** — read a pre-extracted
+  WikiText text file into a single string.
+- **`tokenize_for_ppl(text, tokenizer) -> mx.array`** — tokenize
+  into the `(1, seq_len)` int32 shape the PPL oracles expect.
+
+### `silica.bench.vqbench_baseline`
+
+Drives the vqbench reproduce-script path so silica's PPL numbers are
+measured against the same harness vqbench cites in its public REPORT.
+
+#### `VqbenchBaselineResult` *(public, dataclass)*
+
+One vqbench reproduce-script invocation outcome. Fields: `status`,
+`reason`, `script`, `python_executable`, `script_args`, `model`,
+`method`, `bits`, `ppl_fp16`, `ppl_quant`, `delta_ppl`, `delta_pct`,
+`wall_s`, `returncode`, `stdout_tail`.
+
+#### `parse_headline_row(stdout: str) -> dict[str, Any] | None` *(public function)*
+
+Extract the PPL headline fields from a reproduce-script stdout. Used
+by `run_vqbench_baseline` and exposed for tests.
+
+#### `run_vqbench_baseline(script, *, python_executable, script_args, model, method, bits, subprocess_runner=subprocess.run) -> VqbenchBaselineResult` *(public function)*
+
+Run `script` in a subprocess; parse its PPL headline. The
+`subprocess_runner` seam is for tests.
+
+#### `default_reproduce_script_path() -> Path` *(public function)*
+
+Return the checked-in reproduce script path (relative to the repo
+root). Used as the default value for the
+`bench.py --vqbench-xcheck` command.
+
+---
+
+## `silica.chat`
+
+Chat session abstraction (multi-turn loop with prefix-cache reuse)
+plus the bundled `prompt_toolkit` REPL CLI.
+
+Re-exports (via `silica/chat/__init__.py`):
+
+| Name | Origin | Kind |
+| --- | --- | --- |
+| `ChatSession`, `TurnMetrics` | session | public |
+
+The CLI subpackage `silica.chat.cli` is intentionally not re-exported
+at `silica.chat`; it is a separate namespace with its own internal
+layering. Programmatic users build on `ChatSession` directly.
+
+### `silica.chat.session`
+
+#### `TurnMetrics` *(public, dataclass)*
+
+One chat-turn outcome. Fields: `reply`, `prompt_tokens`,
+`output_tokens`, `finish_reason`, `ttft_ms`, `prefill_tok_s`,
+`decode_tok_s`, `resident_mb`, `peak_memory_mb`, `logical_kv_bytes`,
+`wall_s`, `prefix_hit_blocks`, `prefix_hit_tokens`,
+`prefix_store_resident_bytes`, `prefix_store_logical_bytes`. The
+chat CLI's toolbar reads these; `/showcase` aggregates them across a
+session.
+
+#### `ChatSession` *(public class)*
+
+Stateful multi-turn chat loop. Holds a conversation history (list of
+`{role, content}` messages), an optional `RadixPrefixCache`, and the
+adapter / engine pair. Each `chat()` call rebuilds the prompt via
+`tokenizer.apply_chat_template`, runs through `Engine.generate_batch`
+with `prefix_cache=self._prefix_cache`, and returns a `TurnMetrics`.
+
+Constructor:
+
+```python
+ChatSession(
+    adapter,
+    engine,
+    *,
+    system_prompt: str | None = None,
+    prefix_cache: RadixPrefixCache | None = None,
+    reset_peak_memory: Callable[[], None] | None = None,
+    read_peak_memory_mb: Callable[[], float | None] | None = None,
+    clock: Callable[[], float] = time.perf_counter,
+)
+```
+
+Key methods:
+
+- **`chat(message, params=None, stream_to=None) -> TurnMetrics`** —
+  one turn; `stream_to` is an optional `Callable[[str], None]`
+  invoked on each decoded chunk.
+- **`reset() -> None`** — clear conversation history and reset the
+  prefix cache (if attached).
+- **`replace_messages(messages) -> None`** — wholesale swap of the
+  history, used by `/load` in the chat CLI.
+- **`set_prefix_cache(cache) -> None`** — attach / detach a prefix
+  cache mid-session.
+
+Properties: `messages`, `eos_token_ids`, `prefix_cache`.
+
+### `silica.chat.cli`
+
+Bundled `prompt_toolkit`-driven REPL — design contract in
+`plans/CHAT_CLI_OPENING.md`. The package is layered:
+
+- **`silica.chat.cli.state`** — `ChatCliState` dataclass holding
+  live engine metrics, `StreamState` enum, conversation log,
+  configuration. All other CLI code reads / writes through this
+  state.
+- **`silica.chat.cli.palette`** — `Palette` + `PaletteMode` enum
+  (`PLAIN` / `EIGHT` / `TRUE_COLOR`) + capability detection
+  (24-bit / 8-colour / `NO_COLOR` fallback).
+- **`silica.chat.cli.toolbar`** — pure-function formatter from
+  `ChatCliState` to the bottom-of-terminal status line.
+  `render_toolbar(state, *, palette=None) -> str`,
+  `render_codec_hint(state, *, palette=None, threshold_mb=200.0)
+  -> str | None` (codec recommendation when prefix store crosses a
+  threshold under fp16), `render_showcase(state, *, palette=None)
+  -> str` (the multi-line `/showcase` session report).
+- **`silica.chat.cli.thinking_parser`** — incremental parser that
+  separates `<think>` tag content from reply content during
+  streaming. Emits `ThinkChunk` and `ReplyChunk` events.
+- **`silica.chat.cli.code_fence`** — incremental parser that
+  isolates fenced code blocks for pygments highlighting. Emits
+  `PlainText`, `EnterFence`, `ExitFence` events.
+- **`silica.chat.cli.commands`** — slash-command dispatch
+  (`/reset`, `/stats`, `/save`, `/load`, `/model`, `/showcase`,
+  `/exit`).
+- **`silica.chat.cli.config`** — `ChatCliConfig` pydantic model
+  + `--system` / `--kv-codec` parsing.
+- **`silica.chat.cli.persistence`** — JSON session serialization
+  with `SCHEMA_VERSION = 1`. `serialize_session(...)`,
+  `save_session(path, ...)`, `load_session(path) -> dict`.
+  Permissive forward-compat loading: missing optional fields
+  default; unknown fields ignored.
+- **`silica.chat.cli.app`** — the prompt_toolkit application shell.
+  Owns the event loop, redraws the toolbar at decode boundaries,
+  routes input through commands / fence / thinking parsers,
+  emits coloured output via the palette.
+
+The `state` / `palette` / `toolbar` / `thinking_parser` /
+`code_fence` / `persistence` modules are pure-Python and unit-tested
+without prompt_toolkit. Only `app` carries the event-loop wiring.
+
+---
+
 ## `silica.server`
 
 ### `silica.server.cli`
 
-`python -m silica run …` entry point. One subcommand today; HTTP server
-ships in P-8.
+`silica` console-script entry point (also reachable via `python -m
+silica …`). Two subcommands today: `run` (one-shot single-prompt
+generation; the P-7+ HTTP server lands here too) and `chat` (drops
+into the `silica.chat.cli` REPL). Bare `silica …` is rewritten to
+`silica chat …` at parse time so the chat REPL is the default.
 
 #### `build_parser() -> argparse.ArgumentParser`
 
-Construct the argparse parser. Subcommands: `run`. Arguments:
-`--model` (HF repo id, required), `--prompt` (required),
-`--max-tokens=64`, `--temperature=0.0` (0.0 = greedy),
-`--top-p=None`, `--top-k=None`, `--seed=None`.
+Construct the argparse parser. Subcommands:
+
+- **`run`** — one-shot generation. Arguments: `--model` (HF repo id,
+  required), `--prompt` (required), `--max-tokens=64`,
+  `--temperature=0.0` (0.0 = greedy), `--top-p=None`, `--top-k=None`,
+  `--seed=None`.
+- **`chat`** — start the chat REPL. Arguments: `--model`,
+  `--system`, `--kv-codec`, `--max-tokens`, plus the `--top-*` /
+  `--temperature` / `--seed` shared with `run`.
 
 #### `main(argv: Sequence[str] | None = None) -> int`
 
-Parse + dispatch. `run` calls `_run`. Returns shell exit code.
+Parse + dispatch. Calls `_preprocess_argv(argv)` first so bare
+invocations (`silica --model …`) become `silica chat --model …`.
+`run` calls `_run`; `chat` calls `silica.chat.cli.app.run_app`.
+Returns shell exit code.
+
+#### `_preprocess_argv(argv) -> list[str]` *(internal)*
+
+C-7 bare-`silica` argv preprocessor (claude-style). When the first
+positional token is not a known subcommand and not a top-level flag
+(`--help` / `-h` / `--version`), prepend `chat` so the parser sees
+the chat subcommand. The known-subcommand set is the module-level
+`_KNOWN_SUBCOMMANDS = frozenset({"run", "chat"})`. Empty argv
+becomes `["chat"]`.
 
 #### `_run(args) -> int` *(internal)*
 
@@ -1169,6 +1812,18 @@ skipping `None` fields.
   [`P2_UNIT_16D_PREP.md`](../plans/P2_UNIT_16D_PREP.md) — per-unit prep docs with
   the invariant tables (S-1..S-7, B-1..B-9, L-1..L-3) that the batcher's
   tests enforce.
+- [`P5_OPENING.md`](../plans/P5_OPENING.md) — payload schemas, codec
+  catalogue, scalar-equivalence invariant for `silica.vq` /
+  `silica.kvcache.codec`.
+- [`P5_F_OPENING.md`](../plans/P5_F_OPENING.md) — pre-RoPE production
+  routing for the (3b) projection-output capture path used by
+  `silica.models.pre_norm_capture`.
+- [`P3_MOE_SURVEY.md`](../plans/P3_MOE_SURVEY.md) — Qwen3.5-MoE +
+  Gemma4-MoE adapter design (`silica.models.qwen3_5_moe`,
+  `silica.models.gemma4_moe`).
+- [`CHAT_CLI_OPENING.md`](../plans/CHAT_CLI_OPENING.md) — design
+  contract for `silica.chat.cli` (toolbar field set, palette mode
+  detection, thinking parser, persistence schema).
 - `tests/` — the authoritative behaviour spec. `test_batcher.py`,
   `test_memory_budgeter.py`, `test_p2_batched_parity.py` are the
   high-signal entry points.

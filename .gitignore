@@ -35,3 +35,6 @@ Thumbs.db
 
 # Result
 results/
+
+# Docs build output
+docs/_build/
