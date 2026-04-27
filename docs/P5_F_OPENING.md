@@ -1539,3 +1539,74 @@ commit. v1.7.6 is the version stamp.
 P-5-F's final architecture decision is **(3b)**: projection-output
 capture wrapper + pre-k_norm K storage + on-hit
 `decode → k_norm → RoPE → seed`.
+
+### 10.6 Post-P-5-F follow-up items 1 / 2 / 3 — close (v1.7.7-v1.7.8)
+
+The v1.7.6 close note recorded three items as "What is NOT closed".
+All three landed in the user-ordered cleanup sequence after P-5-F:
+
+**Item 1 — slice-regime + `pre_norm=True` end-to-end on hybrid
+Qwen3.5-0.8B (closed v1.7.8, commit `dc99f7b`).** Adds
+`tests/test_p5_f_pre_norm_e2e_hybrid.py` (2 cases). The companion
+discriminator to F.2b's `tests/test_p5_f_pre_norm_e2e.py`
+(Qwen3-0.6B, pure GQA, non-slice prefill paths). Extends the same
+IdentityCodec bit-equivalence pattern to Qwen3.5-0.8B (hybrid
+DeltaNet + GQA) so the slice-regime helpers exercised under
+`RecurrentStateAdapter + prefix_cache != None` are end-to-end
+validated:
+
+- `_slice_prefill_with_capture` (B=1) — the per-chunk arm/forward/
+  disarm/split lifecycle that F.2b added to the existing slice loop.
+- `_split_capture_into_row_kpre` per-row block-aligned slicing with
+  hybrid attention-layer indices (DeltaNet layers excluded).
+- `_admit_single_hit_row` slice-regime branch — capture during the
+  suffix prefill goes through `_slice_prefill_with_capture`; the
+  fetch side (`apply_k_norm_then_rope`) runs over the attention-
+  layer subset.
+
+Both cases pass HF-cache-skip-gated on `Qwen/Qwen3.5-0.8B`. No
+silica/* runtime change; this is the missing real-hybrid-model
+exercise the v1.7.6 note flagged.
+
+**Item 2 — (b-static) Qwen3.5-4B PPL vs vqbench REPORT.md (closed
+v1.7.7, commit `3161391`).** See `docs/PLAN.md` §13 v1.7.7
+changelog and `docs/P5_ACCEPTANCE_SWEEP/qwen35_4b_b_static_close.md`.
+Closed on the production hot path via the (3b) capture path —
+neither the originally-planned monkey-patch fallback nor a
+P-3-C cooperation sub-unit was needed.
+
+**Item 3 — opt-in per-head Haar rotation (landed v1.7.8 default
+OFF, commit `b06bc4c`).** Adds `per_head_rotation: bool = False`
+to `BlockTurboQuantMSE`, `RaBitQ1Bit`, `ExtRaBitQ`. When `True`,
+codec draws `n_kv_heads` independent Haar rotations seeded
+`seed * 1000 + head_idx` (matching vqbench's `actual_seed =
+run_seed * 1000 + head_idx` at
+`vqbench/scripts/variance_qwen35_4b.py:63`) and applies one per
+head via batched matmul on the `(n_kv_heads, B, d)` reshape of the
+rotated input. The v1.7.6 note recorded this as the source of the
+~0.61 PPL diagnostic gap surfaced by D.2a (silica's shared
+rotation vs vqbench's per-head rotation); having it as an opt-in
+unblocks the future D.2a re-run that would empirically pin
+whether the per-head choice is the dominant residual cost on
+(4-b).
+
+**Default OFF** is deliberate: byte-preserves the closed (4-b)
+D.2a 3-seed cross-check evidence (single shared (d, d) rotation
+unchanged). Flipping the default is a separate empirical decision
+after re-running D.2a with the opt-in active and confirming
+`|mean_gap|` improves vs the current `0.150 PPL` baseline.
+
+Tests in `tests/test_per_head_rotation.py` (22 cases): shape /
+distinctness / orthogonality / per-head seed convention pinned
+to `haar_rotation(d, seed * 1000 + h)` / default-mode byte-
+preservation against `haar_rotation(d, seed)` / round-trip /
+RaBitQ-only zero-head isolation pinning the head-major reshape
+ordering / BlockTQ recon-error sanity. Default-path tests
+(`tests/test_block_tq.py`, `tests/test_block_tq_vqbench_xcheck.py`,
+`tests/test_block_tq_real_activation_xcheck.py`, full rabitq
+suite) remain green.
+
+**All three v1.7.6 follow-ups are now resolved.** The remaining
+P-5-F-related backlog item is: re-run D.2a with
+`per_head_rotation=True` to empirically determine whether to flip
+the default — a separate measurement-only unit, not P-5-F scope.

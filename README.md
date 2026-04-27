@@ -15,7 +15,7 @@ plus a planned mini-sglang outer layer for Phase 8. Target: run dense
 | P-3 | Family adapters — Qwen3 dense, Qwen3.5 hybrid DeltaNet, Gemma4-31B dense, Qwen3.5-MoE, Gemma4-MoE | ✅ mostly (`C5` preempt/replay with recurrent-state snapshot pending; `E4` batched MoE pending) |
 | P-4 | Unified bench harness — runner, oracles, 15 registered scenarios, JSONL + Markdown reports, vqbench subprocess PPL | ✅ complete; P-4 exit surfaced Q-010 chunked-prefill trigger → P-4.5 bridge planned |
 | P-4.5 | P-4 exit bridge — chunked-prefill minimal + VectorCodec runtime integration spike | ✅ complete (v1.6.9) |
-| P-5 | VQ KV compression (BlockTQ / RaBitQ) | ✅ complete (v1.7.4 — P-5-A / B / C / D sub-units + P-5 Acceptance (1)–(4) all closed: codec-swap neutrality by inspection, `--all-kv-codecs` one-command report, `n_block > n_fp16` admission-headroom gate, vqbench-aligned mean-over-seeds PPL cross-check. P-5-F pre-RoPE production routing closed at v1.7.6 via the (3b) projection-output capture path; production (4-b) anchor row measures ΔPPL +0.012 inside D.2a envelope. `PagedPrefixBlockStore` codec injection intentionally deferred under D-003) |
+| P-5 | VQ KV compression (BlockTQ / RaBitQ) | ✅ complete (v1.7.4 — P-5-A / B / C / D sub-units + P-5 Acceptance (1)–(4) all closed: codec-swap neutrality by inspection, `--all-kv-codecs` one-command report, `n_block > n_fp16` admission-headroom gate, vqbench-aligned mean-over-seeds PPL cross-check. P-5-F pre-RoPE production routing closed at v1.7.6 via the (3b) projection-output capture path; production (4-b) anchor row measures ΔPPL +0.012 inside D.2a envelope. (b-static) Qwen3.5-4B vs vqbench REPORT.md baseline closed at v1.7.7. v1.7.8 closes the v1.7.6 follow-up trail: slice-regime + pre_norm hybrid Qwen3.5-0.8B E2E discriminator, opt-in per-head Haar rotation default OFF. `PagedPrefixBlockStore` codec injection intentionally deferred under D-003) |
 | P-6 | Weight streaming | Stub (`ResidentWeightProvider` today) |
 | P-7 | Speculative decoding (DraftTarget / EAGLE / Medusa) | Stub (`NoopDraftEngine` today) |
 | P-8 | OpenAI-compatible HTTP server + session layer | ⏳ planned (leaning T1 tail, after P-5) |
@@ -486,7 +486,23 @@ P-4.5 bridges both.
   envelope. Three legacy comparison arms (`prefix_store_post_rope`,
   `prefix_store_pre_rope`, `vqbench_aligned`) retained as bench-
   only opt-ins per `docs/P5_F_OPENING.md` §6.9 reading order.
-  The single intentionally-deferred Deliverable remains
+  **(b-static) closed at v1.7.7:** the originally v1.5.1-named
+  Qwen3.5-4B PPL gate vs `vqbench/REPORT.md` static baseline
+  closed on the production hot path via the same (3b) capture
+  path (mean ΔPPL = +0.0016 across 3 seeds, inside vqbench's
+  reported `+0.000% ± 0.000%` lossless-at-measurement-precision
+  envelope; ~16x SEM headroom on the (4-b)-style aggregated
+  gate). Evidence:
+  `docs/P5_ACCEPTANCE_SWEEP/qwen35_4b_b_static_close.md`.
+  **v1.7.8 closes the remaining v1.7.6 follow-up trail:** Item 1
+  — slice-regime + `pre_norm=True` end-to-end on hybrid
+  Qwen3.5-0.8B (`tests/test_p5_f_pre_norm_e2e_hybrid.py`,
+  IdentityCodec discriminator on slice-regime helpers); Item 3 —
+  opt-in per-head Haar rotation across BlockTQ / RaBitQ1Bit /
+  ExtRaBitQ (`per_head_rotation: bool = False`, default OFF
+  preserves the closed (4-b) baseline; seed convention `seed *
+  1000 + head_idx` matches vqbench). The single
+  intentionally-deferred Deliverable remains
   `PagedPrefixBlockStore` codec injection (`NotImplementedError`
   stub per D-003 no-compressed-domain-attention scope; lands when
   the paged-attention kernel track advances).
