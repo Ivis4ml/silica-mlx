@@ -1,0 +1,7 @@
+# 2026-04-27T13:33:03-07:00
+# command: python -m scripts.bench --scenario qwen3.5-0.8b-warm-decode-b1 --out plans/P6_0_BASELINE/qwen3.5-0.8b-warm-decode-b1.jsonl --report-md plans/P6_0_BASELINE/qwen3.5-0.8b-warm-decode-b1.md
+---
+Fetching 10 files:   0%|          | 0/10 [00:00<?, ?it/s]Fetching 10 files: 100%|██████████| 10/10 [00:00<00:00, 137068.76it/s]
+| id | codec | seed | status | reason | ttft_ms | decode_tok_s | resident_mb | peak_mb | wall_s | tokens |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| qwen3.5-0.8b-warm-decode-b1 |  | 0 | ok |  | 43.3 | 123.3 | 25.8 | 1813.7 | 3.059 | 256 |

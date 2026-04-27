@@ -1,0 +1,7 @@
+# 2026-04-27T13:34:48-07:00
+# command: SILICA_REAL_QWEN3_5_MOE=1 python -m scripts.bench --scenario qwen3.5-moe-35b-a3b-warm-decode-b2 --out plans/P6_0_BASELINE/qwen3.5-moe-35b-a3b-warm-decode-b2.jsonl --report-md plans/P6_0_BASELINE/qwen3.5-moe-35b-a3b-warm-decode-b2.md
+---
+Fetching 14 files:   0%|          | 0/14 [00:00<?, ?it/s]Fetching 14 files: 100%|██████████| 14/14 [00:00<00:00, 378840.36it/s]
+| id | codec | seed | status | reason | ttft_ms | decode_tok_s | resident_mb | peak_mb | wall_s | tokens |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| qwen3.5-moe-35b-a3b-warm-decode-b2 |  | 0 | ok |  | 2055.7 | 120.9 |  | 20156.2 | 12.487 | 768 |

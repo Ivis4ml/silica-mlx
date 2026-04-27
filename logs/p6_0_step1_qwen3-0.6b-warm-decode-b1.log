@@ -1,0 +1,7 @@
+# 2026-04-27T13:32:42-07:00
+# command: python -m scripts.bench --scenario qwen3-0.6b-warm-decode-b1 --out plans/P6_0_BASELINE/qwen3-0.6b-warm-decode-b1.jsonl --report-md plans/P6_0_BASELINE/qwen3-0.6b-warm-decode-b1.md
+---
+Fetching 7 files:   0%|          | 0/7 [00:00<?, ?it/s]Fetching 7 files: 100%|██████████| 7/7 [00:00<00:00, 184654.89it/s]
+| id | codec | seed | status | reason | ttft_ms | decode_tok_s | resident_mb | peak_mb | wall_s | tokens |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| qwen3-0.6b-warm-decode-b1 |  | 0 | ok |  | 39.2 | 161.2 | 58.7 | 1475.3 | 2.158 | 256 |

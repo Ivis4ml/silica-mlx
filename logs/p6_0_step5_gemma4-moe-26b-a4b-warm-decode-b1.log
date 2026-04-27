@@ -1,0 +1,7 @@
+# 2026-04-27T13:36:04-07:00
+# command: SILICA_REAL_GEMMA4_MOE=1 python -m scripts.bench --scenario gemma4-moe-26b-a4b-warm-decode-b1 --out plans/P6_0_BASELINE/gemma4-moe-26b-a4b-warm-decode-b1.jsonl --report-md plans/P6_0_BASELINE/gemma4-moe-26b-a4b-warm-decode-b1.md
+---
+Fetching 9 files:   0%|          | 0/9 [00:00<?, ?it/s]Fetching 9 files: 100%|██████████| 9/9 [00:00<00:00, 112347.43it/s]
+| id | codec | seed | status | reason | ttft_ms | decode_tok_s | resident_mb | peak_mb | wall_s | tokens |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| gemma4-moe-26b-a4b-warm-decode-b1 |  | 0 | ok |  | 454.0 | 68.6 | 149.3 | 14724.4 | 8.482 | 384 |
