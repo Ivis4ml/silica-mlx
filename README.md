@@ -501,7 +501,13 @@ P-4.5 bridges both.
   opt-in per-head Haar rotation across BlockTQ / RaBitQ1Bit /
   ExtRaBitQ (`per_head_rotation: bool = False`, default OFF
   preserves the closed (4-b) baseline; seed convention `seed *
-  1000 + head_idx` matches vqbench). The single
+  1000 + head_idx` matches vqbench). **v1.7.10 D.2a 3-seed
+  re-measurement** (`scripts/d2a_per_head_3seed.py`) verifies
+  empirically that engaging `per_head_rotation=True` shrinks the
+  silica-vs-vqbench `mean_gap` from 0.150 to 0.066 PPL (~56%
+  reduction) on Qwen3-0.6B WikiText-2; default OFF stays in force,
+  flipping is a separate decision (see
+  `docs/P5_D2_INVESTIGATION/per_head_rotation_3seeds.md`). The single
   intentionally-deferred Deliverable remains
   `PagedPrefixBlockStore` codec injection (`NotImplementedError`
   stub per D-003 no-compressed-domain-attention scope; lands when
