@@ -562,6 +562,120 @@ def test_eos_only_reply_yields_empty_string() -> None:
     assert metrics.reply == ""
 
 
+class _PartialUtf8Tokenizer:
+    """Tokenizer fake whose ``decode`` produces a transient
+    ``\\ufffd`` at one specific token-count boundary.
+
+    Models the BPE-emoji-split case: the cumulative byte sequence
+    after token N has invalid trailing UTF-8 (one byte of a
+    multi-byte char), so the tokenizer emits ``\\ufffd``; token
+    N+1 contributes the missing bytes and the replacement char
+    is replaced by the real character. The streaming code must
+    not leak the ``\\ufffd`` to the consumer in the meantime.
+    """
+
+    eos_token_ids: set[int] = {99}
+    vocab_size: int = 200
+
+    def encode(self, text: str) -> list[int]:
+        return [ord(c) for c in text]
+
+    def decode(self, token_ids: list[int]) -> str:
+        n = len(token_ids)
+        if n == 0:
+            return ""
+        if n == 1:
+            return "Hello"
+        if n == 2:
+            return "Hello �"  # partial emoji
+        if n == 3:
+            return "Hello 😀"  # closing bytes arrived
+        return "Hello 😀 done"
+
+
+def test_streaming_holds_back_trailing_replacement_char() -> None:
+    """The tokenizer's mid-stream ``\\ufffd`` (commonly emoji bytes
+    split across BPE tokens) must NOT be streamed verbatim — it
+    becomes a permanent ``?`` glyph in the conversation log even
+    after the next token completes the multi-byte sequence."""
+    tok = _PartialUtf8Tokenizer()
+    # Hand-build the session — _build_session uses _FakeTokenizer
+    # with deterministic mod-based decode that does not exercise
+    # the boundary case.
+    adapter = _FakeAdapter(tok)
+    engine = _FakeEngine([1, 2, 3, 4])
+    session = ChatSession(
+        adapter,
+        engine,
+        reset_peak_memory=lambda: None,
+        read_peak_memory_mb=lambda: 0.0,
+    )
+    streamed: list[str] = []
+    metrics = session.chat(
+        "hi",
+        sampling_params=SamplingParams(max_tokens=4),
+        stream_to=streamed.append,
+    )
+    full_streamed = "".join(streamed)
+    # The streamed output must NEVER contain a ``�``.
+    assert "�" not in full_streamed
+    # The decoded final replied (after token 3) has the real
+    # emoji; the token-4 step extends with " done"; together the
+    # streamed output reaches the full final.
+    assert full_streamed == "Hello 😀 done"
+    # The stored reply also strips any trailing replacement char
+    # (defensive — full final has none here).
+    assert "�" not in metrics.reply
+    assert metrics.reply == "Hello 😀 done"
+
+
+def test_streaming_drops_truly_invalid_trailing_replacement_char() -> None:
+    """If the model emits a partial multi-byte sequence and then
+    EOS arrives without completing it, the trailing ``\\ufffd``
+    is permanent. The streaming output drops it (better to lose
+    one glyph than to render a permanent ``?``); the stored
+    reply matches by also stripping."""
+
+    class _CutOffTokenizer:
+        eos_token_ids: set[int] = {99}
+        vocab_size: int = 200
+
+        def encode(self, text: str) -> list[int]:
+            return [ord(c) for c in text]
+
+        def decode(self, token_ids: list[int]) -> str:
+            n = len(token_ids)
+            if n == 0:
+                return ""
+            if n == 1:
+                return "Hello"
+            # Token 2 is EOS; the decoded prefix-without-EOS
+            # leaves "Hello�" — partial emoji, never
+            # completed.
+            if n == 2:
+                return "Hello�"
+            return "Hello�"  # never gets here
+
+    tok = _CutOffTokenizer()
+    adapter = _FakeAdapter(tok)
+    engine = _FakeEngine([1, 99])
+    session = ChatSession(
+        adapter,
+        engine,
+        reset_peak_memory=lambda: None,
+        read_peak_memory_mb=lambda: 0.0,
+    )
+    streamed: list[str] = []
+    metrics = session.chat(
+        "hi",
+        sampling_params=SamplingParams(max_tokens=10),
+        stream_to=streamed.append,
+    )
+    assert "�" not in "".join(streamed)
+    assert "�" not in metrics.reply
+    assert metrics.reply == "Hello"
+
+
 def test_non_eos_finish_keeps_full_decoded_text() -> None:
     """When generation ends by max_tokens (no EOS yielded), the
     reply text retains every emitted token. Strip-trailing-EOS is

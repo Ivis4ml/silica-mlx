@@ -279,7 +279,13 @@ class ChatSession:
         reply_tokens = out_tokens
         if reply_tokens and reply_tokens[-1] in self._eos_ids:
             reply_tokens = reply_tokens[:-1]
-        reply_text = self._tokenizer.decode(reply_tokens)
+        # Trailing ``�`` chars indicate an incomplete multi-byte
+        # UTF-8 sequence that EOS / max_tokens cut short before
+        # the closing bytes arrived. Match the streaming
+        # ``rstrip("�")`` so the stored reply equals what the
+        # user saw on screen, and so the next turn's chat-template
+        # tokenisation does not see a ghost replacement char.
+        reply_text = self._tokenizer.decode(reply_tokens).rstrip("�")
         # Prefix-cache path surfaces finish_reason directly via the
         # batcher's terminal BatchEvent; single-request path infers
         # it from the token sequence.
@@ -399,16 +405,31 @@ class ChatSession:
             if tok in stop_set:
                 # Reset printed_prefix to the pre-stop-token text
                 # so the assistant message text we feed downstream
-                # does not include the stop bytes either.
+                # does not include the stop bytes either. Strip
+                # any trailing held-back replacement chars so
+                # they are also dropped from the final reply.
                 printed_prefix = self._tokenizer.decode(
                     out_tokens[:-1]
-                )
+                ).rstrip("�")
                 return
             current = self._tokenizer.decode(out_tokens)
-            delta = current[len(printed_prefix):]
-            if delta:
-                stream_to(delta)
-                printed_prefix = current
+            # UTF-8 boundary handling: hold back trailing
+            # ``�`` (replacement character) chars. The
+            # tokenizer's decode emits these whenever the
+            # cumulative byte sequence ends mid-multi-byte-char
+            # (commonly an emoji whose UTF-8 bytes are split
+            # across two or three BPE tokens). The next token
+            # carries the remaining bytes and the replacement
+            # char vanishes — but if we streamed it as-is, a
+            # permanent ``?`` glyph would already be on screen.
+            # Holding back the trailing run lets the next decode
+            # naturally produce the real character.
+            safe = current.rstrip("�")
+            if len(safe) <= len(printed_prefix):
+                return
+            delta = safe[len(printed_prefix):]
+            stream_to(delta)
+            printed_prefix = safe
 
         if self._prefix_cache is None:
             for tok in self._engine.generate(prompt_text, params):
