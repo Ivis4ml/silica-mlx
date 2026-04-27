@@ -202,7 +202,18 @@ the sense that landing one does not require any other; they are stackable
 in the sense that all of their wins multiply (the bandwidth analysis in
 §1.3 assumes they all land).
 
-Tracks are ranked by `(impact / risk-and-complexity)`:
+Tracks are ranked by `(impact / risk-and-complexity)`. **Note (D-021,
+v1.7.14):** the *execution order* committed at v1.7.14 is **not** the
+ranked order below — the ranked order is "single-track ROI on a
+homogeneous workload." Per D-021 the actual phase sequencing is
+P5.9 hardening → P-6.0.5 measurement expansion → Decision Gate 1 →
+spec foundation + C.1 → C.4 spike → B → C.5 / C.2 / C.3 → A → D / E.
+Track A defers behind the speculative foundation because A's
++5-15% on bandwidth-bound dense is invisible without spec running
+on top; A's +30-80% MoE leverage is real but lands on a target
+that already cleared its baseline gate. A is documented below as
+"general efficiency + MoE amplifier," not as the dense gate
+cracker.
 
 ### Track A — Sync-Barrier Collapse
 
@@ -466,7 +477,7 @@ launch latency and per-layer dispatch. Two levers compound:
   1024-token / B=8 in published benchmarks. Maintainer's last
   release is paused until M5 Max bring-up, so we treat this as
   measurement-gated: only land if the kernel runs cleanly on M5 Pro
-  + macOS 26.x and produces the claimed speedup on our long-prompt
+  with macOS 26.x and produces the claimed speedup on our long-prompt
   scenario. (See PLAN.md Q-009 for the variable-length SDPA story —
   D.2 does not solve Q-009, it just makes the prefill kernel faster
   within the bucketed-padding regime silica already uses.)
@@ -543,31 +554,57 @@ hot path).
 
 ## 4. Cross-Track Dependencies and Execution Order
 
-```
-P-6.0 measurement gate     (must land first, blocks everything)
+The order below is the v1.7.14 D-021 commitment (foundation-first).
+The ranked-by-ROI order in §3 is the *single-track* impact ranking;
+the *phase-execution* order is below.
+
+```text
+P-6.0 measurement gate    LANDED v1.7.13 (plans/P6_0_BASELINE/REPORT.md)
         |
-        +---> A.1 + A.2  (sampler / sync collapse — easy, big win)
-        |       |
-        |       +---> A.3  (snapshot lazy-graph)
-        |
-        +---> B.1 + B.2  (3-bit weights — independent track, parallel)
-        |
-        +---> D.1        (chunked prefill — parallel, scheduler work)
-        |       |
-        |       +---> D.2  (mlx-mfa — measurement-gated, parallel)
-        |
-        +---> C.1        (draft-target speculative)
-        |       |
-        |       +---> C.2 / C.3  (only if C.1 leaves a gap)
-        |
-        +---> E.1 / E.2  (streaming and SSD prefix tier — parallel,
-                          do not block the dense-target gate)
+        v
+P5.9 hardening pass       D-021 step 2 — no new features:
+        |                   load-bearing crack repair (probe double-load,
+        |                   Q-012 prefix-cache initial-cohort, recurrent
+        |                   rollback for spec, P-5 quality regression
+        |                   gate, D-009 audit, full re-run)
+        v
+P-6.0.5 measurement       D-021 step 3 — 27B B=2/B=4, MoE B=3/B=4,
+        |                   27B 4K-context peak, warm-TTFT scenario,
+        |                   target-verification microbench
+        v
+Decision Gate 1           D-021 step 4 — fix (1a)/(1b) framing
+        |                   from data; record re-confirm or re-target
+        v
+Spec foundation + C.1     D-021 step 5 — DraftEngine wiring,
+        |                   greedy parity, metadata schema,
+        |                   recurrent + KV rollback test
+        v
+C.4 DFlash spike          D-021 step 6 — minimal closed loop;
+        |                   gate >=1.8x silica-integrated speedup;
+        |                   >=2.5x justifies pursuing (1b) stretch
+        v
+Track B 3-bit             D-021 step 7 — loader + PPL oracle first,
+        |                   quality gate, then runtime
+        v
+C.5 / C.2 / C.3           D-021 step 8 — selection driven by C.4
+        |                   outcome and (1b) status
+        v
+Track A sync collapse     D-021 step 9 — repositioned as
+        |                   "general efficiency + MoE amplifier"
+        v
+Track D / E               D-021 step 10 — D.1 chunked prefill +
+                            decode merging; D.2 mlx-mfa
+                            measurement-gated; E.1 MoE per-expert
+                            streaming; E.2 SSD prefix cache
 ```
 
-P-6.0 is the strict prerequisite; A / B / D / C / E run in parallel.
-Within Track A, sub-units land in numerical order (A.1+A.2 ship as one
-PR, A.3 follows separately because it has its own correctness contract
-on snapshot equivalence).
+The diagram is sequential where dependent and parallel where not:
+P5.9 hardening blocks everything (steps 3-10 reference its
+deliverables); P-6.0.5 blocks Decision Gate 1; the spec foundation
+blocks every C.x; B and A run independently of each other after
+the foundation. Within Track A, sub-units land in numerical order
+(A.1+A.2 ship as one PR, A.3 follows separately because it has its
+own correctness contract on snapshot equivalence).
 
 ## 4a. Phase exit when?
 
@@ -615,37 +652,52 @@ To keep the scope honest, the following are excluded:
 
 ---
 
-## 6. Phase-Level Acceptance (proposed)
+## 6. Phase-Level Acceptance (revised at v1.7.14 per D-021)
 
-The phase exits successfully when items 1, 3, 4, 5, 6 are all true.
-Item 2 is the stretch validator — passing it is celebrated, missing
-it requires a Decision Log entry but does not fail the phase.
+The phase exits successfully when items 1a, 3, 4, 5, 6 are all true.
+Items 1b and 2 are stretch validators — passing them is celebrated,
+missing them requires a Decision Log entry but does not fail the
+phase.
 
-1. **Dense primary target — Qwen3.5-27B-4bit ≥60 tok/s:** sustained
-   warm-start decode_tok_s on `mlx-community/Qwen3.5-27B-4bit`, B=1,
-   128-token prompt, 384-token generation (warm-start rule per §2)
-   ≥ **60 tok/s**, with the highest-performing Track C variant that
-   lands cleanly enabled and the B.1 3-bit option available as a flag.
-   The 60 tok/s figure rests on the full Track A + B + C stack
-   (see §1.3 arithmetic); on the 4-bit-only path without speculative
-   the bandwidth ceiling is ~22.7 tok/s with a realistic envelope
-   ~26 tok/s after engine fusion. There is **no independent
-   4-bit-only floor** in this gate — committing to one would require
-   a number the bandwidth math says we cannot deliver without
-   speculative.
-2. **MoE stretch validator — Qwen3.5-35B-A3B-4bit ≥100 tok/s:**
-   sustained warm-start aggregate decode_tok_s on
-   `mlx-community/Qwen3.5-35B-A3B-4bit` ≥ **100 tok/s aggregate** on
-   M5 Pro 48 GB. **Primary measurement at B=2** (the largest MoE
-   batch validated to fit 48 GB to date — peak ~30 GB at B=2 per
-   `tests/test_p3_qwen3_5_moe_batched_parity.py` at v1.7.9). **B=4
-   is opt-in stretch** (scenario
-   `qwen3.5-moe-35b-a3b-warm-decode-b4`) with explicit OOM-risk
-   documentation in the bench catalog; the gate clears whichever
-   batch size first lands ≥100 tok/s aggregate. **Status: stretch.**
-   Failing it records a Decision Log entry with the measured
-   overhead floor; passing it confirms the optimization stack lands
-   end-to-end on the hardest engine path silica supports.
+1. **(1a) Dense engineering gate — Qwen3.5-27B-4bit ≥40 tok/s
+   (must pass):** sustained warm-start decode_tok_s on
+   `mlx-community/Qwen3.5-27B-4bit`, B=1, 128-token prompt,
+   384-token generation (warm-start rule per §2) ≥ **40 tok/s**,
+   with the highest-performing landed Track C variant enabled and
+   the B.1 3-bit option allowed but not required. Reachable from the
+   16.05 tok/s baseline via Track A engine fusion 1.10-1.15× ×
+   Track B 3-bit 1.30× × Track C.1 draft-target 1.40-1.80× → 32-50
+   tok/s realistic envelope. **This is the gate the phase actually
+   exits on.**
+
+   **(1b) Dense stretch gate — Qwen3.5-27B-4bit ≥60 tok/s
+   (stretch):** same workload, same enabled stack, but pinning the
+   user's original v0.1 framing. **Reaching this requires Track C.4
+   DFlash and/or C.5 DDTree to land ≥2.5× silica-integrated speedup
+   over the C.1 baseline.** Decision Gate 1 (D-021 step 4) measures
+   the C.4 spike and decides whether (1b) is in pursuit; if the
+   measured C.4 silica-integrated speedup is ≤1.8× the C.1 baseline,
+   (1b) is retired to a Decisions Log entry naming the empirical
+   floor. The phase still exits on (1a) regardless.
+2. **(2a) MoE anchor — Qwen3.5-35B-A3B-4bit ≥100 tok/s aggregate
+   (already cleared at v1.7.13 baseline).** Sustained warm-start
+   aggregate decode_tok_s on `mlx-community/Qwen3.5-35B-A3B-4bit`
+   at B=2 was **120.93 tok/s** at the v1.7.13 P-6.0 baseline before
+   any track work — see `plans/P6_0_BASELINE/qwen3.5-moe-35b-a3b-warm-decode-b2.jsonl`.
+   The anchor is preserved as evidence that the optimization stack
+   runs cleanly on the hardest engine path silica supports.
+
+   **(2b) MoE stretch — ≥150 tok/s aggregate at B=2 OR ≥100 tok/s
+   per-row at B=2.** Either form clears it; both demonstrate
+   silica's MoE-batched throughput is competitive with the
+   GPU-class numbers vllm-mlx publishes (127.7 tok/s on M4 Max
+   single-row). Reachable via Track A sync collapse — the
+   compute-bound MoE regime has 40%+ bandwidth slack at B=2
+   (59.1% utilization in baseline) which is exactly where the
+   +30-80% Track A leverage applies. Status: **stretch**.
+   Missing it records a Decision Log entry; passing it
+   demonstrates the engine's optimization stack lands its
+   estimated leverage on a real Apple Silicon target.
 3. **TTFT under concurrency:** on the new
    `qwen3.5-27b-ttft-under-concurrency-warm` scenario (1 long
    2048-token request + 3 short 64-token requests), the short
@@ -822,8 +874,8 @@ here as a diff-shaped proposal so a reviewer can read them in one place.
   - Date: 2026-04-27.
   - Status: proposed.
   - Decision: PLAN.md §8.1 priority tiers — P-7 (Speculative) moves
-    from T2 to T1, joining P-5 / P-6 in the "make big models fit
-    + run fast at 48 GB" bucket. P-8 (Mini-SGLang) remains T2.
+    from T2 to T1, joining P-5 / P-6 in the "make big models fit and
+    run fast at 48 GB" bucket. P-8 (Mini-SGLang) remains T2.
   - Rationale: bandwidth analysis shows speculative is required, not
     optional, to reach the dense-27B target. Q-002 ("should P-8
     priority float up?") is unaffected; this is about P-7 not P-8.

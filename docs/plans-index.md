@@ -90,6 +90,20 @@ read in-editor while iterating.
   acceptance (dense Qwen3.5-27B-4bit ≥60 tok/s primary + MoE
   Qwen3.5-35B-A3B-4bit ≥100 tok/s stretch on 48 GB M5 Pro),
   proposed PLAN.md edits applied via D-017 / D-018 / D-019.
+- [`P6_0_BASELINE/REPORT.md`](../plans/P6_0_BASELINE/REPORT.md) —
+  P-6.0 measurement-gate baseline interpretation: 8 scenarios
+  measured on M5 Pro 48 GB; dense 27B at 16.05 tok/s (70.6%
+  bandwidth utilization, gap 3.74× to the §6 gate), MoE 35B-A3B
+  B=2 at 120.93 tok/s aggregate (already clears the §6 stretch
+  gate at baseline). Per-scenario `.jsonl` + `.md` reports plus
+  `logs/p6_0_step*.log` reproduce the numbers.
+- [`P6_REVIEW_HANDOFF.md`](../plans/P6_REVIEW_HANDOFF.md) —
+  self-contained handoff for an external reviewer (e.g. GPT-5.5
+  xhigh): mission + hard constraints, phase recap with evidence,
+  the open question (dense 60 tok/s reachability), eight specific
+  review questions Q-R1..Q-R8 ranked by priority, layered
+  reading-order navigation, and the verification map for
+  re-deriving any cited number independently.
 
 ## Side track: chat CLI redesign
 

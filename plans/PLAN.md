@@ -2,9 +2,9 @@
 
 | Field        | Value                                                                      |
 | ------------ | -------------------------------------------------------------------------- |
-| Version      | v1.7.13                                                                    |
+| Version      | v1.7.14                                                                    |
 | Last updated | 2026-04-27                                                                 |
-| Status       | P-5 complete; P-5 Acceptance (1)–(4) closed at v1.7.4; (a-real) real-activation xcheck closed at v1.7.5; P-3-C5 closed in slice-prefill regime (C5.5 α-MVP); P-3-E4 batched MoE smoke + scheduler-glue parity closed at v1.7.9; P-5-F pre-RoPE production routing closed at v1.7.6 via the (3b) projection-output capture path (F.1-F.4); (b-static) Qwen3.5-4B PPL vs vqbench REPORT.md baseline closed at v1.7.7; slice-regime + pre_norm hybrid Qwen3.5-0.8B E2E discriminator closed at v1.7.8; per-head Haar rotation landed as opt-in (default OFF) at v1.7.8; per-head D.2a 3-seed re-measurement at v1.7.10 — \|mean_gap\| 0.150 → 0.066 PPL (56% reduction); per-head (b-static) Qwen3.5-4B production-path re-measurement at v1.7.11 — std 5.3× tighter, mean unchanged in SEM, default flip is now an administrative landing, not an empirical question; **P-6 re-scoped from "Weight Streaming" to "Performance Phase" at v1.7.13 per D-017 / D-018 / D-019 — dense Qwen3.5-27B-4bit ≥60 tok/s primary target + MoE Qwen3.5-35B-A3B-4bit ≥100 tok/s stretch validator on 48 GB M5 Pro; P-7 Speculative promoted from T2 to T1; dense layer-streaming deferred to v0.2; Track C speculative grows to five sub-units per D-020 (C.1 draft-target, C.2 ReDrafter, C.3 MTP, C.4 DFlash, C.5 DDTree); P-6.0 measurement gate started — P-6.0.1 / P-6.0.2 landed (WARM_DECODE oracle), P-6.0.3 / P-6.0.4 in-progress; see `plans/P6_OPENING.md`** |
+| Status       | P-5 complete; P-5 Acceptance (1)–(4) closed at v1.7.4; (a-real) real-activation xcheck closed at v1.7.5; P-3-C5 closed in slice-prefill regime (C5.5 α-MVP); P-3-E4 batched MoE smoke + scheduler-glue parity closed at v1.7.9; P-5-F pre-RoPE production routing closed at v1.7.6 via the (3b) projection-output capture path (F.1-F.4); (b-static) Qwen3.5-4B PPL vs vqbench REPORT.md baseline closed at v1.7.7; slice-regime + pre_norm hybrid Qwen3.5-0.8B E2E discriminator closed at v1.7.8; per-head Haar rotation landed as opt-in (default OFF) at v1.7.8; per-head D.2a 3-seed re-measurement at v1.7.10 — \|mean_gap\| 0.150 → 0.066 PPL (56% reduction); per-head (b-static) Qwen3.5-4B production-path re-measurement at v1.7.11 — std 5.3× tighter, mean unchanged in SEM, default flip is now an administrative landing, not an empirical question; **P-6 re-scoped from "Weight Streaming" to "Performance Phase" at v1.7.13 per D-017 / D-018 / D-019 — dense Qwen3.5-27B-4bit ≥60 tok/s primary target + MoE Qwen3.5-35B-A3B-4bit ≥100 tok/s stretch validator on 48 GB M5 Pro; P-7 Speculative promoted from T2 to T1; dense layer-streaming deferred to v0.2; Track C speculative grows to five sub-units per D-020 (C.1 draft-target, C.2 ReDrafter, C.3 MTP, C.4 DFlash, C.5 DDTree); P-6.0 measurement gate landed at v1.7.13 (8 scenarios + REPORT in `plans/P6_0_BASELINE/`); **P-6 contract sync at v1.7.14 per D-021** — dense gate split into (1a) ≥40 tok/s engineering (must pass) + (1b) ≥60 tok/s stretch (contingent on C.4/C.5 ≥2.5×); execution order rewritten to foundation-first (P5.9 hardening → P-6.0.5 → Decision Gate 1 → spec foundation → C.4 spike → B → A); see `plans/P6_OPENING.md` and `plans/P6_REVIEW_HANDOFF.md`** |
 | Maintainer   | Xin Zhou                                                                   |
 | Source       | `plans/PLAN.md` (single source of truth)                                    |
 
@@ -620,18 +620,45 @@ Each Phase uses the same structure: `ID / Goal / Scope / Strategy / Deliverables
     yielding a ~22.7 tok/s ceiling. Speculative decoding is the only
     lever that amortizes a single weight read across N accepted
     tokens; 3-bit weights lift the ceiling proportionally.
-  - **Step 0 measurement gate (P-6.0).** Before any track lands:
-    warm-start sustained-decode bench scenarios on real Qwen3.5-27B,
-    Gemma4-31B, Qwen3.5-35B-A3B, gemma-4-26B-A4B (dual-gated as
-    today). Every later sub-unit's success criterion is a ratio
-    against the P-6.0 baseline, not an absolute number.
-  - **Five tracks run in parallel** after P-6.0; Track A ships first
-    because its wins are pure Python and unblock measurement of all
-    other tracks (see §4 of the opening doc for the dependency
-    graph).
-  - **Phase exits when at least three of five tracks ship** AND the
-    dual targets in Acceptance below are met OR the user accepts a
-    re-targeted exit via a new Decisions Log entry.
+  - **Lock the foundation before optimization (D-021 path).** The
+    sequencing committed at v1.7.14 is **P5.9 hardening → P-6.0.5
+    measurement expansion → Decision Gate 1 → speculative
+    foundation + C.1 → C.4 DFlash spike → Track B 3-bit → C.5 / C.2 /
+    C.3 by data → Track A sync collapse → Track D/E**. Track A is
+    deferred until after the speculative foundation lands because
+    A's win on dense 27B is small (~5-15%, the path is bandwidth-
+    bound) and is invisible without spec running on top; A's larger
+    +30-80% leverage shows up on MoE workloads where it serves as
+    "general efficiency + MoE amplifier" rather than a dense gate
+    cracker. Full ordered rationale in D-021.
+  - **Step 0 measurement gate (P-6.0).** Already landed as of
+    v1.7.13 — see `plans/P6_0_BASELINE/REPORT.md`. Dense 27B B=1
+    at 16.05 tok/s (70.6% bandwidth utilization); MoE B=2 at
+    120.93 tok/s aggregate (already clears the §6 (2) stretch
+    gate at baseline).
+  - **Step 0.5 measurement expansion (P-6.0.5).** Before any
+    track work, add 27B B=2 / B=4 (B=4 opt-in), MoE B=3 / B=4
+    (B=4 OOM-flagged), 27B 4K-context peak, warm-TTFT scenario
+    (two consecutive prompts, second's TTFT measured after compile
+    is warm), and a target-verification microbench (one target
+    forward verifying 2 / 4 / 8 candidate tokens) — the last is
+    the prerequisite for credible Track C ROI estimation.
+  - **Decision Gate 1 (D-021).** P-6.0.5 data fixes whether the
+    dense gate (1a) ≥40 tok/s engineering target is realistic and
+    whether (1b) ≥60 tok/s stretch warrants Track C.4/C.5 effort.
+    No Track A-E PR opens until Decision Gate 1 records its
+    re-confirmation entry.
+  - **Five tracks land sequentially-where-dependent, parallel-where-
+    independent.** Spec foundation (DraftEngine wiring, parity,
+    metadata, recurrent rollback) gates all C.x. Track B 3-bit
+    runs parallel to Track C from the loader-only stage; quality
+    gate must pass before runtime promotion. Track A ships after
+    the spec foundation as documented above. Track D/E serve
+    product / memory needs and run last.
+  - **Phase exits** when (1a) + (3) + (4) + (5) + (6) pass AND at
+    least three of {Track A.{1,2,3} / B.{1,2} / C.{1,4,5} / D.1 /
+    E.1} land cleanly. (1b) ≥60 tok/s is celebrated when met and
+    explicitly not required for phase exit.
 - **Deliverables:** ride on the five tracks defined in
   `plans/P6_OPENING.md` §3. Concretely:
   - [ ] **P-6.0** — warm-start measurement scenarios for 27B / 31B /
@@ -658,31 +685,47 @@ Each Phase uses the same structure: `ID / Goal / Scope / Strategy / Deliverables
     `silica.kvcache.prefix` extension).
 - **Acceptance:** items 1, 3, 4, 5, 6 must pass; item 2 is the stretch
   validator (record in Decisions Log if missed; phase still exits).
-  - [ ] **(1) Dense primary — Qwen3.5-27B-4bit ≥60 tok/s.** Sustained
-    warm-start `decode_tok_s` on `mlx-community/Qwen3.5-27B-4bit`,
-    B=1, 128-token prompt, 384-token generation, with C.1 speculative
-    enabled and B.1 3-bit option available as a flag. The 60 tok/s
-    figure rests on the full Track A + B + C stack (see
-    `plans/P6_OPENING.md` §1.3 arithmetic); on the 4-bit-only path
-    without speculative the bandwidth ceiling is ~22.7 tok/s with a
-    realistic envelope ~26 tok/s after engine fusion, so the gate
-    deliberately requires the speculative path. There is no
-    independent 4-bit-only floor — that would commit silica to a
-    number the bandwidth math says it cannot deliver without
-    speculative.
-  - [ ] **(2) MoE stretch — Qwen3.5-35B-A3B-4bit ≥100 tok/s.**
-    Sustained warm-start aggregate `decode_tok_s` on
-    `mlx-community/Qwen3.5-35B-A3B-4bit` ≥ 100 tok/s. **Primary
-    measurement at B=2** because B=2 is the largest MoE batch
-    validated to fit the 48 GB envelope (per
-    `tests/test_p3_qwen3_5_moe_batched_parity.py` at v1.7.9, peak
-    ~30 GB at B=2); **B=4 is opt-in stretch** (scenario
-    `qwen3.5-moe-35b-a3b-warm-decode-b4`) with explicit OOM-risk
-    documentation in the bench catalog. The gate clears whichever
-    batch size first lands ≥100 tok/s aggregate; if B=2 alone
-    clears the gate, B=4 is bonus information. Failure records a
-    Decision Log entry naming the measured engine-overhead floor;
-    does not fail the phase.
+  - [ ] **(1a) Dense engineering gate — Qwen3.5-27B-4bit ≥40 tok/s
+    (must pass).** Sustained warm-start `decode_tok_s` on
+    `mlx-community/Qwen3.5-27B-4bit`, B=1, 128-token prompt,
+    384-token generation, with the highest-performing landed Track C
+    variant enabled and Track B 3-bit allowed but not required. This
+    gate represents the floor reachable with engineering work on
+    silica's bandwidth-bound dense path: bandwidth ceiling ~22.7
+    tok/s × Track A engine fusion 1.10-1.15× × Track B 3-bit 1.30×
+    × Track C.1 draft-target 1.40-1.80× → 40-65 tok/s realistic
+    envelope. **This is the gate the phase exits on.**
+  - [ ] **(1b) Dense stretch / primary-challenge gate —
+    Qwen3.5-27B-4bit ≥60 tok/s (stretch).** Same workload as (1a)
+    but pinning the original v0.1 user-stated framing. **Reaching
+    this requires Track C.4 DFlash or C.5 DDTree to land in the
+    upper half of their MLX-conservative bands (≥2.5×
+    silica-integrated speedup over the C.1 baseline).** Per Q-C
+    resolution the phase explicitly does not commit to (1b) until
+    Decision Gate 1 (D-021) measures C.4/C.5 spike numbers; if
+    Decision Gate 1 shows ≤1.8× combined Track C.4 silica speedup,
+    (1b) is documented as out-of-reach and the phase exits on (1a)
+    + a Decision Log entry naming the empirical floor.
+  - [x] **(2a) MoE anchor — Qwen3.5-35B-A3B-4bit ≥100 tok/s
+    aggregate (already cleared at v1.7.13 baseline).** Sustained
+    warm-start aggregate `decode_tok_s` on
+    `mlx-community/Qwen3.5-35B-A3B-4bit` at B=2 = 120.93 tok/s
+    aggregate per `plans/P6_0_BASELINE/qwen3.5-moe-35b-a3b-warm-decode-b2.jsonl`.
+    The anchor is preserved as evidence that the optimization stack
+    runs cleanly end-to-end on the hardest engine path silica
+    supports; it is the floor every later track measurement on the
+    MoE path is compared against.
+  - [ ] **(2b) MoE stretch — Qwen3.5-35B-A3B-4bit ≥150 tok/s
+    aggregate at B=2 OR ≥100 tok/s per-row at B=2.** Either form
+    of the gate clears it; both demonstrate that silica's
+    MoE-batched throughput is competitive with the GPU-class
+    numbers vllm-mlx publishes (127.7 tok/s on M4 Max single-row).
+    Reachable via Track A sync collapse (the +30-80% leverage band
+    on compute-bound MoE applies here) plus B=2 → B=3 if memory
+    fits. Status: **stretch** — failing it records a Decision Log
+    entry but does not fail the phase. Phase exits on (1a) + (3) +
+    (4) + (5) + (6); (2a) is preserved baseline evidence; (1b) and
+    (2b) are stretch slots celebrated when met.
   - [ ] **(3) TTFT under concurrency.** New
     `qwen3.5-27b-ttft-under-concurrency-warm` scenario: short
     requests' TTFT ≤ 2× their solo TTFT in the presence of one long
@@ -1161,6 +1204,226 @@ Append-only. New decisions go at the end; old ones are not edited. Revocations /
 - **References:** D-017, D-019, P-6, P-7, Q-015,
   `plans/P6_OPENING.md` §3 Track C / §11 Q-B Resolution.
 
+### D-021 — P-6 contract sync: two-tier dense gate + foundation-first execution order
+
+- **Date:** 2026-04-27.
+- **Status:** accepted.
+- **Decision:** P-6 acceptance gate (1) splits into two tiers and
+  the phase execution order is locked at the foundation-first path
+  documented below. The split is driven by the v1.7.13 P-6.0
+  baseline measurement (dense 27B-4bit at 16.05 tok/s, 70.6%
+  bandwidth utilization) showing that the original single ≥60
+  tok/s gate sits at the edge of what stacked optimizations can
+  deliver, while a ≥40 tok/s engineering gate is reachable with
+  routine Track A + B + C.1 work.
+  - **(1a) Dense engineering gate ≥40 tok/s** — the gate the
+    phase actually exits on.
+  - **(1b) Dense stretch / primary-challenge gate ≥60 tok/s** —
+    pinned to the user's original framing but explicitly
+    contingent on Track C.4 DFlash and/or C.5 DDTree landing
+    ≥2.5× silica-integrated speedup.
+- **Rationale (the ten-step path):**
+  1. **P-6 contract sync** (this Decision; doc-only).
+  2. **P5.9 hardening pass** — no new features. Repair load-bearing
+     cracks before optimization. Deliverables (every one is a
+     bounded change, not a new architecture):
+     - **(a) Probe double-load fix.** Both `scripts/probe_qwen3_5_27b_load.py`
+       (line 107: `_mlx_lm_load(repo)`) and `scripts/probe_gemma4_31b_load.py`
+       (line 151: same) currently call mlx-lm load **then**
+       `adapter_for_repo(repo)` (lines 170 and 194 respectively),
+       which reloads the same checkpoint via the factory and
+       inflates the reported peak by ~2× on 27B/31B. Switch the
+       second call to `silica.models.factory.adapter_from_loaded_model(model, tokenizer)`
+       (already exists at `silica/models/factory.py:108`) so the
+       probe runs one load and reports honest peak numbers. This
+       directly affects the §6(4) RAM headroom gate's reference
+       baseline.
+     - **(b) Q-012 initial-cohort prefix-cache consultation.**
+       Promote from "open, deferred to v0.2 revisit" (PLAN §10
+       Q-012) to "in-scope for P5.9". Without it, the chat REPL
+       and any future HTTP server see zero prefix reuse across
+       `generate_batch([prompt])` invocations because the initial
+       cohort path bypasses `RadixPrefixCache.lookup` entirely.
+       Net effect on the §6 stretch validators is small (warm-decode
+       prompts are not shared) but on real session workloads the
+       gap is structural.
+     - **(c) Qwen3.5 recurrent rollback (and snapshot pre-draft).**
+       `silica/models/qwen3_5.py:rollback_state` currently raises
+       `NotImplementedError` (intentionally — the docstring says
+       "real rollback semantics land with P-7"). P5.9 takes the
+       snapshot half: a pre-draft snapshot pathway plus
+       `rollback_state` honoring it. Without this, every C.x
+       speculative variant (especially C.4 DFlash and C.5 DDTree
+       which have higher reject rates than autoregressive draft
+       on hybrid stacks) will silently corrupt recurrent state
+       on rejection.
+     - **(d) Sustained 4K / 8K context memory probe.** Extend the
+       P-6.0 warm-decode rows with one new row each on dense
+       Qwen3.5-27B-4bit and Gemma4-31B-4bit at 4K and 8K
+       sustained context, reporting peak under a sustained
+       (not single-forward) decode. The §6(4) "≤36 GB at 4K
+       context" gate currently rests on inference from the
+       384-token P-6.0 baseline; this row verifies it directly
+       and surfaces the headroom margin used by Track C
+       speculative drafts (which expand effective context per
+       step).
+     - **(e) D-009 hot-path audit.** A regression-locked check
+       (lint / CI hook or a pinned grep test) verifying no
+       `torch.Tensor` / `numpy.ndarray` reaches `silica.engine`
+       / `silica.scheduler` / `silica.mlx` / `silica.kvcache`
+       / `silica.models` / `silica.vq` hot path. Today this is
+       enforced at PR review; under P-6's expanding code volume
+       a regression is plausible without an automated gate.
+     - **(f) Speculative-metrics schema.** Define the JSONL
+       fields every C.x track will emit before any C.x lands:
+       `accept_rate`, `verify_cost_ms`, `draft_cost_ms`,
+       `tokens_per_target_forward`, `rollback_count`,
+       `tree_node_visits` (for tree variants),
+       `quality_parity_status`. Carrying these in
+       `ScenarioResult.metadata` from C.1 onward lets the C.4
+       spike's gate threshold (≥1.8× silica-integrated speedup)
+       be evaluated on the same axes as C.1 / C.2 / C.3.
+     - **(g) P-5 quality regression promoted to P-6 per-track
+       gate.** The `qwen3-0.6b-wikitext-ppl-block-tq-b64-b4-vqbench-aligned`
+       (4-b) two-part aggregated gate must pass after every
+       Track A / B / C PR lands, recorded as a Decision Log
+       attestation with the seed-3 mean / SEM numbers. P-6 §6(6)
+       already names this; P5.9 makes it operational by adding
+       a CI check or a dedicated pre-merge bench invocation.
+     - **(h) Full re-run.** `ruff check silica/ tests/` clean;
+       `mypy silica/` clean (currently 73 source files); full
+       non-real-model test suite green (currently 2026 passed /
+       7 skipped at commit `fbce8e7`); bench catalog sanity
+       (`python -m scripts.bench --list` emits all registered
+       scenarios without errors).
+  3. **P-6.0.5 measurement expansion** — add 27B B=2 / B=4
+     (B=4 opt-in), MoE B=3 / B=4 (B=4 OOM-flagged), dense 27B
+     4K-context peak memory, warm-TTFT scenario (two consecutive
+     prompts; second's TTFT post-compile is the warm number),
+     and a target-verification microbench (target forward
+     verifying 2 / 4 / 8 candidate tokens, simulating
+     speculative verify cost). The microbench is the prerequisite
+     for credible Track C ROI estimation.
+  4. **Decision Gate 1** — based on P-6.0.5 evidence, fix the
+     dense gate framing. If verify-k microbench shows target
+     verification scales well, keep (1b) and proceed to
+     C.4 / C.5; if scaling is poor, retire (1b) to stretch-only,
+     anchor on (1a) ≥40 tok/s, and update the MoE stretch from
+     ≥100 tok/s aggregate (already met) to ≥150 tok/s aggregate
+     or ≥100 tok/s per-row at B=2.
+  5. **Speculative foundation** — `silica.speculative.DraftEngine`
+     and `DraftTargetEngine` wired into the engine main loop
+     (greedy spec-on / spec-off byte-exact parity gate);
+     accept-rate / verify-cost / rollback-count / draft-latency /
+     tokens-per-target-forward enter `ScenarioResult.metadata`;
+     Qwen3.5 recurrent rollback and KV rollback bound by a
+     dedicated test. C.1 draft-target serves as the baseline
+     spec path on this foundation.
+  6. **C.4 DFlash spike** — minimal closed-loop integration:
+     drafter wired, fixed P-6.0 prompt / scenario, output
+     speedup + acceptance + draft overhead + peak memory +
+     quality parity. Gate: ≥1.8× silica-integrated speedup
+     continues; ≥2.5× justifies pursuing the (1b) stretch;
+     ≤1.8× retires (1b).
+  7. **Track B 3-bit weights** — loader + PPL oracle first
+     (no runtime change), pass quality gate, then 27B 3-bit
+     warm-decode. If 3-bit lifts dense from 16 → 21-24 tok/s,
+     stack with spec; if quality or MLX path is unstable, ship
+     opt-in.
+  8. **C.5 / C.2 / C.3 selection — and C.6 QuantSpec-like
+     self-spec exploratory option.** Driven by C.4 outcome.
+     If C.4 acceptance is high, C.5 reuses the same drafter and
+     adds the tree-verification path. If C.4 draft quality is
+     mediocre, try MTP head (C.3) or ReDrafter (C.2). C.2 KD
+     pass only if C.1 / C.4 are insufficient and (1b) is still
+     in pursuit.
+     **C.6 (exploratory) — same-model low-precision self-spec.**
+     QuantSpec (ICML 2025, Tiwari et al.) reports ~2.5× speedup
+     and ~1.3× memory reduction by drafting with hierarchical
+     4-bit weights + quantized KV against the full-precision
+     target. This composes naturally with silica's existing
+     surfaces: Track B 3-bit weights provide the draft-side
+     quantization tier, and `silica.vq` BlockTQ / RaBitQ provides
+     the quantized-KV path the draft consumes. C.6 is **only
+     pursued if C.4 / C.5 land below 2× silica-integrated
+     speedup** — at that point the engineering cost of a self-spec
+     path becomes worthwhile relative to maintaining a separate
+     drafter checkpoint. Keep on the radar; do not commit at
+     P5.9 entry.
+     **Adaptive speculation as C.5 follow-up.** Once C.5 has a
+     working tree path, an adaptive layer that adjusts draft
+     length / tree node budget by per-step entropy or running
+     accept-rate is a natural composition. Defer to v0.2 unless
+     C.5 acceptance variance shows a clear ROI signal.
+     **MTP-head + DDTree hybrid.** C.3's MTP head can serve as
+     a tree-node-priority signal for C.5 DDTree's best-first
+     heap rather than as a standalone draft. Note for future
+     C.5 design; not a separate sub-unit.
+  9. **Track A sync collapse** — repositioned from "first easy
+     win" to "general efficiency + MoE amplifier." A.1 defer
+     `.item()` / vectorize stop mask; A.2 sampler `mx.partition`
+     + `mx.compile`; A.3 lazy recurrent snapshot. Expected
+     leverage: small on dense (bandwidth-bound), large on MoE
+     (37-60% utilization at baseline → headroom for sync
+     collapse to harvest). Explicitly **not** the dense gate
+     cracker.
+  10. **Track D / E** — D.1 chunked prefill + decode merging
+      for long-prompt concurrency (resolves Q-010 promotion to
+      default at prompts ≥ 512 tokens); D.2 mlx-mfa kernel
+      measurement-gated (drop without phase impact if it does
+      not load cleanly on M5 Pro); E.1 MoE per-expert streaming
+      (original P-6 deliverable preserved). E.2 extends from
+      "SSD-tiered prefix cache (oMLX pattern)" to a two-tier
+      structure: **active fp16 (recent / hot) + cold compressed
+      tier**. Cold prefix nodes pass through `silica.vq` BlockTQ /
+      RaBitQ on eviction to a memory-mapped SSD blob (or to
+      compressed-resident if SSD is slow), and reconstruct via
+      the existing P-5-F (3b) `apply_k_norm_then_rope` path on
+      hit. This composes with silica's existing infrastructure
+      (codec + capture proxy) without requiring compressed-domain
+      attention (D-003 still holds). Session-first prefix reuse
+      (the chat REPL and future HTTP server's user-perceptible
+      latency lever) gates on E.2 + Q-012 resolution from step 2.
+- **Consequences:**
+  - PLAN.md §7 P-6 acceptance (1) split into (1a) and (1b);
+    Strategy block rewritten to reference this Decision's
+    sequencing.
+  - `plans/P6_OPENING.md` §6 acceptance gates updated to match
+    the (1a) / (1b) split; §3 track ordering rewritten to put
+    the spec foundation ahead of Track A.
+  - `plans/P6_0_BASELINE/REPORT.md` §3 contingencies relabel
+    "contingency 1 / 2 / 3" as "stretch-on / engineering-floor
+    / re-target" and reference (1a) / (1b) explicitly.
+  - Track A's documented expected impact rephrases from "first
+    easy win" to "general efficiency + MoE amplifier."
+  - The "at least three of five tracks" phase-exit clause stays
+    but the count uses the sub-unit list above, not the original
+    Track-level list.
+- **References:** D-017, D-018, D-019, D-020, P-6, M-7, Q-010,
+  Q-012, Q-014, `plans/P6_OPENING.md`, `plans/P6_0_BASELINE/REPORT.md`,
+  `plans/P6_REVIEW_HANDOFF.md` Q-R1 / Q-R3 / Q-R4 (the review that
+  triggered this sync).
+- **Primary sources for the speculative variants in Track C
+  (verified for currency 2026-04-27):**
+  - DFlash (block-diffusion drafter, Chen et al. 2026-02): arxiv
+    2602.06036; MLX port `bstnxbt/dflash-mlx`. Public claim 6×
+    over autoregressive on Qwen3-class targets, 2.5× over EAGLE-3.
+  - DDTree (block-diffusion draft tree, Ringel 2026-04): arxiv
+    2604.12989; MLX port `humanrouter/ddtree-mlx` with hybrid
+    model support. Public claim 8.2× over autoregressive on Qwen3.
+  - QuantSpec (hierarchical-quantization self-spec, Tiwari et al.
+    ICML 2025): proceedings.mlr.press/v267/tiwari25b.html. ~2.5×
+    speedup, ~1.3× memory reduction with 4-bit weights + quantized
+    KV. Composes with silica's existing P-5 codec stack and
+    Track B 3-bit path; tracked as exploratory C.6 in step 8.
+  - Mirror-SD (heterogeneous parallel speculative decoding, 2025):
+    arxiv 2510.13161. Reference for asymmetric draft / target
+    composition; not a track in v0.1 but informs C.5 follow-up.
+  - STree (state-space tree verification, 2025): arxiv 2505.14969.
+    Reference for hybrid-state tree verification under
+    DeltaNet-style recurrent stacks; informs C.5's interaction
+    with Qwen3.5 hybrid attention.
+
 ---
 
 ## 10. Open Questions
@@ -1474,6 +1737,82 @@ Local reference implementations sit at the repo root. **Algorithm / architecture
 ---
 
 ## 13. Changelog
+
+- **v1.7.14** (2026-04-27): **P-6 contract sync per D-021 — two-tier
+  dense gate + foundation-first execution order.** External review
+  (recorded in `plans/P6_REVIEW_HANDOFF.md` Q-R1 / Q-R3 / Q-R4)
+  surfaced two structural defects in the v1.7.13 P-6 contract: (i)
+  the single ≥60 tok/s dense gate sat at the edge of what stacked
+  optimizations can reach and committed to a number the bandwidth
+  math does not robustly support; (ii) the "Track A first" execution
+  order produced an invisible win on the dense path because A's
+  +5-15% on bandwidth-bound dense is hidden in bandwidth wait, while
+  A's +30-80% MoE leverage applies to a target that already cleared
+  its baseline gate.
+
+  **What changed.** PLAN.md §7 P-6 acceptance bullet (1) splits into
+  (1a) ≥40 tok/s engineering gate (must pass) + (1b) ≥60 tok/s
+  stretch (explicitly contingent on Track C.4 DFlash and/or C.5
+  DDTree landing ≥2.5× silica-integrated speedup; otherwise retired
+  to a Decision Log entry). PLAN.md §7 P-6 Strategy block rewritten
+  to commit to a ten-step path: **(1) contract sync, (2) P5.9
+  hardening pass, (3) P-6.0.5 measurement expansion (27B B=2/B=4,
+  MoE B=3/B=4, 27B 4K-context peak, warm-TTFT scenario,
+  target-verification microbench), (4) Decision Gate 1 fixing
+  whether (1b) is realistic, (5) spec foundation + C.1, (6) C.4
+  DFlash spike with ≥1.8× gate, (7) Track B 3-bit, (8) C.5 / C.2 /
+  C.3 selection by data, (9) Track A as general efficiency + MoE
+  amplifier rather than dense gate cracker, (10) Track D/E for
+  product / memory needs**. Q-010 (chunked prefill) reaffirmed at
+  step 10. Q-012 (initial-cohort prefix-cache consultation)
+  promoted to in-scope at step 2 because cross-turn prefix reuse
+  in the chat REPL and future HTTP server are weak without it.
+
+  **What did not change.** D-009 MLX-native hot path constraint;
+  D-006 platform-as-product framing; the §6 dual-target
+  acceptance (MoE 100 tok/s aggregate stretch validator); the
+  five-track A/B/C/D/E decomposition; the P-6.0 baseline numbers
+  (just landed at v1.7.13).
+
+  **What lands next.** P5.9 hardening as a small bounded PR (no
+  new features, only the six bullets in D-021's step 2). After
+  that, P-6.0.5 measurement expansion adds five new bench
+  scenarios; Decision Gate 1 records the re-confirmed gate
+  contract; only then does any actual Track work begin.
+
+  **Subsequent same-day refinement (still v1.7.14).** A second
+  external review (recorded in `plans/P6_REVIEW_HANDOFF.md` §12)
+  surfaced concrete file:line deliverables that fold cleanly into
+  D-021. Same revision absorbs them rather than opening a v1.7.15:
+  (i) §6 P-6 acceptance (2) splits into (2a) ≥100 tok/s aggregate
+  anchor (already cleared at v1.7.13 baseline) + (2b) ≥150 tok/s
+  aggregate or ≥100 per-row stretch; (ii) D-021 step 2 (P5.9
+  hardening) now enumerates eight explicit deliverables with
+  file:line citations, including the probe double-load fix
+  (`scripts/probe_qwen3_5_27b_load.py:107`,
+  `scripts/probe_gemma4_31b_load.py:151` — switch from
+  `_mlx_lm_load` + `adapter_for_repo` to the single-load
+  `adapter_from_loaded_model` at `silica/models/factory.py:108`),
+  Qwen3.5 recurrent rollback (currently `NotImplementedError` at
+  `silica/models/qwen3_5.py:rollback_state`), Q-012 affirmative
+  resolution, sustained 4K/8K context memory probe, D-009 hot-path
+  audit lock-in, speculative-metrics schema definition, P-5
+  quality regression as fixed P-6 per-track gate, and a full
+  toolchain re-run; (iii) D-021 step 8 adds **C.6 QuantSpec-like
+  same-model self-spec** as exploratory option (only pursued if
+  C.4 / C.5 land below 2× silica-integrated speedup, given C.6
+  composes naturally with silica's existing P-5 codec + Track B
+  3-bit surfaces); (iv) D-021 step 10 extends Track E.2 from
+  "SSD-tiered prefix cache" to a two-tier "active fp16 + cold
+  compressed" pattern reusing the P-5-F (3b) capture path; (v)
+  primary-source citations for DFlash / DDTree / QuantSpec /
+  Mirror-SD / STree added to D-021 References.
+
+  **References.** D-021 in §9; `plans/P6_REVIEW_HANDOFF.md`
+  Q-R1 / Q-R3 / Q-R4 (first review) and §12 (second review);
+  `plans/P6_OPENING.md` §3 / §6 / §11;
+  `plans/P6_0_BASELINE/REPORT.md` §3 / §7. **No silica/* runtime
+  change** — pure doc sync.
 
 - **v1.7.13** (2026-04-27): **P-6 re-scoped from "Weight Streaming"
   to "Performance Phase" per D-017 / D-018 / D-019; user-confirmed

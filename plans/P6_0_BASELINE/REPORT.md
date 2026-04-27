@@ -82,33 +82,48 @@ estimated band — the +5-15% figure in `plans/P6_OPENING.md` §3 was
 correct; the higher +30-80% figure applies to MoE active-param paths
 where the chip has bandwidth slack to expose dispatch overhead.
 
-### Implication for the dense-60 gate
+### Implication for the dense gate (re-framed at v1.7.14 per D-021)
 
-The honest reading: **the dense 60 tok/s gate may be unreachable on
-M5 Pro 48 GB even with the full Track A + B + C stack.** Three
-contingencies, ranked by likelihood:
+The v1.7.14 contract sync (D-021 in `plans/PLAN.md` §9) splits the
+dense gate into a two-tier shape that aligns with what the
+bandwidth math actually supports:
 
-1. **C.4 / C.5 deliver as claimed on MLX.** DFlash claims 6× and
-   DDTree 8.2× on GPU; the MLX ports report 1.5× over autoregressive
-   on real silicon. If a fresh measurement under silica's engine
-   delivers ≥3× combined with Track A + B, the gate clears at
-   ~60-75 tok/s. **The fastest way to know: land C.4 first as a
-   measurement.**
+- **(1a) Dense engineering gate ≥40 tok/s — must pass.** Reachable
+  envelope from the 16.05 baseline: A 1.10-1.15× × B 1.30× × C.1
+  1.40-1.80× → 32-50 tok/s. This is the gate the phase exits on.
+- **(1b) Dense stretch gate ≥60 tok/s — contingent on Track C.4 / C.5
+  ≥2.5× silica-integrated speedup.** Reaches 60-75 tok/s only when
+  block-diffusion drafters deliver in the upper half of their
+  MLX-conservative bands. Decision Gate 1 (D-021 step 4) measures
+  the C.4 spike against a ≥1.8× lower bound; below that, (1b) is
+  retired to a Decisions Log entry naming the empirical floor.
 
-2. **Re-target to ≥40 tok/s for dense at 48 GB.** This is what the
-   bandwidth math actually supports without C.4/C.5 best-case. Per
-   the §6 phase-exit clause, missing the 60 tok/s gate triggers a
-   Decision Log entry naming the measured engine-overhead floor —
-   that path is already documented.
+**Three resolution paths from this baseline, ranked by likelihood
+under D-021's foundation-first ordering:**
 
-3. **Dual-target re-confirmation.** The MoE 100 tok/s gate is
-   already met; the dense gate is the one stuck. Per Q-A's
-   resolution, the dense gate is the phase-failing primary; missing
-   it means the phase exits via re-target rather than success.
+1. **Stretch-on path: C.4 / C.5 deliver as claimed on MLX.** DFlash
+   claims 6× and DDTree 8.2× on GPU; the MLX ports report 1.5× over
+   autoregressive on real silicon. If silica's engine integration
+   delivers ≥2.5× combined with Track A + B, (1b) clears at
+   ~60-75 tok/s. The fastest way to know is the C.4 spike at D-021
+   step 6, run after the spec foundation lands at step 5.
 
-**Action item:** track-order should put C.4 (DFlash) first to test
-contingency 1 quickly. If C.4 lands ≥2.5× over baseline, contingency
-1 holds. If C.4 lands <1.8×, contingency 2/3 trigger.
+2. **Engineering-floor path: only (1a) is met.** This is the
+   dominant outcome the bandwidth math supports without C.4/C.5
+   best-case. Phase exits successfully on ≥40 tok/s engineering
+   gate; (1b) is recorded as out-of-reach with the measured C.4
+   speedup pinned in the Decisions Log.
+
+3. **Re-target path: (1a) itself comes in below 40 tok/s.** Under
+   D-021's Decision Gate 1, P-6.0.5 evidence (especially the
+   target-verification microbench) would surface this before any
+   Track work. Phase pauses for an explicit re-target Decision
+   Log entry rather than auto-failing.
+
+**Action item:** D-021 step ordering puts the spec foundation
+(step 5) ahead of the C.4 spike (step 6). The C.4 spike's gate
+threshold is ≥1.8× silica-integrated speedup over C.1; ≥2.5×
+justifies pursuing (1b); below 1.8× retires (1b) per path 2 above.
 
 ---
 
