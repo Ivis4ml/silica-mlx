@@ -902,6 +902,102 @@ def test_set_prefix_cache_to_none_disables_routing() -> None:
     ]
 
 
+class _FakePrefixStoreWithResidentBytes:
+    """Prefix-cache store stub exposing the structural
+    ``resident_bytes()`` method ChatSession reads. Returns a
+    fixed value so the test can assert it propagates to
+    TurnMetrics."""
+
+    def __init__(
+        self, *, resident_bytes: int = 1_234_567
+    ) -> None:
+        self._resident = resident_bytes
+        self._detached: dict[int, list[Any]] = {0: []}
+        # Codec slots — _resident_bytes path follows the no-codec
+        # branch when both are None (logical == resident).
+        self._k_codec = None
+        self._v_codec = None
+        self._num_layers = 1
+
+    def resident_bytes(self) -> int:
+        return self._resident
+
+
+class _FakePrefixCacheWithStore:
+    """Minimal prefix cache exposing ``_store.resident_bytes`` so
+    the C-4 / fix follow-up tests can assert ChatSession reads
+    the prefix-store residency and surfaces it on TurnMetrics."""
+
+    def __init__(self) -> None:
+        self.block_size = 4
+        self._store = _FakePrefixStoreWithResidentBytes()
+        self._hit = _FakePrefixHit()
+
+    def peek(self, tokens: Any) -> _FakePrefixHit:
+        return self._hit
+
+
+def test_turn_metrics_carry_prefix_store_resident_bytes() -> None:
+    """When the prefix-cache store exposes ``resident_bytes()``,
+    ChatSession must read it post-turn and surface the figure on
+    TurnMetrics so the chat-CLI toolbar can show prefix-store
+    occupancy (the ``kv=`` field) instead of the always-zero
+    active-KV figure."""
+    tok = _FakeTokenizer(eos_token_ids={99})
+    adapter = _FakeAdapter(tok)
+    engine = _FakeBatchedEngine([65, 66, 67])
+    pc = _FakePrefixCacheWithStore()
+    session = ChatSession(
+        adapter,
+        engine,
+        prefix_cache=pc,
+        reset_peak_memory=lambda: None,
+        read_peak_memory_mb=lambda: 256.0,
+    )
+    metrics = session.chat("hi")
+    assert metrics.prefix_store_resident_bytes == 1_234_567
+    # No codec on the fake → logical == resident.
+    assert metrics.prefix_store_logical_bytes == 1_234_567
+
+
+def test_turn_metrics_prefix_store_none_when_store_lacks_method() -> None:
+    """PagedPrefixBlockStore (and any future backend that does not
+    track residency) must not break the path — ChatSession's
+    structural ``hasattr`` guard returns None for such stores."""
+
+    class _NoBytes:
+        def __init__(self) -> None:
+            self.block_size = 4
+
+        def peek(self, tokens: Any) -> _FakePrefixHit:
+            return _FakePrefixHit()
+
+    tok = _FakeTokenizer(eos_token_ids={99})
+    adapter = _FakeAdapter(tok)
+    engine = _FakeBatchedEngine([65, 66])
+    pc = _NoBytes()
+    session = ChatSession(
+        adapter,
+        engine,
+        prefix_cache=pc,  # type: ignore[arg-type]
+        reset_peak_memory=lambda: None,
+        read_peak_memory_mb=lambda: 0.0,
+    )
+    metrics = session.chat("hi")
+    assert metrics.prefix_store_resident_bytes is None
+    assert metrics.prefix_store_logical_bytes is None
+
+
+def test_no_prefix_cache_leaves_prefix_store_fields_none() -> None:
+    """Single-request path (no cache wired) leaves prefix-store
+    fields at None so the toolbar's fallback to engine-budget
+    figures kicks in."""
+    session, _, _ = _build_session(engine_tokens=[65, 66, 67])
+    metrics = session.chat("hi")
+    assert metrics.prefix_store_resident_bytes is None
+    assert metrics.prefix_store_logical_bytes is None
+
+
 def test_prefix_cache_session_reset_does_not_clear_cache() -> None:
     """``reset()`` clears messages only — the cache instance is
     held until the caller swaps it via ``set_prefix_cache``.

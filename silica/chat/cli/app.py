@@ -504,12 +504,32 @@ def run_chat(args: argparse.Namespace) -> int:
         state.last_ttft_ms = metrics.ttft_ms
         if metrics.peak_memory_mb is not None:
             state.peak_memory_mb = metrics.peak_memory_mb
-        if metrics.resident_mb is not None:
-            state.kv_resident_mb = metrics.resident_mb
-        if metrics.logical_kv_bytes is not None:
-            state.kv_logical_mb = metrics.logical_kv_bytes / 1e6
         if metrics.decode_tok_s is not None:
             state.tok_per_sec = metrics.decode_tok_s
+        # KV display: between turns the active KV cache is reclaimed
+        # and ``engine.kv_manager.budget()`` reports zero, but the
+        # prefix store still holds the cumulative cached blocks
+        # from every completed turn. The user's "how much KV is in
+        # use right now" answer is the prefix-store figure, not the
+        # active figure. When the prefix store is empty (single-
+        # request session, first turn before any blocks insert),
+        # fall back to the engine's resident_mb so the field is
+        # never permanently None.
+        if metrics.prefix_store_resident_bytes is not None:
+            state.kv_resident_mb = (
+                metrics.prefix_store_resident_bytes / 1e6
+            )
+            state.prefix_store_mb = (
+                metrics.prefix_store_resident_bytes / 1e6
+            )
+        elif metrics.resident_mb is not None:
+            state.kv_resident_mb = metrics.resident_mb
+        if metrics.prefix_store_logical_bytes is not None:
+            state.kv_logical_mb = (
+                metrics.prefix_store_logical_bytes / 1e6
+            )
+        elif metrics.logical_kv_bytes is not None:
+            state.kv_logical_mb = metrics.logical_kv_bytes / 1e6
         # Tier 2 prefix-hit signal: surface block-aligned cache
         # reuse on the toolbar. Denominator is the prompt's total
         # token count so users see "256/640" — i.e. "256 tokens of
@@ -532,9 +552,23 @@ def run_chat(args: argparse.Namespace) -> int:
     return 0
 
 
-_PREFIX_CACHE_BLOCK_SIZE = 16
-"""Matches the block size used in :func:`silica.bench.runner._maybe_build_prefix_cache`
-so chat-CLI prefix caches share the size convention with bench rows."""
+_PREFIX_CACHE_BLOCK_SIZE = 4
+"""Block size for the chat-CLI's prefix cache.
+
+The bench harness uses 16 (matches `_maybe_build_prefix_cache`).
+Chat is different — between turns, the chat template re-renders the
+conversation and the deterministic shared prefix grows by ~10-30
+tokens per turn (one user message + chat-template wrapping). Block
+sizes larger than that boundary lose ALL prefix reuse on short
+turns. Concrete example with Qwen3.5-4B and a `Hi, who are you?`
+opening: turn 1's prompt is 16 tokens ending in `<think>\\n`, but
+turn 2's prompt at position 14 starts the assistant message text;
+the 14-token shared prefix is below `block_size=16` so 0 blocks
+reuse. With `block_size=4`, the same 14-token prefix yields 3
+blocks reused = 12 tokens — and the reuse grows linearly with
+conversation length thereafter. The trade-off is more nodes in
+the radix tree (negligible at chat scale).
+"""
 
 
 def _build_prefix_cache(

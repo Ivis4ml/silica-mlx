@@ -142,6 +142,26 @@ class TurnMetrics:
     aligned hit. ``None`` mirrors the meaning of
     ``prefix_hit_blocks``."""
 
+    prefix_store_resident_bytes: int | None = None
+    """Cumulative bytes held by the prefix-cache store after this
+    turn completes. Includes blocks inserted by every previous
+    turn this session. ``None`` when no prefix cache is wired or
+    when the store does not implement ``resident_bytes()``
+    (PagedPrefixBlockStore today). Surfaced on the chat-CLI
+    toolbar's ``kv=`` field — ``engine.kv_manager.budget()`` only
+    reports the active per-row KV (which goes to zero between
+    turns), so the prefix-store figure is the right "how much KV
+    is in use right now" answer for the chat workload."""
+
+    prefix_store_logical_bytes: int | None = None
+    """fp16-equivalent bytes for the same data the prefix store
+    holds. Equal to ``prefix_store_resident_bytes`` when no codec
+    is bound (raw fp16 storage); larger by the codec's compression
+    ratio when BlockTQ / RaBitQ is active. Surfaced on the
+    toolbar's ``kv_log=`` field; combined with
+    ``prefix_store_resident_bytes`` it drives the ``compr=`` ratio
+    display."""
+
 
 class ChatSession:
     """Stateful multi-turn chat loop.
@@ -345,6 +365,68 @@ class ChatSession:
                 # mask the rest of the turn metrics.
                 pass
 
+        # Prefix-store residency. The cache itself does not expose a
+        # public byte-count getter, but the SyntheticPrefixBlockStore
+        # backing it does (via the structural ``resident_bytes()``
+        # method documented as P-5-A.2's ``MemoryBudgeter`` hook). A
+        # ``hasattr`` guard treats backends that do not implement it
+        # (PagedPrefixBlockStore) as "unknown" rather than zero.
+        prefix_store_resident: int | None = None
+        prefix_store_logical: int | None = None
+        if self._prefix_cache is not None:
+            store = getattr(self._prefix_cache, "_store", None)
+            resident_fn = getattr(store, "resident_bytes", None)
+            if callable(resident_fn):
+                try:
+                    prefix_store_resident = int(resident_fn())
+                except Exception:
+                    prefix_store_resident = None
+            # Logical = fp16 equivalent. The pass-through path
+            # (no codec) makes resident == logical. Under a codec,
+            # the store exposes per-codec ``logical_bytes(num_tokens)``
+            # but a clean public API for the cumulative figure
+            # is not present today; for the chat-CLI's purpose we
+            # approximate logical by walking detached blocks.
+            num_blocks = 0
+            try:
+                num_blocks = len(getattr(store, "_detached", {}))
+            except Exception:
+                pass
+            if (
+                prefix_store_resident is not None
+                and num_blocks > 0
+            ):
+                # Try the codec path first (each codec exposes
+                # ``logical_bytes(num_tokens)``); fall back to
+                # resident == logical for the no-codec path.
+                k_codec = getattr(store, "_k_codec", None)
+                v_codec = getattr(store, "_v_codec", None)
+                num_layers = getattr(store, "_num_layers", None)
+                bs = getattr(self._prefix_cache, "block_size", 0)
+                if (
+                    k_codec is not None
+                    and v_codec is not None
+                    and num_layers is not None
+                    and bs > 0
+                ):
+                    tokens_per_block = bs
+                    try:
+                        per_block_logical = num_layers * (
+                            k_codec.logical_bytes(tokens_per_block)
+                            + v_codec.logical_bytes(tokens_per_block)
+                        )
+                        prefix_store_logical = (
+                            num_blocks * per_block_logical
+                        )
+                    except Exception:
+                        prefix_store_logical = (
+                            prefix_store_resident
+                        )
+                else:
+                    prefix_store_logical = prefix_store_resident
+            elif prefix_store_resident is not None:
+                prefix_store_logical = prefix_store_resident
+
         return TurnMetrics(
             reply=reply_text,
             prompt_tokens=len(prompt_ids),
@@ -359,6 +441,8 @@ class ChatSession:
             wall_s=wall_s,
             prefix_hit_blocks=prefix_hit_blocks,
             prefix_hit_tokens=prefix_hit_tokens,
+            prefix_store_resident_bytes=prefix_store_resident,
+            prefix_store_logical_bytes=prefix_store_logical,
         )
 
     def _run_generation(
