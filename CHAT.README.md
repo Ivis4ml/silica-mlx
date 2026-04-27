@@ -22,18 +22,30 @@ cd ~/Desktop/silica-mlx
 # 1. Create the venv outside iCloud
 uv venv --python 3.13 ~/.cache/uv/silica-mlx-venv
 
-# 2. Install the package + chat extras into that venv
-UV_PROJECT_ENVIRONMENT=$HOME/.cache/uv/silica-mlx-venv \
-    uv pip install -e '.[chat]'
+# 2. Activate it
+source ~/.cache/uv/silica-mlx-venv/bin/activate
 
-# 3. Persist the env-var so `uv run` finds the venv from anywhere
-echo 'export UV_PROJECT_ENVIRONMENT=$HOME/.cache/uv/silica-mlx-venv' \
-    >> ~/.zshrc
-source ~/.zshrc
+# 3. Install the package + chat extras into the active venv
+pip install -e '.[chat]'
 
 # 4. Verify
-~/.cache/uv/silica-mlx-venv/bin/silica chat --help
+silica chat --help
 ```
+
+The activate-then-pip flow leaves nothing in `~/.zshrc`. Once
+activated, `pip` and `silica` both resolve to the venv's `bin/`;
+`pip install -e '.[chat]'` lands inside the venv with no
+environment-variable juggling.
+
+If you prefer one-shot installation without activating first, set
+`UV_PROJECT_ENVIRONMENT` inline:
+
+```bash
+UV_PROJECT_ENVIRONMENT=$HOME/.cache/uv/silica-mlx-venv \
+    uv pip install -e '.[chat]'
+```
+
+Both paths end up at the same place.
 
 ## Daily usage
 
@@ -65,13 +77,14 @@ Then `silica-env` activates and `silica chat` is ready.
 
 ```bash
 cd ~/Desktop/silica-mlx
-uv run silica chat
-uv run silica chat --kv-codec block_tq_b64_b4
+UV_PROJECT_ENVIRONMENT=$HOME/.cache/uv/silica-mlx-venv uv run silica chat
 ```
 
-`UV_PROJECT_ENVIRONMENT` (set in `.zshrc` per step 3 above) tells uv
-where the venv lives. No activation needed. Best fit for one-off
-invocations from inside the project.
+Inline `UV_PROJECT_ENVIRONMENT` tells uv where the venv lives. No
+activation needed; no zshrc change. If you find yourself doing this
+often, persist the env var in `~/.zshrc` so `uv run silica chat`
+works from the project directory without the inline prefix —
+trade-off: one line of zshrc pollution for shorter command.
 
 ### Option 3 — absolute path (works from anywhere, no setup)
 
@@ -199,7 +212,14 @@ normal interactive use.
 ## Updating / reinstalling
 
 When `pyproject.toml` changes (new optional deps, a `[project.scripts]`
-entry, etc.), reinstall:
+entry, etc.), reinstall. Easiest path is activate-then-pip:
+
+```bash
+source ~/.cache/uv/silica-mlx-venv/bin/activate
+pip install -e '.[chat]'
+```
+
+Or one-shot without activating:
 
 ```bash
 UV_PROJECT_ENVIRONMENT=$HOME/.cache/uv/silica-mlx-venv \
@@ -207,8 +227,8 @@ UV_PROJECT_ENVIRONMENT=$HOME/.cache/uv/silica-mlx-venv \
 ```
 
 The editable install means source-code changes are picked up
-automatically — you only re-run `uv pip install -e .` when the
-package metadata (entry points, dependencies) changes.
+automatically — you only re-run `pip install -e .` when the package
+metadata (entry points, dependencies) changes.
 
 ## Tests
 
