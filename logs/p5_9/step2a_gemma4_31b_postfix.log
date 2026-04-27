@@ -1,0 +1,61 @@
+# 2026-04-27T14:36:33-07:00 — P5.9 step 2(a): Gemma4-31B probe double-load fix verification
+# command: python scripts/probe_gemma4_31b_load.py --repo mlx-community/gemma-4-31b-4bit --run-forward
+---
+Fetching 10 files:   0%|          | 0/10 [00:00<?, ?it/s]Fetching 10 files: 100%|██████████| 10/10 [00:00<00:00, 195083.91it/s]
+# P-3-D0 probe — mlx-community/gemma-4-31b-4bit
+
+- Host: macOS-26.4.1-arm64-arm-64bit-Mach-O
+- Timestamp: 2026-04-27T21:36:38Z
+
+## Phase — mlx_lm.load: ok
+
+- **repo**: `mlx-community/gemma-4-31b-4bit`
+- **load_s**: `3.034362625097856`
+- **model_type**: `gemma4`
+- **num_hidden_layers**: `60`
+- **hidden_size**: `5376`
+- **num_attention_heads**: `32`
+- **num_key_value_heads**: `16`
+- **head_dim**: `256`
+- **vocab_size**: `262144`
+- **tokenizer_type**: `TokenizerWrapper`
+- **model_class**: `Model`
+- **args_attrs**: `['model_type', 'text_config', 'vocab_size']`
+- **text_config_keys**: `['attention_bias', 'attention_dropout', 'attention_k_eq_v', 'bos_token_id', 'dtype', 'enable_moe_block', 'eos_token_id', 'expert_intermediate_size', 'final_logit_softcapping', 'global_head_dim', 'head_dim', 'hidden_activation', 'hidden_size', 'hidden_size_per_layer_input', 'initializer_range', 'intermediate_size', 'layer_types', 'max_position_embeddings', 'model_type', 'num_attention_heads', 'num_experts', 'num_global_key_value_heads', 'num_hidden_layers', 'num_key_value_heads', 'num_kv_shared_layers', 'pad_token_id', 'rms_norm_eps', 'rope_parameters', 'sliding_window', 'tie_word_embeddings', 'top_k_experts', 'use_bidirectional_attention', 'use_cache', 'use_double_wide_mlp', 'vocab_size', 'vocab_size_per_layer_input']`
+- **n_layers_from_model_list**: `60`
+
+## Phase — factory.adapter_from_loaded_model: ok
+
+- **repo**: `mlx-community/gemma-4-31b-4bit`
+- **adapter_class**: `Gemma4Adapter`
+- **kv_class**: `SimpleKVCache`
+- **note**: `Dispatch succeeded on an existing family adapter — Gemma4's model_type must overlap with a registered family. Double-check Phase 3 capabilities to confirm the adapter's attention-pattern reading is sane on this checkpoint before treating it as correct.`
+
+## Phase — adapter.capabilities: ok
+
+- **attention_kinds**: `['global', 'sliding']`
+- **has_recurrent_state**: `False`
+- **has_moe**: `False`
+- **num_layers_from_pattern**: `60`
+- **first_8_layer_kinds**: `['sliding', 'sliding', 'sliding', 'sliding', 'sliding', 'global', 'sliding', 'sliding']`
+- **last_8_layer_kinds**: `['sliding', 'global', 'sliding', 'sliding', 'sliding', 'sliding', 'sliding', 'global']`
+- **distinct_layer_kinds**: `['global', 'sliding']`
+
+## Phase — engine.generate: ok
+
+- **prompt**: `Hello`
+- **max_tokens**: `4`
+- **wall_s**: `1.2085108750034124`
+- **output_token_ids**: `[236764, 108, 236777, 735]`
+- **decoded**: `,
+
+I have`
+- **ttft_ms**: `986.1100409179926`
+- **prefill_tok_s**: `2.0281712151902984`
+- **decode_tok_s**: `13.499393327301219`
+- **resident_mb**: `232.32512`
+- **peak_memory_mb**: `17535.901682`
+
+## Summary
+
+- `mlx_lm.load` and `factory.adapter_from_loaded_model` both succeeded. Read Phase 3 `attention_kinds` / `has_recurrent_state` / `has_moe` before concluding that no new adapter file is needed — a fallback dispatch onto the wrong family would still report ok at this phase. If `--run-forward` was set and Phase 4 also green, ``peak_memory_mb`` is the headroom estimate for subsequent P-3-D adapter / bench work.

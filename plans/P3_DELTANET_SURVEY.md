@@ -188,6 +188,14 @@ Total live state per request @ 512 tokens of context ≈ **186 MB**.
   M5 Pro with ~30.5 GB resident after load (P-3-B finding), that leaves
   ~17 GB headroom → 8-way batch consumes ~10% of the remaining budget
   just for live state. Feasible, but tight under longer contexts.
+  **Note (v1.7.14 correction):** the "30.5 GB resident after load"
+  figure has been superseded — see `plans/PLAN.md` §7 P-3 Empirical
+  findings 2026-04-27 (P5.9 step 2(a)). Real peak is ~15.3 GB so
+  the actual 8-way headroom is ~32 GB, not the 17 GB this analysis
+  used. The original analysis remains in place because it informed
+  the C-2 / `recurrent_bytes()` scoping at the time; future memory
+  budgeting derived from this survey should multiply headroom by
+  roughly 1.9× to reflect the corrected baseline.
 
 ### 4.1 Qwen3.5-0.8B numbers
 

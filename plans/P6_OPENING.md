@@ -139,9 +139,13 @@ a number the chip cannot deliver.
   short-prompt requests by more than 2× their solo TTFT — directly
   resolves Q-010 in PLAN.md (chunked prefill promotion).
 - **Peak resident memory (Qwen3.5-27B-4bit, B=1, 4K context):** ≤ 36 GB,
-  leaving 12 GB system headroom on a 48 GB machine. Currently the
-  v1.7.x load probe reports ~30.5 GB peak on a 1-token forward, so
-  there is ~5 GB of additional KV / scratch budget at 4K.
+  leaving 12 GB system headroom on a 48 GB machine. The v1.7.14
+  P5.9 step 2(a) corrected probe reports ~15.3 GB peak on a 1-token
+  forward (was ~30.5 GB at v1.6.1 due to probe double-load); P-6.0
+  warm-decode B=1 at 384-token gen reports peak 15.4 GB, confirming
+  sustained-decode peak matches the probe number. Real headroom at
+  the 4K-context gate is therefore ~21 GB, not the ~5 GB previously
+  assumed.
 - **Concurrent request capacity (Qwen3.5-27B-4bit, mixed 512-token
   prompts):** ≥ 4 requests sustained, with admission-headroom-style
   evidence that BlockTQ KV codec actually translates into more admitted
@@ -309,7 +313,9 @@ holds.
 **Track B acceptance gates:**
 
 - B.1: 3-bit Qwen3.5-27B loads, runs `Engine.generate("Hello",
-  max_tokens=4)` cleanly, peak RAM ≤ 26 GB (vs ~30.5 GB at 4-bit).
+  max_tokens=4)` cleanly, peak RAM ≤ 12 GB (vs ~15.3 GB at 4-bit
+  per the v1.7.14 corrected probe; the ~25% bytes/param reduction
+  from 4-bit to 3-bit applies proportionally).
 - B.2: ΔPPL gate above passes; the 3-bit row ships in the catalog.
 
 **Estimated impact:** Decode tok/s +20-30% on dense 27B / 31B due to
@@ -852,21 +858,24 @@ here as a diff-shaped proposal so a reviewer can read them in one place.
     dense streaming gate. **This gate is dropped.** v0.1 no longer
     validates that residency-relief mechanisms work on dense models;
     it commits instead to "27B-4bit fits within 48 GB unified memory
-    with measured headroom," anchored on the v1.7.x load-probe number
-    (~30.5 GB peak) and re-confirmed under P-6.0 with 4K-context
-    decode. The validation we lose: independent evidence that a
-    dense-streaming fallback exists if a future checkpoint pushes
-    peak above 48 GB. Mitigations: Track B (3-bit) gives a ~25%
-    bytes/param reduction lever before any streaming would be needed;
-    the existing 30.5 GB peak measurement carries the dense-fit
-    assertion; a future v0.2 dense-streaming track can re-validate
-    if the gap reappears.
+    with measured headroom," anchored on the corrected probe number
+    (~15.3 GB peak per v1.7.14 P5.9 step 2(a) — supersedes the
+    inflated ~30.5 GB v1.6.1 figure caused by probe double-load) and
+    re-confirmed under P-6.0 with 4K-context decode. The validation
+    we lose: independent evidence that a dense-streaming fallback
+    exists if a future checkpoint pushes peak above 48 GB.
+    Mitigations: Track B (3-bit) gives a ~25% bytes/param reduction
+    lever before any streaming would be needed; the corrected
+    ~15.3 GB peak measurement carries the dense-fit assertion;
+    a future v0.2 dense-streaming track can re-validate if the gap
+    reappears.
   - Rationale: bandwidth analysis in `plans/P6_OPENING.md` §1.2.
   - Consequences: PLAN.md M-7 milestone narrows from "dense + MoE
     streaming" to "MoE streaming + 27B/31B fit-at-48GB without
     streaming"; the dense-fit assertion is now the responsibility of
-    Track B (3-bit) and the v1.7.x 27B-4bit ~30.5 GB peak measurement
-    rather than residency relief. PLAN.md §7 P-6 acceptance bullet
+    Track B (3-bit) and the v1.7.14-corrected 27B-4bit ~15.3 GB peak
+    measurement (P5.9 step 2(a); supersedes the inflated 30.5 GB
+    v1.6.1 figure) rather than residency relief. PLAN.md §7 P-6 acceptance bullet
     (1) is retired explicitly via this Decision rather than silently
     by the re-scope.
 

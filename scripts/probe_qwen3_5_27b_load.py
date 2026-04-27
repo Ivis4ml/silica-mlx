@@ -23,7 +23,7 @@ previous phase's precondition failed):
             ``hidden_size``, ``num_attention_heads``,
             ``num_key_value_heads``, ``head_dim`` when present).
 
-  Phase 2 — ``adapter_for_repo(repo)`` dispatches the factory. Reports
+  Phase 2 — ``adapter_from_loaded_model(model, tokenizer)`` dispatches the factory. Reports
             which adapter class was selected (expected: Qwen3_5Adapter
             via ``model_type == "qwen3_5"``).
 
@@ -68,7 +68,7 @@ from mlx_lm.utils import load as _mlx_lm_load  # noqa: E402
 from silica import Engine  # noqa: E402
 from silica.core.sampling import SamplingParams  # noqa: E402
 from silica.models.factory import (  # noqa: E402
-    adapter_for_repo,
+    adapter_from_loaded_model,
     supported_model_types,
 )
 
@@ -165,13 +165,24 @@ def _probe_attr(args: Any, name: str) -> Any:
     return None
 
 
-def _probe_dispatch(repo: str) -> tuple[PhaseResult, Any]:
+def _probe_dispatch(
+    repo: str, model: Any, tokenizer: Any
+) -> tuple[PhaseResult, Any, Any]:
+    """Dispatch the factory on the *already-loaded* (model, tokenizer)
+    pair.
+
+    P5.9 step 2(a) (D-021): switched from ``adapter_for_repo(repo)``
+    (which would call ``mlx_lm.load(repo)`` a second time) to
+    ``adapter_from_loaded_model(model, tokenizer)``. The double-load
+    pattern was inflating the probe's reported peak by ~2x on 27B/31B
+    checkpoints, polluting the §6(4) RAM-headroom reference baseline.
+    """
     try:
-        adapter, kv = adapter_for_repo(repo)
+        adapter, kv = adapter_from_loaded_model(model, tokenizer)
     except Exception as exc:  # noqa: BLE001
         return (
             PhaseResult(
-                name="factory.adapter_for_repo",
+                name="factory.adapter_from_loaded_model",
                 ok=False,
                 details={
                     "repo": repo,
@@ -180,10 +191,11 @@ def _probe_dispatch(repo: str) -> tuple[PhaseResult, Any]:
                 error=_describe_exception(exc),
             ),
             None,
+            None,
         )
     return (
         PhaseResult(
-            name="factory.adapter_for_repo",
+            name="factory.adapter_from_loaded_model",
             ok=True,
             details={
                 "repo": repo,
@@ -192,6 +204,7 @@ def _probe_dispatch(repo: str) -> tuple[PhaseResult, Any]:
             },
         ),
         adapter,
+        kv,
     )
 
 
@@ -328,19 +341,23 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     phases: list[PhaseResult] = []
 
-    # ``tokenizer`` is consumed via ``adapter.tokenizer()`` in Phase 4;
-    # the raw handle from ``mlx_lm.load`` is not needed separately.
-    load_result, model, _ = _probe_load(args.repo)
+    # Phase 1 captures (model, tokenizer); Phase 2 reuses them via
+    # adapter_from_loaded_model so the factory does not load the
+    # checkpoint a second time. P5.9 step 2(a) (D-021).
+    load_result, model, tokenizer = _probe_load(args.repo)
     phases.append(load_result)
 
     adapter: Any = None
-    if load_result.ok:
-        dispatch_result, adapter = _probe_dispatch(args.repo)
+    kv: Any = None
+    if load_result.ok and model is not None and tokenizer is not None:
+        dispatch_result, adapter, kv = _probe_dispatch(
+            args.repo, model, tokenizer
+        )
         phases.append(dispatch_result)
     else:
         phases.append(
             PhaseResult(
-                name="factory.adapter_for_repo",
+                name="factory.adapter_from_loaded_model",
                 ok=False,
                 details={"skipped_due_to": "mlx_lm.load failed"},
             )
@@ -359,17 +376,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.skip_forward:
         pass
-    elif adapter is not None:
-        # Build Engine with the kv that adapter_for_repo already produced.
-        # The factory function returns (adapter, kv) but _probe_dispatch
-        # dropped the kv — rebuild Engine using SimpleKVCache.from_model
-        # on the loaded model, same shape as factory produces.
-        from silica.kvcache.simple import SimpleKVCache
-
-        kv = SimpleKVCache.from_model(model)
-        # Rewire adapter to use this kv (adapters hold their own ref;
-        # match the factory's invariant so cache_list(req_id) works).
-        adapter._kv_manager = kv  # noqa: SLF001 — probe-only
+    elif adapter is not None and kv is not None:
+        # Reuse the kv from Phase 2 directly — adapter_from_loaded_model
+        # already produced (adapter, kv) bound to the same loaded model,
+        # so no rewire / second SimpleKVCache.from_model is needed.
         engine = Engine(adapter, kv)
         phases.append(_probe_forward(engine, adapter))
     else:

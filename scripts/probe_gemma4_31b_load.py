@@ -18,7 +18,7 @@ an answer. Four phases:
             (sliding-window, MoE, …) are surfaced without the probe
             having to pre-guess their names.
 
-  Phase 2 — ``adapter_for_repo(repo)``. Expected on a first run to
+  Phase 2 — ``adapter_from_loaded_model(model, tokenizer)``. Expected on a first run to
             fail with ``NotImplementedError: No Silica adapter
             registered for model_type=…`` — that is a valid data
             point. The report names the dispatch outcome together
@@ -80,7 +80,7 @@ from mlx_lm.utils import load as _mlx_lm_load  # noqa: E402
 from silica import Engine  # noqa: E402
 from silica.core.sampling import SamplingParams  # noqa: E402
 from silica.models.factory import (  # noqa: E402
-    adapter_for_repo,
+    adapter_from_loaded_model,
     supported_model_types,
 )
 
@@ -189,13 +189,22 @@ def _probe_load(repo: str) -> tuple[PhaseResult, Any, Any]:
     )
 
 
-def _probe_dispatch(repo: str) -> tuple[PhaseResult, Any]:
+def _probe_dispatch(
+    repo: str, model: Any, tokenizer: Any
+) -> tuple[PhaseResult, Any, Any]:
+    """Dispatch the factory on the *already-loaded* (model, tokenizer)
+    pair. P5.9 step 2(a) (D-021): switched from ``adapter_for_repo(repo)``
+    (which would call ``mlx_lm.load(repo)`` a second time) to
+    ``adapter_from_loaded_model(model, tokenizer)`` so the probe
+    reports honest peak memory rather than the doubled figure caused
+    by re-loading the checkpoint.
+    """
     try:
-        adapter, kv = adapter_for_repo(repo)
+        adapter, kv = adapter_from_loaded_model(model, tokenizer)
     except Exception as exc:  # noqa: BLE001
         return (
             PhaseResult(
-                name="factory.adapter_for_repo",
+                name="factory.adapter_from_loaded_model",
                 ok=False,
                 details={
                     "repo": repo,
@@ -212,10 +221,11 @@ def _probe_dispatch(repo: str) -> tuple[PhaseResult, Any]:
                 error=_describe_exception(exc),
             ),
             None,
+            None,
         )
     return (
         PhaseResult(
-            name="factory.adapter_for_repo",
+            name="factory.adapter_from_loaded_model",
             ok=True,
             details={
                 "repo": repo,
@@ -231,6 +241,7 @@ def _probe_dispatch(repo: str) -> tuple[PhaseResult, Any]:
             },
         ),
         adapter,
+        kv,
     )
 
 
@@ -335,14 +346,14 @@ def _render_report(
 
     load_ok = any(p.name == "mlx_lm.load" and p.ok for p in phases)
     dispatch_ok = any(
-        p.name == "factory.adapter_for_repo" and p.ok for p in phases
+        p.name == "factory.adapter_from_loaded_model" and p.ok for p in phases
     )
     lines.append("## Summary")
     lines.append("")
     if load_ok and dispatch_ok:
         lines.append(
-            "- `mlx_lm.load` and `factory.adapter_for_repo` both "
-            "succeeded. Read Phase 3 `attention_kinds` / "
+            "- `mlx_lm.load` and `factory.adapter_from_loaded_model` "
+            "both succeeded. Read Phase 3 `attention_kinds` / "
             "`has_recurrent_state` / `has_moe` before concluding that "
             "no new adapter file is needed — a fallback dispatch onto "
             "the wrong family would still report ok at this phase. If "
@@ -352,9 +363,9 @@ def _render_report(
         )
     elif load_ok and not dispatch_ok:
         lines.append(
-            "- `mlx_lm.load` succeeded but `adapter_for_repo` failed. "
-            "Phase 2's `next_step_hint` names the path forward: a new "
-            "`silica/models/gemma4.py` adapter file + "
+            "- `mlx_lm.load` succeeded but `adapter_from_loaded_model` "
+            "failed. Phase 2's `next_step_hint` names the path forward: "
+            "a new `silica/models/gemma4.py` adapter file + "
             "`factory._ADAPTERS` registration keyed on the Phase 1 "
             "`model_type`. Compare Phase 1's `args_attrs` / "
             "`text_config_keys` against `silica/models/qwen3_5.py` to "
@@ -399,19 +410,23 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     phases: list[PhaseResult] = []
 
-    # ``tokenizer`` from Phase 1 is reached later via ``adapter.tokenizer()``;
-    # the raw handle is not needed separately here.
-    load_result, model, _ = _probe_load(args.repo)
+    # Phase 1 captures (model, tokenizer); Phase 2 reuses them via
+    # adapter_from_loaded_model so the factory does not load the
+    # checkpoint a second time. P5.9 step 2(a) (D-021).
+    load_result, model, tokenizer = _probe_load(args.repo)
     phases.append(load_result)
 
     adapter: Any = None
-    if load_result.ok:
-        dispatch_result, adapter = _probe_dispatch(args.repo)
+    kv: Any = None
+    if load_result.ok and model is not None and tokenizer is not None:
+        dispatch_result, adapter, kv = _probe_dispatch(
+            args.repo, model, tokenizer
+        )
         phases.append(dispatch_result)
     else:
         phases.append(
             PhaseResult(
-                name="factory.adapter_for_repo",
+                name="factory.adapter_from_loaded_model",
                 ok=False,
                 details={"skipped_due_to": "mlx_lm.load failed"},
             )
@@ -428,12 +443,11 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
 
-    ran_forward = args.run_forward and adapter is not None
+    ran_forward = args.run_forward and adapter is not None and kv is not None
     if ran_forward:
-        from silica.kvcache.simple import SimpleKVCache
-
-        kv = SimpleKVCache.from_model(model)
-        adapter._kv_manager = kv  # noqa: SLF001 — probe-only
+        # Reuse the kv produced by adapter_from_loaded_model — same
+        # SimpleKVCache.from_model invariant the factory uses, no
+        # rewire required.
         engine = Engine(adapter, kv)
         phases.append(_probe_forward(engine, adapter))
     elif args.run_forward and adapter is None:

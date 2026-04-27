@@ -578,7 +578,9 @@ Things this document deliberately does not gloss over:
   the data supports flipping but the flip itself is deferred.
 - **Original P-6 24 GB budget gate was retired (D-018).** v0.1 no
   longer independently validates dense residency relief; we trust
-  the 30.5 GB peak measurement.
+  the corrected ~15.3 GB peak measurement (v1.7.14 P5.9 step 2(a)
+  supersedes the inflated 30.5 GB v1.6.1 figure that was caused by
+  probe double-load).
 
 If any of these turn out to be more load-bearing than the plan
 treats them as, the reviewer's job is to flag it.
