@@ -213,11 +213,88 @@ def render_codec_hint(
     return p.colorize(f"tip: {body}", "yellow", dim=True)
 
 
+def render_showcase(
+    state: ChatCliState,
+    *,
+    palette: Palette | None = None,
+) -> str:
+    """Render the ``/showcase`` session-narrative report.
+
+    A multi-line block summarising the silica-mlx-USP signals
+    accumulated over the session so far: turn count, prefix-cache
+    reuse, peak device memory, average decode throughput, and (when
+    a KV codec is active) compression-driven memory savings.
+
+    Empty / pre-first-turn states are surfaced honestly — fields
+    read ``—`` rather than ``0`` when they have not been measured
+    yet, so the user can distinguish "no data" from "zero".
+    """
+    p = palette if palette is not None else Palette.plain()
+    lines: list[str] = []
+    title = p.colorize(
+        "── silica session showcase ──",
+        "cyan",
+        bold=True,
+    )
+    lines.append(title)
+
+    turns_str = str(state.turn) if state.turn > 0 else "—"
+    lines.append(f"  turns:           {turns_str}")
+    lines.append(f"  model:           {state.model_name}")
+    lines.append(f"  codec:           {state.codec_id or 'fp16'}")
+
+    if state.total_prefix_hit_tokens > 0:
+        lines.append(
+            f"  prefix reused:   {state.total_prefix_hit_tokens} tokens"
+        )
+    else:
+        lines.append("  prefix reused:   —")
+
+    avg = state.session_avg_decode_tok_s()
+    if avg is not None:
+        lines.append(f"  avg decode:      {avg:.1f} tok/s")
+    else:
+        lines.append("  avg decode:      —")
+
+    if state.last_ttft_ms is not None:
+        lines.append(f"  last TTFT:       {state.last_ttft_ms:.0f} ms")
+    else:
+        lines.append("  last TTFT:       —")
+
+    if state.peak_memory_mb is not None:
+        lines.append(
+            f"  peak memory:     {state.peak_memory_mb / 1024.0:.2f} GB"
+        )
+    else:
+        lines.append("  peak memory:     —")
+
+    if state.kv_resident_mb is not None:
+        lines.append(
+            f"  prefix store:    {state.kv_resident_mb:.1f} MB"
+        )
+    else:
+        lines.append("  prefix store:    —")
+
+    ratio = state.compression_ratio()
+    if (
+        ratio is not None
+        and state.kv_logical_mb is not None
+        and state.kv_resident_mb is not None
+    ):
+        saved = state.kv_logical_mb - state.kv_resident_mb
+        lines.append(
+            f"  codec savings:   {saved:.1f} MB ({ratio:.1f}x vs fp16)"
+        )
+
+    return "\n".join(lines)
+
+
 # Surface the public symbols cleanly so other CLI modules import
 # from this file rather than reaching into private helpers.
 __all__: list[str] = [
     "render_toolbar",
     "render_codec_hint",
+    "render_showcase",
 ]
 
 

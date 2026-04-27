@@ -21,10 +21,14 @@ Two subcommands:
   is "open and use", power users override mid-session via
   ``/config``.
 
-Bare-``silica`` argv preprocessing (claude-style: typing ``silica``
-with no subcommand opens the chat REPL) is C-7 — for now both
-``silica chat`` and the explicit ``silica run`` subcommand-required
-form are honoured.
+Bare ``silica`` (no subcommand) opens the chat REPL with all
+defaults — claude-style. Implementation: :func:`main` pre-processes
+``argv`` and prepends ``chat`` when the first positional token is
+not a known subcommand (``run`` / ``chat``) and not a top-level
+flag (``--help`` / ``-h`` / ``--version``). Both ``silica`` and
+``silica chat`` therefore land on the same subparser, so
+``--model`` / ``--system`` / ``--kv-codec`` work uniformly across
+the two invocation forms.
 """
 
 from __future__ import annotations
@@ -132,9 +136,34 @@ def _print_metrics(snapshot: Any) -> None:
         print("[metrics] " + " ".join(parts), file=sys.stderr)
 
 
+_KNOWN_SUBCOMMANDS = frozenset({"run", "chat"})
+_TOP_LEVEL_FLAGS = frozenset({"--help", "-h", "--version"})
+
+
+def _preprocess_argv(argv: Sequence[str]) -> list[str]:
+    """Prepend ``chat`` when ``argv`` does not lead with a known
+    subcommand or a top-level flag.
+
+    Bare ``silica`` (empty argv), ``silica --model X``, and
+    ``silica --kv-codec foo`` all become ``silica chat ...``. The
+    explicit ``silica chat ...`` and ``silica run ...`` paths are
+    untouched. Top-level help / version flags pass through so
+    ``silica --help`` lists the subcommands rather than running
+    chat with ``--help`` swallowed by the chat subparser.
+    """
+    args = list(argv)
+    if not args:
+        return ["chat"]
+    head = args[0]
+    if head in _KNOWN_SUBCOMMANDS or head in _TOP_LEVEL_FLAGS:
+        return args
+    return ["chat", *args]
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    raw = sys.argv[1:] if argv is None else list(argv)
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(_preprocess_argv(raw))
     if args.cmd == "run":
         return _run(args)
     if args.cmd == "chat":

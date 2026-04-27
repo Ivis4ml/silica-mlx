@@ -19,7 +19,11 @@ from silica.chat.cli.palette import (
     detect_palette,
 )
 from silica.chat.cli.state import ChatCliState, StreamState
-from silica.chat.cli.toolbar import render_codec_hint, render_toolbar
+from silica.chat.cli.toolbar import (
+    render_codec_hint,
+    render_showcase,
+    render_toolbar,
+)
 
 # ---------------------------------------------------------------------------
 # Palette detection
@@ -483,3 +487,80 @@ def test_truecolor_and_plain_produce_same_text_after_stripping_escapes() -> None
         f"  plain   : {plain!r}\n"
         f"  stripped: {stripped!r}"
     )
+
+
+
+# ---------------------------------------------------------------------------
+# render_showcase — /showcase narrative report
+# ---------------------------------------------------------------------------
+
+
+def test_showcase_pre_first_turn_uses_emdash_for_unknown_fields() -> None:
+    """At session start (turn=0, no measurements), unknown fields
+    render as ``—`` rather than ``0`` so the user can distinguish
+    "not measured" from "measured zero"."""
+    out = render_showcase(_empty_state(), palette=Palette.plain())
+    assert "turns:" in out
+    # turn=0 reads as "—" — there is no turn-zero, the counter
+    # increments after the first reply lands.
+    assert "turns:           —" in out
+    assert "avg decode:      —" in out
+    assert "last TTFT:       —" in out
+    assert "peak memory:     —" in out
+    assert "prefix reused:   —" in out
+
+
+def test_showcase_renders_cumulative_signals_after_turns() -> None:
+    st = ChatCliState(
+        model_name="Qwen3-0.6B",
+        codec_id=None,
+        turn=3,
+        last_ttft_ms=22.0,
+        peak_memory_mb=2048.0,  # 2 GB
+        kv_resident_mb=18.4,
+        total_prefix_hit_tokens=512,
+        total_decode_tokens=600,
+        total_decode_seconds=4.0,  # 150 tok/s avg
+    )
+    out = render_showcase(st, palette=Palette.plain())
+    assert "turns:           3" in out
+    assert "model:           Qwen3-0.6B" in out
+    assert "codec:           fp16" in out
+    assert "prefix reused:   512 tokens" in out
+    assert "avg decode:      150.0 tok/s" in out
+    assert "last TTFT:       22 ms" in out
+    assert "peak memory:     2.00 GB" in out
+    assert "prefix store:    18.4 MB" in out
+
+
+def test_showcase_codec_savings_only_when_codec_active() -> None:
+    """The "codec savings" line is conditional on a real
+    compression ratio. fp16 (no codec) omits the line; an active
+    codec includes it with both saved-MB and ratio."""
+    fp16_state = ChatCliState(
+        model_name="Qwen3-0.6B",
+        codec_id=None,
+        turn=1,
+        kv_resident_mb=10.0,
+        kv_logical_mb=10.0,
+    )
+    out_fp16 = render_showcase(fp16_state, palette=Palette.plain())
+    assert "codec savings" not in out_fp16
+
+    codec_state = ChatCliState(
+        model_name="Qwen3-0.6B",
+        codec_id="block_tq_b64_b4",
+        turn=1,
+        kv_resident_mb=10.0,
+        kv_logical_mb=38.0,  # 3.8x ratio
+    )
+    out_codec = render_showcase(codec_state, palette=Palette.plain())
+    assert "codec savings:" in out_codec
+    assert "3.8x" in out_codec
+    assert "28.0 MB" in out_codec  # 38 - 10
+
+
+def test_showcase_plain_mode_has_no_ansi_escapes() -> None:
+    st = ChatCliState(model_name="Qwen3-0.6B", turn=1)
+    out = render_showcase(st, palette=Palette.plain())
+    assert "\x1b[" not in out

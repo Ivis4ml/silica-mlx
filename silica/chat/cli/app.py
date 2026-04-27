@@ -53,6 +53,11 @@ from silica.chat.cli.commands import (
 )
 from silica.chat.cli.config import initial_config
 from silica.chat.cli.palette import ColorName, Palette, detect_palette
+from silica.chat.cli.persistence import (
+    SessionFileError,
+    load_session,
+    save_session,
+)
 from silica.chat.cli.state import ChatCliState, StreamState
 from silica.chat.cli.thinking_parser import (
     EnterThinking,
@@ -61,7 +66,11 @@ from silica.chat.cli.thinking_parser import (
     ThinkingChunk,
     ThinkingParser,
 )
-from silica.chat.cli.toolbar import render_codec_hint, render_toolbar
+from silica.chat.cli.toolbar import (
+    render_codec_hint,
+    render_showcase,
+    render_toolbar,
+)
 
 
 def _model_basename(repo: str) -> str:
@@ -356,6 +365,9 @@ def run_chat(args: argparse.Namespace) -> int:
                 state.last_turn_thinking = ""
                 state.prefix_hit_blocks = None
                 state.prefix_hit_max = None
+                state.total_prefix_hit_tokens = 0
+                state.total_decode_tokens = 0
+                state.total_decode_seconds = 0.0
             if result.request_expand_thinking:
                 expanded = palette.colorize(
                     "── thinking ──\n" + state.last_turn_thinking,
@@ -375,30 +387,57 @@ def run_chat(args: argparse.Namespace) -> int:
                         dim=True,
                     )
                 )
-            if result.request_session_save or result.request_session_load:
-                print(
-                    palette.colorize(
-                        "(/save and /load land at C-7; not wired yet)",
-                        "yellow",
-                        dim=True,
-                    )
+            if result.request_session_save:
+                _handle_session_save(
+                    result.request_session_save,
+                    chat_session=chat_session,
+                    state=state,
+                    palette=palette,
                 )
+            if result.request_session_load:
+                load_outcome = _handle_session_load(
+                    result.request_session_load,
+                    chat_session=chat_session,
+                    state=state,
+                    palette=palette,
+                )
+                if load_outcome:
+                    # On successful /load we swap in a fresh prefix
+                    # cache: the restored history was produced
+                    # against a different sequence of inserts, so
+                    # the old radix tree is meaningless and reusing
+                    # it would leak stale blocks.
+                    fresh_cache = _build_prefix_cache(
+                        adapter,
+                        codec_id=getattr(args, "kv_codec", None),
+                        get_codec_spec=get_codec_spec,
+                        store_cls=SyntheticPrefixBlockStore,
+                        cache_cls=RadixPrefixCache,
+                    )
+                    chat_session.set_prefix_cache(fresh_cache)
             if result.request_model_swap:
-                print(
-                    palette.colorize(
-                        "(/model swap lands at C-7; not wired yet)",
-                        "yellow",
-                        dim=True,
-                    )
+                swap_outcome = _swap_model(
+                    result.request_model_swap,
+                    args=args,
+                    state=state,
+                    get_adapter=adapter_for_repo,
+                    engine_cls=Engine,
+                    session_cls=ChatSession,
+                    cache_builder=lambda new_adapter: _build_prefix_cache(
+                        new_adapter,
+                        codec_id=getattr(args, "kv_codec", None),
+                        get_codec_spec=get_codec_spec,
+                        store_cls=SyntheticPrefixBlockStore,
+                        cache_cls=RadixPrefixCache,
+                    ),
+                    palette=palette,
                 )
+                if swap_outcome is not None:
+                    adapter, engine, chat_session = swap_outcome
             if result.request_showcase:
-                print(
-                    palette.colorize(
-                        "(/showcase lands at C-7; not wired yet)",
-                        "yellow",
-                        dim=True,
-                    )
-                )
+                report = render_showcase(state, palette=palette)
+                sys.stdout.write(report + "\n")
+                sys.stdout.flush()
             continue
 
         # Regular chat turn. Defer the assistant prefix line until
@@ -612,6 +651,19 @@ def run_chat(args: argparse.Namespace) -> int:
             state.peak_memory_mb = metrics.peak_memory_mb
         if metrics.decode_tok_s is not None:
             state.tok_per_sec = metrics.decode_tok_s
+        # Cumulative session counters drive ``/showcase`` — total
+        # prefix-token reuse, average decode tok/s, etc.
+        if metrics.prefix_hit_tokens:
+            state.total_prefix_hit_tokens += metrics.prefix_hit_tokens
+        if (
+            metrics.decode_tok_s is not None
+            and metrics.decode_tok_s > 0
+            and metrics.output_tokens
+        ):
+            state.total_decode_tokens += metrics.output_tokens
+            state.total_decode_seconds += (
+                metrics.output_tokens / metrics.decode_tok_s
+            )
         # KV display: between turns the active KV cache is reclaimed
         # and ``engine.kv_manager.budget()`` reports zero, but the
         # prefix store still holds the cumulative cached blocks
@@ -656,6 +708,208 @@ def run_chat(args: argparse.Namespace) -> int:
         _print_separator(palette)
 
     return 0
+
+
+def _handle_session_save(
+    path: str,
+    *,
+    chat_session: Any,
+    state: ChatCliState,
+    palette: Palette,
+) -> None:
+    """Persist the running session to ``path`` as JSON. Errors are
+    reported as red feedback; success prints the resolved path
+    so the user sees where the file actually landed (``~`` is
+    expanded, parent directories are created)."""
+    try:
+        resolved = save_session(
+            path,
+            model=state.model_name,
+            codec_id=state.codec_id,
+            messages=chat_session.messages,
+            config=dict(state.config),
+        )
+    except (SessionFileError, OSError) as exc:
+        sys.stdout.write(
+            palette.colorize(f"/save failed: {exc}", "red") + "\n"
+        )
+        sys.stdout.flush()
+        return
+    sys.stdout.write(
+        palette.colorize(
+            f"saved {len(chat_session.messages)} messages to {resolved}",
+            "cyan",
+            dim=True,
+        )
+        + "\n"
+    )
+    sys.stdout.flush()
+
+
+def _handle_session_load(
+    path: str,
+    *,
+    chat_session: Any,
+    state: ChatCliState,
+    palette: Palette,
+) -> bool:
+    """Restore a saved session from ``path``. Returns ``True`` on
+    success so the caller can swap in a fresh prefix cache (the
+    restored history was produced against a different sequence
+    of inserts; reusing the old cache would leak stale blocks).
+
+    A model mismatch between the file's ``model`` field and the
+    currently-loaded model is **not** an error — the user may have
+    saved with one model and loaded into another deliberately. We
+    print a yellow warning so the discrepancy is visible without
+    blocking the restore.
+    """
+    try:
+        data = load_session(path)
+    except SessionFileError as exc:
+        sys.stdout.write(
+            palette.colorize(f"/load failed: {exc}", "red") + "\n"
+        )
+        sys.stdout.flush()
+        return False
+
+    saved_model = str(data.get("model") or "")
+    saved_basename = saved_model.split("/", 1)[-1]
+    if saved_basename and saved_basename != state.model_name:
+        sys.stdout.write(
+            palette.colorize(
+                f"/load: file was saved under {saved_basename!r}; "
+                f"running against {state.model_name!r} — "
+                "tokenisation may differ.",
+                "yellow",
+                dim=True,
+            )
+            + "\n"
+        )
+        sys.stdout.flush()
+
+    messages: list[dict[str, str]] = list(data["messages"])
+    chat_session.replace_messages(messages)
+
+    # Re-apply config overrides from the file. Only keys that look
+    # like our schema (string-coerce-able) are accepted; unknown
+    # keys are kept as-is so a forward-compatible file does not
+    # lose data on the round trip.
+    saved_config = data.get("config") or {}
+    if isinstance(saved_config, dict):
+        for k, v in saved_config.items():
+            state.config[str(k)] = v
+
+    # Reset the cumulative session counters and the per-turn
+    # snapshot fields. The toolbar's "live" signals (tok/s, ttft)
+    # have no meaning until the first post-load turn runs.
+    state.turn = sum(1 for m in messages if m.get("role") == "assistant")
+    state.last_turn_thinking = ""
+    state.prefix_hit_blocks = None
+    state.prefix_hit_max = None
+    state.total_prefix_hit_tokens = 0
+    state.total_decode_tokens = 0
+    state.total_decode_seconds = 0.0
+    state.tok_per_sec = None
+    state.last_ttft_ms = None
+    state.tokens_generated = 0
+
+    sys.stdout.write(
+        palette.colorize(
+            f"loaded {len(messages)} messages from {path}",
+            "cyan",
+            dim=True,
+        )
+        + "\n"
+    )
+    sys.stdout.flush()
+    return True
+
+
+def _swap_model(
+    new_repo: str,
+    *,
+    args: argparse.Namespace,
+    state: ChatCliState,
+    get_adapter: Any,
+    engine_cls: Any,
+    session_cls: Any,
+    cache_builder: Any,
+    palette: Palette,
+) -> tuple[Any, Any, Any] | None:
+    """Re-load the model with id ``new_repo`` and rebuild the
+    chat session around it. On success returns ``(adapter, engine,
+    chat_session)`` so the caller can rebind its locals; on failure
+    returns ``None`` and the previous (adapter, engine, chat_session)
+    triple stays live.
+
+    System prompt is preserved across the swap (read from
+    ``state.config["system_prompt"]``). Conversation history is
+    NOT preserved — token IDs from the old tokeniser would not
+    match the new one, so retaining them would silently corrupt
+    the chat template. The user gets a yellow notice making this
+    explicit.
+    """
+    sys.stdout.write(
+        palette.colorize(
+            f"loading {new_repo} (this takes a moment) ...",
+            "grey",
+            dim=True,
+        )
+        + "\n"
+    )
+    sys.stdout.flush()
+    try:
+        new_adapter, new_kv = get_adapter(new_repo)
+    except Exception as exc:
+        sys.stdout.write(
+            palette.colorize(
+                f"/model failed: {exc}", "red"
+            )
+            + "\n"
+        )
+        sys.stdout.flush()
+        return None
+    new_engine = engine_cls(new_adapter, new_kv)
+    new_cache = cache_builder(new_adapter)
+    sys_prompt = state.config.get("system_prompt") or None
+    sys_prompt_str = str(sys_prompt) if sys_prompt else None
+    new_session = session_cls(
+        new_adapter,
+        new_engine,
+        system_prompt=sys_prompt_str,
+        prefix_cache=new_cache,
+    )
+
+    # Reset state — old tokens are stale under the new tokeniser.
+    state.model_name = _model_basename(new_repo)
+    state.turn = 0
+    state.last_turn_thinking = ""
+    state.prefix_hit_blocks = None
+    state.prefix_hit_max = None
+    state.total_prefix_hit_tokens = 0
+    state.total_decode_tokens = 0
+    state.total_decode_seconds = 0.0
+    state.tok_per_sec = None
+    state.last_ttft_ms = None
+    state.tokens_generated = 0
+    state.kv_resident_mb = None
+    state.kv_logical_mb = None
+    state.prefix_store_mb = None
+    # Carry the codec_id / system prompt forward unchanged.
+    state.codec_id = getattr(args, "kv_codec", None)
+
+    sys.stdout.write(
+        palette.colorize(
+            f"model swapped to {state.model_name}. Conversation "
+            "history reset (tokenisation differs across models).",
+            "cyan",
+            dim=True,
+        )
+        + "\n"
+    )
+    sys.stdout.flush()
+    return new_adapter, new_engine, new_session
 
 
 _PREFIX_CACHE_BLOCK_SIZE = 4

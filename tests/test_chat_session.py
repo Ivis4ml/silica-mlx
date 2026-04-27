@@ -410,6 +410,41 @@ def test_reset_between_turns_restarts_history() -> None:
     assert "second" in engine.prompts_seen[1]
 
 
+# ---------- replace_messages (C-7 /load) -----------------------------
+
+
+def test_replace_messages_swaps_history_wholesale() -> None:
+    """``replace_messages`` is the chat-CLI ``/load`` hook: the
+    restored conversation replaces every existing message —
+    including the system prompt — so the loaded file is the
+    single source of truth for what the next turn sees."""
+    session, _, _ = _build_session(
+        system_prompt="original system", engine_tokens=[65]
+    )
+    session.chat("first user")
+    assert len(session.messages) == 3  # system + user + assistant
+    new_history = [
+        {"role": "system", "content": "loaded system"},
+        {"role": "user", "content": "loaded user"},
+        {"role": "assistant", "content": "loaded reply"},
+    ]
+    session.replace_messages(new_history)
+    assert session.messages == new_history
+
+
+def test_replace_messages_returns_independent_copy() -> None:
+    """Mutating the input list after the call must not affect the
+    session's stored history (and vice versa)."""
+    session, _, _ = _build_session(engine_tokens=[65])
+    history = [
+        {"role": "user", "content": "a"},
+        {"role": "assistant", "content": "b"},
+    ]
+    session.replace_messages(history)
+    history.append({"role": "user", "content": "MUTATED"})
+    assert {"role": "user", "content": "MUTATED"} not in session.messages
+
+
 def test_empty_user_text_still_records_message() -> None:
     """The session does not filter empty user_text — caller (CLI)
     is expected to skip empties. This pins the behaviour so a

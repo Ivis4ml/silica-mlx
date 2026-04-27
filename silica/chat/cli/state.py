@@ -115,6 +115,22 @@ class ChatCliState:
     """Total prompt tokens that *could* have matched (the divisor of
     the ``prefix_hit=N/M`` field)."""
 
+    # ---- cumulative session counters (Tier 1 — /showcase narrative) ---
+    total_prefix_hit_tokens: int = 0
+    """Sum of per-turn ``prefix_hit_tokens`` across the session.
+    Reset to 0 by ``/reset`` and ``/load``; the narrative report
+    surfaces ``reused N tokens of prefix`` from this field."""
+
+    total_decode_tokens: int = 0
+    """Sum of per-turn ``output_tokens`` across the session — the
+    numerator of the session-average decode tok/s."""
+
+    total_decode_seconds: float = 0.0
+    """Sum of per-turn decode wall-clock seconds (output_tokens /
+    decode_tok_s) — the denominator of session-average decode tok/s.
+    Computed from ``TurnMetrics.decode_tok_s`` rather than measured
+    directly so the report matches the toolbar's tok/s definition."""
+
     # ---- thinking-mode buffer ------------------------------------------
     last_turn_thinking: str = ""
     """Buffered ``<think>...</think>`` content from the previous turn.
@@ -165,3 +181,10 @@ class ChatCliState:
             and self.prefix_hit_max is not None
             and self.prefix_hit_max > 0
         )
+
+    def session_avg_decode_tok_s(self) -> float | None:
+        """Session-average decode throughput. ``None`` until the
+        first completed turn populates the cumulative counters."""
+        if self.total_decode_seconds <= 0.0 or self.total_decode_tokens <= 0:
+            return None
+        return self.total_decode_tokens / self.total_decode_seconds

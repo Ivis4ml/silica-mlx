@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from silica.server.cli import build_parser
+from silica.server.cli import _preprocess_argv, build_parser
 
 
 def test_run_parses_minimum_required_args() -> None:
@@ -66,4 +66,76 @@ def test_missing_model_or_prompt_exits() -> None:
 def test_unknown_subcommand_exits() -> None:
     parser = build_parser()
     with pytest.raises(SystemExit):
+        # An unknown token after preprocessing must not slip through
+        # the parser. ``_preprocess_argv`` would prepend ``chat`` here
+        # and the chat subparser would reject ``doit``; calling the
+        # parser directly skips that prepend and is rejected at the
+        # subparser-routing step.
         parser.parse_args(["doit"])
+
+
+# ---------------------------------------------------------------------------
+# Bare-``silica`` argv preprocessing (C-7)
+# ---------------------------------------------------------------------------
+
+
+def test_preprocess_empty_argv_routes_to_chat() -> None:
+    assert _preprocess_argv([]) == ["chat"]
+
+
+def test_preprocess_explicit_chat_passes_through() -> None:
+    assert _preprocess_argv(["chat", "--model", "m"]) == [
+        "chat",
+        "--model",
+        "m",
+    ]
+
+
+def test_preprocess_explicit_run_passes_through() -> None:
+    assert _preprocess_argv(["run", "--model", "m", "--prompt", "p"]) == [
+        "run",
+        "--model",
+        "m",
+        "--prompt",
+        "p",
+    ]
+
+
+def test_preprocess_bare_flag_prepends_chat() -> None:
+    """``silica --model X`` becomes ``silica chat --model X``."""
+    assert _preprocess_argv(["--model", "Qwen/Qwen3-4B"]) == [
+        "chat",
+        "--model",
+        "Qwen/Qwen3-4B",
+    ]
+
+
+def test_preprocess_kv_codec_alone_prepends_chat() -> None:
+    assert _preprocess_argv(["--kv-codec", "block_tq_b64_b4"]) == [
+        "chat",
+        "--kv-codec",
+        "block_tq_b64_b4",
+    ]
+
+
+def test_preprocess_top_level_help_passes_through() -> None:
+    """``silica --help`` should hit the *root* parser so it lists
+    subcommands; do not prepend ``chat``."""
+    assert _preprocess_argv(["--help"]) == ["--help"]
+    assert _preprocess_argv(["-h"]) == ["-h"]
+
+
+def test_preprocess_full_chat_argv_via_parser() -> None:
+    """End-to-end: bare argv goes through preprocessing and parses
+    cleanly on the chat subparser."""
+    parser = build_parser()
+    args = parser.parse_args(_preprocess_argv(["--model", "Qwen/Qwen3-4B"]))
+    assert args.cmd == "chat"
+    assert args.model == "Qwen/Qwen3-4B"
+
+
+def test_preprocess_empty_argv_via_parser_uses_chat_default_model() -> None:
+    parser = build_parser()
+    args = parser.parse_args(_preprocess_argv([]))
+    assert args.cmd == "chat"
+    assert args.model == "Qwen/Qwen3-0.6B"

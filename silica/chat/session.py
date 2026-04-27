@@ -233,6 +233,23 @@ class ChatSession:
             m for m in self._messages if m["role"] == "system"
         ]
 
+    def replace_messages(
+        self, messages: list[dict[str, str]]
+    ) -> None:
+        """Replace the message history wholesale.
+
+        Used by the chat-CLI's ``/load`` to restore a conversation
+        from disk. The caller is responsible for swapping the
+        prefix cache as well — the new history is unrelated to
+        whatever was previously cached, so retaining the old cache
+        would leak stale blocks into the restored session. This
+        mirrors the contract documented on :meth:`reset`.
+        """
+        self._messages = [
+            {"role": m["role"], "content": m["content"]}
+            for m in messages
+        ]
+
     def set_prefix_cache(
         self, prefix_cache: _PrefixCacheLike | None
     ) -> None:
