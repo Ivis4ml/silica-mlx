@@ -557,15 +557,36 @@ def run_chat(args: argparse.Namespace) -> int:
         )
         thinking_started_at: list[float] = []  # mutable for closure write
         prefix_emitted: list[bool] = [False]
+        reply_emitted: list[bool] = [False]
         fence_parser = CodeFenceParser()
         in_fence: list[bool] = [False]
         _print_phase_indicator("prefilling", "yellow", palette)
 
-        def _emit_assistant_prefix_once() -> None:
+        def _write_generation_text(text: str) -> None:
+            """Write normal conversation text while the live toolbar is active.
+
+            The ANSI live toolbar redraws on the line below the
+            current cursor. Before any ordinary streamed output may
+            move the cursor (assistant text, "thought for..." lines,
+            highlighted code), clear that reserved line so it does
+            not become part of the transcript or get overwritten by
+            wrapped reply text. The stream callback refreshes the
+            toolbar again after parser dispatch.
+            """
+            live_toolbar.clear()
+            sys.stdout.write(text)
+            sys.stdout.flush()
+
+        def _emit_assistant_prefix_once(
+            *, clear_phase: bool = True
+        ) -> None:
             if not prefix_emitted[0]:
-                _clear_phase_indicator()
-                sys.stdout.write(_format_assistant_prefix(palette))
-                sys.stdout.flush()
+                live_toolbar.clear()
+                if clear_phase:
+                    _clear_phase_indicator()
+                _write_generation_text(
+                    _format_assistant_prefix(palette)
+                )
                 prefix_emitted[0] = True
 
         def _emit_reply_text(text: str) -> None:
@@ -580,8 +601,8 @@ def run_chat(args: argparse.Namespace) -> int:
             for fevent in fence_parser.feed(text):
                 if isinstance(fevent, PlainText):
                     if fevent.text:
-                        sys.stdout.write(fevent.text)
-                        sys.stdout.flush()
+                        reply_emitted[0] = True
+                        _write_generation_text(fevent.text)
                 elif isinstance(fevent, EnterFence):
                     in_fence[0] = True
                     label = (
@@ -589,21 +610,21 @@ def run_chat(args: argparse.Namespace) -> int:
                         if fevent.language
                         else "writing code"
                     )
+                    live_toolbar.clear()
                     _print_phase_indicator(label, "cyan", palette)
                 elif isinstance(fevent, ExitFence):
                     in_fence[0] = False
+                    live_toolbar.clear()
                     _clear_phase_indicator()
                     highlighted = _highlight_code(
                         fevent.code, fevent.language
                     )
                     # Frame the block with a leading newline so
                     # the indicator's line break is preserved.
-                    sys.stdout.write(
-                        "\n" + highlighted
-                    )
+                    reply_emitted[0] = True
+                    _write_generation_text("\n" + highlighted)
                     if not highlighted.endswith("\n"):
-                        sys.stdout.write("\n")
-                    sys.stdout.flush()
+                        _write_generation_text("\n")
 
         def _stream_callback(delta: str) -> None:
             # One stream_to call == one decoded token; track the
@@ -622,6 +643,7 @@ def run_chat(args: argparse.Namespace) -> int:
                     # Whatever indicator is currently up (prefill
                     # yellow OR a stale thinking line from a
                     # previous block in the same turn) gets cleared.
+                    live_toolbar.clear()
                     _clear_phase_indicator()
                     state.stream_state = StreamState.THINKING
                     thinking_started_at.append(time.monotonic())
@@ -632,15 +654,15 @@ def run_chat(args: argparse.Namespace) -> int:
                 elif isinstance(event, ThinkingChunk):
                     state.last_turn_thinking += event.text
                     if thinking_display == "show":
-                        sys.stdout.write(
+                        _write_generation_text(
                             palette.colorize(event.text, "grey", dim=True)
                         )
-                        sys.stdout.flush()
                 elif isinstance(event, ExitThinking):
+                    live_toolbar.clear()
                     _clear_phase_indicator()
                     if thinking_started_at and thinking_display != "hidden":
                         elapsed = time.monotonic() - thinking_started_at[-1]
-                        sys.stdout.write(
+                        _write_generation_text(
                             palette.colorize(
                                 f"thought for {elapsed:.1f}s\n",
                                 "grey",
@@ -648,7 +670,7 @@ def run_chat(args: argparse.Namespace) -> int:
                             )
                         )
                     state.stream_state = StreamState.DECODE
-                    _emit_assistant_prefix_once()
+                    _emit_assistant_prefix_once(clear_phase=False)
                 elif isinstance(event, ReplyChunk):
                     if state.stream_state is StreamState.PREFILL:
                         state.stream_state = StreamState.DECODE
@@ -756,28 +778,34 @@ def run_chat(args: argparse.Namespace) -> int:
             for fevent in fence_parser.finish():
                 if isinstance(fevent, PlainText):
                     if fevent.text:
-                        sys.stdout.write(fevent.text)
-                        sys.stdout.flush()
+                        reply_emitted[0] = True
+                        _write_generation_text(fevent.text)
                 elif isinstance(fevent, ExitFence):
+                    live_toolbar.clear()
                     _clear_phase_indicator()
                     highlighted = _highlight_code(
                         fevent.code, fevent.language
                     )
-                    sys.stdout.write("\n" + highlighted)
+                    reply_emitted[0] = True
+                    _write_generation_text("\n" + highlighted)
                     if not highlighted.endswith("\n"):
-                        sys.stdout.write("\n")
-                    sys.stdout.flush()
+                        _write_generation_text("\n")
 
             # Empty-reply edge case: generation ended without
             # emitting a single reply token (everything was
             # thinking, or no tokens at all). Surface a placeholder
             # so the log line still shows ``silica ›`` for visual
             # consistency.
-            if not prefix_emitted[0]:
-                _clear_phase_indicator()
-                sys.stdout.write(
-                    _format_assistant_prefix(palette)
-                    + palette.colorize(
+            if not reply_emitted[0]:
+                live_toolbar.clear()
+                if not prefix_emitted[0]:
+                    _clear_phase_indicator()
+                    _write_generation_text(
+                        _format_assistant_prefix(palette)
+                    )
+                    prefix_emitted[0] = True
+                _write_generation_text(
+                    palette.colorize(
                         "(no reply — try /expand to see the model's reasoning)"
                         if state.last_turn_thinking
                         else "(no reply)",
@@ -785,7 +813,6 @@ def run_chat(args: argparse.Namespace) -> int:
                         dim=True,
                     )
                 )
-                sys.stdout.flush()
 
         # ``with`` exited — toolbar reserved line cleared. Turn-end
         # newline now lands on a clean line.
