@@ -1366,15 +1366,41 @@ Append-only. New decisions go at the end; old ones are not edited. Revocations /
        zero violations, single allowlist entry. Full
        non-real-model suite at landing: 2068 passed / 7 skipped
        (was 2063 after step 2(d); +5 new D-009 tests).
-     - **(f) Speculative-metrics schema.** Define the JSONL
-       fields every C.x track will emit before any C.x lands:
-       `accept_rate`, `verify_cost_ms`, `draft_cost_ms`,
+     - **(f) Speculative-metrics schema.**
+       Closed at P5.9 step 2(f): `silica/bench/spec_metrics.py`
+       defines the seven canonical fields (`accept_rate`,
+       `verify_cost_ms`, `draft_cost_ms`,
        `tokens_per_target_forward`, `rollback_count`,
-       `tree_node_visits` (for tree variants),
-       `quality_parity_status`. Carrying these in
-       `ScenarioResult.metadata` from C.1 onward lets the C.4
-       spike's gate threshold (≥1.8× silica-integrated speedup)
-       be evaluated on the same axes as C.1 / C.2 / C.3.
+       `tree_node_visits`, `quality_parity_status`), the
+       `QualityParityStatus` three-state enum (PARITY / DIVERGED
+       / NOT_TESTED), per-field documentation in
+       `SPECULATIVE_METRIC_FIELD_DOCS`, and a non-coercive
+       `validate_speculative_metrics(metadata) -> list[str]`
+       helper that returns greppable
+       `spec_metrics_{missing,type_error,range_error,value_error}:<field>:...`
+       reasons for the oracle / runner ``reason`` channel.
+       The schema explicitly does **not** wire into any oracle
+       at landing — that integration belongs to C.1 (D-021 step
+       5) and propagates from there. Pinning the schema in code
+       before any C.x implementation forces variant authors to
+       either match the contract or extend it explicitly (with
+       a corresponding update to the schema, the docs, and the
+       composition-pin test). Tests in
+       `tests/test_spec_metrics_schema.py` (24 cases): schema
+       composition pin, per-field docs coverage,
+       QualityParityStatus alphabet pin, validator pass on
+       well-formed metadata + string aliases + zero-cost
+       self-spec + zero tree-visits trajectory drafters,
+       parametrised missing-field reports, type-error reports
+       on strings + bools where ints / floats / enum expected,
+       range-error reports on negative costs / counts and
+       out-of-band accept_rate, value-error report on
+       unknown QualityParityStatus strings, and a regression
+       guard that confirms the schema is decoupled from the
+       existing WARM_DECODE oracle metadata (the two schemas
+       are deliberately disjoint). Full non-real-model suite
+       at landing: 2092 passed / 7 skipped (was 2068 after
+       step 2(e); +24 new schema tests).
      - **(g) P-5 quality regression promoted to P-6 per-track
        gate.** The `qwen3-0.6b-wikitext-ppl-block-tq-b64-b4-vqbench-aligned`
        (4-b) two-part aggregated gate must pass after every
