@@ -26,9 +26,11 @@ import mlx.core as mx
 import pytest
 
 from silica.chat.cli.app import (
+    _apply_rollback_snapshot,
     _apply_system_prompt_request,
     _assistant_ends_in_thinking,
     _build_prefix_cache,
+    _capture_rollback_snapshot,
     _evaluate_continue_request,
     _print_truncation_marker,
     _resolve_live_toolbar_enabled,
@@ -879,3 +881,233 @@ def test_truncation_marker_does_not_pollute_message_log() -> None:
 
     sig = inspect.signature(_print_truncation_marker)
     assert set(sig.parameters) == {"finish_reason", "palette"}
+
+
+# ---------------------------------------------------------------------------
+# CHAT-CLI-RESPONSE-POLICY RP-2 / RP-3 — abort-rollback helper
+# ---------------------------------------------------------------------------
+
+
+class _RollbackFakeSession:
+    """Minimal :class:`ChatSession` surrogate for the rollback
+    tests. Records ``replace_messages`` calls and exposes the
+    deep-copy ``messages`` property so ``_capture_rollback_snapshot``
+    operates against the same surface the live session does."""
+
+    def __init__(
+        self, messages: list[dict[str, str]] | None = None
+    ) -> None:
+        self._messages: list[dict[str, str]] = (
+            list(messages) if messages else []
+        )
+
+    @property
+    def messages(self) -> list[dict[str, str]]:
+        return [
+            {"role": m["role"], "content": m["content"]}
+            for m in self._messages
+        ]
+
+    def replace_messages(
+        self, messages: list[dict[str, str]]
+    ) -> None:
+        self._messages = [
+            {"role": m["role"], "content": m["content"]}
+            for m in messages
+        ]
+
+
+def _seeded_rollback_state() -> ChatCliState:
+    """State with non-default values for every field
+    ``_capture_rollback_snapshot`` reads — so a regression that
+    misses a field shows up as a mismatch on restore."""
+    state = ChatCliState()
+    state.last_turn_thinking = "original-thinking"
+    state.last_turn_reasoning_chars = 100
+    state.last_turn_visible_chars = 50
+    return state
+
+
+def test_capture_rollback_snapshot_reads_messages_and_metrics() -> None:
+    """The capture helper records the message log + the three
+    per-turn metric fields. Pure read; no mutation of either
+    surface."""
+    session = _RollbackFakeSession(
+        messages=[
+            {"role": "user", "content": "u"},
+            {"role": "assistant", "content": "a"},
+        ]
+    )
+    state = _seeded_rollback_state()
+
+    snapshot = _capture_rollback_snapshot(session, state)
+
+    assert snapshot.messages == [
+        {"role": "user", "content": "u"},
+        {"role": "assistant", "content": "a"},
+    ]
+    assert snapshot.thinking == "original-thinking"
+    assert snapshot.reasoning_chars == 100
+    assert snapshot.visible_chars == 50
+    # Capture is non-mutating.
+    assert state.last_turn_thinking == "original-thinking"
+
+
+def test_capture_rollback_snapshot_messages_decoupled_from_session() -> None:
+    """The snapshot's ``messages`` field must not share dict refs
+    with the live session — otherwise an in-place write to
+    ``self._messages[-1]['content']`` (e.g. ``continue_last``'s
+    final assignment) would corrupt the snapshot before rollback
+    runs. Tests RP-2 v4's deep-copy contract through the helper."""
+    session = _RollbackFakeSession(
+        messages=[
+            {"role": "user", "content": "u"},
+            {"role": "assistant", "content": "original"},
+        ]
+    )
+    state = _seeded_rollback_state()
+    snapshot = _capture_rollback_snapshot(session, state)
+    # In-place mutation simulates continue_last's final write.
+    session._messages[-1]["content"] = "(mid-flight partial)"
+    # Snapshot stays at the pre-mutation content.
+    assert snapshot.messages[-1]["content"] == "original"
+
+
+def test_apply_rollback_snapshot_restores_messages() -> None:
+    """``_apply_rollback_snapshot`` writes the captured message
+    log back via ``replace_messages``. Mid-flight mutations are
+    undone."""
+    session = _RollbackFakeSession(
+        messages=[
+            {"role": "user", "content": "u"},
+            {"role": "assistant", "content": "original"},
+        ]
+    )
+    state = _seeded_rollback_state()
+    snapshot = _capture_rollback_snapshot(session, state)
+    # Simulate the chat-turn flow's mid-flight mutation.
+    session.replace_messages(
+        [
+            {"role": "user", "content": "u"},
+            {"role": "assistant", "content": "(partial)"},
+        ]
+    )
+    state.last_turn_thinking = "(stale)"
+    state.last_turn_reasoning_chars = 999
+    state.last_turn_visible_chars = 999
+    # Apply rollback and verify restoration.
+    _apply_rollback_snapshot(
+        snapshot, chat_session=session, state=state
+    )
+    assert session.messages == [
+        {"role": "user", "content": "u"},
+        {"role": "assistant", "content": "original"},
+    ]
+
+
+def test_apply_rollback_snapshot_restores_thinking_and_chars() -> None:
+    """The same rollback restores ``last_turn_thinking`` and the
+    char counters — without this, an aborted /continue would leave
+    half-streamed metrics in /showcase even though the message
+    log was restored."""
+    session = _RollbackFakeSession(
+        messages=[{"role": "assistant", "content": "x"}]
+    )
+    state = _seeded_rollback_state()
+    snapshot = _capture_rollback_snapshot(session, state)
+    state.last_turn_thinking = "(half-streamed thinking)"
+    state.last_turn_reasoning_chars = 1234
+    state.last_turn_visible_chars = 567
+    _apply_rollback_snapshot(
+        snapshot, chat_session=session, state=state
+    )
+    assert state.last_turn_thinking == "original-thinking"
+    assert state.last_turn_reasoning_chars == 100
+    assert state.last_turn_visible_chars == 50
+
+
+def test_apply_rollback_snapshot_idempotent_under_repeated_apply() -> None:
+    """Applying the same snapshot twice yields the same final
+    state as applying once — no compounding side effects. Useful
+    if a /regenerate retry's rollback fires and a follow-up
+    rollback runs against the same captured snapshot."""
+    session = _RollbackFakeSession(
+        messages=[{"role": "assistant", "content": "x"}]
+    )
+    state = _seeded_rollback_state()
+    snapshot = _capture_rollback_snapshot(session, state)
+
+    state.last_turn_thinking = "(once)"
+    state.last_turn_reasoning_chars = 1
+    _apply_rollback_snapshot(
+        snapshot, chat_session=session, state=state
+    )
+    snapshot_after_first = (
+        state.last_turn_thinking,
+        state.last_turn_reasoning_chars,
+        state.last_turn_visible_chars,
+    )
+    _apply_rollback_snapshot(
+        snapshot, chat_session=session, state=state
+    )
+    assert (
+        state.last_turn_thinking,
+        state.last_turn_reasoning_chars,
+        state.last_turn_visible_chars,
+    ) == snapshot_after_first
+
+
+def test_rollback_full_continue_lifecycle_smoke() -> None:
+    """End-to-end smoke for the chat-CLI shell pattern: capture
+    snapshot before /continue, mutate state mid-flight to
+    simulate streaming, then apply rollback on (simulated)
+    KeyboardInterrupt. Verifies the four fields restore in
+    lockstep — the failure mode user caught pre-commit was a
+    half-streamed metric leaking through after the messages
+    rolled back."""
+    session = _RollbackFakeSession(
+        messages=[
+            {"role": "user", "content": "ask"},
+            {"role": "assistant", "content": "<think>partial"},
+        ]
+    )
+    state = ChatCliState()
+    state.last_turn_thinking = "<think>partial"
+    state.last_turn_reasoning_chars = 14
+    state.last_turn_visible_chars = 0
+    state.last_finish_reason = "max_tokens"
+
+    # Pre-/continue snapshot — what the slash branch captures.
+    snapshot = _capture_rollback_snapshot(session, state)
+
+    # Streaming mid-/continue mutates everything in-place.
+    session.replace_messages(
+        [
+            {"role": "user", "content": "ask"},
+            {
+                "role": "assistant",
+                "content": "<think>partial more reasoning",
+            },
+        ]
+    )
+    state.last_turn_thinking = "<think>partial more reasoning"
+    state.last_turn_reasoning_chars = 35
+    state.last_turn_visible_chars = 0
+
+    # KeyboardInterrupt fires; abort branch runs the rollback.
+    _apply_rollback_snapshot(
+        snapshot, chat_session=session, state=state
+    )
+
+    # All four surfaces back to pre-/continue state.
+    assert session.messages == [
+        {"role": "user", "content": "ask"},
+        {"role": "assistant", "content": "<think>partial"},
+    ]
+    assert state.last_turn_thinking == "<think>partial"
+    assert state.last_turn_reasoning_chars == 14
+    assert state.last_turn_visible_chars == 0
+    # last_finish_reason is NOT in the rollback snapshot — it is
+    # set by metrics after the (failed) turn, so abort leaves it
+    # at the pre-call value naturally.
+    assert state.last_finish_reason == "max_tokens"

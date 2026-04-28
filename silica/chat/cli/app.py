@@ -42,6 +42,7 @@ import argparse
 import os
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -249,6 +250,75 @@ def _print_separator(palette: Palette) -> None:
     sys.stdout.flush()
 
 
+@dataclass(frozen=True)
+class _TurnRollbackSnapshot:
+    """Captured pre-call state for ``/regenerate`` and ``/continue``
+    abort / error rollback.
+
+    The chat-turn flow may mutate the live ``ChatSession.messages``
+    AND the per-turn fields on :class:`ChatCliState` (``last_turn_*``)
+    before generation completes. If ``KeyboardInterrupt`` or an
+    unexpected exception unwinds the turn mid-flight, the shell
+    restores both surfaces from this snapshot — without it, the
+    user would see a half-streamed turn in the message log AND
+    half-streamed metrics in ``/showcase``.
+
+    The snapshot is taken in the slash-command branch (after the
+    /regenerate pop or before /continue's continue_last call) and
+    consumed by the abort / error branches inside the
+    ``with live_toolbar`` block. CHAT-CLI-HARDENING-4 +
+    CHAT-CLI-RESPONSE-POLICY RP-2 + RP-3.
+    """
+
+    messages: list[dict[str, str]]
+    """Deep-ish copy of ``ChatSession.messages`` at snapshot time —
+    independent dict objects (the property already deep-copies)."""
+
+    thinking: str
+    """Value of ``state.last_turn_thinking`` at snapshot time."""
+
+    reasoning_chars: int
+    """Value of ``state.last_turn_reasoning_chars`` at snapshot time."""
+
+    visible_chars: int
+    """Value of ``state.last_turn_visible_chars`` at snapshot time."""
+
+
+def _capture_rollback_snapshot(
+    chat_session: Any, state: ChatCliState
+) -> _TurnRollbackSnapshot:
+    """Build a :class:`_TurnRollbackSnapshot` from the live session
+    + state. Pure read; no mutation."""
+    return _TurnRollbackSnapshot(
+        messages=chat_session.messages,
+        thinking=state.last_turn_thinking,
+        reasoning_chars=state.last_turn_reasoning_chars,
+        visible_chars=state.last_turn_visible_chars,
+    )
+
+
+def _apply_rollback_snapshot(
+    snapshot: _TurnRollbackSnapshot,
+    *,
+    chat_session: Any,
+    state: ChatCliState,
+) -> None:
+    """Restore the live session + per-turn state from ``snapshot``.
+
+    Mirrors the inline rollback the chat-turn flow ran in
+    pre-extraction code: ``replace_messages`` for the chat session,
+    direct field writes for the per-turn metric buffers. Used by
+    both the ``/regenerate`` and ``/continue`` abort / error
+    branches; deduping the four sites (KeyboardInterrupt + Exception
+    × regenerate + continue) into one call site keeps the contract
+    in one place.
+    """
+    chat_session.replace_messages(snapshot.messages)
+    state.last_turn_thinking = snapshot.thinking
+    state.last_turn_reasoning_chars = snapshot.reasoning_chars
+    state.last_turn_visible_chars = snapshot.visible_chars
+
+
 def _print_truncation_marker(
     finish_reason: str | None, palette: Palette
 ) -> bool:
@@ -430,20 +500,15 @@ def run_chat(args: argparse.Namespace) -> int:
         # ``ChatSession`` would be left with a trailing user-only
         # message.
         regenerate_text: str | None = None
-        regenerate_snapshot: list[dict[str, str]] | None = None
-        regenerate_thinking_snapshot: str | None = None
-        regenerate_reasoning_chars_snapshot: int | None = None
-        regenerate_visible_chars_snapshot: int | None = None
-        # CHAT-CLI-RESPONSE-POLICY RP-2 (G2): /continue mirrors the
-        # /regenerate request flow but invokes ``continue_last``
-        # instead of ``chat`` and routes no user_text. The
-        # snapshots support the same abort / exception rollback
-        # pattern as /regenerate.
+        # CHAT-CLI-HARDENING-4 + RP-2 + RP-3: a single rollback
+        # snapshot bundles messages + last_turn_thinking + per-turn
+        # char counters. Either /regenerate's pre-pop snapshot or
+        # /continue's pre-call snapshot lands here; the chat-turn
+        # flow's abort / error branches consult it via
+        # ``_apply_rollback_snapshot`` to restore the pre-call
+        # state in one shot.
+        rollback_snapshot: _TurnRollbackSnapshot | None = None
         continue_request: bool = False
-        continue_snapshot: list[dict[str, str]] | None = None
-        continue_thinking_snapshot: str | None = None
-        continue_reasoning_chars_snapshot: int | None = None
-        continue_visible_chars_snapshot: int | None = None
         if is_slash_command(text):
             result = dispatch_command(text, state)
             _print_lines(_format_feedback(result, palette))
@@ -507,10 +572,9 @@ def run_chat(args: argparse.Namespace) -> int:
                 # regenerated turn fails. ``messages`` returns
                 # independent dict copies; restore via
                 # ``replace_messages`` which also deep-copies entries.
-                pre_pop_snapshot = chat_session.messages
-                pre_pop_thinking = state.last_turn_thinking
-                pre_pop_reasoning_chars = state.last_turn_reasoning_chars
-                pre_pop_visible_chars = state.last_turn_visible_chars
+                pre_pop_snapshot = _capture_rollback_snapshot(
+                    chat_session, state
+                )
                 popped = chat_session.pop_last_exchange()
                 if popped is None:
                     sys.stdout.write(
@@ -523,14 +587,7 @@ def run_chat(args: argparse.Namespace) -> int:
                     sys.stdout.flush()
                 else:
                     regenerate_text = popped
-                    regenerate_snapshot = pre_pop_snapshot
-                    regenerate_thinking_snapshot = pre_pop_thinking
-                    regenerate_reasoning_chars_snapshot = (
-                        pre_pop_reasoning_chars
-                    )
-                    regenerate_visible_chars_snapshot = (
-                        pre_pop_visible_chars
-                    )
+                    rollback_snapshot = pre_pop_snapshot
             if result.request_continue:
                 # CHAT-CLI-RESPONSE-POLICY RP-2 (G2): the helper
                 # encodes two guards (no-prior-assistant /
@@ -551,13 +608,8 @@ def run_chat(args: argparse.Namespace) -> int:
                     sys.stdout.flush()
                 else:
                     continue_request = True
-                    continue_snapshot = chat_session.messages
-                    continue_thinking_snapshot = state.last_turn_thinking
-                    continue_reasoning_chars_snapshot = (
-                        state.last_turn_reasoning_chars
-                    )
-                    continue_visible_chars_snapshot = (
-                        state.last_turn_visible_chars
+                    rollback_snapshot = _capture_rollback_snapshot(
+                        chat_session, state
                     )
             if result.request_session_save:
                 _handle_session_save(
@@ -908,51 +960,19 @@ def run_chat(args: argparse.Namespace) -> int:
                     + "\n"
                 )
                 sys.stdout.flush()
-                # CHAT-CLI-HARDENING-4 (F4): if this turn was a
-                # regenerate, the pre-pop snapshot restores the
-                # original ``(user, assistant)`` pair that
-                # ``pop_last_exchange`` dropped, plus the trailing
-                # user-only message that ``ChatSession.chat``
-                # appended before the abort. Without this, the
-                # user permanently loses the prior turn whenever
-                # regenerate is interrupted.
-                if regenerate_snapshot is not None:
-                    chat_session.replace_messages(regenerate_snapshot)
-                    if regenerate_thinking_snapshot is not None:
-                        state.last_turn_thinking = (
-                            regenerate_thinking_snapshot
-                        )
-                    if regenerate_reasoning_chars_snapshot is not None:
-                        state.last_turn_reasoning_chars = (
-                            regenerate_reasoning_chars_snapshot
-                        )
-                    if regenerate_visible_chars_snapshot is not None:
-                        state.last_turn_visible_chars = (
-                            regenerate_visible_chars_snapshot
-                        )
-                # CHAT-CLI-RESPONSE-POLICY RP-2: /continue abort
-                # rollback. Without this, KeyboardInterrupt during
-                # ``continue_last`` would leave the assistant
-                # message containing whatever partial bytes the
-                # session managed to write before the abort, and
-                # ``state.last_turn_thinking`` would carry stray
-                # appended fragments. Restore those plus RP-3's
-                # per-turn char counters to the pre-continue snapshot
-                # so the user can retry or /continue again cleanly.
-                if continue_snapshot is not None:
-                    chat_session.replace_messages(continue_snapshot)
-                    if continue_thinking_snapshot is not None:
-                        state.last_turn_thinking = (
-                            continue_thinking_snapshot
-                        )
-                    if continue_reasoning_chars_snapshot is not None:
-                        state.last_turn_reasoning_chars = (
-                            continue_reasoning_chars_snapshot
-                        )
-                    if continue_visible_chars_snapshot is not None:
-                        state.last_turn_visible_chars = (
-                            continue_visible_chars_snapshot
-                        )
+                # CHAT-CLI-HARDENING-4 (F4) + RP-2 + RP-3 rollback:
+                # restore messages + last_turn_thinking + per-turn
+                # char counters via the shared helper. Without
+                # this, KeyboardInterrupt during chat() (regenerate
+                # path) or continue_last() (continue path) would
+                # leave the message log mid-mutation AND
+                # ``/showcase`` would carry half-streamed metrics.
+                if rollback_snapshot is not None:
+                    _apply_rollback_snapshot(
+                        rollback_snapshot,
+                        chat_session=chat_session,
+                        state=state,
+                    )
                 state.stream_state = StreamState.IDLE
                 continue
             except Exception as exc:  # pragma: no cover — defensive
@@ -968,34 +988,12 @@ def run_chat(args: argparse.Namespace) -> int:
                     + "\n"
                 )
                 sys.stdout.flush()
-                if regenerate_snapshot is not None:
-                    chat_session.replace_messages(regenerate_snapshot)
-                    if regenerate_thinking_snapshot is not None:
-                        state.last_turn_thinking = (
-                            regenerate_thinking_snapshot
-                        )
-                    if regenerate_reasoning_chars_snapshot is not None:
-                        state.last_turn_reasoning_chars = (
-                            regenerate_reasoning_chars_snapshot
-                        )
-                    if regenerate_visible_chars_snapshot is not None:
-                        state.last_turn_visible_chars = (
-                            regenerate_visible_chars_snapshot
-                        )
-                if continue_snapshot is not None:
-                    chat_session.replace_messages(continue_snapshot)
-                    if continue_thinking_snapshot is not None:
-                        state.last_turn_thinking = (
-                            continue_thinking_snapshot
-                        )
-                    if continue_reasoning_chars_snapshot is not None:
-                        state.last_turn_reasoning_chars = (
-                            continue_reasoning_chars_snapshot
-                        )
-                    if continue_visible_chars_snapshot is not None:
-                        state.last_turn_visible_chars = (
-                            continue_visible_chars_snapshot
-                        )
+                if rollback_snapshot is not None:
+                    _apply_rollback_snapshot(
+                        rollback_snapshot,
+                        chat_session=chat_session,
+                        state=state,
+                    )
                 state.stream_state = StreamState.IDLE
                 continue
             # Drain any text the parser held back as a partial-tag
