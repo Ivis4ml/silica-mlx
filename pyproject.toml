@@ -31,7 +31,7 @@ dependencies = [
 [project.urls]
 Repository = "https://github.com/Ivis4ml/silica-mlx"
 Issues = "https://github.com/Ivis4ml/silica-mlx/issues"
-Documentation = "https://github.com/Ivis4ml/silica-mlx/blob/main/docs/API.md"
+Documentation = "https://silica-mlx.readthedocs.io/en/latest/"
 Changelog = "https://github.com/Ivis4ml/silica-mlx/blob/main/plans/PLAN.md"
 
 [project.optional-dependencies]

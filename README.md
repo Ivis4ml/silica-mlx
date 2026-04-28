@@ -1,5 +1,10 @@
 # silica-mlx
 
+[![Docs](https://readthedocs.org/projects/silica-mlx/badge/?version=latest&style=flat-square)](https://silica-mlx.readthedocs.io/en/latest/?badge=latest)
+[![Python](https://img.shields.io/badge/python-3.12%2B-blue?style=flat-square)](https://www.python.org/downloads/)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square)](https://opensource.org/licenses/Apache-2.0)
+[![Platform](https://img.shields.io/badge/platform-Apple%20Silicon-lightgrey?style=flat-square)](https://www.apple.com/mac/)
+
 **Continuous-batching LLM serving on Apple Silicon — vLLM-core
 architecture, MLX-native.**
 
@@ -30,10 +35,13 @@ Qwen3.5-35B-A3B MoE, gemma-4-26B-A4B MoE.
 > on every push that touches `site/` (no build step; static React +
 > Babel-standalone).
 
-> **Documentation.** Quick links: [chat-CLI guide](CHAT.README.md) ·
-> [API reference](docs/API.md) · [plans index](docs/plans-index.md) ·
-> [PLAN](plans/PLAN.md). For the three reading paths (GitHub direct,
-> local Sphinx build, ReadTheDocs after one-click setup) see
+> **Documentation.** Hosted Sphinx site at
+> [silica-mlx.readthedocs.io](https://silica-mlx.readthedocs.io/en/latest/)
+> — overview, chat-CLI guide, benchmark guide, manual + autodoc
+> API, curated plans index. Quick links on GitHub:
+> [chat-CLI guide](CHAT.README.md) · [API reference](docs/API.md) ·
+> [plans index](docs/plans-index.md) · [PLAN](plans/PLAN.md). For all
+> three reading paths (GitHub direct, local Sphinx, RTD) see
 > [§ Documentation](#documentation) below.
 
 ---
@@ -447,12 +455,13 @@ auto-generated API, manual API page, and the curated `plans/`
 index. Files that use MyST `{toctree}` / `{include}` directives
 render best in this mode.
 
-**3. Hosted on Read the Docs** (zero-build, public URL).
-[`.readthedocs.yaml`](.readthedocs.yaml) is committed and
-configured against the `[docs]` extras. Import the repo at
-[readthedocs.org](https://readthedocs.org/) and every push to
-`main` rebuilds the site automatically. The hosted URL appears in
-the badge below once the integration is live.
+**3. Hosted on Read the Docs** (zero-build, public URL):
+[silica-mlx.readthedocs.io/en/latest](https://silica-mlx.readthedocs.io/en/latest/).
+The site rebuilds automatically on every push; configuration lives
+in [`.readthedocs.yaml`](.readthedocs.yaml) (Ubuntu 22.04, Python
+3.12, the `[docs]` extras pulled from `pyproject.toml`). Use this
+when you want rendered cross-references and full-text search
+without any local toolchain.
 
 ---
 

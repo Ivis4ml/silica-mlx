@@ -115,6 +115,7 @@ const Footer = () => (
         </div>
         <div className="foot-col">
           <h4>Docs</h4>
+          <a href="https://silica-mlx.readthedocs.io/en/latest/" target="_blank" rel="noreferrer">Read the Docs</a>
           <a href="#quickstart">Quickstart</a>
           <a href="#architecture">Architecture</a>
           <a href="https://github.com/Ivis4ml/silica-mlx/blob/sonnet/docs/bench.md">Benchmark guide</a>
