@@ -27,6 +27,7 @@ import mlx.core as mx
 from silica.chat.cli.app import (
     _apply_system_prompt_request,
     _build_prefix_cache,
+    _resolve_thinking_history,
     _resolve_thinking_mode,
     _sampling_params_from_state,
 )
@@ -418,3 +419,42 @@ def test_apply_system_prompt_request_does_not_react_to_other_flags() -> None:
     )
     _apply_system_prompt_request(result, session)
     assert session.system_prompt_calls == []
+
+
+# ---------------------------------------------------------------------------
+# CHAT-CLI-RESPONSE-POLICY RP-1 — _resolve_thinking_history
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_thinking_history_returns_strip_when_config_strip() -> None:
+    state = ChatCliState()
+    state.config["thinking_history"] = "strip"
+    assert _resolve_thinking_history(state) == "strip"
+
+
+def test_resolve_thinking_history_returns_keep_when_config_keep() -> None:
+    state = ChatCliState()
+    state.config["thinking_history"] = "keep"
+    assert _resolve_thinking_history(state) == "keep"
+
+
+def test_resolve_thinking_history_defaults_to_strip_when_missing() -> None:
+    """A fresh state with no override falls back to ``strip`` —
+    the safe-by-default behaviour (no thinking pollution into
+    next-turn context)."""
+    state = ChatCliState()
+    state.config.pop("thinking_history", None)
+    assert _resolve_thinking_history(state) == "strip"
+
+
+def test_resolve_thinking_history_falls_back_on_invalid_value() -> None:
+    """Defensive: a corrupted persisted-state value (``"true"``,
+    a bool, an int) collapses to ``strip`` rather than erroring
+    or silently producing ``keep`` semantics."""
+    state = ChatCliState()
+    state.config["thinking_history"] = "garbage"
+    assert _resolve_thinking_history(state) == "strip"
+
+    state2 = ChatCliState()
+    state2.config["thinking_history"] = True  # type: ignore[assignment]
+    assert _resolve_thinking_history(state2) == "strip"

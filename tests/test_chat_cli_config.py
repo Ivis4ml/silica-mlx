@@ -33,6 +33,7 @@ def test_schema_has_documented_keys() -> None:
         "max_tokens",
         "thinking",
         "thinking_mode",
+        "thinking_history",
         "kv_codec_hint_mb",
     }
     assert expected.issubset(set(CONFIG_SCHEMA.keys())), (
@@ -197,6 +198,31 @@ def test_thinking_mode_bool_aliases(raw: str, expected: bool) -> None:
 def test_thinking_mode_garbage_rejected() -> None:
     with pytest.raises(ConfigError, match="expected on/off"):
         parse_config_assignment("thinking_mode=maybe")
+
+
+# ---------------------------------------------------------------------------
+# Choice — thinking_history (CHAT-CLI-RESPONSE-POLICY RP-1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("choice", ["strip", "keep"])
+def test_thinking_history_choices_accepted(choice: str) -> None:
+    _, val = parse_config_assignment(f"thinking_history={choice}")
+    assert val == choice
+
+
+def test_thinking_history_invalid_choice_rejected() -> None:
+    with pytest.raises(ConfigError, match="expected one of"):
+        parse_config_assignment("thinking_history=truncate")
+
+
+def test_thinking_history_default_is_strip() -> None:
+    """RP-1 default safety: history strip is on out of the box,
+    so users who never touch ``/config thinking_history`` still
+    avoid the multi-turn thinking-pollution path."""
+    from silica.chat.cli.config import CONFIG_SCHEMA
+
+    assert CONFIG_SCHEMA["thinking_history"].default == "strip"
 
 
 # ---------------------------------------------------------------------------

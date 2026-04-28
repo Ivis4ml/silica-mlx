@@ -182,6 +182,7 @@ class ConfigEntry:
 # /help. Defining them as module constants keeps documentation and
 # validation in lockstep.
 THINKING_DISPLAY_CHOICES: tuple[str, ...] = ("auto", "show", "hidden")
+THINKING_HISTORY_CHOICES: tuple[str, ...] = ("strip", "keep")
 
 
 CONFIG_SCHEMA: dict[str, ConfigEntry] = {
@@ -240,6 +241,19 @@ CONFIG_SCHEMA: dict[str, ConfigEntry] = {
         valid_help=(
             "on enables Qwen3 reasoning mode (default); off disables "
             "for faster TTFT and shorter total tokens"
+        ),
+    ),
+    "thinking_history": ConfigEntry(
+        key="thinking_history",
+        default="strip",
+        parse=lambda raw: _parse_choice(
+            "thinking_history", raw, THINKING_HISTORY_CHOICES
+        ),
+        summary="strip <think> from assistant message before next turn",
+        valid_help=(
+            "strip = drop reasoning from history so subsequent prompts "
+            "stay short (default); keep = preserve raw decoded reply "
+            "verbatim — useful for /save-then-archive workflows"
         ),
     ),
     "kv_codec_hint_mb": ConfigEntry(
@@ -341,6 +355,7 @@ __all__ = [
     "ConfigEntry",
     "ConfigError",
     "THINKING_DISPLAY_CHOICES",
+    "THINKING_HISTORY_CHOICES",
     "get_default",
     "initial_config",
     "parse_config_assignment",

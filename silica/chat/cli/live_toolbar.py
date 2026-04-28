@@ -19,8 +19,8 @@ particular rendering strategy:
   post-turn ``PromptSession.bottom_toolbar`` still surfaces the
   final values, so the user retains full visibility — just not
   live during generation.
-- :class:`AnsiLiveToolbar` — sticky-bottom-line backend using ANSI
-  cursor save (``\\x1b[s``) / restore (``\\x1b[u``). Reserves the
+- :class:`AnsiLiveToolbar` — sticky-bottom-line backend using DEC
+  cursor save (``\\x1b7``) / restore (``\\x1b8``). Reserves the
   line immediately below the streamed text for the toolbar, redraws
   on each ``refresh``, and clears the line on exit.
 
@@ -182,9 +182,9 @@ class AnsiLiveToolbar(LiveToolbar):
     streamed reply text. On entry the backend writes a placeholder
     line below the cursor and returns the cursor to its original
     position; subsequent ``refresh`` calls save the cursor with
-    ``\\x1b[s``, advance one line with ``\\x1b[E``, clear that line
+    ``\\x1b7``, advance one line with ``\\x1b[E``, clear that line
     with ``\\x1b[K``, write the new toolbar text, and restore the
-    cursor with ``\\x1b[u``. Streamed tokens written between
+    cursor with ``\\x1b8``. Streamed tokens written between
     refreshes appear above the toolbar line; modern terminals
     (iTerm2, WezTerm, kitty, Alacritty, macOS Terminal.app) handle
     save/restore correctly across natural scroll.
@@ -200,9 +200,14 @@ class AnsiLiveToolbar(LiveToolbar):
     """
 
     # Class-level constants make the ANSI sequences inspectable in
-    # tests without scraping the file.
-    SAVE_CURSOR = "\x1b[s"
-    RESTORE_CURSOR = "\x1b[u"
+    # tests without scraping the file. Use DEC save/restore instead
+    # of CSI s/u: some terminals and prompt-toolkit-hosted sessions
+    # ignore CSI u (or reserve it for extended keyboard protocol).
+    # If restore is ignored, the toolbar text becomes normal
+    # transcript output — exactly the F3 regression this backend is
+    # meant to avoid.
+    SAVE_CURSOR = "\x1b7"
+    RESTORE_CURSOR = "\x1b8"
     NEXT_LINE = "\x1b[E"
     CLEAR_LINE = "\x1b[K"
 

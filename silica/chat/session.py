@@ -123,6 +123,14 @@ class TurnMetrics:
     prompt_tokens: int
     output_tokens: int
     finish_reason: str
+    raw_reply: str = ""
+    """Full decoded reply text *before* any ``thinking_history``
+    strip. Equal to :attr:`reply` when ``thinking_history=keep``
+    or when the model produced no thinking content; differs when
+    a ``<think>...</think>`` block was removed at finalise time.
+    Default ``""`` keeps backward compatibility for tests /
+    callers that construct ``TurnMetrics`` without the field
+    (RP-1)."""
     ttft_ms: float | None = None
     prefill_tok_s: float | None = None
     decode_tok_s: float | None = None
@@ -183,6 +191,8 @@ class ChatSession:
         read_peak_memory_mb: Callable[[], float | None] | None = None,
         clock: Callable[[], float] = time.perf_counter,
         thinking_mode: bool | None = None,
+        thinking_history: str = "strip",
+        implicit_thinking_supported: bool = False,
     ) -> None:
         self._adapter = adapter
         self._engine = engine
@@ -205,6 +215,30 @@ class ChatSession:
         # omits the kwarg, preserving backward-compat for tokenizers /
         # templates that do not recognise it.
         self._thinking_mode: bool | None = thinking_mode
+        # CHAT-CLI-RESPONSE-POLICY RP-1 (G1): controls whether the
+        # ``<think>...</think>`` content is stripped from the
+        # assistant message before it lands in ``_messages``. See
+        # ``set_thinking_history`` for the value semantics.
+        self._thinking_history: str = self._validate_thinking_history(
+            thinking_history
+        )
+        # Whether the active model's chat template prepends
+        # ``<think>\n`` to the prompt (Qwen3 family). Used by the
+        # strip helper to decide whether implicit-leading
+        # reasoning (no opening tag in the reply) should be
+        # detected. Mirrors the chat-CLI's display-side parser
+        # logic in ``_model_supports_implicit_thinking``.
+        self._implicit_thinking_supported: bool = (
+            implicit_thinking_supported
+        )
+        # When the previous turn ended at ``finish_reason=max_tokens``
+        # under ``thinking_history=strip``, the assistant message
+        # is left in raw form so RP-2 ``/continue`` can resume
+        # mid-``<think>``. The next ``chat()`` call finalises the
+        # raw form before appending its new user message; until
+        # then the flag tells callers (and ``/continue``) that the
+        # last assistant message is *not* the post-strip text.
+        self._pending_finalize: bool = False
 
     # --- observation -------------------------------------------------
 
@@ -292,6 +326,72 @@ class ChatSession:
         user_msg = self._messages.pop()
         return user_msg["content"]
 
+    @staticmethod
+    def _validate_thinking_history(value: str) -> str:
+        if value not in ("strip", "keep"):
+            raise ValueError(
+                f"thinking_history must be 'strip' or 'keep', got {value!r}"
+            )
+        return value
+
+    def _should_strip_implicit_leading(self) -> bool:
+        """Whether ``_strip_thinking_block`` should treat the
+        decoded reply as starting *inside* an implicit thinking
+        block.
+
+        True iff the active model's template prepends
+        ``<think>\\n`` to the assistant slot AND this turn was
+        rendered with ``enable_thinking != False`` (the template
+        default for Qwen3 is ``True`` when the kwarg is omitted,
+        so ``_thinking_mode is None`` also counts as "thinking
+        was on for this turn").
+        """
+        if not self._implicit_thinking_supported:
+            return False
+        return self._thinking_mode is not False
+
+    def set_thinking_history(self, mode: str) -> None:
+        """Replace the live session's ``thinking_history`` policy.
+
+        CHAT-CLI-RESPONSE-POLICY RP-1. Controls whether the
+        ``<think>...</think>`` content is stripped from the
+        assistant message before it lands in :attr:`messages`.
+
+        - ``"strip"`` (default): on natural turn completion
+          (``finish_reason in {stop_token, done, eos}``) the
+          stripped text is what gets stored. On
+          ``finish_reason=max_tokens`` the raw text is stored
+          temporarily so RP-2 ``/continue`` can resume an
+          unfinished ``<think>`` block; the next ``chat()`` call
+          finalises (strips) the raw form before appending the
+          new user message.
+        - ``"keep"``: the raw decoded reply is stored verbatim,
+          regardless of ``finish_reason``. Right setting for
+          ``/save``-then-archive workflows that want full
+          reasoning traces preserved.
+
+        The display side (``thinking=auto|show|hidden`` in the
+        chat-CLI config) is independent — this knob only affects
+        what lands in :attr:`messages` and what subsequent turns
+        re-tokenise.
+        """
+        self._thinking_history = self._validate_thinking_history(mode)
+
+    def set_implicit_thinking_supported(self, value: bool) -> None:
+        """Set whether the active chat template prepends
+        ``<think>\\n`` to the assistant generation slot.
+
+        CHAT-CLI-RESPONSE-POLICY RP-1. Used by
+        ``thinking_history=strip`` to decide whether the reply
+        starts inside an implicit thinking block (Qwen3 family
+        with ``enable_thinking=True``) and therefore needs the
+        leading reasoning stripped up to the first ``</think>``.
+        On ``/model`` swap the chat-CLI updates this via
+        :meth:`set_implicit_thinking_supported` to match the new
+        model's family.
+        """
+        self._implicit_thinking_supported = value
+
     def set_thinking_mode(self, mode: bool | None) -> None:
         """Replace the live session's ``enable_thinking`` propagation.
 
@@ -378,6 +478,26 @@ class ChatSession:
         stop ids default to the tokenizer's EOS set if the
         caller did not provide them explicitly.
         """
+        # CHAT-CLI-RESPONSE-POLICY RP-1: finalise a deferred-strip
+        # turn before the new user message lands. Under
+        # ``thinking_history=strip`` a turn that ended at
+        # ``finish_reason=max_tokens`` left the raw assistant text
+        # in place so RP-2 ``/continue`` could resume mid-think;
+        # once the user moves on with a fresh turn, the strip
+        # applies (``/continue`` is no longer reachable). Skipped
+        # when the policy is ``keep`` or no defer was registered.
+        if (
+            self._pending_finalize
+            and self._messages
+            and self._messages[-1]["role"] == "assistant"
+        ):
+            raw = self._messages[-1]["content"]
+            self._messages[-1]["content"] = _strip_thinking_block(
+                raw,
+                implicit_leading=self._should_strip_implicit_leading(),
+            )
+        self._pending_finalize = False
+
         self._messages.append({"role": "user", "content": user_text})
         prompt_text, prompt_ids = self._render_prompt()
         params = self._build_sampling_params(sampling_params)
@@ -429,8 +549,35 @@ class ChatSession:
             if finish_reason_from_event is not None
             else self._classify_finish(out_tokens, params)
         )
+        # CHAT-CLI-RESPONSE-POLICY RP-1: gate the eager strip on
+        # finish_reason. Natural completion (stop_token / done /
+        # eos / empty) → strip immediately. Truncation
+        # (max_tokens) → keep raw, set ``_pending_finalize`` so
+        # the next ``chat()`` (or RP-2 ``/continue``) finalises
+        # at the right moment. ``thinking_history=keep`` short-
+        # circuits and stores raw verbatim regardless.
+        raw_reply = reply_text
+        if (
+            self._thinking_history == "strip"
+            and finish_reason != "max_tokens"
+        ):
+            stored_reply = _strip_thinking_block(
+                raw_reply,
+                implicit_leading=self._should_strip_implicit_leading(),
+            )
+            self._pending_finalize = False
+        elif (
+            self._thinking_history == "strip"
+            and finish_reason == "max_tokens"
+        ):
+            stored_reply = raw_reply
+            self._pending_finalize = True
+        else:
+            # keep mode — verbatim regardless of finish_reason.
+            stored_reply = raw_reply
+            self._pending_finalize = False
         self._messages.append(
-            {"role": "assistant", "content": reply_text}
+            {"role": "assistant", "content": stored_reply}
         )
 
         # Engine.generate populates ttft / decode_tok_s / resident_mb
@@ -503,7 +650,8 @@ class ChatSession:
                     prefix_store_logical = pc_stats.logical_bytes
 
         return TurnMetrics(
-            reply=reply_text,
+            reply=stored_reply,
+            raw_reply=raw_reply,
             prompt_tokens=len(prompt_ids),
             output_tokens=len(out_tokens),
             finish_reason=finish_reason,
@@ -706,6 +854,70 @@ class ChatSession:
         return "done"
 
 
+def _strip_thinking_block(text: str, *, implicit_leading: bool) -> str:
+    """Remove ``<think>...</think>`` content from a decoded reply.
+
+    CHAT-CLI-RESPONSE-POLICY RP-1 (G1). Two shapes are supported,
+    composed in this order:
+
+    1. **Implicit-leading**. Qwen3 / Qwen3.5 chat templates with
+       ``enable_thinking=True`` append ``<think>\\n`` to the prompt;
+       the model's reply therefore starts *inside* a thinking block
+       and the first ``</think>`` closes it. There is no opening
+       tag in the reply itself. When ``implicit_leading=True``
+       this helper drops everything from the start of ``text`` up
+       to and including the first ``</think>`` (plus a single
+       trailing newline if present, matching template convention).
+       If no ``</think>`` is found, the text is returned unchanged
+       — the model never closed its thought (e.g.
+       ``finish_reason=max_tokens`` mid-think); preserving the
+       text avoids guessing where reasoning ended.
+    2. **Explicit pairs**. Any ``<think>...</think>`` spans that
+       remain in the text are removed. An unclosed explicit
+       ``<think>`` (no matching ``</think>``) drops the rest of
+       the text — the same conservative choice as the
+       implicit-leading branch.
+
+    Pass-through cases:
+    - ``implicit_leading=False`` and no explicit tags → text
+      unchanged.
+    - empty / whitespace-only text → returned unchanged.
+
+    Pure function; no side effects. Used by ``ChatSession.chat``
+    when ``thinking_history=strip`` finalises a turn.
+    """
+    if not text:
+        return text
+
+    if implicit_leading:
+        close_idx = text.find("</think>")
+        if close_idx >= 0:
+            text = text[close_idx + len("</think>"):]
+            # Template convention: a single ``\n`` follows the
+            # closing tag. Strip it so the visible reply does not
+            # carry a leading blank line.
+            if text.startswith("\n"):
+                text = text[1:]
+
+    # Explicit ``<think>...</think>`` spans, zero or more.
+    parts: list[str] = []
+    pos = 0
+    while True:
+        open_idx = text.find("<think>", pos)
+        if open_idx < 0:
+            parts.append(text[pos:])
+            break
+        parts.append(text[pos:open_idx])
+        close_idx = text.find("</think>", open_idx)
+        if close_idx < 0:
+            # Unclosed explicit tag — drop the remainder.
+            break
+        pos = close_idx + len("</think>")
+        if pos < len(text) and text[pos] == "\n":
+            pos += 1
+    return "".join(parts)
+
+
 def _mlx_reset_peak_memory() -> None:
     """Reset MLX peak-memory accounting. No-op if mlx unavailable."""
     try:
@@ -726,4 +938,4 @@ def _mlx_peak_memory_mb() -> float | None:
         return None
 
 
-__all__ = ["ChatSession", "TurnMetrics"]
+__all__ = ["ChatSession", "TurnMetrics", "_strip_thinking_block"]

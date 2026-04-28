@@ -308,6 +308,10 @@ def run_chat(args: argparse.Namespace) -> int:
         system_prompt=args.system,
         prefix_cache=prefix_cache,
         thinking_mode=_resolve_thinking_mode(state),
+        thinking_history=_resolve_thinking_history(state),
+        implicit_thinking_supported=_model_supports_implicit_thinking(
+            state.model_name
+        ),
     )
 
     # --- prompt_toolkit session ---
@@ -691,6 +695,13 @@ def run_chat(args: argparse.Namespace) -> int:
         # non-bool / missing-key collapse identically to the
         # session-construction path above.
         chat_session.set_thinking_mode(_resolve_thinking_mode(state))
+        # CHAT-CLI-RESPONSE-POLICY RP-1 (G1): re-sync the live
+        # thinking_history flag for the same reason — ``/config
+        # thinking_history=keep`` should affect the next turn
+        # without rebuilding the session.
+        chat_session.set_thinking_history(
+            _resolve_thinking_history(state)
+        )
 
         # HARDENING-6: ``with live_toolbar`` guarantees ``__exit__``
         # runs on every exit path (success, ``continue`` from an
@@ -1070,11 +1081,23 @@ def _swap_model(
     new_cache = cache_builder(new_adapter)
     sys_prompt = state.config.get("system_prompt") or None
     sys_prompt_str = str(sys_prompt) if sys_prompt else None
+    # CHAT-CLI-RESPONSE-POLICY RP-1: thread the policy knobs into
+    # the new session at construction. The per-turn resync also
+    # covers ``thinking_history``; passing it here keeps the very
+    # first post-swap turn correct without relying on the resync
+    # firing first. ``implicit_thinking_supported`` is a
+    # model-level property and changes on /model swap, so it
+    # gets recomputed from the new repo's basename here.
     new_session = session_cls(
         new_adapter,
         new_engine,
         system_prompt=sys_prompt_str,
         prefix_cache=new_cache,
+        thinking_mode=_resolve_thinking_mode(state),
+        thinking_history=_resolve_thinking_history(state),
+        implicit_thinking_supported=_model_supports_implicit_thinking(
+            _model_basename(new_repo)
+        ),
     )
     if captured_messages is not None:
         # ``replace_messages`` deep-copies entries; the prior
@@ -1231,6 +1254,23 @@ def _resolve_thinking_mode(state: ChatCliState) -> bool | None:
     if isinstance(value, bool):
         return value
     return None
+
+
+def _resolve_thinking_history(state: ChatCliState) -> str:
+    """Read ``state.config['thinking_history']`` and coerce to
+    one of ``"strip"`` / ``"keep"``.
+
+    CHAT-CLI-RESPONSE-POLICY RP-1. The config schema enforces the
+    choice at parse time, but the chat REPL reads the value
+    defensively at runtime: a missing key or any non-conforming
+    value falls back to ``"strip"`` so turns with corrupted state
+    still get the safe-by-default behaviour (no thinking
+    pollution into next-turn context).
+    """
+    value = state.config.get("thinking_history")
+    if value in ("strip", "keep"):
+        return str(value)
+    return "strip"
 
 
 def _apply_system_prompt_request(

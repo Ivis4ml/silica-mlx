@@ -26,7 +26,11 @@ from typing import Any
 
 import pytest
 
-from silica.chat.session import ChatSession, TurnMetrics
+from silica.chat.session import (
+    ChatSession,
+    TurnMetrics,
+    _strip_thinking_block,
+)
 from silica.core.sampling import SamplingParams
 from silica.kvcache.prefix import PrefixCacheStats
 
@@ -1572,3 +1576,335 @@ def test_prefix_cache_session_drains_after_terminal_event() -> None:
     # the terminal event still reached TurnMetrics.
     assert metrics.output_tokens == 3
     assert metrics.finish_reason == "stop_token"
+
+
+# ---------------------------------------------------------------------------
+# CHAT-CLI-RESPONSE-POLICY RP-1 — _strip_thinking_block helper unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_strip_thinking_block_empty_text_unchanged() -> None:
+    assert _strip_thinking_block("", implicit_leading=False) == ""
+    assert _strip_thinking_block("", implicit_leading=True) == ""
+
+
+def test_strip_thinking_block_no_tags_returns_unchanged() -> None:
+    """``implicit_leading=False`` and no ``<think>`` tags → text
+    is returned verbatim."""
+    text = "Hello, world!"
+    assert (
+        _strip_thinking_block(text, implicit_leading=False) == text
+    )
+
+
+def test_strip_thinking_block_implicit_leading_drops_up_to_close_tag() -> None:
+    """Implicit-leading: reply starts inside a ``<think>`` block;
+    everything up to and including the first ``</think>`` (plus a
+    single trailing newline) is dropped."""
+    text = "reasoning here\n</think>\nvisible answer"
+    out = _strip_thinking_block(text, implicit_leading=True)
+    assert out == "visible answer"
+
+
+def test_strip_thinking_block_implicit_leading_no_close_tag_unchanged() -> None:
+    """Implicit-leading, but the model never closed ``</think>``
+    (e.g. truncated mid-think). The helper preserves the text
+    rather than guessing where reasoning ended."""
+    text = "still reasoning, no close tag yet"
+    out = _strip_thinking_block(text, implicit_leading=True)
+    assert out == text
+
+
+def test_strip_thinking_block_implicit_leading_no_trailing_newline() -> None:
+    """If ``</think>`` is not followed by a newline, the helper
+    does not eat any character of the visible text that follows."""
+    text = "thoughts</think>visible"
+    out = _strip_thinking_block(text, implicit_leading=True)
+    assert out == "visible"
+
+
+def test_strip_thinking_block_explicit_pair_removed() -> None:
+    """Explicit ``<think>...</think>`` span gets removed even
+    when ``implicit_leading=False``."""
+    text = "before<think>secret</think>after"
+    out = _strip_thinking_block(text, implicit_leading=False)
+    assert out == "beforeafter"
+
+
+def test_strip_thinking_block_explicit_pair_with_trailing_newline() -> None:
+    """Trailing newline after the closing tag is consumed by the
+    explicit-strip path too, mirroring the implicit-leading
+    behaviour."""
+    text = "intro\n<think>x</think>\nbody"
+    out = _strip_thinking_block(text, implicit_leading=False)
+    assert out == "intro\nbody"
+
+
+def test_strip_thinking_block_unclosed_explicit_drops_remainder() -> None:
+    """An ``<think>`` with no matching close tag is conservative:
+    the helper drops everything from the open tag onward."""
+    text = "before<think>truncated"
+    out = _strip_thinking_block(text, implicit_leading=False)
+    assert out == "before"
+
+
+def test_strip_thinking_block_multiple_explicit_pairs() -> None:
+    """All ``<think>...</think>`` spans are removed, in order."""
+    text = "a<think>1</think>b<think>2</think>c"
+    out = _strip_thinking_block(text, implicit_leading=False)
+    assert out == "abc"
+
+
+def test_strip_thinking_block_implicit_plus_trailing_explicit() -> None:
+    """Composition: implicit-leading first, then explicit pairs in
+    the remainder."""
+    text = "lead</think>\npart1<think>more</think>part2"
+    out = _strip_thinking_block(text, implicit_leading=True)
+    assert out == "part1part2"
+
+
+# ---------------------------------------------------------------------------
+# CHAT-CLI-RESPONSE-POLICY RP-1 — ChatSession integration
+# ---------------------------------------------------------------------------
+
+
+def _engine_yielding_text(
+    text: str, *, eos_id: int | None = None
+) -> _FakeEngine:
+    """Build an engine fake that decodes byte-for-byte to ``text``
+    via ``_FakeTokenizer.decode`` (each char → ``ord(char)``).
+    Optionally append an EOS token id so the generated turn
+    finishes with ``finish_reason='stop_token'``."""
+    tokens = [ord(c) for c in text]
+    if eos_id is not None:
+        tokens.append(eos_id)
+    return _FakeEngine(tokens)
+
+
+def _make_session_for_history_test(
+    *,
+    reply_text: str,
+    eos_id: int | None,
+    thinking_history: str = "strip",
+    implicit_thinking_supported: bool = False,
+    thinking_mode: bool | None = None,
+) -> tuple[ChatSession, _FakeEngine]:
+    """Wire a session whose engine decodes byte-for-byte to
+    ``reply_text``."""
+    eos_set: set[int] = set()
+    if eos_id is not None:
+        eos_set.add(eos_id)
+    tok = _FakeTokenizer(eos_token_ids=eos_set)
+    adapter = _FakeAdapter(tok)
+    engine = _engine_yielding_text(reply_text, eos_id=eos_id)
+    session = ChatSession(
+        adapter,  # type: ignore[arg-type]
+        engine,  # type: ignore[arg-type]
+        thinking_mode=thinking_mode,
+        thinking_history=thinking_history,
+        implicit_thinking_supported=implicit_thinking_supported,
+        reset_peak_memory=lambda: None,
+        read_peak_memory_mb=lambda: 0.0,
+    )
+    return session, engine
+
+
+def test_chat_session_strip_natural_completion_drops_implicit_think() -> None:
+    """Natural completion (EOS) under ``thinking_history=strip``
+    with implicit-leading support → the assistant message is
+    stripped and ``raw_reply`` carries the full decoded text."""
+    eos = 250
+    session, _ = _make_session_for_history_test(
+        reply_text="reasoning\n</think>\nvisible answer",
+        eos_id=eos,
+        thinking_history="strip",
+        implicit_thinking_supported=True,
+        thinking_mode=True,
+    )
+    metrics = session.chat("hi")
+    assert metrics.finish_reason == "stop_token"
+    assert metrics.reply == "visible answer"
+    assert metrics.raw_reply == "reasoning\n</think>\nvisible answer"
+    # Stored message matches metrics.reply (post-strip).
+    assert session.messages[-1]["content"] == "visible answer"
+
+
+def test_chat_session_strip_natural_completion_with_explicit_pair() -> None:
+    """Strip mode with ``implicit_thinking_supported=False`` still
+    handles explicit ``<think>...</think>`` pairs."""
+    eos = 250
+    session, _ = _make_session_for_history_test(
+        reply_text="prelude<think>hidden</think>postlude",
+        eos_id=eos,
+        thinking_history="strip",
+        implicit_thinking_supported=False,
+        thinking_mode=False,
+    )
+    metrics = session.chat("hi")
+    assert metrics.reply == "preludepostlude"
+    assert metrics.raw_reply == "prelude<think>hidden</think>postlude"
+
+
+def test_chat_session_keep_mode_stores_raw() -> None:
+    """``thinking_history=keep`` writes the raw decoded reply
+    verbatim to history regardless of finish_reason or
+    implicit-leading support."""
+    eos = 250
+    raw = "reasoning\n</think>\nvisible answer"
+    session, _ = _make_session_for_history_test(
+        reply_text=raw,
+        eos_id=eos,
+        thinking_history="keep",
+        implicit_thinking_supported=True,
+        thinking_mode=True,
+    )
+    metrics = session.chat("hi")
+    assert metrics.reply == raw
+    assert metrics.raw_reply == raw
+    assert session.messages[-1]["content"] == raw
+
+
+def test_chat_session_strip_max_tokens_defers_finalize() -> None:
+    """Truncation under strip mode keeps the raw reply on the
+    assistant message (RP-2 ``/continue`` needs the prefix) and
+    sets the deferred-finalize flag."""
+    # No EOS in the engine output, so finish_reason is max_tokens
+    # once params.max_tokens is reached.
+    raw = "reasoning"  # no </think>; mid-think truncation
+    session, engine = _make_session_for_history_test(
+        reply_text=raw,
+        eos_id=None,
+        thinking_history="strip",
+        implicit_thinking_supported=True,
+        thinking_mode=True,
+    )
+    # max_tokens=len(raw) so engine produces exactly that many.
+    metrics = session.chat("hi", sampling_params=SamplingParams(max_tokens=len(raw)))
+    assert metrics.finish_reason == "max_tokens"
+    # Assistant message is RAW (deferred strip).
+    assert session.messages[-1]["role"] == "assistant"
+    assert session.messages[-1]["content"] == raw
+    assert metrics.reply == raw
+    assert metrics.raw_reply == raw
+    # The deferred-finalize flag is what drives RP-1's strip-on-
+    # next-user-turn path. Test the observable consequence by
+    # running a second turn below.
+
+
+def test_chat_session_strip_max_tokens_finalises_on_next_user_turn() -> None:
+    """After a max_tokens turn under strip mode, the next
+    ``chat()`` call finalises the previous assistant message
+    before the new user message lands."""
+    eos = 250
+    # Turn 1: truncated mid-think (no </think> → strip leaves raw
+    # unchanged because the helper has no anchor; we use an
+    # explicit pair so finalisation has something to remove).
+    session, _ = _make_session_for_history_test(
+        reply_text="<think>secret</think>oops",
+        eos_id=None,  # max_tokens path
+        thinking_history="strip",
+        implicit_thinking_supported=False,
+        thinking_mode=False,
+    )
+    raw_len = len("<think>secret</think>oops")
+    session.chat(
+        "first", sampling_params=SamplingParams(max_tokens=raw_len)
+    )
+    # Pre-finalise: raw on assistant message.
+    assert (
+        session.messages[-1]["content"]
+        == "<think>secret</think>oops"
+    )
+
+    # Swap engine for turn 2 so the second chat() has fresh
+    # tokens. The session's existing _engine is exhausted.
+    eos_set = {eos}
+    tok = session._tokenizer  # reuse the same fake
+    tok.eos_token_ids = eos_set  # type: ignore[attr-defined]
+    session._engine = _engine_yielding_text(  # type: ignore[assignment]
+        "done", eos_id=eos
+    )
+
+    session.chat("second")
+
+    # After turn 2 starts, the previous truncated assistant
+    # message is finalised: raw stripped → "oops".
+    msgs = session.messages
+    # roles: [user1, asst1-stripped, user2, asst2]
+    assert [m["role"] for m in msgs] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert msgs[1]["content"] == "oops"
+
+
+def test_chat_session_set_thinking_history_mutator_switches_modes() -> None:
+    """``set_thinking_history`` lets the chat-CLI flip the policy
+    mid-session without rebuilding ChatSession."""
+    eos = 250
+    session, _ = _make_session_for_history_test(
+        reply_text="<think>secret</think>visible",
+        eos_id=eos,
+        thinking_history="strip",
+    )
+    m1 = session.chat("first")
+    assert m1.reply == "visible"
+
+    session.set_thinking_history("keep")
+    session._engine = _engine_yielding_text(  # type: ignore[assignment]
+        "<think>second-secret</think>visible-2", eos_id=eos
+    )
+    m2 = session.chat("second")
+    # Under keep mode, raw is preserved.
+    assert m2.reply == "<think>second-secret</think>visible-2"
+
+
+def test_chat_session_set_thinking_history_invalid_raises() -> None:
+    session, _ = _make_session_for_history_test(
+        reply_text="x", eos_id=None
+    )
+    with pytest.raises(ValueError, match="thinking_history"):
+        session.set_thinking_history("delete")  # type: ignore[arg-type]
+
+
+def test_chat_session_default_thinking_history_is_strip() -> None:
+    """A ChatSession constructed without an explicit
+    ``thinking_history`` kwarg defaults to strip mode."""
+    eos = 250
+    tok = _FakeTokenizer(eos_token_ids={eos})
+    adapter = _FakeAdapter(tok)
+    engine = _engine_yielding_text(
+        "before<think>x</think>after", eos_id=eos
+    )
+    session = ChatSession(
+        adapter,  # type: ignore[arg-type]
+        engine,  # type: ignore[arg-type]
+        reset_peak_memory=lambda: None,
+        read_peak_memory_mb=lambda: 0.0,
+    )
+    metrics = session.chat("hi")
+    # Default strip + no implicit-leading flag → explicit pairs
+    # are removed, implicit-leading is not assumed.
+    assert metrics.reply == "beforeafter"
+
+
+def test_chat_session_implicit_leading_only_when_thinking_mode_not_false() -> None:
+    """When ``thinking_mode=False`` the chat template did NOT
+    prepend ``<think>\\n``, so implicit-leading strip must NOT
+    apply even if the model is from a Qwen3-shaped family."""
+    eos = 250
+    raw = "fake-leading text\n</think>\nrest"
+    session, _ = _make_session_for_history_test(
+        reply_text=raw,
+        eos_id=eos,
+        thinking_history="strip",
+        implicit_thinking_supported=True,
+        thinking_mode=False,  # <-- key
+    )
+    metrics = session.chat("hi")
+    # Because thinking_mode is False, implicit-leading strip
+    # is skipped. Explicit pairs are still stripped — but raw
+    # has none, so output equals input.
+    assert metrics.reply == raw

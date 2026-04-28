@@ -178,6 +178,18 @@ def test_ansi_toolbar_enter_reserves_line_below_cursor() -> None:
     bar.__exit__(None, None, None)
 
 
+def test_ansi_toolbar_uses_dec_save_restore_sequences() -> None:
+    """DEC save/restore is the compatibility path for real terminals.
+
+    The earlier CSI s/u pair works in some emulators but can be
+    ignored in prompt-toolkit-hosted sessions; when restore is
+    ignored, the live toolbar lands in the transcript as a normal
+    ``state=...`` line.
+    """
+    assert AnsiLiveToolbar.SAVE_CURSOR == "\x1b7"
+    assert AnsiLiveToolbar.RESTORE_CURSOR == "\x1b8"
+
+
 def test_ansi_toolbar_refresh_writes_save_advance_clear_text_restore() -> None:
     """``refresh`` produces: save cursor → advance to reserved
     line → clear → write toolbar text → restore cursor. The
