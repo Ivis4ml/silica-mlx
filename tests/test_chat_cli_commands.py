@@ -245,6 +245,32 @@ def test_regenerate_sets_request_flag() -> None:
 
 
 # ---------------------------------------------------------------------------
+# /continue (CHAT-CLI-RESPONSE-POLICY RP-2)
+# ---------------------------------------------------------------------------
+
+
+def test_continue_sets_request_flag() -> None:
+    res = dispatch_command("/continue", _state())
+    assert res.request_continue is True
+    # Other request flags must not flip — the dispatcher only
+    # signals continuation; the shell's guards live elsewhere.
+    assert res.request_regenerate is False
+    assert res.request_reset is False
+
+
+def test_continue_emits_feedback() -> None:
+    res = dispatch_command("/continue", _state())
+    assert any("continuing" in line.lower() for line in res.feedback)
+    assert res.error is False
+
+
+def test_help_advertises_continue_command() -> None:
+    res = dispatch_command("/help", _state())
+    rendered = "\n".join(res.feedback)
+    assert "/continue" in rendered
+
+
+# ---------------------------------------------------------------------------
 # /save and /load
 # ---------------------------------------------------------------------------
 

@@ -91,6 +91,15 @@ class ChatCliState:
     last_ttft_ms: float | None = None
     """TTFT of the most recent completed turn."""
 
+    last_finish_reason: str | None = None
+    """``finish_reason`` of the most recent completed turn (one of
+    ``"stop_token"`` / ``"max_tokens"`` / ``"empty"`` / ``"done"`` /
+    ``"eos"`` / ``"aborted"``); ``None`` before any turn has run or
+    after ``/reset`` / ``/load`` / any ``/model`` swap. RP-2
+    ``/continue`` reads this to decide whether the prior turn was
+    actually truncated; RP-3 surfaces the value as the toolbar's
+    ``finish=`` field."""
+
     peak_memory_mb: float | None = None
     """Device peak memory in MB (``mx.get_peak_memory()`` / 1e6).
     Sticky high-water mark; never resets within a session."""

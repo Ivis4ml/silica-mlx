@@ -228,6 +228,50 @@ def test_swap_keep_history_resets_model_derived_metrics() -> None:
     assert state.tok_per_sec is None
 
 
+def test_swap_clears_last_finish_reason_even_when_keeping_history() -> None:
+    """CHAT-CLI-RESPONSE-POLICY RP-2 follow-up: ``last_finish_reason``
+    is a runtime signal about the previous turn's stop classification,
+    not part of the conversation text. After a model swap the new
+    tokeniser would render a different continuation prompt, so
+    ``/continue`` against the prior turn's ``max_tokens`` is no
+    longer well-defined. The field clears on every swap — including
+    ``--keep-history`` where the message text survives — so the
+    next ``/continue`` attempt fails the guard and the user starts
+    a fresh turn against the new model."""
+    state = _seeded_state()
+    state.last_finish_reason = "max_tokens"
+    outcome = _swap(
+        keep_history=True,
+        prior_messages=[
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "<think>partial"},
+        ],
+        state=state,
+    )
+    assert outcome is not None
+    # Conversation history did survive the keep-history swap.
+    _adapter, _engine, new_session = outcome
+    assert any(
+        m["role"] == "assistant" for m in new_session.messages
+    )
+    # But the runtime finish-reason cleared so /continue cannot
+    # extend across the model boundary.
+    assert state.last_finish_reason is None
+
+
+def test_swap_clears_last_finish_reason_without_keep_history() -> None:
+    """Default-reset path also clears ``last_finish_reason`` for the
+    same reason — kept here as a regression guard distinct from
+    the ``last_turn_thinking`` reset."""
+    state = _seeded_state()
+    state.last_finish_reason = "max_tokens"
+    outcome = _swap(
+        keep_history=False, prior_messages=[], state=state
+    )
+    assert outcome is not None
+    assert state.last_finish_reason is None
+
+
 def test_swap_keep_history_with_empty_prior_is_no_op_on_messages() -> None:
     """A fresh prior session (no user / assistant turns) yields a
     new session whose only message is the system prompt the

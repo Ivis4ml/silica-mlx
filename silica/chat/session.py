@@ -247,17 +247,62 @@ class ChatSession:
         # change which strip shape applies to the orphaned raw text.
         # ``None`` means no defer is registered.
         self._pending_finalize_implicit_leading: bool | None = None
+        # CHAT-CLI-RESPONSE-POLICY RP-2: continuation-side snapshot
+        # of the truncation-time implicit-leading fact. Tracks the
+        # SAME information as ``_pending_finalize_implicit_leading``
+        # but with a different lifecycle and broader scope: this
+        # field is set on ANY ``finish_reason="max_tokens"`` turn
+        # regardless of ``thinking_history`` (strip OR keep), so
+        # ``continue_last`` can rebuild the original generation
+        # prompt's ``<think>\n`` prefix even under keep mode where
+        # the finalise snapshot is unset. Lifecycle: set on
+        # max_tokens (preserved across chained continuations);
+        # cleared on natural completion, new user turn, ``reset``,
+        # ``replace_messages``, ``pop_last_exchange``. ``None``
+        # means no /continue is reachable.
+        self._pending_continuation_implicit_leading: bool | None = None
 
     # --- observation -------------------------------------------------
 
     @property
     def messages(self) -> list[dict[str, str]]:
-        """Return a shallow copy of the current message history."""
-        return list(self._messages)
+        """Return a deep-ish copy of the current message history.
+
+        Each call produces fresh dict objects so callers can
+        snapshot the history before invoking mutator methods. RP-2
+        ``/continue`` relies on this for the abort-rollback path —
+        ``continue_last`` mutates ``self._messages[-1]["content"]``
+        in place after generation completes; if the snapshot the
+        shell holds shared dict references with the live list, an
+        exception thrown after that mutation but before the
+        function returned would leave the snapshot already
+        corrupted and ``replace_messages(snapshot)`` would not
+        restore the original assistant content.
+        """
+        return [
+            {"role": m["role"], "content": m["content"]}
+            for m in self._messages
+        ]
 
     @property
     def eos_token_ids(self) -> tuple[int, ...]:
         return self._eos_ids
+
+    @property
+    def pending_continuation_implicit_leading(self) -> bool | None:
+        """Truncation-time implicit-leading snapshot for ``/continue``.
+
+        CHAT-CLI-RESPONSE-POLICY RP-2. Read by the chat-CLI shell
+        to seed the streaming :class:`ThinkingParser` based on the
+        FACT recorded at the truncated turn rather than the LIVE
+        ``thinking_mode`` (which the user may have flipped between
+        turns). Independent of ``thinking_history``: set on any
+        ``finish_reason="max_tokens"`` regardless of strip / keep
+        policy. ``None`` means no continuation is pending — fresh
+        session, last turn completed naturally, or the prior
+        truncated turn was dropped via reset / replace / pop.
+        """
+        return self._pending_continuation_implicit_leading
 
     @property
     def prefix_cache(self) -> _PrefixCacheLike | None:
@@ -288,6 +333,7 @@ class ChatSession:
         ]
         self._pending_finalize = False
         self._pending_finalize_implicit_leading = None
+        self._pending_continuation_implicit_leading = None
 
     def replace_messages(
         self, messages: list[dict[str, str]]
@@ -312,6 +358,7 @@ class ChatSession:
         ]
         self._pending_finalize = False
         self._pending_finalize_implicit_leading = None
+        self._pending_continuation_implicit_leading = None
 
     def pop_last_exchange(self) -> str | None:
         """Drop the most recent ``(user, assistant)`` pair from history.
@@ -351,8 +398,11 @@ class ChatSession:
         # ``/regenerate`` flow then re-issues ``chat()`` with the
         # popped user text, which would otherwise see a stale flag
         # and try to strip a now-replaced message.
+        # RP-2 follow-up: same applies to the continuation-side
+        # snapshot — the popped assistant turn cannot be /continue'd.
         self._pending_finalize = False
         self._pending_finalize_implicit_leading = None
+        self._pending_continuation_implicit_leading = None
         return user_msg["content"]
 
     @staticmethod
@@ -362,6 +412,38 @@ class ChatSession:
                 f"thinking_history must be 'strip' or 'keep', got {value!r}"
             )
         return value
+
+    def _resolve_finalise_implicit_leading(self) -> bool:
+        """Pick the right ``implicit_leading`` value for a strip-finalise.
+
+        CHAT-CLI-RESPONSE-POLICY RP-2 v3. Three-tier fallback:
+
+        1. ``_pending_finalize_implicit_leading`` — set when the
+           deferred-finalise path captured a strip-mode truncation
+           snapshot. Most specific.
+        2. ``_pending_continuation_implicit_leading`` — set on any
+           ``finish_reason="max_tokens"`` turn (including keep
+           mode). Covers the cross-policy case where a user
+           truncated under keep then flipped to strip before
+           ``/continue`` reached natural completion: the live
+           ``thinking_mode`` no longer reflects the prompt-level
+           fact, but the continuation snapshot does.
+        3. ``_should_strip_implicit_leading()`` — degenerate
+           fallback when no snapshot is registered (e.g.
+           ``continue_last`` invoked on a naturally-completed
+           turn).
+
+        Order matters: the strip-finalise snapshot is the most
+        specific (only set when a strip-mode chat() truncation
+        registered finalise); the continuation snapshot is broader
+        (any max_tokens registers it); live state is the last
+        resort.
+        """
+        if self._pending_finalize_implicit_leading is not None:
+            return self._pending_finalize_implicit_leading
+        if self._pending_continuation_implicit_leading is not None:
+            return self._pending_continuation_implicit_leading
+        return self._should_strip_implicit_leading()
 
     def _should_strip_implicit_leading(self) -> bool:
         """Whether ``_strip_thinking_block`` should treat the
@@ -528,17 +610,18 @@ class ChatSession:
             and self._messages[-1]["role"] == "assistant"
         ):
             raw = self._messages[-1]["content"]
-            implicit = (
-                self._pending_finalize_implicit_leading
-                if self._pending_finalize_implicit_leading is not None
-                else self._should_strip_implicit_leading()
-            )
             self._messages[-1]["content"] = _strip_thinking_block(
                 raw,
-                implicit_leading=implicit,
+                implicit_leading=self._resolve_finalise_implicit_leading(),
             )
         self._pending_finalize = False
         self._pending_finalize_implicit_leading = None
+        # RP-2: a new user turn closes the prior turn — ``/continue``
+        # is no longer reachable for it, so the continuation
+        # snapshot resets unconditionally before the new turn runs.
+        # The fresh chat() result below re-seeds the snapshot if it
+        # itself ends at ``max_tokens``.
+        self._pending_continuation_implicit_leading = None
 
         self._messages.append({"role": "user", "content": user_text})
         prompt_text, prompt_ids = self._render_prompt()
@@ -626,6 +709,16 @@ class ChatSession:
             stored_reply = raw_reply
             self._pending_finalize = False
             self._pending_finalize_implicit_leading = None
+        # RP-2: continuation-side snapshot lifecycle — orthogonal
+        # to the strip / keep finalise policy above. ANY truncated
+        # turn registers the snapshot so ``/continue`` can resume
+        # against the original generation prompt's
+        # ``<think>\n`` boundary; natural completion leaves it
+        # cleared (the top-of-method reset already handled that).
+        if finish_reason == "max_tokens":
+            self._pending_continuation_implicit_leading = (
+                self._should_strip_implicit_leading()
+            )
         self._messages.append(
             {"role": "assistant", "content": stored_reply}
         )
@@ -702,6 +795,218 @@ class ChatSession:
         return TurnMetrics(
             reply=stored_reply,
             raw_reply=raw_reply,
+            prompt_tokens=len(prompt_ids),
+            output_tokens=len(out_tokens),
+            finish_reason=finish_reason,
+            ttft_ms=ttft_ms,
+            prefill_tok_s=snapshot.prefill_tok_s,
+            decode_tok_s=decode_tok_s,
+            resident_mb=resident_mb,
+            peak_memory_mb=peak_mb,
+            logical_kv_bytes=logical_kv_bytes,
+            wall_s=wall_s,
+            prefix_hit_blocks=prefix_hit_blocks,
+            prefix_hit_tokens=prefix_hit_tokens,
+            prefix_store_resident_bytes=prefix_store_resident,
+            prefix_store_logical_bytes=prefix_store_logical,
+        )
+
+    def continue_last(
+        self,
+        *,
+        sampling_params: SamplingParams | None = None,
+        stream_to: Callable[[str], None] | None = None,
+    ) -> TurnMetrics:
+        """Resume the trailing assistant turn by appending generated
+        tokens to the existing message — no new
+        ``(user, assistant)`` pair is created.
+
+        CHAT-CLI-RESPONSE-POLICY RP-2 (G2). Pairs with RP-1's
+        deferred-finalise contract: a turn that ended at
+        ``finish_reason="max_tokens"`` under
+        ``thinking_history="strip"`` left the raw text on
+        ``messages[-1]`` so this method can resume mid-``<think>``
+        without losing the prefix.
+
+        Renders the prompt with
+        ``apply_chat_template(messages, continue_final_message=True)``
+        — the tokeniser drops the trailing close tag from the
+        assistant slot so the model resumes at the exact text
+        boundary it left. Falls back to a Qwen-shaped manual block
+        list when the tokeniser raises (older transformers, or a
+        template that does not understand ``continue_final_message``).
+
+        Finalisation policy mirrors :meth:`chat`:
+
+        - ``thinking_history="strip"`` + natural completion
+          (``finish_reason != "max_tokens"``) → strip the joined
+          raw text using the truncation-time implicit-leading
+          snapshot when present, falling back to the live decision.
+          Pending state clears.
+        - ``thinking_history="strip"`` + chained truncation
+          (``max_tokens`` again) → keep the joined raw, preserve
+          the snapshot.
+        - ``thinking_history="keep"`` → append verbatim.
+
+        Empty-continuation (``out_tokens == []``) follows the same
+        finalisation branch as natural completion: under strip the
+        existing prefix is finalised through the snapshot, so an
+        immediate-EOS resume on a turn with a closed ``</think>``
+        still strips the leading reasoning.
+
+        Strictness: raises ``RuntimeError`` when ``messages[-1]`` is
+        not an ``assistant`` turn. The "was the last turn actually
+        truncated" check belongs to the caller (the chat-CLI shell
+        guards on ``state.last_finish_reason``); a future code path
+        bypassing the shell can still resume any open assistant
+        message safely.
+
+        RP-2 limitation: the streaming display side does not seed
+        ``ThinkingParser.start_in_thinking`` from the prior assistant
+        prefix here — the chat-CLI shell decides at call site
+        whether to re-enter the thinking state by counting
+        ``<think>`` / ``</think>`` against the existing message
+        content.
+        """
+        if not self._messages or self._messages[-1]["role"] != "assistant":
+            tail_role = (
+                self._messages[-1]["role"] if self._messages else "(empty)"
+            )
+            raise RuntimeError(
+                f"continue_last requires the last message to be an "
+                f"assistant turn (got {tail_role!r})"
+            )
+
+        raw_prefix = self._messages[-1]["content"]
+        prompt_text, prompt_ids = self._render_continuation_prompt()
+        params = self._build_sampling_params(sampling_params)
+
+        prefix_hit_blocks: int | None = None
+        prefix_hit_tokens: int | None = None
+        if self._prefix_cache is not None:
+            hit = self._prefix_cache.peek(prompt_ids)
+            prefix_hit_blocks = len(getattr(hit, "block_ids", ()))
+            prefix_hit_tokens = int(getattr(hit, "num_hit_tokens", 0))
+
+        self._reset_peak()
+        t_start = self._clock()
+        (
+            out_tokens,
+            finish_reason_from_event,
+            t_first_token,
+        ) = self._run_generation(prompt_text, params, stream_to)
+        wall_s = self._clock() - t_start
+        peak_mb = self._read_peak_mb()
+
+        reply_tokens = out_tokens
+        if reply_tokens and reply_tokens[-1] in self._eos_ids:
+            reply_tokens = reply_tokens[:-1]
+        continuation_text = self._tokenizer.decode(reply_tokens).rstrip("�")
+        finish_reason = (
+            finish_reason_from_event
+            if finish_reason_from_event is not None
+            else self._classify_finish(out_tokens, params)
+        )
+
+        raw_full = raw_prefix + continuation_text
+
+        if (
+            self._thinking_history == "strip"
+            and finish_reason != "max_tokens"
+        ):
+            stored_reply = _strip_thinking_block(
+                raw_full,
+                implicit_leading=self._resolve_finalise_implicit_leading(),
+            )
+            self._pending_finalize = False
+            self._pending_finalize_implicit_leading = None
+        elif (
+            self._thinking_history == "strip"
+            and finish_reason == "max_tokens"
+        ):
+            stored_reply = raw_full
+            self._pending_finalize = True
+            # Carry the original truncation-time snapshot forward
+            # so a chained continuation cannot retroactively change
+            # the strip shape; only seed a fresh snapshot when no
+            # chain was registered. The helper consults the
+            # continuation-side snapshot before falling through to
+            # a live decision, so a keep→strip mid-flight switch
+            # still seeds the right value.
+            if self._pending_finalize_implicit_leading is None:
+                self._pending_finalize_implicit_leading = (
+                    self._resolve_finalise_implicit_leading()
+                )
+        else:
+            stored_reply = raw_full
+            if finish_reason != "max_tokens":
+                self._pending_finalize = False
+                self._pending_finalize_implicit_leading = None
+
+        # RP-2: continuation-side snapshot lifecycle in continue_last
+        # — preserve across chained max_tokens, clear on natural
+        # completion. Unlike the strip-finalise field above, this
+        # one tracks the prompt-level truncation fact and is
+        # independent of ``thinking_history``.
+        if finish_reason == "max_tokens":
+            if self._pending_continuation_implicit_leading is None:
+                self._pending_continuation_implicit_leading = (
+                    self._should_strip_implicit_leading()
+                )
+        else:
+            self._pending_continuation_implicit_leading = None
+
+        self._messages[-1]["content"] = stored_reply
+
+        snapshot = self._engine.metrics.snapshot()
+        ttft_ms_computed: float | None = None
+        decode_tok_s_computed: float | None = None
+        if t_first_token is not None:
+            ttft_ms_computed = (t_first_token - t_start) * 1000.0
+            decode_elapsed = wall_s - (t_first_token - t_start)
+            n_decoded = max(0, len(out_tokens) - 1)
+            if decode_elapsed > 0 and n_decoded > 0:
+                decode_tok_s_computed = n_decoded / decode_elapsed
+
+        ttft_ms = (
+            snapshot.ttft_ms
+            if snapshot.ttft_ms is not None
+            else ttft_ms_computed
+        )
+        decode_tok_s = (
+            snapshot.decode_tok_s
+            if snapshot.decode_tok_s is not None
+            else decode_tok_s_computed
+        )
+
+        resident_mb = snapshot.resident_mb
+        logical_kv_bytes = snapshot.logical_kv_bytes
+        if resident_mb is None or logical_kv_bytes is None:
+            try:
+                budget = self._engine.kv_manager.budget()
+                if resident_mb is None:
+                    resident_mb = budget.resident_bytes / 1e6
+                if logical_kv_bytes is None:
+                    logical_kv_bytes = int(budget.logical_bytes)
+            except Exception:
+                pass
+
+        prefix_store_resident: int | None = None
+        prefix_store_logical: int | None = None
+        if self._prefix_cache is not None:
+            stats_fn = getattr(self._prefix_cache, "stats", None)
+            if callable(stats_fn):
+                try:
+                    pc_stats = stats_fn()
+                except Exception:
+                    pc_stats = None
+                if pc_stats is not None:
+                    prefix_store_resident = pc_stats.resident_bytes
+                    prefix_store_logical = pc_stats.logical_bytes
+
+        return TurnMetrics(
+            reply=stored_reply,
+            raw_reply=raw_full,
             prompt_tokens=len(prompt_ids),
             output_tokens=len(out_tokens),
             finish_reason=finish_reason,
@@ -871,6 +1176,107 @@ class ChatSession:
         prompt_text = "".join(parts)
         prompt_ids = list(self._tokenizer.encode(prompt_text))
         return prompt_text, prompt_ids
+
+    def _render_continuation_prompt(self) -> tuple[str, list[int]]:
+        """Return ``(prompt_text, prompt_ids)`` for ``continue_last``.
+
+        Prefers ``apply_chat_template(messages, continue_final_message=True)``
+        so the tokeniser drops the trailing close tag from the
+        assistant slot and the model resumes at the exact text
+        boundary it left. Falls back to a Qwen-shaped manual block
+        list (``<|im_start|>{role}\\n{content}<|im_end|>``) that
+        omits the closing ``<|im_end|>`` from the trailing
+        assistant message; this is the right shape for the Qwen3
+        family RP-1 / RP-2 explicitly target.
+
+        Implicit-leading restoration: when RP-2's continuation
+        snapshot recorded
+        ``_pending_continuation_implicit_leading=True``, the
+        original generation prompt had a ``<think>\\n`` prefix
+        prepended by the chat template (Qwen3 family with
+        ``enable_thinking=True``). The model's reply text — stored
+        on ``messages[-1].content`` — does NOT include that open
+        tag because it came from the template, not from the model.
+        Re-rendering the conversation through the template with
+        ``continue_final_message=True`` would feed the raw prefix
+        without the open tag, breaking the "same prompt at higher
+        max_tokens" contract. We restore the synthetic
+        ``<think>\\n`` prefix on a temporary copy of the message
+        list (the in-memory ``self._messages`` is NOT mutated, so
+        RP-1's raw-prefix preservation stays intact). Skipped when
+        the prefix already starts with ``<think>`` — explicit opens
+        need no synthetic restoration.
+
+        Non-Qwen tokenisers that *also* lack ``continue_final_message``
+        produce a prompt that may diverge from the model's
+        expected format — a future RP-2 refinement can branch by
+        tokeniser family, but the current scope leaves that for
+        follow-up.
+        """
+        messages_for_render = self._messages
+        if self._needs_implicit_thinking_restoration():
+            tail = self._messages[-1]
+            messages_for_render = [
+                *self._messages[:-1],
+                {
+                    "role": tail["role"],
+                    "content": "<think>\n" + tail["content"],
+                },
+            ]
+        apply_template = getattr(
+            self._tokenizer, "apply_chat_template", None
+        )
+        if callable(apply_template):
+            try:
+                template_kwargs: dict[str, Any] = {
+                    "tokenize": True,
+                    "continue_final_message": True,
+                }
+                if self._thinking_mode is not None:
+                    template_kwargs["enable_thinking"] = self._thinking_mode
+                prompt_ids = list(
+                    apply_template(messages_for_render, **template_kwargs)
+                )
+                prompt_text = self._tokenizer.decode(prompt_ids)
+                return prompt_text, prompt_ids
+            except Exception:
+                # Tokeniser refused continue_final_message — fall
+                # through to the Qwen-shaped manual block list.
+                pass
+        parts: list[str] = []
+        last_idx = len(messages_for_render) - 1
+        for i, m in enumerate(messages_for_render):
+            if i == last_idx and m["role"] == "assistant":
+                parts.append(
+                    f"<|im_start|>{m['role']}\n{m['content']}"
+                )
+            else:
+                parts.append(
+                    f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n"
+                )
+        prompt_text = "".join(parts)
+        prompt_ids = list(self._tokenizer.encode(prompt_text))
+        return prompt_text, prompt_ids
+
+    def _needs_implicit_thinking_restoration(self) -> bool:
+        """Whether the continuation prompt should prepend a
+        synthetic ``<think>\\n`` to the trailing assistant content.
+
+        True iff RP-2's continuation-side snapshot
+        (``_pending_continuation_implicit_leading is True``) AND
+        the existing assistant content does not already begin with
+        an explicit ``<think>``. Independent of
+        ``thinking_history`` — keep mode also needs the
+        restoration to give the model a prompt that matches what
+        the original turn actually saw at its boundary.
+        """
+        if self._pending_continuation_implicit_leading is not True:
+            return False
+        if not self._messages or self._messages[-1]["role"] != "assistant":
+            return False
+        return not self._messages[-1]["content"].lstrip().startswith(
+            "<think>"
+        )
 
     def _build_sampling_params(
         self, override: SamplingParams | None

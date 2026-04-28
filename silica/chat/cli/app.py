@@ -93,6 +93,30 @@ def _model_basename(repo: str) -> str:
     return repo.split("/", 1)[-1]
 
 
+def _assistant_ends_in_thinking(
+    text: str, *, implicit_leading: bool
+) -> bool:
+    """Whether ``text`` ends inside an unclosed ``<think>`` block.
+
+    CHAT-CLI-RESPONSE-POLICY RP-2. The chat-CLI shell uses this to
+    seed the streaming :class:`ThinkingParser` for ``/continue`` —
+    the model resuming a turn that was truncated mid-``<think>``
+    keeps emitting reasoning until it produces ``</think>``, so the
+    parser must start in ``THINKING`` to route those tokens as
+    ``ThinkingChunk`` (folding them into the magenta indicator)
+    instead of ``ReplyChunk`` (printing them as visible reply).
+
+    Counts ``<think>`` opens against ``</think>`` closes. When
+    ``implicit_leading`` is True the chat template prepended
+    ``<think>\\n`` to the assistant slot, so the model started
+    inside a thinking block without an opening tag in the visible
+    text — counted as one extra open.
+    """
+    open_count = text.count("<think>") + (1 if implicit_leading else 0)
+    close_count = text.count("</think>")
+    return open_count > close_count
+
+
 def _model_supports_implicit_thinking(model_basename: str) -> bool:
     """Whether the model's chat template prepends ``<think>\\n`` to
     the assistant generation slot when ``enable_thinking=True``.
@@ -380,6 +404,14 @@ def run_chat(args: argparse.Namespace) -> int:
         regenerate_text: str | None = None
         regenerate_snapshot: list[dict[str, str]] | None = None
         regenerate_thinking_snapshot: str | None = None
+        # CHAT-CLI-RESPONSE-POLICY RP-2 (G2): /continue mirrors the
+        # /regenerate request flow but invokes ``continue_last``
+        # instead of ``chat`` and routes no user_text. The
+        # snapshots support the same abort / exception rollback
+        # pattern as /regenerate.
+        continue_request: bool = False
+        continue_snapshot: list[dict[str, str]] | None = None
+        continue_thinking_snapshot: str | None = None
         if is_slash_command(text):
             result = dispatch_command(text, state)
             _print_lines(_format_feedback(result, palette))
@@ -400,6 +432,7 @@ def run_chat(args: argparse.Namespace) -> int:
                 chat_session.set_prefix_cache(fresh_cache)
                 state.turn = 0
                 state.last_turn_thinking = ""
+                state.last_finish_reason = None
                 state.prefix_hit_blocks = None
                 state.prefix_hit_max = None
                 state.total_prefix_hit_tokens = 0
@@ -455,6 +488,28 @@ def run_chat(args: argparse.Namespace) -> int:
                     regenerate_text = popped
                     regenerate_snapshot = pre_pop_snapshot
                     regenerate_thinking_snapshot = pre_pop_thinking
+            if result.request_continue:
+                # CHAT-CLI-RESPONSE-POLICY RP-2 (G2): the helper
+                # encodes two guards (no-prior-assistant /
+                # last-turn-not-truncated). Either failure prints
+                # a yellow warning and falls through to the prompt
+                # without mutating the session; success snapshots
+                # the messages + thinking buffer for abort
+                # rollback below.
+                proceed, warning = _evaluate_continue_request(
+                    chat_session, state
+                )
+                if not proceed:
+                    sys.stdout.write(
+                        palette.colorize(
+                            f"{warning}\n", "yellow", dim=True
+                        )
+                    )
+                    sys.stdout.flush()
+                else:
+                    continue_request = True
+                    continue_snapshot = chat_session.messages
+                    continue_thinking_snapshot = state.last_turn_thinking
             if result.request_session_save:
                 _handle_session_save(
                     result.request_session_save,
@@ -508,14 +563,17 @@ def run_chat(args: argparse.Namespace) -> int:
                 report = render_showcase(state, palette=palette)
                 sys.stdout.write(report + "\n")
                 sys.stdout.flush()
-            if regenerate_text is None:
+            if regenerate_text is None and not continue_request:
                 continue
-            # /regenerate fall-through: feed the popped user prompt
-            # into the regular chat-turn flow below so the same
-            # streaming / parser / metric plumbing applies. The
-            # original ``/regenerate`` line is replaced by the
-            # captured prompt text.
-            text = regenerate_text
+            # Fall-through to the chat-turn flow below.
+            #   /regenerate replaces ``text`` with the popped user
+            #     prompt and runs ``chat_session.chat(text, ...)``.
+            #   /continue leaves ``text`` unused and switches the
+            #     turn-flow to invoke ``chat_session.continue_last(...)``.
+            # Either path reuses the same streaming / parser /
+            # metric plumbing.
+            if regenerate_text is not None:
+                text = regenerate_text
 
         # Regular chat turn. Defer the assistant prefix line until
         # the first reply token actually arrives — that way long-
@@ -528,7 +586,13 @@ def run_chat(args: argparse.Namespace) -> int:
         state.stream_state = StreamState.PREFILL
         state.tokens_generated = 0
         state.max_tokens = int(state.config.get("max_tokens", 1024))
-        state.last_turn_thinking = ""
+        # /continue extends the previous turn — preserve the prior
+        # ``last_turn_thinking`` so the streaming callback's
+        # ``+= event.text`` accumulates across the boundary and
+        # ``/expand`` shows the full reasoning trace. Fresh chat
+        # turns reset to empty as before.
+        if not continue_request:
+            state.last_turn_thinking = ""
         # CHAT-CLI-HARDENING-6 (F3) + post-H6 follow-up: live
         # toolbar backend selection. The Ansi backend is opt-in
         # (default ``NullLiveToolbar``) because cursor save/restore
@@ -566,8 +630,33 @@ def run_chat(args: argparse.Namespace) -> int:
             bool(state.config.get("thinking_mode", True))
             and _model_supports_implicit_thinking(state.model_name)
         )
+        # CHAT-CLI-RESPONSE-POLICY RP-2: for /continue, the parser's
+        # initial state must reflect the TRUNCATION-TIME fact, not
+        # the live ``thinking_mode`` config. The session exposes a
+        # continuation snapshot (set on any max_tokens turn,
+        # cleared on natural completion / new user turn / mutator)
+        # — consult that to decide whether the synthetic
+        # ``<think>\\n`` was prepended to the original generation
+        # prompt. Falling back to the live config when no snapshot
+        # is registered (degenerate case: ``/continue`` against a
+        # naturally-completed turn under the permissive precondition).
+        # Without this snapshot route, a user who flips
+        # ``/config thinking_mode`` between truncation and
+        # ``/continue`` would see reasoning leak into the visible
+        # transcript (mode on→off) or visible reply hidden behind
+        # the magenta indicator (mode off→on).
+        if continue_request:
+            snap = chat_session.pending_continuation_implicit_leading
+            if snap is None:
+                snap = implicit_thinking
+            parser_start_thinking = _assistant_ends_in_thinking(
+                chat_session.messages[-1]["content"],
+                implicit_leading=snap,
+            )
+        else:
+            parser_start_thinking = implicit_thinking
         parser = ThinkingParser(
-            start_in_thinking=implicit_thinking
+            start_in_thinking=parser_start_thinking
         )
         thinking_started_at: list[float] = []  # mutable for closure write
         prefix_emitted: list[bool] = [False]
@@ -724,11 +813,17 @@ def run_chat(args: argparse.Namespace) -> int:
         with live_toolbar:
             live_toolbar.refresh(state)
             try:
-                metrics = chat_session.chat(
-                    text,
-                    sampling_params=params,
-                    stream_to=_stream_callback,
-                )
+                if continue_request:
+                    metrics = chat_session.continue_last(
+                        sampling_params=params,
+                        stream_to=_stream_callback,
+                    )
+                else:
+                    metrics = chat_session.chat(
+                        text,
+                        sampling_params=params,
+                        stream_to=_stream_callback,
+                    )
             except KeyboardInterrupt:
                 if state.stream_state in (
                     StreamState.PREFILL,
@@ -760,6 +855,21 @@ def run_chat(args: argparse.Namespace) -> int:
                         state.last_turn_thinking = (
                             regenerate_thinking_snapshot
                         )
+                # CHAT-CLI-RESPONSE-POLICY RP-2: /continue abort
+                # rollback. Without this, KeyboardInterrupt during
+                # ``continue_last`` would leave the assistant
+                # message containing whatever partial bytes the
+                # session managed to write before the abort, and
+                # ``state.last_turn_thinking`` would carry stray
+                # appended fragments. Restore both to the
+                # pre-continue snapshot so the user can retry or
+                # /continue again cleanly.
+                if continue_snapshot is not None:
+                    chat_session.replace_messages(continue_snapshot)
+                    if continue_thinking_snapshot is not None:
+                        state.last_turn_thinking = (
+                            continue_thinking_snapshot
+                        )
                 state.stream_state = StreamState.IDLE
                 continue
             except Exception as exc:  # pragma: no cover — defensive
@@ -780,6 +890,12 @@ def run_chat(args: argparse.Namespace) -> int:
                     if regenerate_thinking_snapshot is not None:
                         state.last_turn_thinking = (
                             regenerate_thinking_snapshot
+                        )
+                if continue_snapshot is not None:
+                    chat_session.replace_messages(continue_snapshot)
+                    if continue_thinking_snapshot is not None:
+                        state.last_turn_thinking = (
+                            continue_thinking_snapshot
                         )
                 state.stream_state = StreamState.IDLE
                 continue
@@ -842,7 +958,20 @@ def run_chat(args: argparse.Namespace) -> int:
 
         # Update post-turn state.
         state.stream_state = StreamState.IDLE
-        state.turn += 1
+        # CHAT-CLI-RESPONSE-POLICY RP-2 / RP-3: track the most
+        # recent finish_reason so /continue can guard against
+        # naturally-completed turns and RP-3's toolbar can render
+        # the ``finish=`` field. Set on every successful chat() AND
+        # continue_last(); resets to ``None`` on /reset, /load,
+        # and any /model swap.
+        state.last_finish_reason = metrics.finish_reason
+        # /continue reuses the previous turn's slot rather than
+        # appending a new (user, assistant) pair; do not bump the
+        # turn counter for it. Cumulative metric counters below
+        # still aggregate continuation tokens / decode time so
+        # /showcase reflects the real work the session performed.
+        if not continue_request:
+            state.turn += 1
         state.last_ttft_ms = metrics.ttft_ms
         if metrics.peak_memory_mb is not None:
             state.peak_memory_mb = metrics.peak_memory_mb
@@ -1010,6 +1139,7 @@ def _handle_session_load(
     state.tok_per_sec = None
     state.last_ttft_ms = None
     state.tokens_generated = 0
+    state.last_finish_reason = None
 
     sys.stdout.write(
         palette.colorize(
@@ -1129,6 +1259,16 @@ def _swap_model(
     state.kv_resident_mb = None
     state.kv_logical_mb = None
     state.prefix_store_mb = None
+    # ``last_finish_reason`` is a runtime-only signal about the
+    # PREVIOUS turn's stop classification — it cannot be
+    # transferred across a model swap because the new tokeniser
+    # would render a different continuation prompt and the
+    # ``/continue`` guard's truthful answer is "this is now a new
+    # session at the model boundary, don't extend a turn the new
+    # model never produced". Cleared on every swap, including
+    # ``--keep-history`` (the conversation text survives, the
+    # finish-reason is not part of that text). See RP-2 commit.
+    state.last_finish_reason = None
     # Conversation-level state: keep iff the history did.
     if not keep_history:
         state.turn = 0
@@ -1307,6 +1447,45 @@ def _resolve_live_toolbar_enabled(
             return False
     config_value = state.config.get("live_toolbar", "off")
     return config_value == "on"
+
+
+def _evaluate_continue_request(
+    chat_session: Any, state: ChatCliState
+) -> tuple[bool, str | None]:
+    """Decide whether ``/continue`` can proceed against the live
+    session.
+
+    CHAT-CLI-RESPONSE-POLICY RP-2 (G2). Returns ``(proceed,
+    warning)`` where ``warning`` is the yellow text the shell
+    should print when ``proceed`` is False; ``None`` when the
+    request can run.
+
+    Two guards:
+
+    1. The session must end with an ``assistant`` message — a
+       fresh session, system-only history, or a trailing-user-only
+       (mid-generation abort) shape has nothing to extend.
+    2. ``state.last_finish_reason`` must be ``"max_tokens"`` —
+       turns that ended naturally (``stop_token`` / ``done`` /
+       ``empty``) are already complete and resuming would
+       hallucinate continuation rather than recover lost output.
+
+    The helper is pure; the shell handles the side effect of
+    snapshotting state and printing the warning.
+    """
+    msgs = chat_session.messages
+    if not msgs or msgs[-1]["role"] != "assistant":
+        return (
+            False,
+            "(/continue: no prior turn to extend)",
+        )
+    if state.last_finish_reason != "max_tokens":
+        return (
+            False,
+            "(/continue: last turn was not truncated; "
+            "nothing to continue)",
+        )
+    return True, None
 
 
 def _resolve_thinking_history(state: ChatCliState) -> str:

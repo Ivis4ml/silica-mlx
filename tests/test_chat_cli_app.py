@@ -27,7 +27,9 @@ import pytest
 
 from silica.chat.cli.app import (
     _apply_system_prompt_request,
+    _assistant_ends_in_thinking,
     _build_prefix_cache,
+    _evaluate_continue_request,
     _resolve_live_toolbar_enabled,
     _resolve_thinking_history,
     _resolve_thinking_mode,
@@ -530,3 +532,286 @@ def test_resolve_live_toolbar_enabled_unrecognised_env_defers_to_config() -> Non
         )
         is True
     )
+
+
+# ---------------------------------------------------------------------------
+# CHAT-CLI-RESPONSE-POLICY RP-2 — _assistant_ends_in_thinking
+# ---------------------------------------------------------------------------
+
+
+def test_assistant_ends_in_thinking_explicit_open_no_close() -> None:
+    """An explicit ``<think>`` with no matching ``</think>`` ends
+    inside the block. Implicit-leading does not need to be set
+    when the open tag is in the text."""
+    assert (
+        _assistant_ends_in_thinking(
+            "<think>partial reasoning",
+            implicit_leading=False,
+        )
+        is True
+    )
+
+
+def test_assistant_ends_in_thinking_balanced_explicit_pair() -> None:
+    """A complete ``<think>...</think>`` pair followed by visible
+    text ends OUTSIDE the block."""
+    assert (
+        _assistant_ends_in_thinking(
+            "<think>reason</think>visible body",
+            implicit_leading=False,
+        )
+        is False
+    )
+
+
+def test_assistant_ends_in_thinking_implicit_leading_no_close() -> None:
+    """Implicit-leading (Qwen3 family) — the model started inside
+    a think block, never emitted ``</think>``. The leading open is
+    not in the text but still counts."""
+    assert (
+        _assistant_ends_in_thinking(
+            "leading reasoning content",
+            implicit_leading=True,
+        )
+        is True
+    )
+
+
+def test_assistant_ends_in_thinking_implicit_leading_with_close() -> None:
+    """Implicit-leading + a single ``</think>`` in the text → the
+    model closed the implicit block and continued in visible
+    territory."""
+    assert (
+        _assistant_ends_in_thinking(
+            "reasoning\n</think>\nvisible answer",
+            implicit_leading=True,
+        )
+        is False
+    )
+
+
+def test_assistant_ends_in_thinking_no_tags_at_all() -> None:
+    """Without implicit-leading and no tags: not in thinking."""
+    assert (
+        _assistant_ends_in_thinking(
+            "plain visible reply",
+            implicit_leading=False,
+        )
+        is False
+    )
+
+
+def test_assistant_ends_in_thinking_nested_open_explicit() -> None:
+    """Multiple opens / closes balance correctly. Two opens, one
+    close → still inside."""
+    assert (
+        _assistant_ends_in_thinking(
+            "<think>first</think>middle<think>second",
+            implicit_leading=False,
+        )
+        is True
+    )
+
+
+def test_assistant_ends_in_thinking_implicit_leading_explicit_open_no_close() -> None:
+    """Implicit + explicit open + no close → 2 opens, 0 closes;
+    still inside."""
+    assert (
+        _assistant_ends_in_thinking(
+            "leading\n</think>\ntext<think>nested",
+            implicit_leading=True,
+        )
+        is True
+    )
+
+
+# ---------------------------------------------------------------------------
+# CHAT-CLI-RESPONSE-POLICY RP-2 — _evaluate_continue_request
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _FakeChatSessionForContinue:
+    """Minimal chat-session shape exposing the message log so the
+    continue-request guard helper can be exercised without a
+    real ``ChatSession``."""
+
+    messages: list[dict[str, str]] = field(default_factory=list)
+
+
+def test_evaluate_continue_request_no_prior_returns_warning() -> None:
+    """An empty message log fails the no-prior-assistant guard."""
+    session = _FakeChatSessionForContinue(messages=[])
+    state = ChatCliState()
+    state.last_finish_reason = "max_tokens"
+    proceed, warning = _evaluate_continue_request(session, state)
+    assert proceed is False
+    assert warning is not None
+    assert "no prior" in warning.lower()
+
+
+def test_evaluate_continue_request_system_only_returns_warning() -> None:
+    """System-only history fails the same guard — no assistant
+    tail to extend."""
+    session = _FakeChatSessionForContinue(
+        messages=[{"role": "system", "content": "be terse"}]
+    )
+    state = ChatCliState()
+    state.last_finish_reason = "max_tokens"
+    proceed, warning = _evaluate_continue_request(session, state)
+    assert proceed is False
+    assert warning is not None
+    assert "no prior" in warning.lower()
+
+
+def test_evaluate_continue_request_user_only_tail_returns_warning() -> None:
+    """A trailing user-only message (mid-generation abort shape)
+    is not a valid continue target."""
+    session = _FakeChatSessionForContinue(
+        messages=[
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "reply"},
+            {"role": "user", "content": "follow-up"},
+        ]
+    )
+    state = ChatCliState()
+    state.last_finish_reason = "max_tokens"
+    proceed, warning = _evaluate_continue_request(session, state)
+    assert proceed is False
+    assert warning is not None
+    assert "no prior" in warning.lower()
+
+
+def test_evaluate_continue_request_not_truncated_returns_warning() -> None:
+    """Last turn ended naturally (``stop_token`` / ``done`` /
+    ``empty``) → guard fails closed."""
+    session = _FakeChatSessionForContinue(
+        messages=[
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "complete reply"},
+        ]
+    )
+    state = ChatCliState()
+    state.last_finish_reason = "stop_token"
+    proceed, warning = _evaluate_continue_request(session, state)
+    assert proceed is False
+    assert warning is not None
+    assert "not truncated" in warning.lower()
+
+
+def test_evaluate_continue_request_none_finish_reason_returns_warning() -> None:
+    """A fresh session (no turns run, ``last_finish_reason``
+    still ``None``) cannot be /continue'd even if a stray
+    assistant message exists."""
+    session = _FakeChatSessionForContinue(
+        messages=[
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "reply"},
+        ]
+    )
+    state = ChatCliState()
+    assert state.last_finish_reason is None
+    proceed, warning = _evaluate_continue_request(session, state)
+    assert proceed is False
+    assert warning is not None
+
+
+def test_evaluate_continue_request_truncated_assistant_proceeds() -> None:
+    """Both guards pass: assistant tail + ``last_finish_reason ==
+    "max_tokens"`` → proceed; warning is ``None``."""
+    session = _FakeChatSessionForContinue(
+        messages=[
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "<think>partial"},
+        ]
+    )
+    state = ChatCliState()
+    state.last_finish_reason = "max_tokens"
+    proceed, warning = _evaluate_continue_request(session, state)
+    assert proceed is True
+    assert warning is None
+
+
+# ---------------------------------------------------------------------------
+# Last-finish-reason lifecycle on ChatCliState
+# ---------------------------------------------------------------------------
+
+
+def test_chat_cli_state_last_finish_reason_default_none() -> None:
+    """Fresh state — no turn has run yet, so the field is ``None``.
+    RP-2's continue guard relies on this default to refuse
+    /continue on a never-used session."""
+    state = ChatCliState()
+    assert state.last_finish_reason is None
+
+
+# ---------------------------------------------------------------------------
+# RP-2 v3: parser-start composition uses the truncation-time snapshot
+# ---------------------------------------------------------------------------
+
+
+def test_continue_parser_start_uses_snapshot_when_mode_flipped_off() -> None:
+    """Scenario: prior turn was generated under
+    ``thinking_mode=on`` (Qwen implicit ``<think>`` prepended) and
+    truncated mid-think. User flips
+    ``/config thinking_mode=off`` before ``/continue``. The
+    snapshot says implicit_leading=True; the live config says
+    False. The shell must compose ``_assistant_ends_in_thinking``
+    with the SNAPSHOT to keep the parser in thinking until the
+    model emits ``</think>`` — otherwise reasoning leaks into
+    the visible transcript."""
+    raw_prefix = "leading reasoning"  # no </think> yet
+    snapshot_implicit_leading = True
+    live_implicit_thinking = False  # mode flipped off
+    snap_or_live = (
+        snapshot_implicit_leading
+        if snapshot_implicit_leading is not None
+        else live_implicit_thinking
+    )
+    parser_start = _assistant_ends_in_thinking(
+        raw_prefix, implicit_leading=snap_or_live
+    )
+    assert parser_start is True
+
+
+def test_continue_parser_start_uses_snapshot_when_mode_flipped_on() -> None:
+    """Mirror scenario: prior turn ran with
+    ``thinking_mode=off`` (no implicit ``<think>`` prepended) and
+    truncated in visible reply. User flips
+    ``/config thinking_mode=on`` before ``/continue``. Snapshot
+    says implicit_leading=False; live says True. Composing with
+    the snapshot keeps the parser OUT of thinking — otherwise the
+    visible reply continuation gets hidden behind the magenta
+    indicator."""
+    raw_prefix = "visible reply prefix"
+    snapshot_implicit_leading = False
+    live_implicit_thinking = True  # mode flipped on
+    snap_or_live = (
+        snapshot_implicit_leading
+        if snapshot_implicit_leading is not None
+        else live_implicit_thinking
+    )
+    parser_start = _assistant_ends_in_thinking(
+        raw_prefix, implicit_leading=snap_or_live
+    )
+    assert parser_start is False
+
+
+def test_continue_parser_start_falls_back_to_live_when_snapshot_none() -> None:
+    """Degenerate path: continue_last invoked on a turn that
+    finished naturally (no snapshot). The shell falls back to the
+    live ``implicit_thinking`` flag — which is the right answer
+    because there is no truncation-time fact to honour."""
+    raw_prefix = "visible reply"
+    snapshot_implicit_leading = None
+    live_implicit_thinking = True
+    snap_or_live = (
+        snapshot_implicit_leading
+        if snapshot_implicit_leading is not None
+        else live_implicit_thinking
+    )
+    parser_start = _assistant_ends_in_thinking(
+        raw_prefix, implicit_leading=snap_or_live
+    )
+    # implicit_leading=True + content has no </think> → True.
+    assert parser_start is True

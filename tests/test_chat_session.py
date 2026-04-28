@@ -2066,3 +2066,889 @@ def test_pending_finalise_snapshot_cleared_on_natural_completion() -> None:
     session.chat("hi")
     assert session._pending_finalize is False
     assert session._pending_finalize_implicit_leading is None
+
+
+# ---------------------------------------------------------------------------
+# CHAT-CLI-RESPONSE-POLICY RP-2 — ChatSession.continue_last
+# ---------------------------------------------------------------------------
+
+
+def _swap_engine(
+    session: ChatSession, *, text: str, eos_id: int | None
+) -> None:
+    """Replace the session's exhausted engine with a fresh one
+    decoding ``text`` byte-for-byte. Tests that drive multiple
+    turns rely on this since ``_FakeEngine`` consumes its tokens
+    list once and a second ``chat()`` / ``continue_last`` would
+    otherwise see no output. Synchronises the session's cached
+    ``_eos_ids`` so the new engine actually stops on the
+    yielded EOS token (the cached set is built at construction
+    and the chat session does not re-read the tokeniser
+    per-turn)."""
+    session._engine = _engine_yielding_text(  # type: ignore[assignment]
+        text, eos_id=eos_id
+    )
+    if eos_id is None:
+        session._tokenizer.eos_token_ids = set()  # type: ignore[attr-defined]
+        session._eos_ids = ()
+    else:
+        session._tokenizer.eos_token_ids = {eos_id}  # type: ignore[attr-defined]
+        session._eos_ids = (eos_id,)
+
+
+def test_continue_last_appends_to_existing_assistant_message() -> None:
+    """``continue_last`` extends the trailing assistant message;
+    no new ``(user, assistant)`` pair is created. The combined
+    text is the prior raw prefix concatenated with the new
+    decoded continuation."""
+    eos = 250
+    raw_prefix = "first half"
+    session, _ = _make_session_for_history_test(
+        reply_text=raw_prefix,
+        eos_id=None,
+        thinking_history="strip",
+        implicit_thinking_supported=False,
+        thinking_mode=False,
+    )
+    session.chat(
+        "hi",
+        sampling_params=SamplingParams(max_tokens=len(raw_prefix)),
+    )
+    # Pre-continue: one (user, assistant) pair with raw prefix.
+    assert [m["role"] for m in session.messages] == [
+        "user",
+        "assistant",
+    ]
+    assert session.messages[-1]["content"] == raw_prefix
+
+    _swap_engine(session, text=" second half", eos_id=eos)
+    metrics = session.continue_last()
+    assert metrics.finish_reason == "stop_token"
+    # Still one (user, assistant) pair — same shape, extended content.
+    assert [m["role"] for m in session.messages] == [
+        "user",
+        "assistant",
+    ]
+    assert session.messages[-1]["content"] == "first half second half"
+    assert metrics.reply == "first half second half"
+    # Raw equals the joined text since there is no thinking content.
+    assert metrics.raw_reply == "first half second half"
+
+
+def test_continue_last_threads_continue_final_message_kwarg() -> None:
+    """``continue_last`` must pass ``continue_final_message=True``
+    to the tokeniser's ``apply_chat_template`` so the assistant
+    slot's close tag is dropped — the model resumes at the exact
+    text boundary it left."""
+    session, _, tok = _build_session(
+        apply_template=_identity_template_via_text,
+        eos_token_ids={250},
+    )
+    # Chat once so there's an assistant message to continue.
+    session.chat("hi")
+    # Replace engine so continue_last has tokens to yield.
+    _swap_engine(session, text="more", eos_id=250)
+    session.continue_last()
+    assert tok.last_apply_template_kwargs is not None
+    assert (
+        tok.last_apply_template_kwargs.get("continue_final_message")
+        is True
+    )
+    # ``add_generation_prompt`` must NOT be set for continuation —
+    # otherwise the template would inject a fresh <|im_start|>assistant
+    # boundary and the model would not resume in-place.
+    assert (
+        tok.last_apply_template_kwargs.get("add_generation_prompt")
+        is not True
+    )
+
+
+def test_continue_last_falls_back_when_continue_final_message_unsupported() -> None:
+    """Tokenisers that raise on ``continue_final_message`` route
+    through the manual block-list fallback. The fallback's last
+    assistant message has NO closing ``<|im_end|>`` so the model
+    resumes from the existing content."""
+
+    def template_that_refuses_continue(
+        messages: list[dict[str, str]],
+        *,
+        tokenize: bool = False,
+        add_generation_prompt: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        if kwargs.get("continue_final_message"):
+            raise TypeError(
+                "this tokeniser does not support continue_final_message"
+            )
+        rendered = "\n".join(
+            f"<{m['role']}>{m['content']}" for m in messages
+        )
+        if add_generation_prompt:
+            rendered += "\n<assistant>"
+        if tokenize:
+            return [(ord(c) % 200) for c in rendered]
+        return rendered
+
+    session, _, _ = _build_session(
+        apply_template=template_that_refuses_continue,
+        eos_token_ids={250},
+    )
+    session.chat("hi")
+    # Replace engine with a fresh tokens list. ``_swap_engine``
+    # constructs a new ``_FakeEngine`` and binds it to the
+    # session, so we capture that one to inspect what
+    # ``continue_last`` fed to it.
+    _swap_engine(session, text="more", eos_id=250)
+    # session._engine is typed as the narrow ``_EngineLike``
+    # Protocol, so the test fake's ``prompts_seen`` attribute is
+    # not visible to mypy through that path. The cast is what
+    # the rest of the test suite already does for the same
+    # reason (see _build_session's # type: ignore[arg-type]).
+    new_engine: _FakeEngine = session._engine  # type: ignore[assignment]
+    session.continue_last()
+    # Inspect the prompt the new engine saw. The manual fallback
+    # should have run because ``continue_final_message`` raised.
+    # Fallback shape: leading <|im_start|>{role}\n... blocks for
+    # the closed messages, and a trailing
+    # <|im_start|>assistant\n<content> with NO <|im_end|>.
+    last_prompt = new_engine.prompts_seen[-1]
+    assert "<|im_start|>assistant" in last_prompt
+    # The prompt must not end with <|im_end|> — the model resumes
+    # the open assistant slot rather than starting a new one.
+    assert not last_prompt.rstrip().endswith("<|im_end|>")
+
+
+def test_continue_last_finalises_strip_only_on_natural_completion() -> None:
+    """Chained continuation: turn 1 truncates; continue_last truncates
+    again; final continue_last completes naturally → strip applies
+    once at the very end. The raw prefix is preserved across every
+    intermediate boundary."""
+    eos = 250
+    session, _ = _make_session_for_history_test(
+        reply_text="<think>secret",  # mid-think truncation
+        eos_id=None,
+        thinking_history="strip",
+        implicit_thinking_supported=False,
+        thinking_mode=False,
+    )
+    session.chat(
+        "hi",
+        sampling_params=SamplingParams(
+            max_tokens=len("<think>secret")
+        ),
+    )
+    assert session._pending_finalize is True
+    # Continuation 1: still truncates mid-think.
+    _swap_engine(session, text=" more", eos_id=None)
+    session.continue_last(
+        sampling_params=SamplingParams(max_tokens=len(" more"))
+    )
+    # Raw still on assistant; pending state survives.
+    assert session.messages[-1]["content"] == "<think>secret more"
+    assert session._pending_finalize is True
+    # Continuation 2: closes thinking and reaches EOS.
+    _swap_engine(session, text="</think>visible", eos_id=eos)
+    metrics = session.continue_last()
+    assert metrics.finish_reason == "stop_token"
+    # Strip applies to the joined text — explicit pair removed.
+    assert session.messages[-1]["content"] == "visible"
+    assert session._pending_finalize is False
+    assert session._pending_finalize_implicit_leading is None
+
+
+def test_continue_last_preserves_truncation_snapshot_across_chain() -> None:
+    """If thinking_mode flips between the truncated turn and
+    continue_last, the deferred finalise must use the snapshot
+    captured at the original truncation, not the current live
+    mode. Mirrors the chat() snapshot guarantee for chained
+    continuations."""
+    eos = 250
+    raw = "leading reasoning"  # mid-think, no </think>
+    session, _ = _make_session_for_history_test(
+        reply_text=raw,
+        eos_id=None,
+        thinking_history="strip",
+        implicit_thinking_supported=True,
+        thinking_mode=True,
+    )
+    session.chat(
+        "hi",
+        sampling_params=SamplingParams(max_tokens=len(raw)),
+    )
+    # Snapshot captured: implicit_leading=True.
+    assert session._pending_finalize_implicit_leading is True
+    # User flips thinking_mode off; the snapshot must NOT change.
+    session.set_thinking_mode(False)
+    # Chained continuation that truncates again — snapshot should
+    # carry forward unchanged.
+    _swap_engine(session, text=" more reasoning", eos_id=None)
+    session.continue_last(
+        sampling_params=SamplingParams(max_tokens=len(" more reasoning"))
+    )
+    assert session._pending_finalize_implicit_leading is True
+    # Final continuation closes the think block and completes.
+    _swap_engine(session, text="\n</think>\nvisible body", eos_id=eos)
+    session.continue_last()
+    # Strip used the original implicit_leading=True → drops
+    # everything before </think>.
+    assert session.messages[-1]["content"] == "visible body"
+
+
+def test_continue_last_keep_mode_appends_verbatim() -> None:
+    """Under ``thinking_history=keep`` the continuation appends to
+    the assistant message verbatim; no strip, ever."""
+    eos = 250
+    session, _ = _make_session_for_history_test(
+        reply_text="<think>kept",
+        eos_id=None,
+        thinking_history="keep",
+        implicit_thinking_supported=False,
+        thinking_mode=False,
+    )
+    session.chat(
+        "hi",
+        sampling_params=SamplingParams(max_tokens=len("<think>kept")),
+    )
+    # Under keep mode, no defer registered.
+    assert session._pending_finalize is False
+    _swap_engine(session, text="</think>visible", eos_id=eos)
+    metrics = session.continue_last()
+    assert metrics.reply == "<think>kept</think>visible"
+    assert session.messages[-1]["content"] == (
+        "<think>kept</think>visible"
+    )
+
+
+def test_continue_last_raises_when_no_assistant_tail() -> None:
+    """Without a trailing assistant message, ``continue_last``
+    raises immediately. Tested for fresh session, system-only
+    history, and trailing-user-only (mid-generation abort) shape."""
+    # Fresh session.
+    session, _, _ = _build_session()
+    with pytest.raises(RuntimeError, match="continue_last"):
+        session.continue_last()
+    # System-only history.
+    session, _, _ = _build_session(system_prompt="be terse")
+    with pytest.raises(RuntimeError, match="continue_last"):
+        session.continue_last()
+    # Trailing user-only (mid-generation abort shape).
+    session, _, _ = _build_session()
+    session.replace_messages(
+        [{"role": "user", "content": "hi"}]
+    )
+    with pytest.raises(RuntimeError, match="continue_last"):
+        session.continue_last()
+
+
+def test_continue_last_raw_prefix_preserved_across_truncation() -> None:
+    """The raw prefix on a truncated turn is what allows
+    ``continue_last`` to resume mid-``<think>``. Verify the
+    pre-continue assistant message exposes the raw text and the
+    post-continue join produces byte-equivalent concatenation."""
+    eos = 250
+    raw_prefix = "<think>partial reasoning"
+    session, _ = _make_session_for_history_test(
+        reply_text=raw_prefix,
+        eos_id=None,
+        thinking_history="strip",
+        implicit_thinking_supported=False,
+        thinking_mode=False,
+    )
+    session.chat(
+        "hi",
+        sampling_params=SamplingParams(max_tokens=len(raw_prefix)),
+    )
+    # Assistant message holds the raw text (deferred strip).
+    assert session.messages[-1]["content"] == raw_prefix
+    # Continuation completes naturally; final stripped form is
+    # everything after </think>.
+    _swap_engine(session, text="</think>answer", eos_id=eos)
+    session.continue_last()
+    assert session.messages[-1]["content"] == "answer"
+
+
+def test_continue_last_empty_continuation_finalises_existing_prefix() -> None:
+    """If the continuation yields zero tokens (immediate EOS on
+    resume), the existing raw prefix must still be finalised
+    through the snapshot — under strip mode the leading reasoning
+    block gets stripped and pending state clears."""
+    eos = 250
+    raw_prefix = "leading reasoning\n</think>\nvisible"
+    session, _ = _make_session_for_history_test(
+        reply_text=raw_prefix,
+        eos_id=None,
+        thinking_history="strip",
+        implicit_thinking_supported=True,
+        thinking_mode=True,
+    )
+    session.chat(
+        "hi",
+        sampling_params=SamplingParams(max_tokens=len(raw_prefix)),
+    )
+    assert session._pending_finalize is True
+    # Engine yields only EOS on continuation — out_tokens = [eos],
+    # stripped to [], decoded to "". ``_swap_engine`` syncs
+    # session._eos_ids so the EOS-trailing branch in chat() /
+    # continue_last() classifies as ``stop_token``.
+    _swap_engine(session, text="", eos_id=eos)
+    metrics = session.continue_last()
+    assert metrics.finish_reason == "stop_token"
+    # Strip applied via implicit_leading snapshot (True from the
+    # truncated turn). Leading reasoning + </think>\n stripped.
+    assert session.messages[-1]["content"] == "visible"
+    assert session._pending_finalize is False
+
+
+def test_continue_last_fallback_prompt_restores_implicit_thinking_prefix() -> None:
+    """When RP-1's snapshot says the truncated turn was generated
+    inside an implicit ``<think>`` block, the continuation prompt
+    must include the synthetic ``<think>\\n`` prefix in front of
+    the raw assistant content — otherwise the model resumes
+    against a prompt it never saw at the original turn's
+    boundary. The session's stored ``messages[-1].content`` must
+    NOT acquire the synthetic prefix; only the rendered prompt
+    does."""
+    raw = "leading reasoning"  # implicit-leading, no <think> in text
+
+    def template_that_refuses_continue(
+        messages: list[dict[str, str]],
+        *,
+        tokenize: bool = False,
+        add_generation_prompt: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        if kwargs.get("continue_final_message"):
+            raise TypeError(
+                "this tokeniser does not support continue_final_message"
+            )
+        rendered = "\n".join(
+            f"<{m['role']}>{m['content']}" for m in messages
+        )
+        if add_generation_prompt:
+            rendered += "\n<assistant>"
+        if tokenize:
+            return [(ord(c) % 200) for c in rendered]
+        return rendered
+
+    tok = _FakeTokenizer(
+        eos_token_ids=set(),
+        apply_template=template_that_refuses_continue,
+    )
+    adapter = _FakeAdapter(tok)
+    engine = _engine_yielding_text(raw, eos_id=None)
+    session = ChatSession(
+        adapter,  # type: ignore[arg-type]
+        engine,  # type: ignore[arg-type]
+        thinking_mode=True,
+        thinking_history="strip",
+        implicit_thinking_supported=True,
+        reset_peak_memory=lambda: None,
+        read_peak_memory_mb=lambda: 0.0,
+    )
+    session.chat(
+        "hi", sampling_params=SamplingParams(max_tokens=len(raw))
+    )
+    # RP-1 snapshot must say implicit_leading=True for this case.
+    assert session._pending_finalize_implicit_leading is True
+    # Stored message content is the RAW text — no synthetic
+    # <think>\n leakage from the next prompt rendering.
+    assert session.messages[-1]["content"] == raw
+
+    # Replace engine; continue_last invokes the manual fallback
+    # because the template raises on continue_final_message.
+    _swap_engine(session, text="", eos_id=None)
+    new_engine: _FakeEngine = session._engine  # type: ignore[assignment]
+    session.continue_last(
+        sampling_params=SamplingParams(max_tokens=1)
+    )
+    last_prompt = new_engine.prompts_seen[-1]
+    # The fallback prompt must contain the synthetic <think>\n
+    # ahead of the raw prefix so the model's resume position
+    # matches the original generation prompt.
+    assert "<think>\n" + raw in last_prompt
+    # Stored message content is still the raw text post-continue —
+    # the synthetic prefix is a render-time concern only.
+    assert (
+        session.messages[-1]["content"].startswith(raw)
+        and not session.messages[-1]["content"].startswith("<think>")
+    )
+
+
+def test_continue_last_no_implicit_restoration_when_explicit_open_present() -> None:
+    """If the raw prefix already starts with an explicit ``<think>``
+    open tag (e.g. the model emitted it itself rather than receiving
+    it from the template), no synthetic restoration fires — the
+    prompt would otherwise carry two opens."""
+    raw = "<think>explicit open already"
+
+    def template_that_refuses_continue(
+        messages: list[dict[str, str]],
+        *,
+        tokenize: bool = False,
+        add_generation_prompt: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        if kwargs.get("continue_final_message"):
+            raise TypeError("no continue_final_message")
+        rendered = "\n".join(
+            f"<{m['role']}>{m['content']}" for m in messages
+        )
+        if add_generation_prompt:
+            rendered += "\n<assistant>"
+        if tokenize:
+            return [(ord(c) % 200) for c in rendered]
+        return rendered
+
+    tok = _FakeTokenizer(
+        eos_token_ids=set(),
+        apply_template=template_that_refuses_continue,
+    )
+    adapter = _FakeAdapter(tok)
+    engine = _engine_yielding_text(raw, eos_id=None)
+    session = ChatSession(
+        adapter,  # type: ignore[arg-type]
+        engine,  # type: ignore[arg-type]
+        thinking_mode=True,
+        thinking_history="strip",
+        implicit_thinking_supported=True,
+        reset_peak_memory=lambda: None,
+        read_peak_memory_mb=lambda: 0.0,
+    )
+    session.chat(
+        "hi", sampling_params=SamplingParams(max_tokens=len(raw))
+    )
+    assert session._pending_finalize_implicit_leading is True
+    # Continuation prompt should NOT prepend a second <think>\n
+    # because the raw prefix already opens with one.
+    _swap_engine(session, text="", eos_id=None)
+    new_engine: _FakeEngine = session._engine  # type: ignore[assignment]
+    session.continue_last(
+        sampling_params=SamplingParams(max_tokens=1)
+    )
+    last_prompt = new_engine.prompts_seen[-1]
+    # Single <think> total in the rendered prompt — no doubling.
+    assert last_prompt.count("<think>") == 1
+
+
+# ---------------------------------------------------------------------------
+# RP-2 v3: continuation-side implicit-leading snapshot lifecycle
+# ---------------------------------------------------------------------------
+
+
+def test_pending_continuation_set_on_max_tokens_under_strip() -> None:
+    """A truncated turn under ``thinking_history=strip`` registers
+    the continuation snapshot — sample the property after the
+    chat() call so /continue reads the truncation-time fact."""
+    raw = "leading reasoning"
+    session, _ = _make_session_for_history_test(
+        reply_text=raw,
+        eos_id=None,
+        thinking_history="strip",
+        implicit_thinking_supported=True,
+        thinking_mode=True,
+    )
+    session.chat(
+        "hi", sampling_params=SamplingParams(max_tokens=len(raw))
+    )
+    assert session.pending_continuation_implicit_leading is True
+
+
+def test_pending_continuation_set_on_max_tokens_under_keep() -> None:
+    """v2's bug: keep mode + max_tokens cleared the finalise
+    snapshot AND therefore lost the implicit-leading restoration
+    on /continue. v3 splits the snapshots so keep mode also gets
+    a continuation-side record."""
+    raw = "leading reasoning"
+    session, _ = _make_session_for_history_test(
+        reply_text=raw,
+        eos_id=None,
+        thinking_history="keep",
+        implicit_thinking_supported=True,
+        thinking_mode=True,
+    )
+    session.chat(
+        "hi", sampling_params=SamplingParams(max_tokens=len(raw))
+    )
+    # Strip-finalise snapshot stays cleared under keep (RP-1 contract).
+    assert session._pending_finalize_implicit_leading is None
+    # But continuation-side snapshot IS set so /continue can rebuild
+    # the original generation prompt's <think>\n boundary.
+    assert session.pending_continuation_implicit_leading is True
+
+
+def test_pending_continuation_cleared_on_natural_completion() -> None:
+    """A turn that completes naturally has nothing to continue —
+    the snapshot must clear so the next /continue invocation
+    finds ``None`` and falls back to the live config / no-op."""
+    eos = 250
+    session, _ = _make_session_for_history_test(
+        reply_text="<think>x</think>visible",
+        eos_id=eos,
+        thinking_history="strip",
+        implicit_thinking_supported=True,
+        thinking_mode=True,
+    )
+    session.chat("hi")
+    assert session.pending_continuation_implicit_leading is None
+
+
+def test_pending_continuation_cleared_on_new_user_turn() -> None:
+    """A new user turn closes the prior turn — even if the prior
+    turn was truncated, the user moving on means /continue is no
+    longer valid for it. The continuation snapshot clears at
+    chat() entry."""
+    eos = 250
+    raw = "leading reasoning"
+    session, _ = _make_session_for_history_test(
+        reply_text=raw,
+        eos_id=None,
+        thinking_history="strip",
+        implicit_thinking_supported=True,
+        thinking_mode=True,
+    )
+    session.chat(
+        "first", sampling_params=SamplingParams(max_tokens=len(raw))
+    )
+    assert session.pending_continuation_implicit_leading is True
+    # Swap engine for the second turn; finalise will land first,
+    # then continuation snapshot resets at top.
+    _swap_engine(session, text="ack", eos_id=eos)
+    session.chat("second")
+    # Second turn finished naturally — continuation snapshot cleared.
+    assert session.pending_continuation_implicit_leading is None
+
+
+def test_pending_continuation_preserved_across_chained_truncation() -> None:
+    """Chained continue_last that itself truncates must preserve
+    the original truncation-time snapshot — a thinking_mode flip
+    between calls cannot retroactively change the recorded fact."""
+    raw = "leading reasoning"
+    session, _ = _make_session_for_history_test(
+        reply_text=raw,
+        eos_id=None,
+        thinking_history="strip",
+        implicit_thinking_supported=True,
+        thinking_mode=True,
+    )
+    session.chat(
+        "first", sampling_params=SamplingParams(max_tokens=len(raw))
+    )
+    assert session.pending_continuation_implicit_leading is True
+    # Flip thinking_mode off mid-flight; live mode now disagrees
+    # with the truncation-time fact.
+    session.set_thinking_mode(False)
+    _swap_engine(session, text=" more", eos_id=None)
+    session.continue_last(
+        sampling_params=SamplingParams(max_tokens=len(" more"))
+    )
+    # Snapshot preserved at True despite live mode = False.
+    assert session.pending_continuation_implicit_leading is True
+
+
+def test_pending_continuation_cleared_on_reset() -> None:
+    """``reset()`` drops the truncated assistant message; the
+    continuation snapshot must clear so a future chat() does not
+    misroute."""
+    raw = "leading reasoning"
+    session, _ = _make_session_for_history_test(
+        reply_text=raw,
+        eos_id=None,
+        thinking_history="strip",
+        implicit_thinking_supported=True,
+        thinking_mode=True,
+    )
+    session.chat(
+        "hi", sampling_params=SamplingParams(max_tokens=len(raw))
+    )
+    assert session.pending_continuation_implicit_leading is True
+    session.reset()
+    assert session.pending_continuation_implicit_leading is None
+
+
+def test_pending_continuation_cleared_on_replace_messages() -> None:
+    """``/load`` route — wholesale replacement clears the
+    continuation snapshot; the loaded history is independent of
+    whatever truncation state the prior session had."""
+    raw = "leading reasoning"
+    session, _ = _make_session_for_history_test(
+        reply_text=raw,
+        eos_id=None,
+        thinking_history="strip",
+        implicit_thinking_supported=True,
+        thinking_mode=True,
+    )
+    session.chat(
+        "hi", sampling_params=SamplingParams(max_tokens=len(raw))
+    )
+    assert session.pending_continuation_implicit_leading is True
+    session.replace_messages(
+        [{"role": "user", "content": "x"}]
+    )
+    assert session.pending_continuation_implicit_leading is None
+
+
+def test_pending_continuation_cleared_on_pop_last_exchange() -> None:
+    """``/regenerate`` route — popping the last (user, assistant)
+    pair removes the truncation target; continuation snapshot
+    clears so the regenerated turn is not mis-classified."""
+    raw = "leading reasoning"
+    session, _ = _make_session_for_history_test(
+        reply_text=raw,
+        eos_id=None,
+        thinking_history="strip",
+        implicit_thinking_supported=True,
+        thinking_mode=True,
+    )
+    session.chat(
+        "hi", sampling_params=SamplingParams(max_tokens=len(raw))
+    )
+    assert session.pending_continuation_implicit_leading is True
+    session.pop_last_exchange()
+    assert session.pending_continuation_implicit_leading is None
+
+
+def test_continue_last_keep_mode_implicit_leading_restoration() -> None:
+    """Keep mode + implicit-leading + max_tokens: the continuation
+    prompt MUST still prepend the synthetic ``<think>\\n`` even
+    though the strip-finalise snapshot is cleared under keep."""
+    raw = "leading reasoning"
+
+    def template_that_refuses_continue(
+        messages: list[dict[str, str]],
+        *,
+        tokenize: bool = False,
+        add_generation_prompt: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        if kwargs.get("continue_final_message"):
+            raise TypeError("no continue_final_message")
+        rendered = "\n".join(
+            f"<{m['role']}>{m['content']}" for m in messages
+        )
+        if add_generation_prompt:
+            rendered += "\n<assistant>"
+        if tokenize:
+            return [(ord(c) % 200) for c in rendered]
+        return rendered
+
+    tok = _FakeTokenizer(
+        eos_token_ids=set(),
+        apply_template=template_that_refuses_continue,
+    )
+    adapter = _FakeAdapter(tok)
+    engine = _engine_yielding_text(raw, eos_id=None)
+    session = ChatSession(
+        adapter,  # type: ignore[arg-type]
+        engine,  # type: ignore[arg-type]
+        thinking_mode=True,
+        thinking_history="keep",
+        implicit_thinking_supported=True,
+        reset_peak_memory=lambda: None,
+        read_peak_memory_mb=lambda: 0.0,
+    )
+    session.chat(
+        "hi", sampling_params=SamplingParams(max_tokens=len(raw))
+    )
+    # Keep mode: strip-finalise snapshot remains cleared, but
+    # continuation snapshot is set.
+    assert session._pending_finalize_implicit_leading is None
+    assert session.pending_continuation_implicit_leading is True
+
+    _swap_engine(session, text="", eos_id=None)
+    new_engine: _FakeEngine = session._engine  # type: ignore[assignment]
+    session.continue_last(
+        sampling_params=SamplingParams(max_tokens=1)
+    )
+    last_prompt = new_engine.prompts_seen[-1]
+    # Synthetic restoration fired even under keep mode.
+    assert "<think>\n" + raw in last_prompt
+
+
+def test_pending_continuation_independent_of_thinking_history_flip() -> None:
+    """The continuation snapshot tracks the prompt-level fact,
+    not the strip / keep policy. A user flipping
+    ``thinking_history=keep`` after truncation must not lose the
+    snapshot — /continue still needs to rebuild the open think
+    block. Mirror of the strip-mode finalise-snapshot guarantee."""
+    raw = "leading reasoning"
+    session, _ = _make_session_for_history_test(
+        reply_text=raw,
+        eos_id=None,
+        thinking_history="strip",
+        implicit_thinking_supported=True,
+        thinking_mode=True,
+    )
+    session.chat(
+        "hi", sampling_params=SamplingParams(max_tokens=len(raw))
+    )
+    assert session.pending_continuation_implicit_leading is True
+    # User flips history mode to keep — continuation snapshot
+    # must NOT be cleared by this; the truncation fact is still
+    # the same fact.
+    session.set_thinking_history("keep")
+    assert session.pending_continuation_implicit_leading is True
+
+
+# ---------------------------------------------------------------------------
+# RP-2 v4: messages snapshot independence + finalise three-tier fallback
+# ---------------------------------------------------------------------------
+
+
+def test_messages_property_returns_independent_dict_copies() -> None:
+    """``ChatSession.messages`` deep-copies each dict so snapshot
+    callers (notably ``/continue``'s pre-call capture) are
+    decoupled from later in-place mutations of the live message
+    log."""
+    session, _, _ = _build_session(system_prompt="sys")
+    session.chat("hello")
+    snapshot = session.messages
+    # Mutate the snapshot's elements; the live session must NOT
+    # see the change.
+    snapshot[-1]["content"] = "(mutated externally)"
+    snapshot[-1]["role"] = "system"  # extreme, just to be sure
+    live = session.messages
+    assert live[-1]["role"] == "assistant"
+    assert live[-1]["content"] != "(mutated externally)"
+    # Each call also produces fresh dicts — two snapshots taken
+    # back-to-back share no dict references.
+    a = session.messages
+    b = session.messages
+    assert a is not b
+    assert all(da is not db for da, db in zip(a, b, strict=True))
+
+
+def test_messages_snapshot_decoupled_from_continue_last_inplace_write() -> None:
+    """The exact pattern the chat-CLI shell uses: take a snapshot,
+    invoke ``continue_last`` (which writes
+    ``messages[-1]["content"]`` in place at the end of generation),
+    and verify the snapshot still reflects the pre-continue state.
+    Without deep-copy, the snapshot's dict reference would also
+    see the mutation, defeating abort rollback."""
+    eos = 250
+    raw_prefix = "<think>partial"
+    session, _ = _make_session_for_history_test(
+        reply_text=raw_prefix,
+        eos_id=None,
+        thinking_history="strip",
+        implicit_thinking_supported=False,
+        thinking_mode=False,
+    )
+    session.chat(
+        "hi",
+        sampling_params=SamplingParams(max_tokens=len(raw_prefix)),
+    )
+    # Mirror the shell's pre-continue snapshot.
+    snapshot = session.messages
+    pre_continue_assistant = snapshot[-1]["content"]
+    assert pre_continue_assistant == raw_prefix
+    # Run continue_last to natural completion — mutates messages[-1].
+    _swap_engine(session, text="</think>visible", eos_id=eos)
+    session.continue_last()
+    # Live session reflects the new content.
+    assert session.messages[-1]["content"] == "visible"
+    # Snapshot's dict is untouched — abort rollback would restore
+    # the original assistant content correctly.
+    assert snapshot[-1]["content"] == raw_prefix
+
+
+def test_finalise_uses_continuation_snapshot_after_keep_to_strip_switch() -> None:
+    """v3 left a hole: keep+on+truncate → switch to strip+off →
+    /continue completes naturally. The strip-finalise snapshot
+    was never set (keep mode skipped it), and the live mode is
+    now off, so the v3 two-tier fallback would strip with
+    ``implicit_leading=False`` and leak reasoning into history.
+    v4's three-tier fallback consults the continuation snapshot
+    (set on any max_tokens, including keep) and strips
+    correctly."""
+    eos = 250
+    raw = "leading reasoning"  # implicit-leading, no </think>
+    # Turn 1: keep mode + thinking_mode=on, hits max_tokens.
+    session, _ = _make_session_for_history_test(
+        reply_text=raw,
+        eos_id=None,
+        thinking_history="keep",
+        implicit_thinking_supported=True,
+        thinking_mode=True,
+    )
+    session.chat(
+        "hi",
+        sampling_params=SamplingParams(max_tokens=len(raw)),
+    )
+    # Keep mode: no strip-finalise snapshot, but continuation
+    # snapshot IS set.
+    assert session._pending_finalize_implicit_leading is None
+    assert session.pending_continuation_implicit_leading is True
+    # User flips to strip + thinking_mode=off mid-flight.
+    session.set_thinking_history("strip")
+    session.set_thinking_mode(False)
+    # Continuation reaches natural completion: emits </think> and
+    # visible body.
+    _swap_engine(session, text="</think>visible body", eos_id=eos)
+    session.continue_last()
+    # The finalise must use implicit_leading=True (from the
+    # continuation snapshot) — leading reasoning gets stripped.
+    assert session.messages[-1]["content"] == "visible body"
+
+
+def test_finalise_prefers_finalize_snapshot_over_continuation_snapshot() -> None:
+    """First-tier fallback wins: when both snapshots are present,
+    the finalise-side one is consulted. They normally agree, but
+    the order pins the helper's contract."""
+    eos = 250
+    raw = "leading reasoning"
+    session, _ = _make_session_for_history_test(
+        reply_text=raw,
+        eos_id=None,
+        thinking_history="strip",
+        implicit_thinking_supported=True,
+        thinking_mode=True,
+    )
+    session.chat(
+        "hi",
+        sampling_params=SamplingParams(max_tokens=len(raw)),
+    )
+    # Both snapshots present and agreeing.
+    assert session._pending_finalize_implicit_leading is True
+    assert session.pending_continuation_implicit_leading is True
+    # Force a divergence by mutating the continuation snapshot —
+    # tests don't normally do this, but the helper's order
+    # contract is what protects callers when the two fields drift
+    # for any reason.
+    session._pending_continuation_implicit_leading = False
+    # Continuation completes naturally. Strip should use the
+    # FINALIZE snapshot (True) per first-tier preference.
+    _swap_engine(
+        session, text="\n</think>\nvisible body", eos_id=eos
+    )
+    session.continue_last()
+    assert session.messages[-1]["content"] == "visible body"
+
+
+def test_continue_last_chained_truncation_sets_snapshot_when_unset() -> None:
+    """A continue_last invoked on a turn that finished naturally
+    (no prior pending state) but then itself truncates must seed
+    a fresh snapshot. Edge case under the permissive precondition
+    — degenerate but legal."""
+    eos = 250
+    session, _ = _make_session_for_history_test(
+        reply_text="<think>x</think>complete",
+        eos_id=eos,
+        thinking_history="strip",
+        implicit_thinking_supported=True,
+        thinking_mode=True,
+    )
+    session.chat("hi")
+    # Natural completion — pending state cleared.
+    assert session._pending_finalize is False
+    assert session._pending_finalize_implicit_leading is None
+    # Now continue_last on this naturally-completed turn; the
+    # continuation truncates. A fresh snapshot must register so
+    # the eventual finalise has the right implicit_leading.
+    _swap_engine(session, text=" extra", eos_id=None)
+    session.continue_last(
+        sampling_params=SamplingParams(max_tokens=len(" extra"))
+    )
+    assert session._pending_finalize is True
+    # Snapshot captured at this truncation: thinking_mode=True
+    # AND implicit support → True.
+    assert session._pending_finalize_implicit_leading is True

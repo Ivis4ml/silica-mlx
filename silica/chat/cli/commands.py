@@ -88,6 +88,14 @@ class CommandResult:
     request_regenerate: bool = False
     """Shell redoes the previous turn with a fresh sample."""
 
+    request_continue: bool = False
+    """CHAT-CLI-RESPONSE-POLICY RP-2 (G2) signal: shell extends the
+    previous truncated assistant turn via
+    ``ChatSession.continue_last``. Guarded by the shell against (a)
+    no prior assistant message and (b)
+    ``state.last_finish_reason != "max_tokens"``; either guard fails
+    closed with a yellow warning and no session mutation."""
+
     request_session_save: str | None = None
     """Path the shell should serialise the session to."""
 
@@ -252,6 +260,14 @@ def _cmd_regenerate(state: ChatCliState, args: str) -> CommandResult:
     )
 
 
+def _cmd_continue(state: ChatCliState, args: str) -> CommandResult:
+    del state, args
+    return CommandResult(
+        feedback=["continuing last turn..."],
+        request_continue=True,
+    )
+
+
 def _cmd_save(state: ChatCliState, args: str) -> CommandResult:
     del state
     path = args.strip()
@@ -364,6 +380,11 @@ COMMANDS: dict[str, Command] = {
         name="regenerate",
         summary="redo the previous turn with a fresh sample",
         handler=_cmd_regenerate,
+    ),
+    "continue": Command(
+        name="continue",
+        summary="extend the previous turn when it stopped at max_tokens",
+        handler=_cmd_continue,
     ),
     "save": Command(
         name="save",
