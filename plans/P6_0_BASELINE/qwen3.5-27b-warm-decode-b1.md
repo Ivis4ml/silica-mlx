@@ -1,5 +1,17 @@
 # silica-mlx bench report
 
+> **Supersede note (added v1.7.14, post P5.9 step 2(d) — 2026-04-27).**
+> The scenario-description block below contains the literal
+> ``Scenario.description`` text from the v1.7.13 source, which read
+> "peak device memory during the forward is ~30 GB on M5 Pro 48 GB".
+> That figure was inflated by probe double-load; corrected at v1.7.14
+> P5.9 step 2(a) to **~15.3 GB** (the actual forward peak this row
+> measured: see `peak_mb` in the result table). Body left intact as
+> a point-in-time bench-run artefact; current `Scenario.description`
+> in `silica/bench/scenarios.py` has been refreshed to the
+> corrected figure. Re-rendering the report from the current source
+> would update the description block automatically.
+
 Generated: 2026-04-27T13:33:51
 
 Scenarios: total=1 Runs: total=1 ok=1 skipped=0 failed=0

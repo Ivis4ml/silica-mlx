@@ -74,6 +74,8 @@ Cache + `SILICA_REAL_<family>=1`.
 | --- | --- | --- |
 | `qwen3.5-27b-smoke` | `SILICA_REAL_QWEN3_5_27B` | SMOKE, ~16 GB checkpoint |
 | `qwen3.5-27b-warm-decode-b1` | `SILICA_REAL_QWEN3_5_27B` | **P-6 dense primary baseline**, 384-token gen |
+| `qwen3.5-27b-warm-decode-b1-4k` | `SILICA_REAL_QWEN3_5_27B` | sustained 4K-context probe (P5.9 step 2(d)); ~3500-token prompt + 600 max |
+| `qwen3.5-27b-warm-decode-b1-8k` | `SILICA_REAL_QWEN3_5_27B` | sustained 8K-context probe (P5.9 step 2(d)); ~7500-token prompt + 600 max |
 | `qwen3.5-moe-smoke` | `SILICA_REAL_QWEN3_5_MOE` | MoE SMOKE, ~20 GB checkpoint, ~30 GB peak |
 | `qwen3.5-moe-35b-a3b-warm-decode-b1` | `SILICA_REAL_QWEN3_5_MOE` | MoE B=1 warm-decode |
 | `qwen3.5-moe-35b-a3b-warm-decode-b4` | `SILICA_REAL_QWEN3_5_MOE` | **P-6 MoE stretch validator** (≥100 tok/s aggregate gate) |
@@ -81,6 +83,8 @@ Cache + `SILICA_REAL_<family>=1`.
 | `gemma4-31b-b1-parity` | `SILICA_REAL_GEMMA4_31B` | B=1 parity on dense 31B |
 | `gemma4-31b-bgt1-parity` | `SILICA_REAL_GEMMA4_31B` | B=2 parity vs direct mlx-lm |
 | `gemma4-31b-warm-decode-b1` | `SILICA_REAL_GEMMA4_31B` | dense Gemma4-31B warm-decode baseline |
+| `gemma4-31b-warm-decode-b1-4k` | `SILICA_REAL_GEMMA4_31B` | sustained 4K-context probe (P5.9 step 2(d)); sliding/full hybrid layout |
+| `gemma4-31b-warm-decode-b1-8k` | `SILICA_REAL_GEMMA4_31B` | sustained 8K-context probe (P5.9 step 2(d)); sliding-window-capped KV growth |
 | `gemma4-moe-smoke` | `SILICA_REAL_GEMMA4_MOE` | MoE SMOKE, ~16 GB checkpoint |
 | `gemma4-moe-26b-a4b-warm-decode-b1` | `SILICA_REAL_GEMMA4_MOE` | second-MoE-family warm-decode baseline |
 

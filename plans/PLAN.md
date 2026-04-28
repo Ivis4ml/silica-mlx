@@ -1312,16 +1312,37 @@ Append-only. New decisions go at the end; old ones are not edited. Revocations /
        collapse, nested-window rejection, free cleanup, no-snapshot
        failure); full non-real-model suite at landing: 2037 passed /
        25 skipped.
-     - **(d) Sustained 4K / 8K context memory probe.** Extend the
-       P-6.0 warm-decode rows with one new row each on dense
-       Qwen3.5-27B-4bit and Gemma4-31B-4bit at 4K and 8K
-       sustained context, reporting peak under a sustained
-       (not single-forward) decode. The §6(4) "≤36 GB at 4K
-       context" gate currently rests on inference from the
-       384-token P-6.0 baseline; this row verifies it directly
-       and surfaces the headroom margin used by Track C
-       speculative drafts (which expand effective context per
-       step).
+     - **(d) Sustained 4K / 8K context memory probe.**
+       Closed at P5.9 step 2(d): four new bench rows registered in
+       `silica.bench.scenarios.BUILTIN_SCENARIOS` —
+       `qwen3.5-27b-warm-decode-b1-4k` /
+       `qwen3.5-27b-warm-decode-b1-8k` /
+       `gemma4-31b-warm-decode-b1-4k` /
+       `gemma4-31b-warm-decode-b1-8k`. Each reuses the WARM_DECODE
+       oracle (no new judgement logic per the v1.7.14 round-2 scope
+       constraint); `oracle_config` carries `target_context_tokens`
+       and `expected_total_context_floor`. The runner records the
+       actual `prompt_token_count` at run time (via
+       `adapter.tokenizer().encode(prompt)`) and the oracle echoes
+       all of `target_context_tokens` /
+       `expected_total_context_floor` / `prompt_token_counts` /
+       `actual_total_context_per_row` /
+       `actual_total_context_min` / `reached_expected_floor` /
+       `max_tokens` in the JSONL row; under-target outcomes
+       (tokenizer drift) are diagnostic, not gate failures.
+       Real-hardware execution against
+       `SILICA_REAL_QWEN3_5_27B` / `SILICA_REAL_GEMMA4_31B`
+       belongs to P-6.0.5 measurement expansion (D-021 step 3);
+       this step lands the registration + structural contract +
+       metadata schema only.
+       Evidence: `tests/test_warm_decode_extended_context_scenarios.py`
+       (22 tests covering catalog presence, oracle-config shape,
+       gate env vars, workload shape, prompt-character monotonicity
+       4K > 384 / 8K > 4K, and the oracle's metadata-echo behaviour
+       under runner-populated and legacy-runner contexts). Full
+       non-real-model suite at landing: 2063 passed / 7 skipped
+       (was 2037 after step 2(c); +26 = +22 new + 4 catalog
+       parametrisations).
      - **(e) D-009 hot-path audit.** A regression-locked check
        (lint / CI hook or a pinned grep test) verifying no
        `torch.Tensor` / `numpy.ndarray` reaches `silica.engine`

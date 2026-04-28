@@ -1603,6 +1603,24 @@ def _run_warm_decode(
     )
     measurement_steps_min = int(cfg.get("measurement_steps_min", 64))
 
+    # P5.9 step 2(d): extended-context probes record the actual
+    # prompt-token count (tokenizer-dependent; the registration
+    # only chooses a repetition factor against an approximate
+    # ~150-token-per-repeat calibration). The oracle echoes
+    # ``prompt_token_count`` and the configured
+    # ``target_context_tokens`` / ``expected_total_context_floor``
+    # back into the JSONL row so under-target outcomes are
+    # observable rather than silently absorbed by tokenizer drift.
+    target_context_tokens = cfg.get("target_context_tokens")
+    expected_total_context_floor = cfg.get(
+        "expected_total_context_floor"
+    )
+    prompt_token_counts: list[int] = []
+    if target_context_tokens is not None:
+        tokenizer = adapter.tokenizer()
+        for prompt in wl.prompts:
+            prompt_token_counts.append(len(tokenizer.encode(prompt)))
+
     params = _build_sampling_params(wl, adapter)
     if wl.max_batch_size == 1:
         tokens_list, ts_list = _collect_warm_decode_b1(
@@ -1622,6 +1640,15 @@ def _run_warm_decode(
         "warmup_rel_std_threshold": warmup_rel_std_threshold,
         "measurement_steps_min": measurement_steps_min,
     }
+    if target_context_tokens is not None:
+        context["target_context_tokens"] = int(target_context_tokens)
+    if expected_total_context_floor is not None:
+        context["expected_total_context_floor"] = int(
+            expected_total_context_floor
+        )
+    if prompt_token_counts:
+        context["prompt_token_counts"] = prompt_token_counts
+        context["max_tokens"] = wl.max_tokens
     return (tokens, token_ts_ms), context
 
 

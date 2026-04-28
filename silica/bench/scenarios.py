@@ -485,7 +485,9 @@ _QWEN3_5_27B_SMOKE = Scenario(
         "row fills the gap with a four-token greedy generation on "
         "prompt 'Hello'. Dual-gated: the 4-bit checkpoint is "
         "~16 GB on disk and peak device memory during the forward "
-        "is ~30 GB on M5 Pro 48 GB, so opt-in via "
+        "is ~15.3 GB on M5 Pro 48 GB (corrected at v1.7.14 P5.9 "
+        "step 2(a) — the prior ~30.5 GB figure was inflated by "
+        "probe double-load), so opt-in via "
         "SILICA_REAL_QWEN3_5_27B=1 is mandatory."
     ),
 )
@@ -1797,6 +1799,78 @@ _WARM_DECODE_PROMPT = (
 )
 
 
+# P5.9 step 2(d) extended-context calibration. The base
+# ``_WARM_DECODE_PROMPT`` tokenizes to roughly 150 tokens on the Qwen3 /
+# Qwen3.5 / Gemma4 tokenizers (verified empirically against the cached
+# small-model rows). The 4K / 8K extended-context scenarios repeat the
+# base prompt by an integer factor so the resulting prompt
+# **approaches** the target total-context envelope without
+# over-reaching. The runner records the actual ``prompt_token_count``
+# at run time (it has the tokenizer); the oracle echoes
+# ``target_context_tokens`` and ``expected_total_context_floor`` from
+# ``oracle_config`` so a soft / under-target outcome is observable in
+# the JSONL row rather than silently passing through.
+_WARM_DECODE_BASE_TOKENS_PER_REPEAT = 150
+
+
+def _warm_decode_extended_prompt(
+    *, target_context_tokens: int, max_tokens: int
+) -> str:
+    """Build a repeated-base prompt sized to approach
+    ``target_context_tokens`` total context (prompt + ``max_tokens``).
+
+    Per the user-stated v1.7.14 D-021 step 2(d) constraint: do not
+    rely on character-length heuristics for tokenizer-exact
+    calibration; aim for "reaches / approaches the target" and let
+    the runner's actual ``prompt_token_count`` capture the truth.
+    The repetition count is computed against
+    ``_WARM_DECODE_BASE_TOKENS_PER_REPEAT`` (≈150 tokens for
+    ``_WARM_DECODE_PROMPT`` under Qwen3 / Gemma4 tokenizers); a
+    256-token floor on the prompt portion guards against pathological
+    ``target_context_tokens <= max_tokens`` inputs.
+    """
+    target_prompt_tokens = max(
+        target_context_tokens - max_tokens, 256
+    )
+    repeats = max(
+        1,
+        target_prompt_tokens // _WARM_DECODE_BASE_TOKENS_PER_REPEAT,
+    )
+    return " ".join([_WARM_DECODE_PROMPT] * repeats)
+
+
+def _warm_decode_workload_extended(
+    *,
+    max_batch_size: int,
+    max_tokens: int,
+    target_context_tokens: int,
+) -> Workload:
+    """Extended-context variant of :func:`_warm_decode_workload`.
+
+    Builds a long prompt by repeating ``_WARM_DECODE_PROMPT`` so the
+    resulting prompt + ``max_tokens`` approaches
+    ``target_context_tokens``. The exact prompt-token count is
+    determined at runtime by the adapter's tokenizer; this factory
+    only chooses an integer repetition count against the
+    ``_WARM_DECODE_BASE_TOKENS_PER_REPEAT ≈ 150`` calibration. The
+    runner echoes the measured ``prompt_token_count`` into the
+    JSONL row so tokenizer drift is observable.
+    """
+    prompt = _warm_decode_extended_prompt(
+        target_context_tokens=target_context_tokens,
+        max_tokens=max_tokens,
+    )
+    return Workload(
+        name=f"warm-decode-b{max_batch_size}-extended-ctx-{target_context_tokens}",
+        prompts=tuple([prompt] * max_batch_size),
+        max_tokens=max_tokens,
+        max_batch_size=max_batch_size,
+        prefix_cache=False,
+        temperature=0.0,
+        top_p=1.0,
+    )
+
+
 def _warm_decode_workload(
     *, max_batch_size: int, max_tokens: int
 ) -> Workload:
@@ -1888,7 +1962,10 @@ _QWEN3_5_27B_WARM_DECODE_B1 = Scenario(
         "before any Track work begins (Q-C resolution, P6_OPENING "
         "§11). Dual-gated on SILICA_REAL_QWEN3_5_27B because the "
         "checkpoint is ~16 GB on disk and peak device memory during "
-        "the forward is ~30 GB on M5 Pro 48 GB."
+        "sustained decode is ~15.3 GB on M5 Pro 48 GB (corrected at "
+        "v1.7.14 P5.9 step 2(a) — the prior ~30.5 GB figure was "
+        "inflated by probe double-load and is no longer the active "
+        "rationale)."
     ),
 )
 
@@ -1993,6 +2070,145 @@ _GEMMA4_MOE_WARM_DECODE_B1 = Scenario(
 )
 
 
+# --- P5.9 step 2(d) sustained 4K / 8K context memory probes ----------------
+#
+# Per D-021 step 2(d) (v1.7.14): extend the P-6.0 warm-decode rows with
+# 4K and 8K sustained-context probes on dense Qwen3.5-27B-4bit and
+# Gemma4-31B-4bit. The §6(4) RAM headroom gate currently rests on
+# inference from the 384-token P-6.0 baseline; these rows verify it
+# directly under sustained decode at materially longer contexts.
+#
+# Each scenario uses the same WARM_DECODE oracle (no new oracle —
+# scope is data, not judgement). ``oracle_config`` carries the
+# context-target metadata: ``target_context_tokens`` (design
+# anchor), ``expected_total_context_floor`` (soft floor — under-
+# target outcomes are diagnostic, not gate failures, because Qwen3 /
+# Gemma4 tokenizers can drift the prompt token count by ±10%). The
+# runner records ``prompt_token_count`` from
+# ``adapter.tokenizer().encode(prompt)`` and the oracle echoes both
+# the configured targets and the measured count back into the
+# JSONL row.
+#
+# B=4 / sustained MoE / Gemma4-MoE 4K-8K rows are deliberately not
+# registered in this step — D-021 step 2(d) targets dense 27B / 31B
+# at 4K and 8K only. Extending to MoE happens in P-6.0.5 measurement
+# expansion (D-021 step 3) when target-verification microbench data
+# settles the C.x track ROI.
+
+_QWEN3_5_27B_WARM_DECODE_B1_4K = Scenario(
+    id="qwen3.5-27b-warm-decode-b1-4k",
+    repo="mlx-community/Qwen3.5-27B-4bit",
+    workload=_warm_decode_workload_extended(
+        max_batch_size=1,
+        max_tokens=600,
+        target_context_tokens=4096,
+    ),
+    oracle=OracleKind.WARM_DECODE,
+    oracle_config={
+        "target_context_tokens": 4096,
+        "expected_total_context_floor": 3500,
+    },
+    gate_env_var="SILICA_REAL_QWEN3_5_27B",
+    description=(
+        "P5.9 step 2(d): sustained 4K-context memory probe on "
+        "Qwen3.5-27B-4bit. Extends the P-6.0 warm-decode shape to a "
+        "~4K total-context envelope (prompt by ~24x repetition of "
+        "the base warm-decode prompt + max_tokens=600). The "
+        "§6(4) RAM headroom gate (≤36 GB at 4K context) is "
+        "evaluated against this row's reported peak under sustained "
+        "decode — not just the 384-token P-6.0 baseline. "
+        "``oracle_config.target_context_tokens`` and "
+        "``expected_total_context_floor`` are diagnostic anchors; "
+        "the runner records the actual ``prompt_token_count`` so "
+        "tokenizer drift is observable rather than silently absorbed."
+    ),
+)
+
+
+_QWEN3_5_27B_WARM_DECODE_B1_8K = Scenario(
+    id="qwen3.5-27b-warm-decode-b1-8k",
+    repo="mlx-community/Qwen3.5-27B-4bit",
+    workload=_warm_decode_workload_extended(
+        max_batch_size=1,
+        max_tokens=600,
+        target_context_tokens=8192,
+    ),
+    oracle=OracleKind.WARM_DECODE,
+    oracle_config={
+        "target_context_tokens": 8192,
+        "expected_total_context_floor": 7000,
+    },
+    gate_env_var="SILICA_REAL_QWEN3_5_27B",
+    description=(
+        "P5.9 step 2(d): sustained 8K-context memory probe on "
+        "Qwen3.5-27B-4bit. Same shape as the 4K row but the prompt "
+        "is repeated ~50x for an ~8K total-context envelope. "
+        "Surfaces whether the ~32 GB headroom (corrected baseline "
+        "per the v1.7.14 P5.9 step 2(a) probe) covers a 2x-larger "
+        "KV growth before the §6(4) ≤36 GB gate becomes a binding "
+        "constraint. Hybrid DeltaNet's 3:1 deltanet:global ratio "
+        "(48 + 16 layers on 27B) limits attention-KV growth to "
+        "the 16 global layers; the deltanet recurrent state is "
+        "size-stable. So 8K context here costs less RAM than a "
+        "pure-attention model would."
+    ),
+)
+
+
+_GEMMA4_31B_WARM_DECODE_B1_4K = Scenario(
+    id="gemma4-31b-warm-decode-b1-4k",
+    repo="mlx-community/gemma-4-31b-4bit",
+    workload=_warm_decode_workload_extended(
+        max_batch_size=1,
+        max_tokens=600,
+        target_context_tokens=4096,
+    ),
+    oracle=OracleKind.WARM_DECODE,
+    oracle_config={
+        "target_context_tokens": 4096,
+        "expected_total_context_floor": 3500,
+    },
+    gate_env_var="SILICA_REAL_GEMMA4_31B",
+    description=(
+        "P5.9 step 2(d): sustained 4K-context memory probe on "
+        "Gemma4-31B-4bit. Different attention layout from "
+        "Qwen3.5-27B (50 sliding + 10 full instead of 48 deltanet "
+        "+ 16 global) so the 4K-context KV cost profile differs. "
+        "Sliding-window attention caps the per-sliding-layer KV "
+        "footprint at ``sliding_window=1024`` regardless of total "
+        "context, so the 4K-vs-baseline delta is concentrated in "
+        "the 10 full-attention layers. Validates §6(4) RAM headroom "
+        "on the second dense production target."
+    ),
+)
+
+
+_GEMMA4_31B_WARM_DECODE_B1_8K = Scenario(
+    id="gemma4-31b-warm-decode-b1-8k",
+    repo="mlx-community/gemma-4-31b-4bit",
+    workload=_warm_decode_workload_extended(
+        max_batch_size=1,
+        max_tokens=600,
+        target_context_tokens=8192,
+    ),
+    oracle=OracleKind.WARM_DECODE,
+    oracle_config={
+        "target_context_tokens": 8192,
+        "expected_total_context_floor": 7000,
+    },
+    gate_env_var="SILICA_REAL_GEMMA4_31B",
+    description=(
+        "P5.9 step 2(d): sustained 8K-context memory probe on "
+        "Gemma4-31B-4bit. Same sliding-window-capped attention "
+        "layout as the 4K row; the only KV-cost growth between "
+        "4K and 8K is on the 10 full-attention layers. Useful "
+        "as a delta measurement against the Qwen3.5-27B 8K row — "
+        "the two models reach the same total-context envelope "
+        "via very different per-layer KV growth profiles."
+    ),
+)
+
+
 BUILTIN_SCENARIOS: dict[str, Scenario] = {
     _QWEN3_0_6B_SMOKE.id: _QWEN3_0_6B_SMOKE,
     _QWEN3_0_6B_B1_PARITY.id: _QWEN3_0_6B_B1_PARITY,
@@ -2063,6 +2279,12 @@ BUILTIN_SCENARIOS: dict[str, Scenario] = {
     _QWEN3_5_MOE_WARM_DECODE_B2.id: _QWEN3_5_MOE_WARM_DECODE_B2,
     _QWEN3_5_MOE_WARM_DECODE_B4.id: _QWEN3_5_MOE_WARM_DECODE_B4,
     _GEMMA4_MOE_WARM_DECODE_B1.id: _GEMMA4_MOE_WARM_DECODE_B1,
+    # P5.9 step 2(d) — sustained 4K / 8K context memory probes
+    # (dual-gated, real models).
+    _QWEN3_5_27B_WARM_DECODE_B1_4K.id: _QWEN3_5_27B_WARM_DECODE_B1_4K,
+    _QWEN3_5_27B_WARM_DECODE_B1_8K.id: _QWEN3_5_27B_WARM_DECODE_B1_8K,
+    _GEMMA4_31B_WARM_DECODE_B1_4K.id: _GEMMA4_31B_WARM_DECODE_B1_4K,
+    _GEMMA4_31B_WARM_DECODE_B1_8K.id: _GEMMA4_31B_WARM_DECODE_B1_8K,
 }
 
 

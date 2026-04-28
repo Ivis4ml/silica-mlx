@@ -1253,6 +1253,59 @@ def warm_decode_oracle(
         r["decode_tok_s_warm"] for r in per_row.values()
     ) / len(per_row)
 
+    # P5.9 step 2(d) extended-context metadata. Echoed back into the
+    # JSONL row only when the runner populated the corresponding
+    # context keys (legacy WARM_DECODE rows without
+    # ``target_context_tokens`` in their oracle_config see no new
+    # fields, preserving byte-identical metadata for the cache-only
+    # / dense / MoE rows landed at v1.7.13).
+    extended_context_metadata: dict[str, Any] = {}
+    target_context_tokens = context.get("target_context_tokens")
+    if target_context_tokens is not None:
+        extended_context_metadata["target_context_tokens"] = int(
+            target_context_tokens
+        )
+    expected_total_context_floor = context.get(
+        "expected_total_context_floor"
+    )
+    if expected_total_context_floor is not None:
+        extended_context_metadata["expected_total_context_floor"] = int(
+            expected_total_context_floor
+        )
+    prompt_token_counts = context.get("prompt_token_counts")
+    if isinstance(prompt_token_counts, list) and prompt_token_counts:
+        extended_context_metadata["prompt_token_counts"] = list(
+            prompt_token_counts
+        )
+        extended_context_metadata["prompt_token_count_per_row_mean"] = (
+            sum(prompt_token_counts) / len(prompt_token_counts)
+        )
+        # ``actual_total_context`` per row = prompt_token_count[row] +
+        # tokens_emitted[row]; minimum across rows is the most
+        # honest "did we reach the target" floor.
+        actual_total_per_row: list[int] = []
+        for row_idx in sorted(tokens):
+            if row_idx < len(prompt_token_counts):
+                actual_total_per_row.append(
+                    prompt_token_counts[row_idx] + len(tokens[row_idx])
+                )
+        if actual_total_per_row:
+            extended_context_metadata["actual_total_context_per_row"] = (
+                actual_total_per_row
+            )
+            extended_context_metadata["actual_total_context_min"] = min(
+                actual_total_per_row
+            )
+            if expected_total_context_floor is not None:
+                extended_context_metadata[
+                    "reached_expected_floor"
+                ] = min(actual_total_per_row) >= int(
+                    expected_total_context_floor
+                )
+        max_tokens = context.get("max_tokens")
+        if max_tokens is not None:
+            extended_context_metadata["max_tokens"] = int(max_tokens)
+
     metadata: dict[str, Any] = {
         "decode_tok_s_warm_aggregate": decode_tok_s_warm_aggregate,
         "decode_tok_s_warm_per_row_mean": decode_tok_s_warm_per_row_mean,
@@ -1260,6 +1313,7 @@ def warm_decode_oracle(
             t_overlap_end - t_overlap_start
         ),
         "aggregate_overlap_decodes": overlap_decodes,
+        **extended_context_metadata,
         "warmup_min_steps": warmup_min_steps,
         "warmup_rolling_window": warmup_rolling_window,
         "warmup_rel_std_threshold": warmup_rel_std_threshold,
