@@ -479,6 +479,8 @@ def run_chat(args: argparse.Namespace) -> int:
                     result.request_model_swap,
                     args=args,
                     state=state,
+                    keep_history=result.request_model_keep_history,
+                    prior_session=chat_session,
                     get_adapter=adapter_for_repo,
                     engine_cls=Engine,
                     session_cls=ChatSession,
@@ -927,6 +929,8 @@ def _swap_model(
     *,
     args: argparse.Namespace,
     state: ChatCliState,
+    keep_history: bool = False,
+    prior_session: Any = None,
     get_adapter: Any,
     engine_cls: Any,
     session_cls: Any,
@@ -939,12 +943,21 @@ def _swap_model(
     returns ``None`` and the previous (adapter, engine, chat_session)
     triple stays live.
 
-    System prompt is preserved across the swap (read from
+    System prompt is always preserved (read from
     ``state.config["system_prompt"]``). Conversation history is
-    NOT preserved — token IDs from the old tokeniser would not
-    match the new one, so retaining them would silently corrupt
-    the chat template. The user gets a yellow notice making this
-    explicit.
+    preserved iff ``keep_history`` is True (CHAT-CLI-HARDENING-5 /
+    F5): the new ``ChatSession`` is repopulated with the prior
+    session's text-level message log via ``replace_messages``, and
+    the new tokeniser re-tokenises the stored text on the next
+    turn. The fresh prefix cache is empty, so the first
+    post-swap turn's prefill runs full-cost — only the message
+    text is preserved, not the cache state.
+
+    Default ``keep_history=False`` matches the pre-HARDENING-5
+    behaviour: history is dropped and the user gets a notice
+    explaining why. This default avoids silently inheriting a
+    stale conversation when the user picks a model whose chat
+    template / EOS handling differs incompatibly.
     """
     sys.stdout.write(
         palette.colorize(
@@ -966,6 +979,15 @@ def _swap_model(
         )
         sys.stdout.flush()
         return None
+    # Capture text history before building the new session — both
+    # the capture and ``replace_messages`` deep-copy entries, so the
+    # prior session is no longer referenced after this call. Note
+    # that downstream construction failures (engine_cls /
+    # session_cls / cache_builder raising) propagate past
+    # ``_swap_model``; only the ``get_adapter`` raise is caught.
+    captured_messages: list[dict[str, str]] | None = None
+    if keep_history and prior_session is not None:
+        captured_messages = prior_session.messages
     new_engine = engine_cls(new_adapter, new_kv)
     new_cache = cache_builder(new_adapter)
     sys_prompt = state.config.get("system_prompt") or None
@@ -976,33 +998,49 @@ def _swap_model(
         system_prompt=sys_prompt_str,
         prefix_cache=new_cache,
     )
+    if captured_messages is not None:
+        # ``replace_messages`` deep-copies entries; the prior
+        # session is no longer referenced after this call.
+        new_session.replace_messages(captured_messages)
 
-    # Reset state — old tokens are stale under the new tokeniser.
+    # Reset model-derived state regardless of keep_history — the
+    # cache, KV manager, and per-turn metric figures all refer to
+    # the swapped-in model and would mislead if carried forward.
+    # ``tok_per_sec`` is the live decode speed for the in-flight
+    # turn (see ChatCliState.tok_per_sec docstring), not a
+    # conversation-level rolling figure, so it resets here too.
     state.model_name = _model_basename(new_repo)
-    state.turn = 0
-    state.last_turn_thinking = ""
     state.prefix_hit_blocks = None
     state.prefix_hit_max = None
-    state.total_prefix_hit_tokens = 0
-    state.total_decode_tokens = 0
-    state.total_decode_seconds = 0.0
-    state.tok_per_sec = None
     state.last_ttft_ms = None
     state.tokens_generated = 0
+    state.tok_per_sec = None
     state.kv_resident_mb = None
     state.kv_logical_mb = None
     state.prefix_store_mb = None
+    # Conversation-level state: keep iff the history did.
+    if not keep_history:
+        state.turn = 0
+        state.last_turn_thinking = ""
+        state.total_prefix_hit_tokens = 0
+        state.total_decode_tokens = 0
+        state.total_decode_seconds = 0.0
     # Carry the codec_id / system prompt forward unchanged.
     state.codec_id = getattr(args, "kv_codec", None)
 
-    sys.stdout.write(
-        palette.colorize(
-            f"model swapped to {state.model_name}. Conversation "
-            "history reset (tokenisation differs across models).",
-            "cyan",
-            dim=True,
+    if keep_history:
+        notice = (
+            f"model swapped to {state.model_name}. "
+            "Conversation history preserved; the new tokeniser will "
+            "re-tokenise stored messages on the next turn."
         )
-        + "\n"
+    else:
+        notice = (
+            f"model swapped to {state.model_name}. Conversation "
+            "history reset (tokenisation differs across models)."
+        )
+    sys.stdout.write(
+        palette.colorize(notice, "cyan", dim=True) + "\n"
     )
     sys.stdout.flush()
     return new_adapter, new_engine, new_session

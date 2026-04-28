@@ -97,6 +97,16 @@ class CommandResult:
     request_model_swap: str | None = None
     """HF repo id for the shell to re-load."""
 
+    request_model_keep_history: bool = False
+    """CHAT-CLI-HARDENING-5 (F5) signal: when ``True`` (paired
+    with a non-``None`` :attr:`request_model_swap`), the shell
+    preserves the text-level conversation history across the swap
+    via ``ChatSession.replace_messages``. The new tokeniser
+    re-tokenises the stored text on the next turn — token ids are
+    free to differ. Default ``False`` keeps the pre-HARDENING-5
+    behaviour (history reset) so a user who picks an incompatible
+    model does not silently inherit a stale conversation."""
+
     request_expand_thinking: bool = False
     """Shell reprints :attr:`ChatCliState.last_turn_thinking` to
     the conversation log in dimmed-italic style."""
@@ -266,12 +276,35 @@ def _cmd_load(state: ChatCliState, args: str) -> CommandResult:
 
 def _cmd_model(state: ChatCliState, args: str) -> CommandResult:
     del state
-    repo = args.strip()
-    if not repo:
-        return _err("/model: missing repo id. usage: /model <repo_id>")
+    usage = "/model <repo_id> [--keep-history]"
+    parts = args.split()
+    if not parts:
+        return _err(f"/model: missing repo id. usage: {usage}")
+    keep_history = False
+    repo: str | None = None
+    for part in parts:
+        if part == "--keep-history":
+            keep_history = True
+        elif part.startswith("-"):
+            return _err(
+                f"/model: unknown flag {part}. usage: {usage}"
+            )
+        elif repo is None:
+            repo = part
+        else:
+            return _err(
+                f"/model: too many arguments. usage: {usage}"
+            )
+    if repo is None:
+        return _err(f"/model: missing repo id. usage: {usage}")
+    notice = f"swapping model to {repo}"
+    if keep_history:
+        notice += " (keeping history)"
+    notice += "..."
     return CommandResult(
-        feedback=[f"swapping model to {repo}..."],
+        feedback=[notice],
         request_model_swap=repo,
+        request_model_keep_history=keep_history,
     )
 
 
@@ -348,7 +381,7 @@ COMMANDS: dict[str, Command] = {
         name="model",
         summary="swap the active model (full re-load; heavy)",
         handler=_cmd_model,
-        args_help="<repo_id>",
+        args_help="<repo_id> [--keep-history]",
     ),
     "expand": Command(
         name="expand",

@@ -280,12 +280,74 @@ def test_load_missing_path_reports_error() -> None:
 def test_model_carries_repo_in_request() -> None:
     res = dispatch_command("/model Qwen/Qwen3-4B", _state())
     assert res.request_model_swap == "Qwen/Qwen3-4B"
+    # Default: history is reset.
+    assert res.request_model_keep_history is False
 
 
 def test_model_missing_repo_reports_error() -> None:
     res = dispatch_command("/model", _state())
     assert res.error is True
     assert res.request_model_swap is None
+    assert res.request_model_keep_history is False
+
+
+def test_model_keep_history_flag_after_repo() -> None:
+    """``/model <repo> --keep-history`` opts into preserving the
+    conversation history across the swap. CHAT-CLI-HARDENING-5 / F5."""
+    res = dispatch_command(
+        "/model Qwen/Qwen3-4B --keep-history", _state()
+    )
+    assert res.error is False
+    assert res.request_model_swap == "Qwen/Qwen3-4B"
+    assert res.request_model_keep_history is True
+
+
+def test_model_keep_history_flag_before_repo() -> None:
+    """Flag-first ordering also accepted."""
+    res = dispatch_command(
+        "/model --keep-history Qwen/Qwen3-4B", _state()
+    )
+    assert res.error is False
+    assert res.request_model_swap == "Qwen/Qwen3-4B"
+    assert res.request_model_keep_history is True
+
+
+def test_model_unknown_flag_reports_error() -> None:
+    """Unknown flags surface a usage error rather than being
+    silently accepted as a repo id."""
+    res = dispatch_command(
+        "/model Qwen/Qwen3-4B --reset", _state()
+    )
+    assert res.error is True
+    assert res.request_model_swap is None
+    assert res.request_model_keep_history is False
+
+
+def test_model_too_many_args_reports_error() -> None:
+    """Multiple positional args (e.g. two repo ids) is a usage error."""
+    res = dispatch_command(
+        "/model Qwen/Qwen3-4B extra-arg", _state()
+    )
+    assert res.error is True
+    assert res.request_model_swap is None
+
+
+def test_model_keep_history_with_only_flag_reports_missing_repo() -> None:
+    """``/model --keep-history`` with no repo id is a usage error."""
+    res = dispatch_command("/model --keep-history", _state())
+    assert res.error is True
+    assert res.request_model_swap is None
+
+
+def test_help_advertises_model_keep_history_flag() -> None:
+    """``/help`` must surface the ``--keep-history`` flag in the
+    /model usage line. F4's lesson was "help advertised a feature
+    that didn't exist"; the symmetric guard catches "feature
+    exists but help doesn't mention it"."""
+    res = dispatch_command("/help", _state())
+    assert any(
+        "--keep-history" in line for line in res.feedback
+    ), res.feedback
 
 
 # ---------------------------------------------------------------------------
