@@ -235,8 +235,14 @@ mid-session via `/config`):
 | Flag | Purpose |
 | --- | --- |
 | `--model` | HuggingFace repo id (e.g. `Qwen/Qwen3-0.6B`, `Qwen/Qwen3.5-4B`) |
-| `--system` | Initial system prompt; omit for empty system |
+| `--system` | Initial system prompt; omit for the bundled concise default; pass `""` for no system |
 | `--kv-codec` | KV codec id (e.g. `block_tq_b64_b4`); omit for fp16 |
+
+Without `--system`, `silica chat` ships a concise default ("answer
+directly, skip preamble, stop when complete"). Override with
+`--system "..."` or clear with `--system ""`. To disable Qwen3's
+`<think>` reasoning phase entirely (saves tokens), run
+`/config thinking_mode=off` once inside the REPL.
 
 ### 3. Python API — single request
 

@@ -26,6 +26,7 @@ import mlx.core as mx
 import pytest
 
 from silica.chat.cli.app import (
+    DEFAULT_SYSTEM_PROMPT,
     _apply_rollback_snapshot,
     _apply_system_prompt_request,
     _assistant_ends_in_thinking,
@@ -33,6 +34,7 @@ from silica.chat.cli.app import (
     _capture_rollback_snapshot,
     _evaluate_continue_request,
     _print_truncation_marker,
+    _resolve_initial_system_prompt,
     _resolve_live_toolbar_enabled,
     _resolve_thinking_history,
     _resolve_thinking_mode,
@@ -1055,6 +1057,59 @@ def test_apply_rollback_snapshot_idempotent_under_repeated_apply() -> None:
         state.last_turn_reasoning_chars,
         state.last_turn_visible_chars,
     ) == snapshot_after_first
+
+
+# ---------------------------------------------------------------------------
+# Default system prompt + _resolve_initial_system_prompt
+# ---------------------------------------------------------------------------
+
+
+def test_default_system_prompt_is_a_concise_string() -> None:
+    """``DEFAULT_SYSTEM_PROMPT`` is a non-empty plain-text string
+    of moderate length — concise enough to not bloat every turn's
+    prompt, long enough to convey the directives. The string-shape
+    asserts also pin the basic content (avoid an accidental empty
+    or all-whitespace value)."""
+    assert isinstance(DEFAULT_SYSTEM_PROMPT, str)
+    assert DEFAULT_SYSTEM_PROMPT.strip() == DEFAULT_SYSTEM_PROMPT
+    assert 50 <= len(DEFAULT_SYSTEM_PROMPT) <= 400
+    # Core directives the prompt commits to (case-insensitive
+    # substring match — exact wording is allowed to evolve as long
+    # as the spirit holds).
+    lower = DEFAULT_SYSTEM_PROMPT.lower()
+    assert "concise" in lower or "directly" in lower
+    assert "preamble" in lower or "self-narration" in lower or "elaborate" in lower
+
+
+def test_resolve_initial_system_prompt_none_returns_default() -> None:
+    """No ``--system`` flag (``args.system is None``) routes to
+    the bundled default — the silica chat REPL ships with a
+    sensible system prompt out of the box rather than empty."""
+    assert _resolve_initial_system_prompt(None) == DEFAULT_SYSTEM_PROMPT
+
+
+def test_resolve_initial_system_prompt_empty_string_returns_none() -> None:
+    """``--system ""`` is the explicit opt-out: the user wants no
+    system message at all. The helper returns ``None`` so
+    ``ChatSession`` skips the system entry."""
+    assert _resolve_initial_system_prompt("") is None
+
+
+def test_resolve_initial_system_prompt_explicit_text_passes_through() -> None:
+    """Non-empty ``--system`` is the user's override; the helper
+    returns it unchanged. The default does NOT augment a custom
+    prompt — silica chat respects user intent verbatim."""
+    custom = "You are a senior code reviewer. Be terse."
+    assert _resolve_initial_system_prompt(custom) == custom
+
+
+def test_resolve_initial_system_prompt_whitespace_only_passes_through() -> None:
+    """A whitespace-only ``--system "   "`` is unusual but legal;
+    ``ChatSession`` will create a system message with that content.
+    We do NOT silently fall back to the default for whitespace
+    input — the user opted in to something. The helper only
+    triggers the default for the literal ``None`` (no flag)."""
+    assert _resolve_initial_system_prompt("   ") == "   "
 
 
 def test_rollback_full_continue_lifecycle_smoke() -> None:

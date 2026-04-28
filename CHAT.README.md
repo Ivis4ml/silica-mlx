@@ -149,6 +149,62 @@ inside the REPL. Launch surface stays minimal: `--model`,
 `--system`, `--kv-codec`. See `plans/CHAT_CLI_OPENING.md` §6 for the
 rationale.
 
+### Default system prompt
+
+If `--system` is not passed, `silica chat` ships a concise default
+that steers the model towards short, direct replies and away from
+preamble / self-narration / over-elaboration:
+
+```text
+You are a concise assistant. Answer directly: skip preamble, skip
+self-narration, do not over-elaborate. Stop when the answer is
+complete. Reply in the user's language. For code questions, show
+the code first.
+```
+
+Override or clear:
+
+| Launch | Effect |
+| --- | --- |
+| `silica chat --model X` | Default prompt above (silica-mlx pre-set) |
+| `silica chat --model X --system "You are a senior reviewer."` | Custom prompt verbatim |
+| `silica chat --model X --system ""` | No system prompt at all (vanilla model behaviour) |
+| `/system "..."` mid-session | Replace the live system prompt |
+| `/system` (no arg) mid-session | Clear the live system prompt |
+
+The default is appropriate for local Apple-Silicon inference of
+Qwen3 / Qwen3.5 / Gemma4 class models where decode time and
+`max_tokens` budget are usually the user's bottleneck rather than
+reply quality. For Qwen3 with `thinking_mode=on` the prompt is
+read inside the implicit thinking slot too, so the same
+"don't over-elaborate" guidance applies to reasoning the user
+never sees.
+
+### Disabling the model's reasoning entirely
+
+The default prompt asks the model to be concise but does NOT
+disable Qwen3's reasoning phase. To skip the `<think>` block
+entirely (saves tokens, faster TTFT-to-visible-reply on cap-bound
+turns):
+
+```text
+/config thinking_mode=off
+```
+
+This threads `enable_thinking=False` to `apply_chat_template`, so
+Qwen3 generates the visible reply directly — no `<think>...</think>`
+block in the output. Use `/config thinking_mode=on` to re-enable.
+
+The two related axes are independent (see `plans/CHAT_CLI_RESPONSE_POLICY.md`
+Decision E):
+
+- `/config thinking=hidden` — display side; the model still
+  reasons, the visible transcript just folds the block into a
+  magenta "thinking..." indicator.
+- `/config thinking_history=keep` — history side; preserves
+  `<think>` content in the next turn's prompt for archival
+  workflows. Default `strip` keeps history clean.
+
 ## Background — why the venv lives outside iCloud
 
 macOS Sequoia (15.x) tags certain installed files with the

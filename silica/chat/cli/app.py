@@ -82,6 +82,51 @@ from silica.chat.cli.toolbar import (
     render_toolbar,
 )
 
+DEFAULT_SYSTEM_PROMPT = (
+    "You are a concise assistant. Answer directly: skip preamble, "
+    "skip self-narration, do not over-elaborate. Stop when the "
+    "answer is complete. Reply in the user's language. For code "
+    "questions, show the code first."
+)
+"""Out-of-the-box system prompt for ``silica chat`` when the user
+does not pass ``--system``.
+
+silica-mlx targets local Apple-Silicon inference of Qwen3 / Qwen3.5
+/ Gemma4 class models on a 48 GB envelope, where decode time and
+``max_tokens`` budget are the user's bottleneck rather than reply
+quality. The default prompt steers the model towards short, direct
+replies and discourages it from spending its budget on preamble,
+meta-commentary, or self-narration inside the ``<think>`` block.
+For Qwen3 with ``thinking_mode=on`` the prompt is read inside the
+implicit thinking slot too, so the same instructions apply to the
+reasoning text the user never sees.
+
+Override with ``--system "..."`` (custom prompt) or ``--system ""``
+(empty system; useful for vanilla model behaviour). To disable the
+model's reasoning phase entirely, pair the prompt with
+``/config thinking_mode=off`` once inside the REPL.
+"""
+
+
+def _resolve_initial_system_prompt(arg_system: str | None) -> str | None:
+    """Decide the effective system prompt for ``silica chat``.
+
+    Tri-state behaviour:
+
+    - ``arg_system is None`` (no ``--system`` flag) →
+      :data:`DEFAULT_SYSTEM_PROMPT`. The default discourages
+      preamble / meta-commentary / over-elaboration, which is
+      what most local-inference users want against small Qwen3 /
+      Qwen3.5 / Gemma4 checkpoints.
+    - ``arg_system == ""`` (explicit ``--system ""``) → ``None``.
+      The user opts out of any system prompt; the conversation
+      starts with no system message at all.
+    - ``arg_system == "<text>"`` → the literal text, user override.
+    """
+    if arg_system is None:
+        return DEFAULT_SYSTEM_PROMPT
+    return arg_system or None
+
 
 def _model_basename(repo: str) -> str:
     """Strip an HF org prefix and a trailing dtype suffix.
@@ -412,8 +457,9 @@ def run_chat(args: argparse.Namespace) -> int:
         codec_id=getattr(args, "kv_codec", None),
     )
     state.config.update(initial_config())
-    if args.system:
-        state.config["system_prompt"] = args.system
+    initial_system_prompt = _resolve_initial_system_prompt(args.system)
+    if initial_system_prompt is not None:
+        state.config["system_prompt"] = initial_system_prompt
     state.stream_state = StreamState.IDLE
 
     # CHAT-CLI-HARDENING-2 (F2): pass the configured thinking_mode
@@ -427,7 +473,7 @@ def run_chat(args: argparse.Namespace) -> int:
     chat_session = ChatSession(
         adapter,
         engine,  # type: ignore[arg-type]
-        system_prompt=args.system,
+        system_prompt=initial_system_prompt,
         prefix_cache=prefix_cache,
         thinking_mode=_resolve_thinking_mode(state),
         thinking_history=_resolve_thinking_history(state),
