@@ -1343,13 +1343,29 @@ Append-only. New decisions go at the end; old ones are not edited. Revocations /
        non-real-model suite at landing: 2063 passed / 7 skipped
        (was 2037 after step 2(c); +26 = +22 new + 4 catalog
        parametrisations).
-     - **(e) D-009 hot-path audit.** A regression-locked check
-       (lint / CI hook or a pinned grep test) verifying no
-       `torch.Tensor` / `numpy.ndarray` reaches `silica.engine`
-       / `silica.scheduler` / `silica.mlx` / `silica.kvcache`
-       / `silica.models` / `silica.vq` hot path. Today this is
-       enforced at PR review; under P-6's expanding code volume
-       a regression is plausible without an automated gate.
+     - **(e) D-009 hot-path audit.**
+       Closed at P5.9 step 2(e): `tests/test_d009_hot_path_audit.py`
+       walks every `.py` file under the six hot-path packages
+       (`silica.engine` / `silica.scheduler` / `silica.mlx` /
+       `silica.kvcache` / `silica.models` / `silica.vq`) and
+       AST-parses each one to reject any `import torch` /
+       `import numpy` / `from torch...` / `from numpy...` /
+       aliased variants. Comments and docstrings that mention
+       the names do not trigger because they are not AST nodes.
+       The single allowlist entry — `silica/vq/_calibration.py`
+       — covers the D-009-permitted build-time numpy seam
+       (codec `__init__` uploads pre-computed centroids /
+       boundaries to `mx.array` once, then the runtime encode /
+       decode bodies are MLX-native). Five tests pin the
+       contract: enumeration sanity (≥30 files), main no-leak
+       audit, allowlist-entry-exists guard, allowlist-composition
+       pin (forces a deliberate update if a future PR adds a new
+       exception), and a synthetic-violation negative control
+       that locks the AST detection logic against future
+       refactors. Empirical state at landing: 34 files swept,
+       zero violations, single allowlist entry. Full
+       non-real-model suite at landing: 2068 passed / 7 skipped
+       (was 2063 after step 2(d); +5 new D-009 tests).
      - **(f) Speculative-metrics schema.** Define the JSONL
        fields every C.x track will emit before any C.x lands:
        `accept_rate`, `verify_cost_ms`, `draft_cost_ms`,
