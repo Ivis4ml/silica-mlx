@@ -1,0 +1,60 @@
+name: Deploy site to GitHub Pages
+
+# silica-mlx project homepage. Lives under site/ in the repo so the
+# root tree is not polluted by HTML/JSX. GitHub Pages's
+# "Deploy from a branch" source only supports / or /docs as folder
+# choices, so we use the Actions-based deployment path instead:
+# upload site/ as the Pages artifact and let the deploy-pages
+# action publish it.
+#
+# Prerequisite: in repo Settings → Pages, set Source to
+# "GitHub Actions" (not "Deploy from a branch"). Once configured,
+# every push that touches site/ rebuilds the live URL at
+# https://ivis4ml.github.io/silica-mlx/.
+
+on:
+  push:
+    branches:
+      - sonnet
+      - main
+    paths:
+      - 'site/**'
+      - '.github/workflows/deploy-site.yml'
+  workflow_dispatch:
+
+# Pages deployment requires read access to the repo and write
+# access to the Pages environment + an OIDC token for
+# deploy-pages to authenticate.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one concurrent deployment per environment; do not cancel
+# in-progress deploys (they finish quickly and cancellation can
+# leave the live site half-updated).
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload site/ as Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/
+
+      - name: Deploy to Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
