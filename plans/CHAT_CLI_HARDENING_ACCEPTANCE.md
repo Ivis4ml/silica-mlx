@@ -87,6 +87,7 @@ this section do not apply (record that explicitly).
 | 3.4 | Triggered error path (e.g. ill-typed `/config max_tokens=foo` then a turn) | If the turn raises, `[error: ...]` lands on a clean line; no terminal corruption after returning to prompt | `<TODO>` | `<TODO>` | `<TODO>` |
 | 3.5 | After `/exit` | Cursor is on a fresh line; no leftover toolbar text; shell prompt unaffected | `<TODO>` | `<TODO>` | `<TODO>` |
 | 3.6 | Pipe stdout to a file: `python scripts/chat.py --model Qwen/Qwen3-0.6B < /tmp/in > /tmp/out` | File contains streamed text only — no ANSI escape sequences (NullLiveToolbar selected on non-TTY) | `<TODO>` | `<TODO>` | `<TODO>` |
+| 3.7 | After several turns with thinking blocks and code fences | Toolbar text never appears mid-transcript above the latest output; assistant prefix and reply are not eaten by toolbar overlap. Locks the regression mode fixed at commit `eb337d8` (clear toolbar before any cursor-moving streamed text). | `<TODO>` | `<TODO>` | `<TODO>` |
 
 Decision-D reminder: this section verifies the ANSI sticky-bottom-line
 backend, not a full prompt-toolkit `Application`. The latter is
@@ -164,7 +165,7 @@ matches.
 | --- | --- | --- | --- | --- |
 | F1 | `/system` writes config but live session keeps old prompt | `cec2c7f` | §2 row 2.2 | `<TODO: closed / failed>` |
 | F2 | `enable_thinking` not threaded → reasoning leaks when `thinking_mode=off` | `9601f64` | §2 rows 2.3–2.4 | `<TODO>` |
-| F3 | Toolbar refreshes only at prompt phase; tok/s / tokens / state are post-turn snapshots | `b79ee58` | §3 rows 3.1–3.6 | `<TODO>` |
+| F3 | Toolbar refreshes only at prompt phase; tok/s / tokens / state are post-turn snapshots | `b79ee58` (+ hotfix `eb337d8`) | §3 rows 3.1–3.7 | `<TODO>` |
 | F4 | `/regenerate` printed "(not wired yet)" | `52fc44d` | §2 rows 2.5–2.7 | `<TODO>` |
 | F5 | `/model` silently drops history despite plan saying default keeps | `410db40` | §2 rows 2.10–2.12 | `<TODO>` |
 | F6 | ChatSession reads `_store` / `_detached` / `_k_codec` private fields | `3241ab7` | Indirect — automated tests cover the public stats API; live REPL exercises it via `/showcase` (§2 row 2.13) | `<TODO>` |
@@ -240,6 +241,8 @@ remaining placeholders are open work items.
 - `plans/CHAT_CLI_OPENING.md` — original C-1..C-8 design.
 - HARDENING-1..8 commits: `cec2c7f`, `9601f64`, `3241ab7`,
   `52fc44d`, `410db40`, `b79ee58`, `df3bd24`, `9a9d5d3`.
+- HARDENING-6 hotfix: `eb337d8` (live toolbar overlap with
+  generation output; locked by §3 row 3.7).
 - `silica/bench/chat_bench.py` + `scripts/chat_bench.py` — the
   non-interactive harness §4 invokes.
 - `silica/chat/cli/live_toolbar.py` — the §3 backend under test.
