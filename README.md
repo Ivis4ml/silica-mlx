@@ -21,14 +21,11 @@ Qwen3.5-35B-A3B MoE, gemma-4-26B-A4B MoE.
 > streaming for MoE residency remain stubs behind frozen interfaces,
 > scheduled next.
 
-> **Documentation.** Build the full Sphinx site with
-> `pip install -e '.[docs]' && make -C docs html`, then open
-> `docs/_build/html/index.html`. The site bundles the
-> [overview](docs/overview.md), the [chat-CLI guide](docs/chat-cli.md),
-> the [benchmark harness guide](docs/bench.md), the
-> [auto-generated per-module API](docs/api/index.md), the hand-curated
-> [API reference](docs/API.md), and a
-> [curated index into `plans/`](docs/plans-index.md).
+> **Documentation.** Quick links: [chat-CLI guide](CHAT.README.md) ·
+> [API reference](docs/API.md) · [plans index](docs/plans-index.md) ·
+> [PLAN](plans/PLAN.md). For the three reading paths (GitHub direct,
+> local Sphinx build, ReadTheDocs after one-click setup) see
+> [§ Documentation](#documentation) below.
 
 ---
 
