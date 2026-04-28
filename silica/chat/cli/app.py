@@ -3,9 +3,13 @@
 Wires the C-1 palette / state / toolbar and the C-2 slash-command
 dispatcher into a live REPL using ``prompt_toolkit``'s
 ``PromptSession``. Streams tokens from ``ChatSession.chat`` to the
-terminal between prompts; the bottom toolbar refreshes during
-input phases. Live mid-generation toolbar updates land in C-5
-(full-Application layout); C-3 ships the working end-to-end shell.
+terminal between prompts. Two-surface toolbar story: the input
+phase uses ``PromptSession.bottom_toolbar`` (refreshes on each
+keystroke); the generation phase uses the live toolbar backend
+in :mod:`silica.chat.cli.live_toolbar` (HARDENING-6 / F3) for
+per-token ``tokens=N/max`` / ``tok/s`` / ``state=`` updates. See
+``plans/CHAT_CLI_HARDENING.md`` Decision D for why the full
+prompt-toolkit ``Application`` layout is deferred.
 
 Invocation paths after C-3:
 
@@ -35,6 +39,7 @@ Manual smoke checklist — see ``plans/CHAT_CLI_OPENING.md`` §10.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -52,6 +57,10 @@ from silica.chat.cli.commands import (
     is_slash_command,
 )
 from silica.chat.cli.config import initial_config
+from silica.chat.cli.live_toolbar import (
+    RollingTokRate,
+    make_live_toolbar,
+)
 from silica.chat.cli.palette import ColorName, Palette, detect_palette
 from silica.chat.cli.persistence import (
     SessionFileError,
@@ -338,9 +347,10 @@ def run_chat(args: argparse.Namespace) -> int:
     # --- REPL ---
     prompt_str = palette.colorize("You ›", "green", bold=True) + " "
     while True:
-        # Bottom toolbar refreshes only during the prompt; that's
-        # acceptable for C-3 — live mid-generation toolbar lands
-        # at C-5 with a full-Application layout.
+        # ``PromptSession.bottom_toolbar`` covers the input phase;
+        # the generation phase below opens its own live toolbar
+        # backend (HARDENING-6 / F3) so ``tokens=N/max`` / ``tok/s``
+        # / ``state=`` update per-token while the model decodes.
         try:
             user_text = session.prompt(ANSI(prompt_str))
         except KeyboardInterrupt:
@@ -520,6 +530,21 @@ def run_chat(args: argparse.Namespace) -> int:
         state.tokens_generated = 0
         state.max_tokens = int(state.config.get("max_tokens", 1024))
         state.last_turn_thinking = ""
+        # CHAT-CLI-HARDENING-6 (F3): live toolbar backend selection.
+        # ANSI sticky-bottom-line on a capable TTY; no-op fallback
+        # otherwise. ``RollingTokRate`` drives ``state.tok_per_sec``
+        # live during the turn (the post-turn engine snapshot still
+        # overwrites it with the precise figure once chat() returns).
+        live_toolbar = make_live_toolbar(
+            palette=palette,
+            output_stream=sys.stdout,
+            term=os.environ.get("TERM"),
+        )
+        tok_rate = RollingTokRate(window=20)
+        # Per-token timestamp side-state for live tok/s; reset
+        # between turns so the prior turn's samples cannot bleed
+        # into the new window.
+        state.tok_per_sec = None
         thinking_display = str(state.config.get("thinking", "auto"))
         # Qwen3 / Qwen3.5 chat templates append ``<think>\n`` to the
         # *prompt* when ``enable_thinking=True`` (the family default).
@@ -590,6 +615,13 @@ def run_chat(args: argparse.Namespace) -> int:
             # token counter once per call regardless of how the
             # parser splits the delta into events.
             state.tokens_generated += 1
+            # HARDENING-6: live tok/s via a rolling window. The
+            # sample is taken before parser dispatch so the toolbar
+            # refresh below sees the just-incremented rate.
+            tok_rate.record(time.monotonic())
+            rate = tok_rate.rate()
+            if rate is not None:
+                state.tok_per_sec = rate
             for event in parser.feed(delta):
                 if isinstance(event, EnterThinking):
                     # Whatever indicator is currently up (prefill
@@ -627,6 +659,13 @@ def run_chat(args: argparse.Namespace) -> int:
                         state.stream_state = StreamState.DECODE
                     _emit_assistant_prefix_once()
                     _emit_reply_text(event.text)
+            # HARDENING-6: refresh the bottom toolbar so the user
+            # sees ``tokens=N/max``, live ``tok/s``, and the
+            # current ``state=`` value update per-token. The
+            # backend is Null (no-op) on non-TTY / TERM=dumb /
+            # plain-palette environments, so this is safe to call
+            # unconditionally.
+            live_toolbar.refresh(state)
 
         # CHAT-CLI-HARDENING-2 (F2): re-sync the live thinking_mode
         # before each chat() turn so /config thinking_mode=on|off
@@ -639,105 +678,125 @@ def run_chat(args: argparse.Namespace) -> int:
             sync_thinking_mode = None
         chat_session.set_thinking_mode(sync_thinking_mode)
 
-        try:
-            metrics = chat_session.chat(
-                text,
-                sampling_params=params,
-                stream_to=_stream_callback,
-            )
-        except KeyboardInterrupt:
-            if state.stream_state in (
-                StreamState.PREFILL,
-                StreamState.THINKING,
-            ):
-                _clear_phase_indicator()
-            sys.stdout.write(
-                "\n"
-                + palette.colorize("[generation aborted]", "red")
-                + "\n"
-            )
-            sys.stdout.flush()
-            # CHAT-CLI-HARDENING-4 (F4): if this turn was a
-            # regenerate, the pre-pop snapshot restores the original
-            # ``(user, assistant)`` pair that ``pop_last_exchange``
-            # dropped, plus the trailing user-only message that
-            # ``ChatSession.chat`` appended before the abort.
-            # Without this, the user permanently loses the prior
-            # turn whenever regenerate is interrupted.
-            if regenerate_snapshot is not None:
-                chat_session.replace_messages(regenerate_snapshot)
-                if regenerate_thinking_snapshot is not None:
-                    state.last_turn_thinking = (
-                        regenerate_thinking_snapshot
-                    )
-            state.stream_state = StreamState.IDLE
-            continue
-        except Exception as exc:  # pragma: no cover — defensive
-            if state.stream_state in (
-                StreamState.PREFILL,
-                StreamState.THINKING,
-            ):
-                _clear_phase_indicator()
-            sys.stdout.write(
-                "\n"
-                + palette.colorize(f"[error: {exc}]", "red")
-                + "\n"
-            )
-            sys.stdout.flush()
-            if regenerate_snapshot is not None:
-                chat_session.replace_messages(regenerate_snapshot)
-                if regenerate_thinking_snapshot is not None:
-                    state.last_turn_thinking = (
-                        regenerate_thinking_snapshot
-                    )
-            state.stream_state = StreamState.IDLE
-            continue
-        # Drain any text the parser held back as a partial-tag
-        # candidate (e.g. ``<th`` at end of stream without follow-up).
-        for event in parser.finish():
-            if isinstance(event, ThinkingChunk):
-                state.last_turn_thinking += event.text
-            elif isinstance(event, ReplyChunk):
-                _emit_assistant_prefix_once()
-                _emit_reply_text(event.text)
-        # Drain any text the fence parser held back. A truncated
-        # fence yields a final ExitFence so the highlighter still
-        # gets to emit; a held-back partial-open marker becomes
-        # plain text and flushes out untouched.
-        for fevent in fence_parser.finish():
-            if isinstance(fevent, PlainText):
-                if fevent.text:
-                    sys.stdout.write(fevent.text)
-                    sys.stdout.flush()
-            elif isinstance(fevent, ExitFence):
-                _clear_phase_indicator()
-                highlighted = _highlight_code(
-                    fevent.code, fevent.language
+        # HARDENING-6: ``with live_toolbar`` guarantees ``__exit__``
+        # runs on every exit path (success, ``continue`` from an
+        # abort branch, exception bubbling out of the parser
+        # drain). The initial ``refresh`` makes ``state=prefill``
+        # visible during the prefill wait — without it the
+        # reserved line stays blank for the 1-3 seconds of prefill
+        # on bigger models. The Null backend's enter/exit/refresh
+        # are no-ops, so this is safe on non-TTY paths.
+        with live_toolbar:
+            live_toolbar.refresh(state)
+            try:
+                metrics = chat_session.chat(
+                    text,
+                    sampling_params=params,
+                    stream_to=_stream_callback,
                 )
-                sys.stdout.write("\n" + highlighted)
-                if not highlighted.endswith("\n"):
-                    sys.stdout.write("\n")
+            except KeyboardInterrupt:
+                if state.stream_state in (
+                    StreamState.PREFILL,
+                    StreamState.THINKING,
+                ):
+                    _clear_phase_indicator()
+                # Clear the toolbar line before printing the abort
+                # marker so the marker lands on a fresh line rather
+                # than overlapping the toolbar text. The backend
+                # stays active; ``with`` exit handles final teardown.
+                live_toolbar.clear()
+                sys.stdout.write(
+                    "\n"
+                    + palette.colorize("[generation aborted]", "red")
+                    + "\n"
+                )
+                sys.stdout.flush()
+                # CHAT-CLI-HARDENING-4 (F4): if this turn was a
+                # regenerate, the pre-pop snapshot restores the
+                # original ``(user, assistant)`` pair that
+                # ``pop_last_exchange`` dropped, plus the trailing
+                # user-only message that ``ChatSession.chat``
+                # appended before the abort. Without this, the
+                # user permanently loses the prior turn whenever
+                # regenerate is interrupted.
+                if regenerate_snapshot is not None:
+                    chat_session.replace_messages(regenerate_snapshot)
+                    if regenerate_thinking_snapshot is not None:
+                        state.last_turn_thinking = (
+                            regenerate_thinking_snapshot
+                        )
+                state.stream_state = StreamState.IDLE
+                continue
+            except Exception as exc:  # pragma: no cover — defensive
+                if state.stream_state in (
+                    StreamState.PREFILL,
+                    StreamState.THINKING,
+                ):
+                    _clear_phase_indicator()
+                live_toolbar.clear()
+                sys.stdout.write(
+                    "\n"
+                    + palette.colorize(f"[error: {exc}]", "red")
+                    + "\n"
+                )
+                sys.stdout.flush()
+                if regenerate_snapshot is not None:
+                    chat_session.replace_messages(regenerate_snapshot)
+                    if regenerate_thinking_snapshot is not None:
+                        state.last_turn_thinking = (
+                            regenerate_thinking_snapshot
+                        )
+                state.stream_state = StreamState.IDLE
+                continue
+            # Drain any text the parser held back as a partial-tag
+            # candidate (e.g. ``<th`` at end of stream without
+            # follow-up).
+            for event in parser.finish():
+                if isinstance(event, ThinkingChunk):
+                    state.last_turn_thinking += event.text
+                elif isinstance(event, ReplyChunk):
+                    _emit_assistant_prefix_once()
+                    _emit_reply_text(event.text)
+            # Drain any text the fence parser held back. A truncated
+            # fence yields a final ExitFence so the highlighter
+            # still gets to emit; a held-back partial-open marker
+            # becomes plain text and flushes out untouched.
+            for fevent in fence_parser.finish():
+                if isinstance(fevent, PlainText):
+                    if fevent.text:
+                        sys.stdout.write(fevent.text)
+                        sys.stdout.flush()
+                elif isinstance(fevent, ExitFence):
+                    _clear_phase_indicator()
+                    highlighted = _highlight_code(
+                        fevent.code, fevent.language
+                    )
+                    sys.stdout.write("\n" + highlighted)
+                    if not highlighted.endswith("\n"):
+                        sys.stdout.write("\n")
+                    sys.stdout.flush()
+
+            # Empty-reply edge case: generation ended without
+            # emitting a single reply token (everything was
+            # thinking, or no tokens at all). Surface a placeholder
+            # so the log line still shows ``silica ›`` for visual
+            # consistency.
+            if not prefix_emitted[0]:
+                _clear_phase_indicator()
+                sys.stdout.write(
+                    _format_assistant_prefix(palette)
+                    + palette.colorize(
+                        "(no reply — try /expand to see the model's reasoning)"
+                        if state.last_turn_thinking
+                        else "(no reply)",
+                        "grey",
+                        dim=True,
+                    )
+                )
                 sys.stdout.flush()
 
-        # Empty-reply edge case: generation ended without emitting
-        # a single reply token (everything was thinking, or no
-        # tokens at all). Surface a placeholder so the log line
-        # still shows ``silica ›`` for visual consistency.
-        if not prefix_emitted[0]:
-            _clear_phase_indicator()
-            sys.stdout.write(
-                _format_assistant_prefix(palette)
-                + palette.colorize(
-                    "(no reply — try /expand to see the model's reasoning)"
-                    if state.last_turn_thinking
-                    else "(no reply)",
-                    "grey",
-                    dim=True,
-                )
-            )
-            sys.stdout.flush()
-
-        # Newline closes the streamed assistant line.
+        # ``with`` exited — toolbar reserved line cleared. Turn-end
+        # newline now lands on a clean line.
         sys.stdout.write("\n")
         sys.stdout.flush()
 

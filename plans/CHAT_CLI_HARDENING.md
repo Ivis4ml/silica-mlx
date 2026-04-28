@@ -72,7 +72,7 @@ rather than a multi-feature commit.
 | **HARDENING-3** | Public stats API on `RadixPrefixCache` + store (fix F6). Add `RadixPrefixCache.stats() -> PrefixCacheStats` (resident_bytes, logical_bytes, num_blocks, num_codec_codes if applicable). `ChatSession` switches off the `_store` / `_detached` / `_k_codec` reads. | `silica/kvcache/prefix.py`, `silica/kvcache/store.py`, `silica/chat/session.py` | `tests/test_prefix_cache.py` (or new `tests/test_prefix_cache_stats.py`); `tests/test_chat_session.py` (toolbar metrics path no longer touches private fields). |
 | **HARDENING-4** | Implement `/regenerate` (fix F4). Pop the last assistant turn from `ChatSession`, re-issue `chat()` with the same user prompt + sampling params. Prefix cache wins through Q-012 affirmative resolution — second turn's prefix is already stored. | `silica/chat/session.py` (drop_last_assistant_turn or similar), `silica/chat/cli/app.py` | `tests/test_chat_session.py` (drop-last invariant); `tests/test_chat_cli_commands.py` (request_regenerate flow). |
 | **HARDENING-5** | `/model --keep-history` honours plan (fix F5). Default behaviour stays "drop history" but adds an explicit flag (or default flips, with explicit `--reset` to drop). Either way, the plan / impl mismatch resolves. New tokeniser re-tokenises stored text messages; prefix cache invalidates because the new model has a different cache namespace. | `silica/chat/cli/app.py`, possibly `silica/chat/cli/commands.py` | `tests/test_chat_cli_commands.py` (model-swap with kept history). |
-| **HARDENING-6** | Live bottom toolbar (fix F3). Replace the inline indicator with a real prompt-toolkit `Application` layout that updates per-token: `tokens=N/max`, `tok/s` rolling window, `state=prefill|thinking|decode`. Post-turn fields (TTFT, peak, prefix-hit, compr) settle once. | `silica/chat/cli/app.py` (substantial rewrite of the generation phase), `silica/chat/cli/toolbar.py` | `tests/test_chat_cli_toolbar.py` (live-update path on a fake clock); manual smoke. |
+| **HARDENING-6** | Live bottom toolbar backend (fix F3). Pluggable backend so the chat-turn flow can request live refreshes per token without committing to one rendering strategy. Ship the ANSI sticky-bottom-line backend now (cursor save / restore around the streamed text); leave the prompt-toolkit `Application` backend optional and deferred — see Decision D below. The chat-turn flow updates `tokens=N/max`, live `tok/s` (rolling window), and `state=prefill|thinking|decode` per token; post-turn fields (TTFT, peak, prefix-hit, compr) settle once. Null backend on non-TTY / `TERM=dumb` / plain palette so file-redirected output stays clean. | `silica/chat/cli/live_toolbar.py` (new), `silica/chat/cli/app.py` (generation phase wires `with live_toolbar:` and a `RollingTokRate`) | `tests/test_chat_cli_live_toolbar.py` (StringIO sequence checks; fake-clock rolling tok/s; backend-selection table; abort-path `__exit__` lock). |
 | **HARDENING-7** | Non-interactive metric harness (`scripts/chat_bench.py`?). Three-turn shared-prompt run; reports first-turn TTFT, second-turn TTFT (prefix-hit), third-turn TTFT, codec compr if installed. Locks the Q-012 cross-turn prefix-reuse claim end-to-end on real prompts (not just the unit-test fake cohort). | new `scripts/chat_bench.py`, possibly extends `silica.bench` | `tests/test_chat_bench.py`. |
 | **HARDENING-8** | App-layer unit tests for the helper functions GPT named: `_build_prefix_cache`, `_sampling_params_from_state`, system-prompt propagation flow, thinking-template kwargs flow. | `tests/test_chat_cli_app.py` (new). | New tests only. |
 | **HARDENING-9** | Manual real-model acceptance pass (Qwen3-0.6B fp16; Qwen3.5-4B + BlockTQ; three-turn long-context prefix hit). | none (acceptance run only); produces `plans/CHAT_CLI_HARDENING_ACCEPTANCE.md`. | none. |
@@ -145,7 +145,52 @@ hardening for free.
 
 ---
 
-## 6. Cross-references
+## 6. Decisions
+
+### Decision D — full prompt-toolkit `Application` backend deferred (HARDENING-6)
+
+**Date:** 2026-04-27.
+**Author:** Xin Zhou.
+
+The original sub-unit table for HARDENING-6 called for a "real
+prompt-toolkit `Application` layout that updates per-token". On
+review, that path materially exceeds what F3 needs: it requires a
+worker-thread engine driver, queue-based token transport, an
+`Application` event loop running concurrently with the synchronous
+chat-turn flow, full-screen layout with a scrollable text Window,
+key bindings, and TTY teardown discipline. The risk surface
+(KeyboardInterrupt propagation, MLX threading semantics, terminal
+state on crash) is concentrated on exactly the paths that the
+pure-Python test infrastructure cannot exercise.
+
+F3's user-visible symptom is narrow: `tokens=N/max`, `tok/s`, and
+`state=prefill|thinking|decode` should update per token during
+generation. A swappable-backend approach with an ANSI
+sticky-bottom-line implementation closes that symptom without
+introducing a parallel UI runtime. The chat-turn flow stays
+synchronous; the live update is one cursor-save / clear / write /
+cursor-restore sequence per token; non-TTY environments fall
+through to a `NullLiveToolbar` that the post-turn
+`PromptSession.bottom_toolbar` already covers.
+
+The full `Application` path remains addressable later. The
+backend interface (`LiveToolbar` ABC) is the seam; an
+`ApplicationLiveToolbar` could replace `AnsiLiveToolbar` at the
+construction site without changing the chat-turn flow. That work
+is appropriate when (and only when) the chat CLI grows additional
+TUI affordances that genuinely require an event loop —
+scrollback panes, click-to-pause-resume, live config panel,
+multi-conversation tabs. None of those are F1-F6 concerns.
+
+This decision narrows HARDENING-6's scope from "Application
+backend" to "live toolbar backend, ANSI now, Application
+optional later". The acceptance bar in §5 ("Toolbar updates live
+across `tokens=N/max`, `state=...`, rolling `tok/s`") is
+unchanged.
+
+---
+
+## 7. Cross-references
 
 - `plans/CHAT_CLI_OPENING.md` — original C-1..C-8 design doc.
 - PLAN.md §10 Q-012 — initial-cohort prefix-cache consultation
