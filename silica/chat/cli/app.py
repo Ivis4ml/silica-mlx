@@ -355,6 +355,20 @@ def run_chat(args: argparse.Namespace) -> int:
             continue
 
         # Slash command or chat?
+        # ``regenerate_text`` is set by /regenerate when a prior turn
+        # was successfully popped; the slash branch then falls through
+        # into the chat-turn flow with that text instead of the
+        # normal ``continue``. CHAT-CLI-HARDENING-4 (F4).
+        # ``regenerate_snapshot`` / ``regenerate_thinking_snapshot``
+        # capture the pre-pop session state so the abort / error
+        # branches in the chat-turn flow can roll back if the
+        # regenerated turn fails — without rollback the original
+        # ``(user, assistant)`` pair would be permanently lost and
+        # ``ChatSession`` would be left with a trailing user-only
+        # message.
+        regenerate_text: str | None = None
+        regenerate_snapshot: list[dict[str, str]] | None = None
+        regenerate_thinking_snapshot: str | None = None
         if is_slash_command(text):
             result = dispatch_command(text, state)
             _print_lines(_format_feedback(result, palette))
@@ -401,16 +415,37 @@ def run_chat(args: argparse.Namespace) -> int:
                 sys.stdout.write(expanded + "\n\n")
                 sys.stdout.flush()
             if result.request_regenerate:
-                # C-4 will wire actual regenerate; for v1 print a
-                # "not yet implemented" notice so the command surface
-                # exists but the heavy lift waits its sub-unit.
-                print(
-                    palette.colorize(
-                        "(/regenerate lands at C-4; not wired yet)",
-                        "yellow",
-                        dim=True,
+                # CHAT-CLI-HARDENING-4 (F4): pop the last
+                # ``(user, assistant)`` pair from the session and
+                # re-issue ``chat()`` with the same user prompt.
+                # The prefix cache is **not** invalidated — the
+                # popped user text re-tokenises to identical prompt
+                # ids, so the next turn's peek hits every block of
+                # the prior prefill (Q-012 cross-call reuse). On
+                # an empty / fresh / aborted-turn history,
+                # ``pop_last_exchange`` returns ``None``; report
+                # the no-op and continue to the prompt.
+                # Snapshot before pop so the abort / error branches
+                # in the chat-turn flow can roll back if the
+                # regenerated turn fails. ``messages`` is a shallow
+                # copy of the live list; restore via
+                # ``replace_messages`` which deep-copies entries.
+                pre_pop_snapshot = chat_session.messages
+                pre_pop_thinking = state.last_turn_thinking
+                popped = chat_session.pop_last_exchange()
+                if popped is None:
+                    sys.stdout.write(
+                        palette.colorize(
+                            "(/regenerate: no prior turn to redo)\n",
+                            "yellow",
+                            dim=True,
+                        )
                     )
-                )
+                    sys.stdout.flush()
+                else:
+                    regenerate_text = popped
+                    regenerate_snapshot = pre_pop_snapshot
+                    regenerate_thinking_snapshot = pre_pop_thinking
             if result.request_session_save:
                 _handle_session_save(
                     result.request_session_save,
@@ -462,7 +497,14 @@ def run_chat(args: argparse.Namespace) -> int:
                 report = render_showcase(state, palette=palette)
                 sys.stdout.write(report + "\n")
                 sys.stdout.flush()
-            continue
+            if regenerate_text is None:
+                continue
+            # /regenerate fall-through: feed the popped user prompt
+            # into the regular chat-turn flow below so the same
+            # streaming / parser / metric plumbing applies. The
+            # original ``/regenerate`` line is replaced by the
+            # captured prompt text.
+            text = regenerate_text
 
         # Regular chat turn. Defer the assistant prefix line until
         # the first reply token actually arrives — that way long-
@@ -613,6 +655,19 @@ def run_chat(args: argparse.Namespace) -> int:
                 + "\n"
             )
             sys.stdout.flush()
+            # CHAT-CLI-HARDENING-4 (F4): if this turn was a
+            # regenerate, the pre-pop snapshot restores the original
+            # ``(user, assistant)`` pair that ``pop_last_exchange``
+            # dropped, plus the trailing user-only message that
+            # ``ChatSession.chat`` appended before the abort.
+            # Without this, the user permanently loses the prior
+            # turn whenever regenerate is interrupted.
+            if regenerate_snapshot is not None:
+                chat_session.replace_messages(regenerate_snapshot)
+                if regenerate_thinking_snapshot is not None:
+                    state.last_turn_thinking = (
+                        regenerate_thinking_snapshot
+                    )
             state.stream_state = StreamState.IDLE
             continue
         except Exception as exc:  # pragma: no cover — defensive
@@ -627,6 +682,12 @@ def run_chat(args: argparse.Namespace) -> int:
                 + "\n"
             )
             sys.stdout.flush()
+            if regenerate_snapshot is not None:
+                chat_session.replace_messages(regenerate_snapshot)
+                if regenerate_thinking_snapshot is not None:
+                    state.last_turn_thinking = (
+                        regenerate_thinking_snapshot
+                    )
             state.stream_state = StreamState.IDLE
             continue
         # Drain any text the parser held back as a partial-tag

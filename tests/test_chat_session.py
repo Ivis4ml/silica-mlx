@@ -406,6 +406,188 @@ def test_set_thinking_mode_None_drops_kwarg_on_next_chat() -> None:
     assert "enable_thinking" not in tok.last_apply_template_kwargs
 
 
+# ---------------------------------------------------------------------------
+# pop_last_exchange (CHAT-CLI-HARDENING-4 / F4)
+# ---------------------------------------------------------------------------
+
+
+def test_pop_last_exchange_returns_user_content_and_drops_pair() -> None:
+    """After one full turn, ``pop_last_exchange`` removes the
+    ``(user, assistant)`` pair and returns the popped user text."""
+    session, _, _ = _build_session(engine_tokens=[65, 66, 67])
+    session.chat("hello world")
+    assert session.messages[-1]["role"] == "assistant"
+    assert session.messages[-2]["role"] == "user"
+
+    popped = session.pop_last_exchange()
+    assert popped == "hello world"
+    # Only the system prompt remains (or empty if none).
+    assert all(m["role"] == "system" for m in session.messages)
+
+
+def test_pop_last_exchange_returns_none_on_fresh_session() -> None:
+    """A fresh session has no ``(user, assistant)`` pair; the
+    method returns ``None`` and does not touch the message log."""
+    session, _, _ = _build_session()
+    before = list(session.messages)
+    assert session.pop_last_exchange() is None
+    assert session.messages == before
+
+
+def test_pop_last_exchange_returns_none_when_only_system_present() -> None:
+    """System-only history (no user / assistant turns yet) reports
+    nothing to regenerate."""
+    session, _, _ = _build_session(system_prompt="be terse")
+    assert session.pop_last_exchange() is None
+    assert session.messages == [
+        {"role": "system", "content": "be terse"}
+    ]
+
+
+def test_pop_last_exchange_returns_none_when_last_is_user_only() -> None:
+    """A trailing user-only message (e.g. mid-generation abort
+    leaving the appended user message but no assistant reply) is
+    NOT a valid regenerate target — strict shape returns None."""
+    session, _, _ = _build_session()
+    # Manually shape the history to model an aborted turn: user
+    # message appended but no assistant reply.
+    session.replace_messages(
+        [
+            {"role": "user", "content": "hi"},
+        ]
+    )
+    assert session.pop_last_exchange() is None
+    assert session.messages == [
+        {"role": "user", "content": "hi"}
+    ]
+
+
+def test_pop_last_exchange_preserves_system_prompt() -> None:
+    """The system prompt sits at index 0 and is independent of
+    user / assistant turns; pop_last_exchange must not touch it."""
+    session, _, _ = _build_session(
+        system_prompt="be precise", engine_tokens=[65, 66, 67]
+    )
+    session.chat("hello")
+    popped = session.pop_last_exchange()
+    assert popped == "hello"
+    assert session.messages == [
+        {"role": "system", "content": "be precise"}
+    ]
+
+
+def test_pop_last_exchange_preserves_earlier_turns() -> None:
+    """Multi-turn history: only the most recent
+    ``(user, assistant)`` pair is dropped; earlier turns survive."""
+    session, _, _ = _build_session(engine_tokens=[65, 66, 67])
+    session.chat("first")
+    session.chat("second")
+    popped = session.pop_last_exchange()
+    assert popped == "second"
+    # First turn's pair survives.
+    roles = [m["role"] for m in session.messages]
+    contents = [m["content"] for m in session.messages]
+    assert roles[-2:] == ["user", "assistant"]
+    assert contents[-2] == "first"
+
+
+def test_pop_last_exchange_then_chat_round_trips() -> None:
+    """End-to-end: pop, then re-issue chat() with the returned
+    prompt — the message log returns to a one-turn shape and the
+    next assistant message is freshly generated."""
+    session, engine, _ = _build_session(engine_tokens=[65, 66, 67])
+    session.chat("regen me")
+    n_calls_before = len(engine.prompts_seen)
+    popped = session.pop_last_exchange()
+    assert popped == "regen me"
+
+    session.chat(popped)
+    # One additional engine call.
+    assert len(engine.prompts_seen) == n_calls_before + 1
+    # History shape after regenerate is identical to the original
+    # one-turn shape.
+    roles = [m["role"] for m in session.messages]
+    assert roles[-2:] == ["user", "assistant"]
+    assert session.messages[-2]["content"] == "regen me"
+
+
+def test_pop_last_exchange_does_not_clear_prefix_cache() -> None:
+    """The prefix cache survives the pop — same user text re-
+    tokenises to identical prompt ids, and Q-012 cross-call reuse
+    means the next chat() turn hits the prior prefill exactly."""
+    session, _, pc = _build_session_with_cache()
+    pc_before = session.prefix_cache
+    session.chat("hello")
+    session.pop_last_exchange()
+    # Cache instance unchanged — caller is responsible if they
+    # want to invalidate.
+    assert session.prefix_cache is pc_before
+
+
+def test_messages_snapshot_round_trips_via_replace_messages() -> None:
+    """Load-bearing contract for ``/regenerate`` rollback (F4): the
+    chat-CLI app snapshots ``chat_session.messages`` before
+    ``pop_last_exchange`` and restores via ``replace_messages`` if
+    the regenerated turn aborts. The snapshot must round-trip
+    byte-equivalently — mutating the live session after capturing
+    it must NOT alter the snapshot, and restoring must yield the
+    exact pre-pop state."""
+    session, _, _ = _build_session(
+        system_prompt="be terse", engine_tokens=[65, 66, 67]
+    )
+    session.chat("hello")
+    snapshot = session.messages
+    assert [m["role"] for m in snapshot] == [
+        "system",
+        "user",
+        "assistant",
+    ]
+
+    session.pop_last_exchange()
+    # Snapshot must be unaffected by the pop.
+    assert [m["role"] for m in snapshot] == [
+        "system",
+        "user",
+        "assistant",
+    ]
+
+    # Simulate the app's abort branch appending a user message
+    # (chat() does this before the engine call) then rolling back.
+    session.replace_messages(
+        [*session.messages, {"role": "user", "content": "hello"}]
+    )
+    assert [m["role"] for m in session.messages] == [
+        "system",
+        "user",
+    ]
+    # Rollback restores the pre-pop state byte-equivalently.
+    session.replace_messages(snapshot)
+    assert session.messages == snapshot
+
+
+def test_pop_last_exchange_then_chat_re_peeks_identical_prompt_ids() -> None:
+    """Load-bearing claim for Q-012 cross-call reuse: after
+    ``pop_last_exchange()``, a fresh ``chat()`` with the popped
+    user text must produce identical prompt ids to the original
+    turn — so the cache's ``peek`` call on the regenerated turn is
+    a byte-for-byte replay of the first turn's peek (and would
+    therefore hit every block of the prior prefill if those blocks
+    were inserted)."""
+    session, _, pc = _build_session_with_cache(
+        engine_tokens=[65, 66, 67]
+    )
+    session.chat("regen me")
+    first_peek_ids = list(pc.peek_calls[-1])
+
+    popped = session.pop_last_exchange()
+    assert popped == "regen me"
+
+    session.chat(popped)
+    second_peek_ids = list(pc.peek_calls[-1])
+
+    assert first_peek_ids == second_peek_ids
+
+
 def test_thinking_mode_default_is_None() -> None:
     """ChatSession's default thinking_mode is None (no propagation),
     not True/False. Explicit construction-time / shell-side wiring

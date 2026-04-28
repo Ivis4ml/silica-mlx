@@ -257,6 +257,41 @@ class ChatSession:
             for m in messages
         ]
 
+    def pop_last_exchange(self) -> str | None:
+        """Drop the most recent ``(user, assistant)`` pair from history.
+
+        Returns the popped user content, or ``None`` if the message
+        log does not end with the canonical ``[..., user, assistant]``
+        shape — fresh session, system-only history, or a turn that
+        aborted mid-generation leaving only a user message. Caller
+        pairs the pop with a fresh ``chat(returned_text)`` to
+        regenerate the dropped turn.
+
+        CHAT-CLI-HARDENING-4 (F4): the chat-CLI's ``/regenerate``
+        command pre-HARDENING-4 only printed "(not wired yet)". This
+        method is the session-side support for the wire-up; the
+        shell pops, then re-issues ``chat()`` with the returned user
+        prompt. The prefix cache is intentionally **not**
+        invalidated — the same user text re-tokenises to the same
+        prompt ids, so the cache's ``peek`` hits every block of the
+        prior turn's prefill (Q-012 cross-call prefix reuse,
+        resolved at v1.7.15).
+
+        Strict shape: requires the last two messages to be exactly
+        ``user`` then ``assistant``. A trailing user-only message
+        (mid-generation abort) returns ``None`` rather than
+        regenerating against a half-broken history.
+        """
+        if len(self._messages) < 2:
+            return None
+        if self._messages[-1]["role"] != "assistant":
+            return None
+        if self._messages[-2]["role"] != "user":
+            return None
+        self._messages.pop()  # assistant
+        user_msg = self._messages.pop()
+        return user_msg["content"]
+
     def set_thinking_mode(self, mode: bool | None) -> None:
         """Replace the live session's ``enable_thinking`` propagation.
 
