@@ -64,6 +64,17 @@ read in-editor while iterating.
 - [`P5_F_OPENING.md`](../plans/P5_F_OPENING.md) — pre-RoPE production
   routing via the (3b) projection-output capture path.
 
+### Operational gate (P5.9 step 2(g))
+
+- [`P5_REGRESSION_GATE.md`](../plans/P5_REGRESSION_GATE.md) —
+  operator's how-to for the (4-b) two-part aggregated gate as
+  a P-6 per-track regression contract. Documents both
+  evaluation modes (cheap silica-only pre-merge gate / full
+  silica-vs-vqbench phase-exit attestation), the canonical
+  bench command for each, the v1.7.3 pinned reference values,
+  the per-mode running frequency table, and the
+  drift-investigation playbook.
+
 ### Acceptance evidence
 
 - [`P5_ACCEPTANCE_SWEEP/`](../plans/P5_ACCEPTANCE_SWEEP/) — `bench.py`

@@ -1402,12 +1402,36 @@ Append-only. New decisions go at the end; old ones are not edited. Revocations /
        at landing: 2092 passed / 7 skipped (was 2068 after
        step 2(e); +24 new schema tests).
      - **(g) P-5 quality regression promoted to P-6 per-track
-       gate.** The `qwen3-0.6b-wikitext-ppl-block-tq-b64-b4-vqbench-aligned`
-       (4-b) two-part aggregated gate must pass after every
-       Track A / B / C PR lands, recorded as a Decision Log
-       attestation with the seed-3 mean / SEM numbers. P-6 §6(6)
-       already names this; P5.9 makes it operational by adding
-       a CI check or a dedicated pre-merge bench invocation.
+       gate.**
+       Closed at P5.9 step 2(g): `silica/bench/p5_regression_gate.py`
+       lifts the v1.7.3 / v1.7.4 (4-b) two-part aggregated gate
+       from a one-off acceptance event into an operational
+       pre-merge contract. The module owns the gate decision
+       math (`evaluate_silica_regression` for the cheap
+       silica-only mode the every-PR gate uses;
+       `evaluate_4b_gate` for the full silica-vs-vqbench
+       phase-exit attestation form), the v1.7.3 pinned reference
+       values (`SILICA_V1_7_3_SNAPSHOT` mean +0.511 ± 0.354,
+       `VQBENCH_V1_7_3_SNAPSHOT` mean +0.661 ± 0.347), and the
+       `GateResult` dataclass that captures both the pass / fail
+       decision and the structured greppable reason for the
+       oracle / log channel. The operator's how-to —
+       `plans/P5_REGRESSION_GATE.md` — names the canonical bench
+       command for both modes, the per-mode running frequency
+       (silica-only every PR; full-4b once per phase exit + once
+       per C.x close gate), and the playbook for when the gate
+       fails (confirm reproducibility → bisect → revert vs
+       deliberate snapshot update). Tests in
+       `tests/test_p5_regression_gate.py` (16 cases): both modes
+       on synthetic seed arrays, the v1.7.3 evidence reproduction
+       (`mean_gap = -0.150`, `aggregate_band ≈ 0.572`),
+       per-component band failures (aggregate-only, absolute-only,
+       both), structured failure reasons for empty / mismatched
+       seed arrays, and pinned snapshot immutability + recorded-
+       evidence value pins. Default tolerance for the silica-only
+       mode is 0.5 PPL (≈ 2 × v1.7.3 silica SEM). Full
+       non-real-model suite at landing: 2108 passed / 7 skipped
+       (was 2092 after step 2(f); +16 new gate tests).
      - **(h) Full re-run.** `ruff check silica/ tests/` clean;
        `mypy silica/` clean (currently 73 source files); full
        non-real-model test suite green (currently 2026 passed /
