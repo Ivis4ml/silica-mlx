@@ -275,13 +275,6 @@ def run_chat(args: argparse.Namespace) -> int:
     # exposes it as a read-only property; the runtime contract is
     # satisfied (Protocol member access works either way), only
     # the structural type-check trips.
-    chat_session = ChatSession(
-        adapter,
-        engine,  # type: ignore[arg-type]
-        system_prompt=args.system,
-        prefix_cache=prefix_cache,
-    )
-
     # --- Build state ---
     state = ChatCliState(
         model_name=_model_basename(args.model),
@@ -291,6 +284,25 @@ def run_chat(args: argparse.Namespace) -> int:
     if args.system:
         state.config["system_prompt"] = args.system
     state.stream_state = StreamState.IDLE
+
+    # CHAT-CLI-HARDENING-2 (F2): pass the configured thinking_mode
+    # through to ChatSession at construction so the very first chat
+    # turn renders with the right ``enable_thinking`` kwarg. The
+    # config schema's default is ``True`` (Qwen3 family default);
+    # the shell re-syncs from state.config before each chat() call
+    # (see the chat-turn loop below) so /config thinking_mode=on|off
+    # takes effect on the next turn without requiring a session
+    # rebuild.
+    initial_thinking_mode = state.config.get("thinking_mode")
+    if not isinstance(initial_thinking_mode, bool):
+        initial_thinking_mode = None
+    chat_session = ChatSession(
+        adapter,
+        engine,  # type: ignore[arg-type]
+        system_prompt=args.system,
+        prefix_cache=prefix_cache,
+        thinking_mode=initial_thinking_mode,
+    )
 
     # --- prompt_toolkit session ---
     history_path = Path.home() / ".cache" / "silica" / "chat_history"
@@ -571,6 +583,17 @@ def run_chat(args: argparse.Namespace) -> int:
                         state.stream_state = StreamState.DECODE
                     _emit_assistant_prefix_once()
                     _emit_reply_text(event.text)
+
+        # CHAT-CLI-HARDENING-2 (F2): re-sync the live thinking_mode
+        # before each chat() turn so /config thinking_mode=on|off
+        # takes effect immediately without requiring a session
+        # rebuild. ``state.config["thinking_mode"]`` is bool (the
+        # config schema enforces it); a non-bool value (defensive)
+        # collapses to ``None`` so ChatSession omits the kwarg.
+        sync_thinking_mode = state.config.get("thinking_mode")
+        if not isinstance(sync_thinking_mode, bool):
+            sync_thinking_mode = None
+        chat_session.set_thinking_mode(sync_thinking_mode)
 
         try:
             metrics = chat_session.chat(

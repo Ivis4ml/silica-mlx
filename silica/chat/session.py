@@ -182,6 +182,7 @@ class ChatSession:
         reset_peak_memory: Callable[[], None] | None = None,
         read_peak_memory_mb: Callable[[], float | None] | None = None,
         clock: Callable[[], float] = time.perf_counter,
+        thinking_mode: bool | None = None,
     ) -> None:
         self._adapter = adapter
         self._engine = engine
@@ -198,6 +199,12 @@ class ChatSession:
         self._read_peak_mb = read_peak_memory_mb or _mlx_peak_memory_mb
         self._clock = clock
         self._prefix_cache: _PrefixCacheLike | None = prefix_cache
+        # CHAT-CLI-HARDENING-2 (F2): when non-None, ``_render_prompt``
+        # forwards ``enable_thinking=self._thinking_mode`` to the
+        # tokenizer's ``apply_chat_template``. ``None`` (the default)
+        # omits the kwarg, preserving backward-compat for tokenizers /
+        # templates that do not recognise it.
+        self._thinking_mode: bool | None = thinking_mode
 
     # --- observation -------------------------------------------------
 
@@ -249,6 +256,25 @@ class ChatSession:
             {"role": m["role"], "content": m["content"]}
             for m in messages
         ]
+
+    def set_thinking_mode(self, mode: bool | None) -> None:
+        """Replace the live session's ``enable_thinking`` propagation.
+
+        CHAT-CLI-HARDENING-2 (F2): the chat-CLI's
+        ``/config thinking_mode=on|off`` command pre-HARDENING-2
+        flipped the parser-side ``start_in_thinking`` only —
+        ``apply_chat_template`` was never told about the new mode, so
+        the model continued emitting reasoning regardless of the
+        user's preference. This method is the live-session update
+        side of the fix; the next ``chat()`` call's
+        ``_render_prompt`` forwards the new value to the template
+        if non-``None``.
+
+        Pass ``None`` to drop the kwarg from future template calls
+        entirely (the tokenizer / model family default applies).
+        Pass ``True`` / ``False`` to force the corresponding mode.
+        """
+        self._thinking_mode = mode
 
     def set_system_prompt(self, text: str | None) -> None:
         """Replace (or clear) the live session's system prompt.
@@ -621,12 +647,20 @@ class ChatSession:
         )
         if callable(apply_template):
             try:
+                # CHAT-CLI-HARDENING-2 (F2): forward
+                # ``enable_thinking`` only when the session has an
+                # explicit mode set. ``None`` (the default) omits the
+                # kwarg so tokenizers without thinking-mode support
+                # do not receive an unrecognised parameter and
+                # families with their own default mode keep it.
+                template_kwargs: dict[str, Any] = {
+                    "tokenize": True,
+                    "add_generation_prompt": True,
+                }
+                if self._thinking_mode is not None:
+                    template_kwargs["enable_thinking"] = self._thinking_mode
                 prompt_ids = list(
-                    apply_template(
-                        self._messages,
-                        tokenize=True,
-                        add_generation_prompt=True,
-                    )
+                    apply_template(self._messages, **template_kwargs)
                 )
                 prompt_text = self._tokenizer.decode(prompt_ids)
                 return prompt_text, prompt_ids

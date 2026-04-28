@@ -62,13 +62,23 @@ class _FakeTokenizer:
         *,
         tokenize: bool = False,
         add_generation_prompt: bool = False,
+        **kwargs: Any,
     ) -> Any:
         if self._apply_template is None:
             raise AttributeError("apply_chat_template disabled in this fake")
+        # Record the kwargs so HARDENING-2 tests can assert which
+        # template parameters ChatSession forwarded (notably
+        # ``enable_thinking``).
+        self.last_apply_template_kwargs = {
+            "tokenize": tokenize,
+            "add_generation_prompt": add_generation_prompt,
+            **kwargs,
+        }
         return self._apply_template(
             messages,
             tokenize=tokenize,
             add_generation_prompt=add_generation_prompt,
+            **kwargs,
         )
 
 
@@ -156,6 +166,7 @@ def _build_session(
     apply_template: Callable[..., Any] | None = None,
     engine_tokens: list[int] | None = None,
     peak_memory_mb: float | None = 128.0,
+    thinking_mode: bool | None = None,
 ) -> tuple[ChatSession, _FakeEngine, _FakeTokenizer]:
     tok = _FakeTokenizer(
         eos_token_ids=eos_token_ids if eos_token_ids is not None else {99},
@@ -177,6 +188,7 @@ def _build_session(
     session = ChatSession(
         adapter,
         engine,
+        thinking_mode=thinking_mode,
         system_prompt=system_prompt,
         reset_peak_memory=fake_reset,
         read_peak_memory_mb=fake_read,
@@ -298,6 +310,118 @@ def test_set_system_prompt_takes_effect_in_next_chat_render() -> None:
     last_prompt = engine.prompts_seen[-1]
     assert "sys-replacement" in last_prompt
     assert "sys-original" not in last_prompt
+
+
+# ---------- thinking_mode threading (CHAT-CLI-HARDENING-2, F2) ------
+
+
+def _identity_template_via_text(
+    messages: list[dict[str, str]],
+    *,
+    tokenize: bool = False,
+    add_generation_prompt: bool = False,
+    **kwargs: Any,
+) -> Any:
+    """Test apply_chat_template that renders messages by joining
+    role / content with a separator the test can pattern-match.
+    Returns token IDs when ``tokenize=True``; the kwargs are
+    accepted but ignored — the recording lives on the
+    ``_FakeTokenizer.last_apply_template_kwargs`` attribute."""
+    del kwargs  # consumed via the fake's recording, not by this template
+    rendered = "\n".join(f"<{m['role']}>{m['content']}" for m in messages)
+    if add_generation_prompt:
+        rendered += "\n<assistant>"
+    if tokenize:
+        return [(ord(c) % 200) for c in rendered]
+    return rendered
+
+
+def test_thinking_mode_True_threads_enable_thinking_kwarg() -> None:
+    """Pre-HARDENING-2 the chat template was called without
+    ``enable_thinking``, so toggling /config thinking_mode=on/off
+    only flipped the parser-side fold and the model could still
+    emit reasoning regardless. After HARDENING-2 the kwarg is
+    forwarded so the template builds the right prompt for the
+    requested mode."""
+    session, _, tok = _build_session(
+        apply_template=_identity_template_via_text,
+        thinking_mode=True,
+    )
+    session.chat("hello")
+    assert tok.last_apply_template_kwargs is not None
+    assert tok.last_apply_template_kwargs.get("enable_thinking") is True
+
+
+def test_thinking_mode_False_threads_enable_thinking_kwarg() -> None:
+    session, _, tok = _build_session(
+        apply_template=_identity_template_via_text,
+        thinking_mode=False,
+    )
+    session.chat("hello")
+    assert tok.last_apply_template_kwargs is not None
+    assert tok.last_apply_template_kwargs.get("enable_thinking") is False
+
+
+def test_thinking_mode_None_omits_enable_thinking_kwarg() -> None:
+    """When the caller leaves ``thinking_mode`` unset (the v1.7.x
+    default), ChatSession does not pass ``enable_thinking`` at
+    all, preserving backward-compat for tokenizers / templates
+    that do not understand the kwarg or whose default mode is
+    correct already."""
+    session, _, tok = _build_session(
+        apply_template=_identity_template_via_text,
+        thinking_mode=None,
+    )
+    session.chat("hello")
+    assert tok.last_apply_template_kwargs is not None
+    assert "enable_thinking" not in tok.last_apply_template_kwargs
+
+
+def test_set_thinking_mode_takes_effect_on_next_chat() -> None:
+    """Mid-session ``set_thinking_mode(False)`` flips the kwarg
+    from True (or None) to False on the next ``chat()`` call —
+    this is the contract /config thinking_mode=off needs to be
+    honest about the live session, not just save / load state."""
+    session, _, tok = _build_session(
+        apply_template=_identity_template_via_text,
+        thinking_mode=True,
+    )
+    session.chat("first")
+    assert tok.last_apply_template_kwargs.get("enable_thinking") is True
+    session.set_thinking_mode(False)
+    session.chat("second")
+    assert tok.last_apply_template_kwargs.get("enable_thinking") is False
+
+
+def test_set_thinking_mode_None_drops_kwarg_on_next_chat() -> None:
+    session, _, tok = _build_session(
+        apply_template=_identity_template_via_text,
+        thinking_mode=True,
+    )
+    session.chat("first")
+    assert "enable_thinking" in tok.last_apply_template_kwargs
+    session.set_thinking_mode(None)
+    session.chat("second")
+    assert "enable_thinking" not in tok.last_apply_template_kwargs
+
+
+def test_thinking_mode_default_is_None() -> None:
+    """ChatSession's default thinking_mode is None (no propagation),
+    not True/False. Explicit construction-time / shell-side wiring
+    is required to opt into either explicit mode. This default
+    keeps existing call sites that did not know about the
+    parameter byte-equivalent to pre-HARDENING-2 behaviour."""
+    # Construct without the helper's thinking_mode= so we exercise
+    # ChatSession.__init__ default directly.
+    tok = _FakeTokenizer(
+        apply_template=_identity_template_via_text,
+        eos_token_ids={99},
+    )
+    adapter = _FakeAdapter(tok)
+    engine = _FakeEngine([65, 66, 67])
+    session = ChatSession(adapter, engine)  # no thinking_mode= kwarg
+    session.chat("hello")
+    assert "enable_thinking" not in tok.last_apply_template_kwargs
 
 
 def test_session_with_no_system_prompt_resets_to_empty() -> None:
