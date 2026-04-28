@@ -368,6 +368,18 @@ def run_chat(args: argparse.Namespace) -> int:
                 state.total_prefix_hit_tokens = 0
                 state.total_decode_tokens = 0
                 state.total_decode_seconds = 0.0
+            if result.request_system_prompt is not None:
+                # CHAT-CLI-HARDENING-1 (F1): propagate /system to
+                # the live ChatSession alongside the config-side
+                # update the dispatcher already performed. Empty
+                # string clears; non-empty replaces. The prefix
+                # cache is not explicitly invalidated — the
+                # rendered prompt's leading tokens change with the
+                # new system content, so the next chat() call's
+                # peek mismatches the old radix nodes naturally.
+                chat_session.set_system_prompt(
+                    result.request_system_prompt or None
+                )
             if result.request_expand_thinking:
                 expanded = palette.colorize(
                     "── thinking ──\n" + state.last_turn_thinking,

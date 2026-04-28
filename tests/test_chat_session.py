@@ -214,6 +214,92 @@ def test_session_reset_retains_only_system_prompt() -> None:
     assert session.messages[0]["content"] == "sys"
 
 
+# ---------- set_system_prompt (CHAT-CLI-HARDENING-1, F1) -------------
+
+
+def test_set_system_prompt_replaces_existing_system_message() -> None:
+    """The original system prompt is supplied at construction. After
+    ``set_system_prompt('new ...')`` the live session's leading
+    system-role message carries the new content. Pre-HARDENING-1 the
+    /system command wrote ``state.config["system_prompt"]`` only and
+    never touched the live session, so user-facing chat continued
+    against the original construction-time prompt."""
+    session, _, _ = _build_session(system_prompt="sys-original")
+    session.set_system_prompt("sys-replacement")
+    msgs = session.messages
+    assert msgs[0] == {"role": "system", "content": "sys-replacement"}
+    # Only one system message; the replacement does not append.
+    sys_msgs = [m for m in msgs if m["role"] == "system"]
+    assert len(sys_msgs) == 1
+
+
+def test_set_system_prompt_inserts_when_session_had_none() -> None:
+    """A session built with ``system_prompt=None`` accepts a later
+    ``set_system_prompt('...')`` and has the new message prepended
+    at index 0."""
+    session, _, _ = _build_session(system_prompt=None)
+    session.chat("hello")
+    # Pre-set: messages = [user, assistant].
+    assert [m["role"] for m in session.messages] == ["user", "assistant"]
+    session.set_system_prompt("system-injected")
+    # Post-set: system is at index 0; the rest of history is preserved.
+    roles = [m["role"] for m in session.messages]
+    assert roles == ["system", "user", "assistant"]
+    assert session.messages[0]["content"] == "system-injected"
+
+
+def test_set_system_prompt_empty_string_clears() -> None:
+    session, _, _ = _build_session(system_prompt="sys-original")
+    session.set_system_prompt("")
+    assert all(m["role"] != "system" for m in session.messages)
+
+
+def test_set_system_prompt_none_clears() -> None:
+    session, _, _ = _build_session(system_prompt="sys-original")
+    session.set_system_prompt(None)
+    assert all(m["role"] != "system" for m in session.messages)
+
+
+def test_set_system_prompt_preserves_non_system_history() -> None:
+    """Setting / clearing the system prompt must not touch the
+    user / assistant turns. This pins the contract that /system
+    only edits role=system entries — the conversation log is
+    not collateral damage."""
+    session, _, _ = _build_session(system_prompt="sys-original")
+    session.chat("hello")
+    session.chat("again")
+    user_assist_before = [
+        m for m in session.messages if m["role"] != "system"
+    ]
+    session.set_system_prompt("sys-replacement")
+    user_assist_after = [
+        m for m in session.messages if m["role"] != "system"
+    ]
+    assert user_assist_before == user_assist_after
+    session.set_system_prompt(None)  # clear
+    user_assist_cleared = [
+        m for m in session.messages if m["role"] != "system"
+    ]
+    assert user_assist_cleared == user_assist_before
+
+
+def test_set_system_prompt_takes_effect_in_next_chat_render() -> None:
+    """The next ``chat()`` call must render the new system prompt
+    into the prompt the engine sees. This is the user-facing
+    correctness contract HARDENING-1 fixes — the /system command
+    promises 'for the rest of the session', not just 'in saved
+    state'."""
+    session, engine, _ = _build_session(system_prompt="sys-original")
+    session.set_system_prompt("sys-replacement")
+    session.chat("hi")
+    # The fake template includes message contents verbatim; the
+    # engine sees the new system prompt in the rendered text.
+    assert engine.prompts_seen, "engine never saw a prompt"
+    last_prompt = engine.prompts_seen[-1]
+    assert "sys-replacement" in last_prompt
+    assert "sys-original" not in last_prompt
+
+
 def test_session_with_no_system_prompt_resets_to_empty() -> None:
     session, _, _ = _build_session(system_prompt=None)
     session.chat("hello")

@@ -137,6 +137,57 @@ def test_system_empty_args_clears_prompt() -> None:
     assert state.config["system_prompt"] == ""
 
 
+# CHAT-CLI-HARDENING-1 (F1): /system must signal the shell to update
+# the live ChatSession, not just write to state.config.
+
+
+def test_system_emits_request_to_propagate_to_live_session() -> None:
+    """``/system foo`` produces ``CommandResult.request_system_prompt
+    == 'foo'`` so the shell can call ``ChatSession.set_system_prompt``
+    on the live session. Pre-HARDENING-1 the command only wrote
+    ``state.config[...]``, leaving in-flight chat against the
+    construction-time system prompt."""
+    state = _state()
+    res = dispatch_command("/system You are concise.", state)
+    assert res.error is False
+    assert res.request_system_prompt == "You are concise."
+
+
+def test_system_empty_args_emits_clear_request() -> None:
+    """``/system`` with no args emits an empty-string request signal
+    so the shell can call ``set_system_prompt('')`` (or None) on the
+    live session. The empty string is meaningfully different from
+    ``None``-as-default — it means 'the user explicitly issued the
+    clear-prompt command'."""
+    state = _state()
+    state.config["system_prompt"] = "earlier prompt"
+    res = dispatch_command("/system", state)
+    assert res.error is False
+    # The request was issued (not None / unset) and carries the
+    # clear-signal payload (empty string).
+    assert res.request_system_prompt == ""
+
+
+def test_system_quoted_arg_emits_unquoted_request() -> None:
+    state = _state()
+    res = dispatch_command('/system "Be concise."', state)
+    assert res.error is False
+    assert res.request_system_prompt == "Be concise."
+
+
+def test_other_commands_leave_request_system_prompt_unset() -> None:
+    """Regression guard: only ``/system`` writes the new request
+    field. Drift would let unrelated commands silently propagate
+    a system-prompt change."""
+    state = _state()
+    res = dispatch_command("/help", state)
+    assert res.request_system_prompt is None
+    res = dispatch_command("/reset", state)
+    assert res.request_system_prompt is None
+    res = dispatch_command("/config temperature=0.3", state)
+    assert res.request_system_prompt is None
+
+
 # ---------------------------------------------------------------------------
 # /config
 # ---------------------------------------------------------------------------

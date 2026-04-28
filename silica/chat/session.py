@@ -250,6 +250,43 @@ class ChatSession:
             for m in messages
         ]
 
+    def set_system_prompt(self, text: str | None) -> None:
+        """Replace (or clear) the live session's system prompt.
+
+        Mutates ``self._messages``: drops every existing
+        ``role="system"`` entry, then prepends a fresh
+        ``{"role": "system", "content": text}`` when ``text`` is
+        non-empty. ``None`` and the empty string both clear.
+        Non-system history (user / assistant turns) is preserved.
+
+        CHAT-CLI-HARDENING-1 (F1): the chat-CLI's ``/system``
+        command pre-HARDENING-1 wrote
+        ``state.config["system_prompt"]`` only, never touching the
+        live session. The user-facing help promised "for the rest
+        of the session" but in-flight chat continued against the
+        construction-time prompt. This method is the live-session
+        update side of the fix; the shell pairs it with the
+        existing config-side update so save / load fidelity is
+        preserved.
+
+        The prefix cache is **not** explicitly invalidated — the
+        rendered prompt's leading tokens change with the new
+        system content, so the next ``chat()`` call's prefix-cache
+        ``peek`` mismatches the old radix tree at the root and
+        the cache's mismatch path takes over naturally. Stale
+        blocks remain in the store until the user explicitly
+        ``/reset``s the conversation (which the shell pairs with
+        a fresh prefix cache via :meth:`set_prefix_cache`).
+        """
+        non_system = [m for m in self._messages if m["role"] != "system"]
+        if text:
+            self._messages = [
+                {"role": "system", "content": text},
+                *non_system,
+            ]
+        else:
+            self._messages = non_system
+
     def set_prefix_cache(
         self, prefix_cache: _PrefixCacheLike | None
     ) -> None:

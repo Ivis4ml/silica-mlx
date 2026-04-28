@@ -105,6 +105,24 @@ class CommandResult:
     """Shell renders the session-narrative report (uses the
     cumulative session metrics, not just the live state)."""
 
+    request_system_prompt: str | None = None
+    """CHAT-CLI-HARDENING-1 (F1) signal: shell calls
+    ``ChatSession.set_system_prompt(value)`` on the live session.
+    Tri-state semantics distinguish "the user did not invoke
+    ``/system`` this turn" from "the user explicitly cleared":
+
+      * ``None`` — no request; the shell skips the live-session
+        update.
+      * ``""``  — user issued ``/system`` with no args; shell
+        clears the live session's system prompt.
+      * non-empty ``str`` — user issued ``/system <text>``; shell
+        sets the live session's system prompt to ``text``.
+
+    Independent of ``state.config["system_prompt"]``, which the
+    ``/system`` command continues to update for save / load
+    fidelity. The two-channel design lets the shell apply the
+    change live without losing the persisted-state record."""
+
 
 def _ok(*lines: str) -> CommandResult:
     return CommandResult(feedback=list(lines))
@@ -176,9 +194,22 @@ def _cmd_system(state: ChatCliState, args: str) -> CommandResult:
     if len(text) >= 2 and text[0] == text[-1] and text[0] in ('"', "'"):
         text = text[1:-1]
     state.config["system_prompt"] = text
-    if text:
-        return _ok(f"system prompt set ({len(text)} chars).")
-    return _ok("system prompt cleared.")
+    feedback = (
+        f"system prompt set ({len(text)} chars)."
+        if text
+        else "system prompt cleared."
+    )
+    # CHAT-CLI-HARDENING-1 (F1): emit the live-session update
+    # request alongside the config write. The shell drains the
+    # request and calls ``ChatSession.set_system_prompt(text)`` so
+    # the in-flight session honours the change instead of waiting
+    # until the next session construction. Empty string carries the
+    # explicit-clear signal (see CommandResult docstring for the
+    # tri-state semantics).
+    return CommandResult(
+        feedback=[feedback],
+        request_system_prompt=text,
+    )
 
 
 def _cmd_config(state: ChatCliState, args: str) -> CommandResult:
