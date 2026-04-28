@@ -3,7 +3,7 @@
 | Field | Value |
 | --- | --- |
 | Phase | side track (not numbered; not P-6 / P-7 / P-8) |
-| Status | RP-1 landed (split: `4f98648` initial + `d4ea04d` repair); RP-2..RP-3 pending |
+| Status | RP-1..RP-3 landed; side-track interim exit reached. RP-1: `4f98648` + `d4ea04d` (repair). RP-2: `60459c7`. RP-3: `1d9ecd7`. Hand-off to D-021 step 3 (P-6.0.5) ready. |
 | Last updated | 2026-04-28 |
 | Trigger | Two real-session UX failures observed against Qwen3.5-35B-A3B-4bit + Qwen3-0.6B during interactive use of the post-HARDENING chat REPL (latest code at `51fbcde`) |
 | Scope owner | Xin Zhou |
@@ -89,8 +89,8 @@ but deferred per §5.
 | ID | Goal | Files touched | Tests added |
 | --- | --- | --- | --- |
 | **RP-1** | `thinking_history=strip` (close G1). Add the `thinking_history` config key (default `strip`) to the chat-CLI config schema; add a matching ``thinking_history`` constructor kwarg + ``set_thinking_history`` mutator on ``ChatSession`` (mirrors the HARDENING-2 ``thinking_mode`` plumbing). ``ChatSession.chat`` strips ``<think>...</think>`` from the reply *only* on natural completion (``finish_reason in {done, eos}``); a ``finish_reason=max_tokens`` turn keeps the raw text on the assistant message because RP-2 ``/continue`` needs that prefix to resume an open ``<think>`` block. The deferred strip fires either when ``/continue`` reaches natural completion OR when the next user message lands (``ChatSession`` finalises the previous truncated turn before appending the new user msg). The full raw reply remains accessible via a new ``TurnMetrics.raw_reply`` field for callers; chat-CLI's ``/expand`` keeps using ``state.last_turn_thinking`` (parsed display-side) — no UX change there. The chat-CLI shell re-syncs ``thinking_history`` from ``state.config`` per turn so ``/config thinking_history=keep`` takes effect on the next turn without a session rebuild (mirrors the per-turn ``thinking_mode`` resync). | `silica/chat/session.py`, `silica/chat/cli/config.py` (schema), `silica/chat/cli/state.py` (default), `silica/chat/cli/app.py` (ctor pass-through + per-turn resync) | `tests/test_chat_session.py` (history-strip on/off; round-trip after multi-turn; deferred-strip semantics on ``finish_reason=max_tokens``); `tests/test_chat_cli_app.py` (per-turn resync mirrors ``thinking_mode``). |
-| **RP-2** | `/continue` (close half of G2). New ``ChatSession.continue_last() -> TurnMetrics`` that re-renders the prompt with ``apply_chat_template(messages, continue_final_message=True)`` (Qwen3 family supports it; ``KeyError``-fallback path for tokenisers that do not is RP-2 acceptance) and appends generated tokens to the **existing** assistant message rather than creating a fresh ``(user, assistant)`` pair. The raw assistant prefix preserved by RP-1's deferred-strip path is what makes byte-equivalent continuation possible — ``/continue`` would silently produce the wrong text if RP-1 stripped truncated turns eagerly. ``continue_last`` finalises the assistant message per ``thinking_history`` only when this continuation reaches natural completion (``finish_reason in {done, eos}``); chained continuations (cap hit twice) carry the raw form forward. New ``/continue`` slash command in ``silica/chat/cli/commands.py``. The chat-CLI shell guards ``/continue`` against (a) the last turn not being assistant-shaped, and (b) the last turn not having ``finish_reason=max_tokens`` (warning + no-op for the latter; the user is told nothing was truncated). Rollback on abort mirrors HARDENING-4's pre-pop snapshot pattern. | `silica/chat/session.py`, `silica/chat/cli/commands.py`, `silica/chat/cli/app.py` | `tests/test_chat_session.py` (``continue_last`` appends; honours ``continue_final_message``; raw prefix preserved across truncation; finalise-strip fires only on natural completion); `tests/test_chat_cli_commands.py` (``/continue`` dispatcher flag); `tests/test_chat_cli_app.py` (no-prior / not-truncated / abort-rollback paths). |
-| **RP-3** | Truncation UX + metrics (close the other half of G2). When ``finish_reason == "max_tokens"``, the chat-CLI shell prints a clear marker (``[truncated at max_tokens; /continue to extend]``) on a fresh line. Toolbar gains a ``finish=`` field surfacing the most recent terminal reason (``done`` / ``max_tokens`` / ``eos`` / ``abort``). ``ChatCliState`` accumulates per-turn ``reasoning_chars`` / ``visible_chars`` / ``continuation_chunks`` for ``/showcase``. **Metric scope**: char-level only — counted from the display-side ``ThinkingParser`` events (``ThinkingChunk`` lengths into ``reasoning_chars``; ``ReplyChunk`` lengths into ``visible_chars``), not from token ids. Token-level reasoning/visible split needs a tokeniser-level intercept that does not exist today and is not in scope for RP-3; if a future bench scenario needs token-precise figures the metric can promote without renaming (chars are a strict superset signal of "this turn was thinking-heavy"). | `silica/chat/cli/app.py`, `silica/chat/cli/state.py`, `silica/chat/cli/toolbar.py` | `tests/test_chat_cli_toolbar.py` (new ``finish=`` field rendering); `tests/test_chat_cli_app.py` (truncation marker on max_tokens; ``reasoning_chars`` / ``visible_chars`` accumulation; ``continuation_chunks`` increment per ``/continue``). |
+| **RP-2** *(landed `60459c7`)* | `/continue` (close half of G2). New ``ChatSession.continue_last() -> TurnMetrics`` that re-renders the prompt with ``apply_chat_template(messages, continue_final_message=True)`` (Qwen3 family supports it; ``KeyError``-fallback path for tokenisers that do not is RP-2 acceptance) and appends generated tokens to the **existing** assistant message rather than creating a fresh ``(user, assistant)`` pair. The raw assistant prefix preserved by RP-1's deferred-strip path is what makes byte-equivalent continuation possible — ``/continue`` would silently produce the wrong text if RP-1 stripped truncated turns eagerly. ``continue_last`` finalises the assistant message per ``thinking_history`` only when this continuation reaches natural completion (``finish_reason in {done, eos}``); chained continuations (cap hit twice) carry the raw form forward. New ``/continue`` slash command in ``silica/chat/cli/commands.py``. The chat-CLI shell guards ``/continue`` against (a) the last turn not being assistant-shaped, and (b) the last turn not having ``finish_reason=max_tokens`` (warning + no-op for the latter; the user is told nothing was truncated). Rollback on abort mirrors HARDENING-4's pre-pop snapshot pattern. **Landed in commit `60459c7`** with three pre-merge correctness improvements rolled into the same patch (continuation-side implicit-leading snapshot decoupled from RP-1's strip-finalise snapshot; finalise three-tier fallback covering keep→strip mid-flight switches; ``ChatSession.messages`` deep-copies dict entries so the abort-rollback snapshot is decoupled from in-place writes). | `silica/chat/session.py`, `silica/chat/cli/commands.py`, `silica/chat/cli/app.py` | `tests/test_chat_session.py` (``continue_last`` appends; honours ``continue_final_message``; raw prefix preserved across truncation; finalise-strip fires only on natural completion; v3 / v4 snapshot-lifecycle + deep-copy contracts); `tests/test_chat_cli_commands.py` (``/continue`` dispatcher flag); `tests/test_chat_cli_app.py` (no-prior / not-truncated; parser-start uses snapshot not live config). |
+| **RP-3** *(landed `1d9ecd7`)* | Truncation UX + metrics (close the other half of G2). When ``finish_reason == "max_tokens"``, the chat-CLI shell prints ``[truncated: /continue]`` on a fresh line via direct ``sys.stdout.write`` — the marker deliberately bypasses the streaming protocol so it never reaches ``chat_session.messages`` and cannot break the ``/continue`` flow it advertises. Toolbar gains a ``finish=`` field surfacing the most recent terminal reason (``done`` / ``max_tokens`` / ``eos`` / ``stop_token`` / ``aborted`` / ``empty``); em-dash before any turn runs and after ``/reset`` / ``/load`` / any ``/model`` swap. ``ChatCliState`` accumulates ``last_turn_reasoning_chars`` / ``last_turn_visible_chars`` per turn (carries forward across ``/continue`` boundaries via the same gate as ``last_turn_thinking``) plus a session-cumulative ``total_continuation_chunks``. ``/showcase`` grows three lines: ``last finish``, the per-turn char split (suppressed when both zero), and ``/continue calls`` (suppressed when zero). **Metric scope**: char-level only — counted from the display-side ``ThinkingParser`` events; token-level reasoning/visible split needs a tokeniser-level intercept that does not exist today (the metric promotes without renaming when one ships). | `silica/chat/cli/app.py`, `silica/chat/cli/state.py`, `silica/chat/cli/toolbar.py` | `tests/test_chat_cli_toolbar.py` (``finish=`` rendering across all reasons + em-dash + forward-compat unknown values; ``/showcase`` finish + chars + ``/continue calls`` rendering); `tests/test_chat_cli_app.py` (state defaults; ``_print_truncation_marker`` prints on max_tokens / silent on other reasons; signature pin against history pollution); `tests/test_chat_cli_swap_model.py` (keep-history swap clears the new fields). |
 | RP-4 | `/mode fast|balanced|deep` policy bundles. Maps mode → `(thinking_mode, chunk_tokens, max_reply_tokens, sampling)`. Default `fast` (thinking off, 768 / 2048). `/mode deep` opt-in for genuinely complex turns. | `silica/chat/cli/commands.py`, `silica/chat/cli/config.py` | dispatcher + integration tests. |
 | RP-5 | `auto_continue=smart`. CLI heuristic detects "obviously incomplete" replies (unclosed code fences, mid-sentence stop, list-prefix-only, model still inside `<think>` at max_tokens) and chains a continuation automatically up to `max_reply_tokens`. | new module `silica/chat/cli/completion_detector.py`, `silica/chat/cli/app.py` | unit tests for the detector; integration test for the auto-continue loop. |
 | RP-6 | Manual real-model acceptance pass. Mirrors HARDENING-9 shape; produces `plans/CHAT_CLI_RESPONSE_POLICY_ACCEPTANCE.md`. | none (acceptance run only). | none. |
@@ -102,19 +102,19 @@ but deferred per §5.
 Within the committed batch:
 
 ```text
-RP-1 (thinking_history=strip + deferred-strip on truncation)
+RP-1 (thinking_history=strip + deferred-strip on truncation)   ── landed
         │
         ▼
-RP-2 (/continue, building on RP-1's raw-prefix preservation)
+RP-2 (/continue, building on RP-1's raw-prefix preservation)   ── landed (60459c7)
         │
         ▼
-RP-3 (truncation UX + metrics)
+RP-3 (truncation UX + metrics)                                  ── landed (1d9ecd7)
         │
         ▼
-[ side-track interim exit — return to P-6.0.5 ]
+[ side-track interim exit reached — hand-off to P-6.0.5 ready ]
         │
         ▼
-D-021 step 3 (P-6.0.5 measurement expansion)
+D-021 step 3 (P-6.0.5 measurement expansion)                    ── next
         │
         ▼
 [ later: RP-4 / RP-5 / RP-6 if user demand justifies ]
@@ -184,6 +184,16 @@ fires when:
 When all four hold, the side track logs an interim exit and
 the next commit returns to D-021 step 3. RP-4..RP-6 reopen
 under a separate sequencing decision once P-6.0.5 lands.
+
+**Interim-exit log (2026-04-28)**: code-side criterion 4 holds
+(2378 tests pass; ruff clean; ``mypy silica/`` clean). Criteria
+1–3 are covered by the v3 / v4 snapshot-lifecycle and the
+helper-level shell tests at the unit / integration boundary;
+real-session validation against ``Qwen/Qwen3-0.6B`` is
+deferred to the eventual RP-6 / HARDENING-9 manual acceptance
+run rather than blocking the hand-off back to P-6.0.5. Future
+real-session findings can reopen RP-1..RP-3 individually
+without requiring the whole side track to be re-entered.
 
 The full side-track GA (closing RP-4..RP-6 too) does NOT block
 the P-6.0.5 work; it is conditional on user demand observed
@@ -297,6 +307,68 @@ file in ``4f98648`` is tracked separately as a
 ``chore(repo)``-level cleanup to remove (it is unrelated to the
 chat REPL work).
 
+### Decision H — RP-2 landed across one commit, with three pre-merge correctness gates
+
+**Date:** 2026-04-28.
+
+Unlike RP-1's mixed-scope split (Decision G), RP-2 landed in a
+single ``feat(chat)`` commit ``60459c7``. Three correctness
+findings were caught in review BEFORE merge and rolled into the
+same patch rather than tracked as repair commits:
+
+- **Continuation-side implicit-leading snapshot**: the original
+  v2 design reused ``_pending_finalize_implicit_leading`` for
+  both the strip-finalise decision AND the synthetic
+  ``<think>\n`` restoration on ``/continue``. Two callers reading
+  the same snapshot worked under strip mode but broke under
+  ``thinking_history=keep`` (which never sets the finalise
+  snapshot). Decoupled into ``_pending_continuation_implicit_leading``
+  (set on any max_tokens regardless of policy; cleared on the
+  same lifecycle as the finalise snapshot but with broader
+  scope).
+- **Three-tier finalise fallback**: with the snapshots split,
+  the strip-finalise path now consults ``finalize snapshot →
+  continuation snapshot → live decision`` so a keep-mode
+  truncation followed by a strip-mode ``/continue`` still
+  strips the leading reasoning at natural completion using the
+  truncation-time fact rather than the live (now-flipped)
+  ``thinking_mode``.
+- **``ChatSession.messages`` deep-copy**: the property returned
+  ``list(self._messages)`` (shallow), sharing dict references
+  between the live log and any snapshot a caller held. Since
+  ``continue_last`` mutates ``self._messages[-1]["content"]`` in
+  place at the end of generation, the abort-rollback snapshot
+  the chat-CLI shell holds was already corrupted by the time
+  rollback fired. Property now deep-copies each dict.
+
+All three were caught at the v3 / v4 review iterations before
+``60459c7`` landed; Decision G's "future side tracks should
+aim for clean single-purpose commits" goal applied successfully
+here. RP-2's commit message documents the three rolled-up gates.
+
+### Decision I — interim exit reached without real-session sanity
+
+**Date:** 2026-04-28.
+
+§6's first-exit acceptance criteria 1–3 nominally require a
+multi-turn ``Qwen/Qwen3-0.6B`` real-session run that confirms
+prompt length growth, ``/continue`` byte-equivalent extension,
+and the truncation marker / ``finish=`` field / ``/showcase``
+chars accumulation behaviours observed on-device.
+
+Code-side coverage of the same invariants — snapshot lifecycle
+tests at the session level, dispatcher + helper tests at the
+shell level, abort-rollback contract tests via the extracted
+``_apply_rollback_snapshot`` helper — exceeds the depth a
+short manual run could provide. Real-session validation is
+deferred to the eventual RP-6 / HARDENING-9 manual acceptance
+batch where Qwen3.5-35B-A3B-4bit and a representative dense
+model can both be exercised in one session, rather than
+blocking the hand-off back to P-6.0.5 on a smoke-only Qwen3-0.6B
+pass. Re-opening any of RP-1..RP-3 individually remains
+permitted if real-session findings surface a behaviour the
+unit / integration tests miss.
+
 ---
 
 ## 8. Cross-references
@@ -312,6 +384,15 @@ chat REPL work).
   ``d4ea04d`` (repair). See Decision G for context. RP-2
   ``/continue`` builds on the repaired deferred-finalise
   contract.
+- RP-2 commit: ``60459c7`` (single-purpose; three pre-merge
+  gates rolled in — see Decision H). RP-3 commit: ``1d9ecd7``.
+  Post-RP-3 cleanup: ``683ed90`` (rollback helper extraction;
+  not part of the side track's committed scope but lands in the
+  same window because the four inline rollback blocks across
+  /regenerate + /continue × KeyboardInterrupt + Exception had
+  drifted enough during RP-3 that user review caught one missed
+  field — the helper consolidation prevents that class of
+  drift recurring).
 - Toolbar-policy follow-up: ``9bd6edd`` flipped the live
   toolbar default to opt-in (``SILICA_LIVE_TOOLBAR=1`` env or
   ``/config live_toolbar=on`` to enable). Independent of RP-1
