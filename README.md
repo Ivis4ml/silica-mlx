@@ -21,6 +21,12 @@ Qwen3.5-35B-A3B MoE, gemma-4-26B-A4B MoE.
 > streaming for MoE residency remain stubs behind frozen interfaces,
 > scheduled next.
 
+> **Website.** Project homepage at
+> [ivis4ml.github.io/silica-mlx](https://ivis4ml.github.io/silica-mlx/)
+> — overview, architecture, scheduler animation, REPL preview,
+> roadmap. Source under [`site/`](site/); served by GitHub Pages
+> directly from the branch (no build step).
+
 > **Documentation.** Quick links: [chat-CLI guide](CHAT.README.md) ·
 > [API reference](docs/API.md) · [plans index](docs/plans-index.md) ·
 > [PLAN](plans/PLAN.md). For the three reading paths (GitHub direct,
