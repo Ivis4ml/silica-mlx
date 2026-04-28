@@ -134,6 +134,7 @@ def evaluate_silica_regression(
     silica_seed_delta_ppls: list[float],
     snapshot: PinnedSnapshot = SILICA_V1_7_3_SNAPSHOT,
     tolerance_ppl: float = DEFAULT_SILICA_REGRESSION_TOLERANCE_PPL,
+    expected_n_seeds: int | None = None,
 ) -> GateResult:
     """Cheap one-sided regression check.
 
@@ -142,7 +143,19 @@ def evaluate_silica_regression(
     ``|mean - snapshot.mean| <= tolerance_ppl``. Uses no
     vqbench data; suitable for the pre-merge bench gate that
     every Track A / B / C PR runs.
+
+    P5.9.1 hardening: ``expected_n_seeds`` defaults to
+    ``snapshot.n_seeds`` (3 under the v1.7.3 anchor) and the helper
+    rejects seed arrays of any other length with a structured
+    ``silica_regression_seed_count_mismatch`` reason. Without this
+    a 1-seed run would silently pass the gate and defeat the
+    statistical assumption the snapshot's std encodes. Callers who
+    legitimately want a single-seed exploratory check pass
+    ``expected_n_seeds=1`` explicitly.
     """
+    n_required = (
+        snapshot.n_seeds if expected_n_seeds is None else expected_n_seeds
+    )
     if not silica_seed_delta_ppls:
         return GateResult(
             passes=False,
@@ -150,6 +163,17 @@ def evaluate_silica_regression(
             mean_gap=float("nan"),
             threshold=tolerance_ppl,
             reason="silica_regression_no_seeds",
+        )
+    if len(silica_seed_delta_ppls) != n_required:
+        return GateResult(
+            passes=False,
+            mode="silica_only",
+            mean_gap=float("nan"),
+            threshold=tolerance_ppl,
+            reason=(
+                f"silica_regression_seed_count_mismatch:"
+                f"expected_{n_required}_got_{len(silica_seed_delta_ppls)}"
+            ),
         )
     silica_mean = sum(silica_seed_delta_ppls) / len(
         silica_seed_delta_ppls
@@ -181,6 +205,7 @@ def evaluate_4b_gate(
     silica_seed_delta_ppls: list[float],
     vqbench_seed_delta_ppls: list[float],
     absolute_threshold_ppl: float = 1.0,
+    expected_n_seeds: int = 3,
 ) -> GateResult:
     """Full (4-b) two-part aggregated gate.
 
@@ -197,6 +222,15 @@ def evaluate_4b_gate(
     ``mean_gap = -0.150`` PPL, ``2 * SEM_diff = 0.572`` — both
     gates passed with comfortable headroom (~3.8x on the
     aggregate band, ~6.7x on the absolute band).
+
+    P5.9.1 hardening: ``expected_n_seeds`` defaults to ``3`` (the
+    v1.7.3 canonical seed-count {42, 43, 44}) and the helper
+    rejects either array if its length differs. Without this a
+    1-seed run would yield ``SEM_diff = 0`` (Bessel-corrected std
+    on n=1 is 0 by convention) and mechanically collapse the
+    aggregate band to 0, defeating the statistical contract the
+    gate encodes. Callers who legitimately want a different
+    seed budget pass ``expected_n_seeds`` explicitly.
     """
     if (
         not silica_seed_delta_ppls
@@ -219,6 +253,18 @@ def evaluate_4b_gate(
                 f"full_4b_seed_count_mismatch:"
                 f"silica={len(silica_seed_delta_ppls)}_"
                 f"vqbench={len(vqbench_seed_delta_ppls)}"
+            ),
+        )
+    if len(silica_seed_delta_ppls) != expected_n_seeds:
+        return GateResult(
+            passes=False,
+            mode="full_4b",
+            mean_gap=float("nan"),
+            threshold=absolute_threshold_ppl,
+            reason=(
+                f"full_4b_seed_count_mismatch:"
+                f"expected_{expected_n_seeds}_got_"
+                f"{len(silica_seed_delta_ppls)}"
             ),
         )
     n = len(silica_seed_delta_ppls)

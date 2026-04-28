@@ -117,6 +117,116 @@ def test_silica_regression_empty_seeds_fails_structured() -> None:
     assert result.reason == "silica_regression_no_seeds"
 
 
+# --- P5.9.1 hardening: enforce canonical seed count ---
+
+
+def test_silica_regression_rejects_single_seed_run() -> None:
+    """P5.9.1: the v1.7.3 snapshot encodes ``n_seeds=3``; a 1-seed
+    run would silently pass the gate pre-P5.9.1 even though the
+    underlying statistical assumption (3-seed mean ± std) is no
+    longer satisfied. The default ``expected_n_seeds = snapshot.n_seeds``
+    now rejects mismatched lengths with a structured reason."""
+    result = evaluate_silica_regression(
+        [SILICA_V1_7_3_SNAPSHOT.mean_delta_ppl]
+    )
+    assert not result.passes
+    assert result.reason.startswith(
+        "silica_regression_seed_count_mismatch:"
+    )
+    assert "expected_3_got_1" in result.reason
+
+
+def test_silica_regression_rejects_two_seed_run() -> None:
+    """Two seeds also rejected — gate requires the canonical 3."""
+    result = evaluate_silica_regression(SILICA_V1_7_3_SEEDS[:2])
+    assert not result.passes
+    assert "expected_3_got_2" in result.reason
+
+
+def test_silica_regression_explicit_expected_n_seeds_override() -> None:
+    """Callers running an exploratory single-seed check pass
+    ``expected_n_seeds=1`` explicitly. The override takes precedence
+    over ``snapshot.n_seeds`` so a deliberate sparse run is allowed
+    while accidental sparse runs are caught."""
+    result = evaluate_silica_regression(
+        [SILICA_V1_7_3_SNAPSHOT.mean_delta_ppl],
+        expected_n_seeds=1,
+    )
+    assert result.passes, result.reason
+
+
+def test_silica_regression_explicit_higher_n_seeds() -> None:
+    """A 5-seed run against the v1.7.3 (n=3) snapshot is rejected by
+    default but allowed when the caller passes ``expected_n_seeds=5``
+    (e.g. for a tighter-statistics study)."""
+    five_seeds = [SILICA_V1_7_3_SNAPSHOT.mean_delta_ppl] * 5
+    default = evaluate_silica_regression(five_seeds)
+    assert not default.passes
+    assert "expected_3_got_5" in default.reason
+    explicit = evaluate_silica_regression(
+        five_seeds, expected_n_seeds=5
+    )
+    assert explicit.passes, explicit.reason
+
+
+def test_full_gate_rejects_single_seed_pair() -> None:
+    """P5.9.1: 1-seed input on both sides yields ``SEM_diff = 0``
+    (Bessel-corrected std on n=1 is 0 by convention), collapsing
+    the aggregate band to 0 and mechanically failing the gate for
+    any non-zero gap. The validator now rejects upfront with a
+    seed-count reason rather than letting the math reach a
+    degenerate state."""
+    silica = [0.5]
+    vqbench = [0.5]
+    result = evaluate_4b_gate(silica, vqbench)
+    assert not result.passes
+    assert result.reason.startswith("full_4b_seed_count_mismatch:")
+    assert "expected_3_got_1" in result.reason
+
+
+def test_full_gate_rejects_two_seed_pair() -> None:
+    result = evaluate_4b_gate(
+        SILICA_V1_7_3_SEEDS[:2], VQBENCH_V1_7_3_SEEDS[:2]
+    )
+    assert not result.passes
+    assert "expected_3_got_2" in result.reason
+
+
+def test_full_gate_explicit_expected_n_seeds_override() -> None:
+    """Callers running a higher-statistics study pass
+    ``expected_n_seeds=5`` explicitly."""
+    silica5 = SILICA_V1_7_3_SEEDS + [
+        SILICA_V1_7_3_SNAPSHOT.mean_delta_ppl
+    ] * 2
+    vqbench5 = VQBENCH_V1_7_3_SEEDS + [
+        VQBENCH_V1_7_3_SNAPSHOT.mean_delta_ppl
+    ] * 2
+    default = evaluate_4b_gate(silica5, vqbench5)
+    assert not default.passes
+    assert "expected_3_got_5" in default.reason
+    explicit = evaluate_4b_gate(
+        silica5, vqbench5, expected_n_seeds=5
+    )
+    assert explicit.passes, explicit.reason
+
+
+def test_full_gate_seed_count_mismatch_dominates_n_check() -> None:
+    """If both the unequal-length check and the expected-count
+    check would fire, the unequal-length one runs first
+    (more specific failure surface)."""
+    result = evaluate_4b_gate(
+        [0.5, 0.5], [0.5, 0.5, 0.5]
+    )
+    assert not result.passes
+    # The unequal-length form names both side counts; the
+    # expected-count form names "expected_X_got_Y". Either is a
+    # legal P5.9.1 outcome — assert one of the two patterns fires.
+    assert (
+        "silica=2_vqbench=3" in result.reason
+        or "expected_3_got_2" in result.reason
+    )
+
+
 def test_silica_regression_against_custom_snapshot() -> None:
     """A C.x variant may pin a different snapshot (e.g. once C.4
     DFlash establishes its own convergence baseline) — the helper

@@ -246,6 +246,89 @@ def test_validator_int_accepted_where_float_expected() -> None:
 # --- regression guard: schema is decoupled from existing oracles ---
 
 
+# --- P5.9.1 hardening: non-finite float values ---
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["accept_rate", "verify_cost_ms", "draft_cost_ms", "tokens_per_target_forward"],
+)
+def test_validator_rejects_nan_for_float_metric(field: str) -> None:
+    """P5.9.1: ``float('nan')`` slips past ``< 0.0`` / ``<=`` /
+    ``>=`` comparisons (any nan comparison is False), so a Track C
+    timer that explodes to nan would silently pass the range band
+    pre-P5.9.1. The validator now rejects nan via
+    ``math.isfinite`` before the range comparison."""
+    meta = _valid_metadata(**{field: float("nan")})
+    violations = validate_speculative_metrics(meta)
+    assert any(
+        v.startswith(f"spec_metrics_value_error:{field}:")
+        and "expected_finite" in v
+        for v in violations
+    ), (field, violations)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("verify_cost_ms", float("inf")),
+        ("draft_cost_ms", float("inf")),
+        ("tokens_per_target_forward", float("inf")),
+    ],
+)
+def test_validator_rejects_inf_for_non_negative_float(
+    field: str, value: float
+) -> None:
+    """``float('inf') >= 0.0`` is True, so positive infinity passes
+    the non-negative range check pre-P5.9.1. The finite check now
+    catches it. Negative infinity already fails the non-negative
+    check, so the inf failure mode here is the positive-inf one."""
+    meta = _valid_metadata(**{field: value})
+    violations = validate_speculative_metrics(meta)
+    assert any(
+        v.startswith(f"spec_metrics_value_error:{field}:")
+        and "expected_finite" in v
+        for v in violations
+    ), (field, violations)
+
+
+def test_validator_rejects_inf_for_accept_rate() -> None:
+    """``accept_rate = +inf`` fails the finite check (P5.9.1) before
+    the range check would have caught it; ``-inf`` fails the finite
+    check too. Either way the reason names ``expected_finite``,
+    not ``expected_in_[0,1]``, so the failure surface is honest
+    about the nature of the error."""
+    for value in (float("inf"), float("-inf")):
+        meta = _valid_metadata(accept_rate=value)
+        violations = validate_speculative_metrics(meta)
+        assert any(
+            v.startswith("spec_metrics_value_error:accept_rate:")
+            and "expected_finite" in v
+            for v in violations
+        ), (value, violations)
+
+
+def test_validator_rejects_negative_inf_for_non_negative_float() -> None:
+    """Negative infinity fails the finite check (P5.9.1). Pre-P5.9.1
+    it would have hit the range check; post-P5.9.1 the finite check
+    runs first and is the more informative reason."""
+    for field in (
+        "verify_cost_ms",
+        "draft_cost_ms",
+        "tokens_per_target_forward",
+    ):
+        meta = _valid_metadata(**{field: float("-inf")})
+        violations = validate_speculative_metrics(meta)
+        assert any(
+            v.startswith(f"spec_metrics_value_error:{field}:")
+            and "expected_finite" in v
+            for v in violations
+        ), (field, violations)
+
+
+# --- regression guard: schema is decoupled from existing oracles ---
+
+
 def test_existing_oracle_metadata_does_not_satisfy_spec_schema() -> None:
     """Negative-control: validate that the WARM_DECODE oracle's
     metadata shape is **not** silently mistaken for spec metadata.

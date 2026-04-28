@@ -43,6 +43,7 @@ module's docs and the validator).
 
 from __future__ import annotations
 
+import math
 from enum import Enum
 from typing import Any
 
@@ -173,14 +174,28 @@ def validate_speculative_metrics(
 
 def _validate_field(field: str, value: Any) -> list[str]:
     """Per-field type + range check. Centralised so a future field
-    addition only adds one elif branch here."""
+    addition only adds one elif branch here.
+
+    P5.9.1 hardening: float-typed metrics reject ``nan`` / ``inf`` /
+    ``-inf`` via ``math.isfinite`` before the range comparison.
+    Without the finite check ``float('nan') < 0.0`` is ``False``
+    (any ``nan`` comparison is ``False``), so a Track C timer that
+    explodes to a non-finite value would silently pass the range
+    band and corrupt downstream comparisons.
+    """
     if field == "accept_rate":
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             return [
                 f"spec_metrics_type_error:{field}:"
                 f"expected_float_got_{type(value).__name__}"
             ]
-        if not (0.0 <= float(value) <= 1.0):
+        fv = float(value)
+        if not math.isfinite(fv):
+            return [
+                f"spec_metrics_value_error:{field}:"
+                f"expected_finite_got_{value}"
+            ]
+        if not (0.0 <= fv <= 1.0):
             return [
                 f"spec_metrics_range_error:{field}:"
                 f"expected_in_[0,1]_got_{value}"
@@ -192,7 +207,13 @@ def _validate_field(field: str, value: Any) -> list[str]:
                 f"spec_metrics_type_error:{field}:"
                 f"expected_float_got_{type(value).__name__}"
             ]
-        if float(value) < 0.0:
+        fv = float(value)
+        if not math.isfinite(fv):
+            return [
+                f"spec_metrics_value_error:{field}:"
+                f"expected_finite_got_{value}"
+            ]
+        if fv < 0.0:
             return [
                 f"spec_metrics_range_error:{field}:"
                 f"expected_non_negative_got_{value}"

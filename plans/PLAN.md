@@ -2,7 +2,7 @@
 
 | Field        | Value                                                                      |
 | ------------ | -------------------------------------------------------------------------- |
-| Version      | v1.7.15                                                                    |
+| Version      | v1.7.16                                                                    |
 | Last updated | 2026-04-27                                                                 |
 | Status       | P-5 complete; P-5 Acceptance (1)–(4) closed at v1.7.4; (a-real) real-activation xcheck closed at v1.7.5; P-3-C5 closed in slice-prefill regime (C5.5 α-MVP); P-3-E4 batched MoE smoke + scheduler-glue parity closed at v1.7.9; P-5-F pre-RoPE production routing closed at v1.7.6 via the (3b) projection-output capture path (F.1-F.4); (b-static) Qwen3.5-4B PPL vs vqbench REPORT.md baseline closed at v1.7.7; slice-regime + pre_norm hybrid Qwen3.5-0.8B E2E discriminator closed at v1.7.8; per-head Haar rotation landed as opt-in (default OFF) at v1.7.8; per-head D.2a 3-seed re-measurement at v1.7.10 — \|mean_gap\| 0.150 → 0.066 PPL (56% reduction); per-head (b-static) Qwen3.5-4B production-path re-measurement at v1.7.11 — std 5.3× tighter, mean unchanged in SEM, default flip is now an administrative landing, not an empirical question; **P-6 re-scoped from "Weight Streaming" to "Performance Phase" at v1.7.13 per D-017 / D-018 / D-019 — dense Qwen3.5-27B-4bit ≥60 tok/s primary target + MoE Qwen3.5-35B-A3B-4bit ≥100 tok/s stretch validator on 48 GB M5 Pro; P-7 Speculative promoted from T2 to T1; dense layer-streaming deferred to v0.2; Track C speculative grows to five sub-units per D-020 (C.1 draft-target, C.2 ReDrafter, C.3 MTP, C.4 DFlash, C.5 DDTree) and to six sub-units at v1.7.14 round-2 review (C.6 QuantSpec-like self-spec exploratory); P-6.0 measurement gate landed at v1.7.13 (8 scenarios + REPORT in `plans/P6_0_BASELINE/`); **P-6 contract sync at v1.7.14 per D-021** — dense gate split into (1a) ≥40 tok/s engineering (must pass) + (1b) ≥60 tok/s stretch (contingent on C.4/C.5 ≥2.5×); MoE acceptance split into (2a) ≥100 tok/s anchor (cleared at baseline) + (2b) ≥150 aggregate or ≥100 per-row stretch; execution order rewritten to foundation-first (P5.9 hardening → P-6.0.5 → Decision Gate 1 → spec foundation → C.4 spike → B → A); v1.7.14 round-3 review absorbed via stale-text cleanup; **P5.9 hardening complete at v1.7.15** — eight D-021 step 2 sub-units (a..h) closed across commits `0bd931a` / `bbdb7f7` / `9a9bff9` / `2483715` / `aa85e1c` / `dc5ba59` / `5d0f474` / `c385837`: probe double-load fix (27B/31B peaks corrected ~30.5→~15.3/~17.5 GB), Q-012 initial-cohort prefix consultation, Qwen3.5 pre-draft recurrent rollback, sustained 4K/8K context probes, D-009 hot-path audit lock-in, speculative metrics schema, operationalised (4-b) regression gate, full toolchain re-run attestation (2108 passed / 7 skipped, +82 P5.9 tests over the v1.7.13 baseline); see `plans/P6_OPENING.md` and `plans/P6_REVIEW_HANDOFF.md`** |
 | Maintainer   | Xin Zhou                                                                   |
@@ -1914,6 +1914,54 @@ Local reference implementations sit at the repo root. **Algorithm / architecture
 ---
 
 ## 13. Changelog
+
+- **v1.7.16** (2026-04-27): **P5.9.1 — validator hardening before
+  P-6.0.5.** Two soundness gaps caught by GPT-5.5 review against
+  v1.7.15, fixed before D-021 step 3 lands so the schema +
+  regression-gate contracts are tight from the start of Track A-E
+  work:
+
+  - `silica/bench/spec_metrics.py`: float-typed metrics
+    (`accept_rate`, `verify_cost_ms`, `draft_cost_ms`,
+    `tokens_per_target_forward`) now reject `nan` / `±inf` via
+    `math.isfinite` before the range comparison. The pre-P5.9.1
+    `< 0.0` check let `nan` through (any `nan` comparison is
+    `False`), so a Track C timer that explodes to a non-finite
+    value would silently pass the range band and corrupt
+    downstream comparisons. Failure surfaces as
+    `spec_metrics_value_error:<field>:expected_finite_got_<value>`.
+  - `silica/bench/p5_regression_gate.py`:
+    `evaluate_silica_regression` now rejects seed arrays whose
+    length differs from `snapshot.n_seeds` (default 3 under the
+    v1.7.3 anchor); `evaluate_4b_gate` rejects either array if
+    its length differs from `expected_n_seeds=3` (default). Both
+    helpers expose an `expected_n_seeds` override for
+    legitimate single-seed exploratory or higher-statistics
+    studies. Pre-P5.9.1 a 1-seed run would silently pass with
+    `SEM_diff = 0` (Bessel-corrected std on n=1 is 0 by
+    convention), collapsing the aggregate band to 0 and
+    defeating the statistical contract the gate encodes.
+    Failure surfaces as
+    `silica_regression_seed_count_mismatch:expected_X_got_Y` /
+    `full_4b_seed_count_mismatch:expected_X_got_Y`.
+
+  Tests added to `tests/test_spec_metrics_schema.py` (+9 cases
+  parametrised over the four float fields × {nan, +inf, -inf}
+  pairs that pre-P5.9.1 would have passed) and
+  `tests/test_p5_regression_gate.py` (+8 cases covering 1-seed /
+  2-seed rejection in both modes, explicit `expected_n_seeds`
+  overrides for both modes, and an unequal-length-vs-mismatched-
+  count precedence pin).
+
+  Toolchain attestation at v1.7.16: ruff clean (silica + tests +
+  scripts); mypy clean (75 source files, unchanged from v1.7.15);
+  full non-real-model suite **2125 passed / 7 skipped** (was 2108
+  at v1.7.15; +17 from P5.9.1 tests).
+
+  No PLAN-level decision change — D-021 step 2 already closed at
+  v1.7.15. v1.7.16 hardens the contracts before D-021 step 3
+  consumers (P-6.0.5 measurement expansion + later C.x track
+  oracles) start exercising them at scale.
 
 - **v1.7.15** (2026-04-27): **P5.9 hardening complete — D-021 step 2
   closed in eight bounded sub-units (a..h).** v1.7.14 committed the
