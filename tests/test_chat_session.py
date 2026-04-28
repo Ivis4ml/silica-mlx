@@ -1908,3 +1908,161 @@ def test_chat_session_implicit_leading_only_when_thinking_mode_not_false() -> No
     # is skipped. Explicit pairs are still stripped — but raw
     # has none, so output equals input.
     assert metrics.reply == raw
+
+
+# ---------------------------------------------------------------------------
+# RP-1 repair (post-4f98648): deferred-finalise correctness
+# ---------------------------------------------------------------------------
+
+
+def test_pending_finalise_uses_truncation_time_implicit_snapshot() -> None:
+    """If thinking_mode flips between the truncated turn and the
+    next user message, the deferred finalise must use the snapshot
+    captured at truncation — not the current live mode. Otherwise
+    a turn generated with thinking-on (implicit-leading text) would
+    NOT get its leading reasoning stripped after the user flips
+    thinking_mode off."""
+    eos = 250
+    raw = "leading reasoning\n</think>\nvisible body"
+    session, _ = _make_session_for_history_test(
+        reply_text=raw,
+        eos_id=None,  # forces max_tokens path
+        thinking_history="strip",
+        implicit_thinking_supported=True,
+        thinking_mode=True,  # turn 1: thinking on
+    )
+    # Turn 1: truncated mid-completion; deferred state captured
+    # while thinking_mode=True.
+    session.chat(
+        "first",
+        sampling_params=SamplingParams(max_tokens=len(raw)),
+    )
+    # User flips thinking_mode off between turns. WITHOUT the
+    # snapshot fix, the deferred finalise would now consult the
+    # live (False) mode and skip implicit-leading strip — leaving
+    # "leading reasoning" embedded in history.
+    session.set_thinking_mode(False)
+    # Swap engine for turn 2.
+    session._engine = _engine_yielding_text(  # type: ignore[assignment]
+        "ack", eos_id=eos
+    )
+    tok = session._tokenizer
+    tok.eos_token_ids = {eos}  # type: ignore[attr-defined]
+    session.chat("second")
+    # The first assistant message must show implicit-leading
+    # strip applied — "visible body" is what survives.
+    assert session.messages[1]["content"] == "visible body"
+
+
+def test_pending_finalise_respects_keep_when_user_flips_history() -> None:
+    """If the user flips thinking_history=strip→keep between the
+    truncated turn and the next user message, the deferred path
+    must NOT strip — the user explicitly asked to preserve raw."""
+    eos = 250
+    raw = "<think>secret</think>oops"
+    session, _ = _make_session_for_history_test(
+        reply_text=raw,
+        eos_id=None,
+        thinking_history="strip",
+        implicit_thinking_supported=False,
+        thinking_mode=False,
+    )
+    session.chat(
+        "first",
+        sampling_params=SamplingParams(max_tokens=len(raw)),
+    )
+    # Pre-finalise: raw on assistant.
+    assert session.messages[-1]["content"] == raw
+    # User flips history policy to keep.
+    session.set_thinking_history("keep")
+    session._engine = _engine_yielding_text(  # type: ignore[assignment]
+        "ack", eos_id=eos
+    )
+    tok = session._tokenizer
+    tok.eos_token_ids = {eos}  # type: ignore[attr-defined]
+    session.chat("second")
+    # Under live keep policy, the deferred finalise must not
+    # strip — raw is preserved on the prior assistant message.
+    assert session.messages[1]["content"] == raw
+
+
+def test_reset_clears_pending_finalise_flag() -> None:
+    """``reset()`` drops the truncated assistant message; the
+    pending-finalise flag must clear too so subsequent turns do
+    not try to strip a now-missing (or replaced) message."""
+    session, _ = _make_session_for_history_test(
+        reply_text="<think>x</think>oops",
+        eos_id=None,
+        thinking_history="strip",
+        implicit_thinking_supported=False,
+    )
+    raw_len = len("<think>x</think>oops")
+    session.chat(
+        "first", sampling_params=SamplingParams(max_tokens=raw_len)
+    )
+    assert session._pending_finalize is True
+    session.reset()
+    assert session._pending_finalize is False
+    assert session._pending_finalize_implicit_leading is None
+
+
+def test_replace_messages_clears_pending_finalise_flag() -> None:
+    """``/load`` route — wholesale message replacement clears the
+    deferred-finalise state because the prior assistant target is
+    gone."""
+    session, _ = _make_session_for_history_test(
+        reply_text="<think>x</think>oops",
+        eos_id=None,
+        thinking_history="strip",
+        implicit_thinking_supported=False,
+    )
+    raw_len = len("<think>x</think>oops")
+    session.chat(
+        "first", sampling_params=SamplingParams(max_tokens=raw_len)
+    )
+    assert session._pending_finalize is True
+    session.replace_messages(
+        [
+            {"role": "system", "content": "fresh"},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "world"},
+        ]
+    )
+    assert session._pending_finalize is False
+    assert session._pending_finalize_implicit_leading is None
+
+
+def test_pop_last_exchange_clears_pending_finalise_flag() -> None:
+    """``/regenerate`` route — popping the last (user, assistant)
+    pair removes the deferred-finalise target; the flag must
+    clear so the regenerated turn does not strip a stale buffer."""
+    session, _ = _make_session_for_history_test(
+        reply_text="<think>x</think>oops",
+        eos_id=None,
+        thinking_history="strip",
+        implicit_thinking_supported=False,
+    )
+    raw_len = len("<think>x</think>oops")
+    session.chat(
+        "first", sampling_params=SamplingParams(max_tokens=raw_len)
+    )
+    assert session._pending_finalize is True
+    popped = session.pop_last_exchange()
+    assert popped == "first"
+    assert session._pending_finalize is False
+    assert session._pending_finalize_implicit_leading is None
+
+
+def test_pending_finalise_snapshot_cleared_on_natural_completion() -> None:
+    """A turn that completes naturally (EOS) under strip mode
+    must clear the snapshot too — only truncated turns set it."""
+    eos = 250
+    session, _ = _make_session_for_history_test(
+        reply_text="<think>x</think>visible",
+        eos_id=eos,
+        thinking_history="strip",
+        implicit_thinking_supported=False,
+    )
+    session.chat("hi")
+    assert session._pending_finalize is False
+    assert session._pending_finalize_implicit_leading is None

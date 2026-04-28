@@ -239,6 +239,14 @@ class ChatSession:
         # then the flag tells callers (and ``/continue``) that the
         # last assistant message is *not* the post-strip text.
         self._pending_finalize: bool = False
+        # Snapshot of ``_should_strip_implicit_leading()`` taken at
+        # the moment a turn entered deferred-finalise. The deferred
+        # path consults THIS snapshot instead of the live value so
+        # a ``/config thinking_mode=off`` flipped between the
+        # truncated turn and the next user message cannot retroactively
+        # change which strip shape applies to the orphaned raw text.
+        # ``None`` means no defer is registered.
+        self._pending_finalize_implicit_leading: bool | None = None
 
     # --- observation -------------------------------------------------
 
@@ -269,10 +277,17 @@ class ChatSession:
         via :meth:`set_prefix_cache`). Leaving the previous cache
         intact would leak prior-conversation tokens into the new
         conversation; the shell is expected to swap it out.
+
+        RP-1 follow-up: clears the deferred-finalise pending flag.
+        Any truncated assistant message is gone after the reset, so
+        the next ``chat()`` must not try to strip a non-existent
+        (or replaced) message.
         """
         self._messages = [
             m for m in self._messages if m["role"] == "system"
         ]
+        self._pending_finalize = False
+        self._pending_finalize_implicit_leading = None
 
     def replace_messages(
         self, messages: list[dict[str, str]]
@@ -285,11 +300,18 @@ class ChatSession:
         whatever was previously cached, so retaining the old cache
         would leak stale blocks into the restored session. This
         mirrors the contract documented on :meth:`reset`.
+
+        RP-1 follow-up: clears the deferred-finalise pending flag.
+        The prior session's truncated assistant (if any) is no
+        longer the trailing message after a wholesale replace, so
+        the strip-on-next-turn path has no valid target.
         """
         self._messages = [
             {"role": m["role"], "content": m["content"]}
             for m in messages
         ]
+        self._pending_finalize = False
+        self._pending_finalize_implicit_leading = None
 
     def pop_last_exchange(self) -> str | None:
         """Drop the most recent ``(user, assistant)`` pair from history.
@@ -324,6 +346,13 @@ class ChatSession:
             return None
         self._messages.pop()  # assistant
         user_msg = self._messages.pop()
+        # RP-1 follow-up: the popped assistant message is gone, so
+        # any deferred-finalise flag that targeted it is stale. The
+        # ``/regenerate`` flow then re-issues ``chat()`` with the
+        # popped user text, which would otherwise see a stale flag
+        # and try to strip a now-replaced message.
+        self._pending_finalize = False
+        self._pending_finalize_implicit_leading = None
         return user_msg["content"]
 
     @staticmethod
@@ -485,18 +514,31 @@ class ChatSession:
         # in place so RP-2 ``/continue`` could resume mid-think;
         # once the user moves on with a fresh turn, the strip
         # applies (``/continue`` is no longer reachable). Skipped
-        # when the policy is ``keep`` or no defer was registered.
+        # when the live policy has flipped to ``keep`` between
+        # turns (the user explicitly opted into preserving raw
+        # text), or when no defer was registered. The
+        # implicit-leading decision uses the snapshot captured at
+        # truncation time so a mid-flight ``/config thinking_mode``
+        # change cannot retroactively change which strip shape
+        # applies to text the model already produced.
         if (
             self._pending_finalize
+            and self._thinking_history == "strip"
             and self._messages
             and self._messages[-1]["role"] == "assistant"
         ):
             raw = self._messages[-1]["content"]
+            implicit = (
+                self._pending_finalize_implicit_leading
+                if self._pending_finalize_implicit_leading is not None
+                else self._should_strip_implicit_leading()
+            )
             self._messages[-1]["content"] = _strip_thinking_block(
                 raw,
-                implicit_leading=self._should_strip_implicit_leading(),
+                implicit_leading=implicit,
             )
         self._pending_finalize = False
+        self._pending_finalize_implicit_leading = None
 
         self._messages.append({"role": "user", "content": user_text})
         prompt_text, prompt_ids = self._render_prompt()
@@ -566,16 +608,24 @@ class ChatSession:
                 implicit_leading=self._should_strip_implicit_leading(),
             )
             self._pending_finalize = False
+            self._pending_finalize_implicit_leading = None
         elif (
             self._thinking_history == "strip"
             and finish_reason == "max_tokens"
         ):
             stored_reply = raw_reply
             self._pending_finalize = True
+            # Snapshot the implicit-leading decision NOW so a later
+            # ``/config thinking_mode`` flip cannot retroactively
+            # alter the strip shape when the deferred finalise fires.
+            self._pending_finalize_implicit_leading = (
+                self._should_strip_implicit_leading()
+            )
         else:
             # keep mode — verbatim regardless of finish_reason.
             stored_reply = raw_reply
             self._pending_finalize = False
+            self._pending_finalize_implicit_leading = None
         self._messages.append(
             {"role": "assistant", "content": stored_reply}
         )
