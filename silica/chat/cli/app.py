@@ -302,15 +302,12 @@ def run_chat(args: argparse.Namespace) -> int:
     # (see the chat-turn loop below) so /config thinking_mode=on|off
     # takes effect on the next turn without requiring a session
     # rebuild.
-    initial_thinking_mode = state.config.get("thinking_mode")
-    if not isinstance(initial_thinking_mode, bool):
-        initial_thinking_mode = None
     chat_session = ChatSession(
         adapter,
         engine,  # type: ignore[arg-type]
         system_prompt=args.system,
         prefix_cache=prefix_cache,
-        thinking_mode=initial_thinking_mode,
+        thinking_mode=_resolve_thinking_mode(state),
     )
 
     # --- prompt_toolkit session ---
@@ -404,18 +401,16 @@ def run_chat(args: argparse.Namespace) -> int:
                 state.total_prefix_hit_tokens = 0
                 state.total_decode_tokens = 0
                 state.total_decode_seconds = 0.0
-            if result.request_system_prompt is not None:
-                # CHAT-CLI-HARDENING-1 (F1): propagate /system to
-                # the live ChatSession alongside the config-side
-                # update the dispatcher already performed. Empty
-                # string clears; non-empty replaces. The prefix
-                # cache is not explicitly invalidated — the
-                # rendered prompt's leading tokens change with the
-                # new system content, so the next chat() call's
-                # peek mismatches the old radix nodes naturally.
-                chat_session.set_system_prompt(
-                    result.request_system_prompt or None
-                )
+            # CHAT-CLI-HARDENING-1 (F1): propagate /system to the
+            # live ChatSession alongside the config-side update the
+            # dispatcher already performed. The helper handles the
+            # tri-state semantics (None = no request, "" = clear,
+            # non-empty = replace). The prefix cache is not
+            # explicitly invalidated — the rendered prompt's
+            # leading tokens change with the new system content,
+            # so the next chat() call's peek mismatches the old
+            # radix nodes naturally.
+            _apply_system_prompt_request(result, chat_session)
             if result.request_expand_thinking:
                 expanded = palette.colorize(
                     "── thinking ──\n" + state.last_turn_thinking,
@@ -670,13 +665,10 @@ def run_chat(args: argparse.Namespace) -> int:
         # CHAT-CLI-HARDENING-2 (F2): re-sync the live thinking_mode
         # before each chat() turn so /config thinking_mode=on|off
         # takes effect immediately without requiring a session
-        # rebuild. ``state.config["thinking_mode"]`` is bool (the
-        # config schema enforces it); a non-bool value (defensive)
-        # collapses to ``None`` so ChatSession omits the kwarg.
-        sync_thinking_mode = state.config.get("thinking_mode")
-        if not isinstance(sync_thinking_mode, bool):
-            sync_thinking_mode = None
-        chat_session.set_thinking_mode(sync_thinking_mode)
+        # rebuild. ``_resolve_thinking_mode`` handles the bool /
+        # non-bool / missing-key collapse identically to the
+        # session-construction path above.
+        chat_session.set_thinking_mode(_resolve_thinking_mode(state))
 
         # HARDENING-6: ``with live_toolbar`` guarantees ``__exit__``
         # runs on every exit path (success, ``continue`` from an
@@ -1108,12 +1100,14 @@ def _swap_model(
 _PREFIX_CACHE_BLOCK_SIZE = 4
 """Block size for the chat-CLI's prefix cache.
 
-The bench harness uses 16 (matches `_maybe_build_prefix_cache`).
-Chat is different — between turns, the chat template re-renders the
-conversation and the deterministic shared prefix grows by ~10-30
-tokens per turn (one user message + chat-template wrapping). Block
-sizes larger than that boundary lose ALL prefix reuse on short
-turns. Concrete example with Qwen3.5-4B and a `Hi, who are you?`
+The general bench harness (`silica.bench.runner`) uses 16, matching
+its scenario-level oracles. Chat is different — between turns, the
+chat template re-renders the conversation and the deterministic
+shared prefix grows by ~10-30 tokens per turn (one user message +
+chat-template wrapping). Block sizes larger than that boundary lose
+ALL prefix reuse on short turns. The chat-bench harness in
+``silica.bench.chat_bench`` mirrors this 4-token block size for
+the same reason; both must move together if it ever changes. Concrete example with Qwen3.5-4B and a `Hi, who are you?`
 opening: turn 1's prompt is 16 tokens ending in `<think>\\n`, but
 turn 2's prompt at position 14 starts the assistant message text;
 the 14-token shared prefix is below `block_size=16` so 0 blocks
@@ -1143,9 +1137,8 @@ def _build_prefix_cache(
     Helper-injected arguments mirror the imports inside
     :func:`run_chat` so this builder stays pure-Python and can be
     unit-tested without the heavy MLX / engine warm-up — see
-    ``tests/test_chat_cli_app_prefix_cache_factory.py`` (planned
-    follow-up; for now the function is exercised end-to-end via
-    the live REPL smoke).
+    ``tests/test_chat_cli_app.py`` for the fp16 / codec / injection
+    coverage (HARDENING-8).
     """
     layout = adapter.kv_layout()
     codec: Any = None
@@ -1190,6 +1183,48 @@ def _sampling_params_from_state(
         max_tokens=int(state.config.get("max_tokens", 1024)),
         stop_token_ids=eos_ids,
     )
+
+
+def _resolve_thinking_mode(state: ChatCliState) -> bool | None:
+    """Read ``state.config['thinking_mode']`` and coerce to
+    ``bool | None``.
+
+    CHAT-CLI-HARDENING-2 / -8. The config schema declares
+    ``thinking_mode`` as a bool, but the chat REPL reads the value
+    defensively: a non-bool (e.g. legacy persisted-state shape, a
+    user typo before validation kicks in) collapses to ``None`` so
+    ``ChatSession`` omits the ``enable_thinking`` kwarg from the
+    chat template entirely (the model family default applies).
+
+    Used both at session construction and per-turn re-sync so
+    ``/config thinking_mode=on|off`` takes effect on the next
+    turn without requiring a session rebuild.
+    """
+    value = state.config.get("thinking_mode")
+    if isinstance(value, bool):
+        return value
+    return None
+
+
+def _apply_system_prompt_request(
+    result: CommandResult, chat_session: Any
+) -> None:
+    """Propagate ``/system`` from the dispatcher to the live
+    :class:`ChatSession`.
+
+    CHAT-CLI-HARDENING-1 / -8. The dispatcher uses tri-state
+    semantics for ``request_system_prompt``: ``None`` means "no
+    request this turn"; the empty string ``""`` means
+    ``/system`` was issued with no args (clear); a non-empty
+    string means ``/system <text>`` (replace). This helper turns
+    that tri-state into the matching ``set_system_prompt``
+    invocation, leaving non-system slash commands untouched.
+    """
+    if result.request_system_prompt is None:
+        return
+    # Empty string -> clear; non-empty -> replace.
+    text = result.request_system_prompt or None
+    chat_session.set_system_prompt(text)
 
 
 __all__ = ["run_chat"]
