@@ -88,9 +88,15 @@ either yet — see "What's planned" below for the gap.
   argmax, WikiText-2 perplexity) producing JSONL + Markdown reports
   with an optional vqbench subprocess cross-check column. One
   command runs the entire catalogue.
-- **CLI + Python API.** `silica run` single-shot, `scripts/chat.py`
-  streaming REPL with `/reset` and `/stats`, plus
-  `Engine.generate` / `Engine.generate_batch` for direct embedding.
+- **CLI + Python API.** `silica run` single-shot;
+  `silica chat` (or bare `silica`) — full `prompt_toolkit` REPL
+  with live toolbar (tok/s, KV residency, prefix-hit, finish
+  reason), `/continue` for `max_tokens`-truncated turns,
+  `/regenerate`, `/save` · `/load`, `/model` swap (with
+  `--keep-history`), `/system`, `/showcase` session narrative;
+  plus `Engine.generate` / `Engine.generate_batch` and
+  `ChatSession.chat` / `ChatSession.continue_last` for direct
+  embedding.
 
 ---
 
@@ -192,36 +198,45 @@ installed.
 ### 2. CLI — chat REPL
 
 ```bash
-python scripts/chat.py --model Qwen/Qwen3-0.6B \
-    --system "You are a concise assistant." \
-    --temperature 0.7 --top-p 0.9 --max-tokens 256
+silica chat --model Qwen/Qwen3-0.6B --system "You are concise."
+silica chat --model Qwen/Qwen3.5-4B --kv-codec block_tq_b64_b4
+silica            # bare-launch — claude-style; --model becomes implicit
 ```
 
-Opens a multi-turn REPL that streams each reply token-by-token. After
-every turn stderr prints a single-line metrics record:
+Bare `silica` (no subcommand) is rewritten to `silica chat ...` at
+parse time. The script alias `python scripts/chat.py ...` exposes the
+same launch surface.
 
-```text
-[ttft=25.1ms prefill=596.9tok/s decode=151.4tok/s
- resident_kv=29.4MB peak=1261.5MB logical_kv=29.4MB
- prompt=15 out=64 wall=0.44s finish=max_tokens]
-```
+Opens a multi-turn REPL that streams each reply token-by-token over a
+persistent bottom toolbar showing `state= · tok/s · tokens=N/max ·
+ttft · peak · kv · prefix_hit=N/M · finish=`. When a turn ends at
+`finish_reason=max_tokens` a yellow `[truncated: /continue]` marker
+prints below the reply, advertising the path forward.
 
-REPL commands:
+Slash commands:
 
 | Command | Effect |
 | --- | --- |
-| `/reset` | drop all messages except the initial `--system` prompt |
-| `/stats` | print cumulative session metrics (avg TTFT, avg decode tok/s, total tokens, wall time) |
-| `/exit` · EOF · Ctrl-C | quit |
+| `/help` | List every command + the full `/config` schema |
+| `/exit` · EOF | Quit the REPL |
+| `/reset` | Drop conversation log + invalidate prefix cache |
+| `/system "..."` | Replace the live system prompt (empty arg clears) |
+| `/config key=value` | Adjust runtime config (`temperature`, `max_tokens`, `thinking_mode`, `thinking_history`, `live_toolbar`, ...) |
+| `/regenerate` | Redo the previous turn with a fresh sample (rollback on abort) |
+| `/continue` | Extend the previous turn when it stopped at `max_tokens` |
+| `/save <path>` · `/load <path>` | Persist / restore conversation as JSON |
+| `/model <repo>` · `/model <repo> --keep-history` | Swap model (default resets history; `--keep-history` re-tokenises stored text against the new tokeniser) |
+| `/expand` | Reprint the previous turn's collapsed `<think>` content |
+| `/showcase` | One-paragraph session narrative (turns, prefix reuse, avg decode, last finish, last-turn reasoning/visible char split, `/continue` calls) |
 
-Flags:
+Launch flags (sampling knobs intentionally **not** CLI flags — adjust
+mid-session via `/config`):
 
 | Flag | Purpose |
 | --- | --- |
-| `--model` | HuggingFace repo id (e.g. `Qwen/Qwen3-0.6B`, `Qwen/Qwen3.5-0.8B`) |
-| `--system` | system prompt; omit for an empty system |
-| `--temperature` · `--top-p` · `--top-k` · `--max-tokens` | sampling |
-| `--no-stream` | print the full reply only after generation completes |
+| `--model` | HuggingFace repo id (e.g. `Qwen/Qwen3-0.6B`, `Qwen/Qwen3.5-4B`) |
+| `--system` | Initial system prompt; omit for empty system |
+| `--kv-codec` | KV codec id (e.g. `block_tq_b64_b4`); omit for fp16 |
 
 ### 3. Python API — single request
 
@@ -310,6 +325,27 @@ decode tok/s, resident KV, peak memory, logical KV bytes, wall
 seconds, and finish reason. `session.reset()` drops every message
 except the system prompt.
 
+Three additional ctor knobs cover the chat-CLI's response-policy
+surface (Qwen3 family with `enable_thinking=True`):
+
+- `thinking_mode: bool | None` — threaded as `enable_thinking` to
+  `apply_chat_template` so `/config thinking_mode=on|off` actually
+  changes what the model reasons about. `None` keeps the
+  tokeniser's default.
+- `thinking_history: "strip" | "keep"` — `strip` (default) removes
+  `<think>...</think>` content from `messages[-1].content` after
+  each turn so the next turn's prompt does not re-feed cumulative
+  reasoning; `keep` preserves the raw decoded reply for archival
+  use cases.
+- `implicit_thinking_supported: bool` — `True` for Qwen3 / Qwen3.5
+  templates that prepend `<think>\n` to the assistant slot.
+
+When a turn ends at `finish_reason="max_tokens"`, the assistant
+message holds the raw prefix (deferred-finalise contract); call
+`session.continue_last()` to extend the same message in place
+without inserting a new `(user, assistant)` pair. Chained
+`continue_last` is supported.
+
 ### 6. Benchmark harness
 
 ```bash
@@ -327,7 +363,7 @@ sweep, `--vqbench-xcheck` cross-check column — lives in
 ## Running the tests
 
 ```bash
-uv run pytest tests           # full suite (currently 778 tests, ~20 s)
+uv run pytest tests           # full suite (currently ~2370 tests, ~80 s)
 uv run ruff check .
 uv run mypy silica
 ```

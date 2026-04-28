@@ -110,13 +110,38 @@ Slash commands available out of the box:
 | `/config` | Print current config + schema |
 | `/config temperature=0.3` | Adjust sampling mid-session |
 | `/config max_tokens=2048` | Adjust per-turn token ceiling |
-| `/config thinking=hidden` | Hide `<think>` blocks (lands fully at C-8) |
+| `/config thinking=auto\|show\|hidden` | Display side: live render of `<think>` blocks |
+| `/config thinking_mode=on\|off` | Model side: thread `enable_thinking` to the chat template |
+| `/config thinking_history=strip\|keep` | History side: drop or preserve `<think>` content in the next turn's prompt |
+| `/config live_toolbar=on\|off` | Opt in to the per-token Ansi toolbar overlay (default off; `SILICA_LIVE_TOOLBAR=1` env override) |
 | `/system "You are concise."` | Set / replace the system prompt |
 | `/reset` | Clear conversation log + invalidate prefix cache |
-| `/regenerate` | Redo the previous turn (lands at C-4) |
-| `/save <path>` / `/load <path>` | Persist / restore (lands at C-7) |
-| `/model <repo>` | Swap the active model (lands at C-7) |
+| `/regenerate` | Redo the previous turn with a fresh sample |
+| `/continue` | Extend the previous turn when it stopped at `max_tokens` |
+| `/save <path>` · `/load <path>` | Persist / restore conversation as JSON |
+| `/model <repo> [--keep-history]` | Swap the active model; flag re-tokenises stored text against the new tokeniser instead of resetting history |
+| `/expand` | Reprint the previous turn's collapsed `<think>` content |
+| `/showcase` | One-paragraph session narrative (turns, prefix reuse, last finish, last-turn reasoning/visible char split, `/continue` calls) |
 | `/exit` | Quit the REPL |
+
+The **three-axis thinking model** (`thinking_mode` / `thinking` /
+`thinking_history`) keeps the model side, the display side, and the
+history side independent — see `plans/CHAT_CLI_RESPONSE_POLICY.md`
+Decision E. The recommended chat default after the response-policy
+side track is `thinking_mode=on` + `thinking=hidden` +
+`thinking_history=strip`, which lets the model reason silently
+without re-feeding the reasoning into every subsequent turn's
+prompt.
+
+When a turn ends at `finish_reason=max_tokens` the shell prints
+`[truncated: /continue]` on a fresh line below the reply (the
+marker is rendered via direct `sys.stdout.write` and never reaches
+`messages`). Run `/continue` to extend the same assistant turn
+in place — no new `(user, assistant)` pair is created. Chained
+`/continue` is supported; the assistant message stays raw across
+the boundary so `apply_chat_template(continue_final_message=True)`
+can rebuild the original generation prompt's `<think>\n` boundary
+on Qwen3-family templates.
 
 Sampling knobs (temperature, top_p, top_k, max_tokens) are
 intentionally **not** CLI flags — they live behind `/config`
@@ -233,14 +258,25 @@ metadata (entry points, dependencies) changes.
 ## Tests
 
 Unit tests for the chat-CLI layers (palette, state, toolbar,
-commands, config) run in any environment that has the project
+commands, config, app helpers, persistence, live-toolbar backends,
+swap-model) plus the full `ChatSession` surface
+(`chat`, `continue_last`, `pop_last_exchange`, `replace_messages`,
+deferred-finalise + continuation-snapshot lifecycle, three-tier
+strip fallback) run in any environment that has the project
 installed:
 
 ```bash
-uv run pytest tests/test_chat_cli_*.py
+uv run pytest tests/test_chat_cli_*.py tests/test_chat_session.py
 ```
 
-The prompt_toolkit Application (C-3) itself is not unit-tested —
-the event loop is covered by manual smoke (open the REPL, exercise
-each slash command, check colour rendering, verify the toolbar
-fields update between turns).
+Helper-level coverage hits the `_evaluate_continue_request`,
+`_assistant_ends_in_thinking`, `_print_truncation_marker`,
+`_capture_rollback_snapshot` / `_apply_rollback_snapshot`,
+`_resolve_thinking_mode` / `_resolve_thinking_history` /
+`_resolve_live_toolbar_enabled` extracts so REPL-side regressions
+land on a focused test rather than only on manual smoke.
+
+The prompt_toolkit Application's event loop itself is covered by
+manual smoke (open the REPL, exercise each slash command, check
+colour rendering, verify the toolbar fields update between turns;
+see HARDENING-9 / RP-6 manual acceptance templates under `plans/`).

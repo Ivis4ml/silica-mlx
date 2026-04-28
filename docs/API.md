@@ -1660,13 +1660,31 @@ layering. Programmatic users build on `ChatSession` directly.
 
 #### `TurnMetrics` *(public, dataclass)*
 
-One chat-turn outcome. Fields: `reply`, `prompt_tokens`,
-`output_tokens`, `finish_reason`, `ttft_ms`, `prefill_tok_s`,
-`decode_tok_s`, `resident_mb`, `peak_memory_mb`, `logical_kv_bytes`,
-`wall_s`, `prefix_hit_blocks`, `prefix_hit_tokens`,
-`prefix_store_resident_bytes`, `prefix_store_logical_bytes`. The
-chat CLI's toolbar reads these; `/showcase` aggregates them across a
-session.
+One chat-turn outcome. Fields: `reply`, `raw_reply`,
+`prompt_tokens`, `output_tokens`, `finish_reason`, `ttft_ms`,
+`prefill_tok_s`, `decode_tok_s`, `resident_mb`, `peak_memory_mb`,
+`logical_kv_bytes`, `wall_s`, `prefix_hit_blocks`,
+`prefix_hit_tokens`, `prefix_store_resident_bytes`,
+`prefix_store_logical_bytes`. The chat CLI's toolbar reads these;
+`/showcase` aggregates them across a session.
+
+`raw_reply` carries the full decoded reply text BEFORE
+`thinking_history` strip; equal to `reply` under
+`thinking_history="keep"` or when the model produced no thinking
+content; differs when a `<think>...</think>` block was removed at
+finalise time. Default `""` keeps backward compatibility for
+callers constructing `TurnMetrics` directly without the field.
+
+#### `_strip_thinking_block(text, *, implicit_leading: bool) -> str` *(internal helper)*
+
+Pure function used by `chat()` / `continue_last()` to remove
+`<think>...</think>` content under `thinking_history="strip"`.
+Handles two shapes — `implicit_leading=True` for Qwen3-family
+templates that prepend `<think>\n` to the assistant slot (no
+opening tag in the model's output), and explicit `<think>...</think>`
+pairs anywhere in the text. Unclosed thinking blocks are preserved
+unchanged (the conservative choice when truncation cuts the model
+mid-think). Re-exported from the module for unit-test reach.
 
 #### `ChatSession` *(public class)*
 
@@ -1688,22 +1706,89 @@ ChatSession(
     reset_peak_memory: Callable[[], None] | None = None,
     read_peak_memory_mb: Callable[[], float | None] | None = None,
     clock: Callable[[], float] = time.perf_counter,
+    thinking_mode: bool | None = None,
+    thinking_history: str = "strip",
+    implicit_thinking_supported: bool = False,
 )
 ```
 
-Key methods:
+Three response-policy ctor knobs (CHAT-CLI-RESPONSE-POLICY RP-1):
 
-- **`chat(message, params=None, stream_to=None) -> TurnMetrics`** —
+- **`thinking_mode`** threads `enable_thinking` to
+  `apply_chat_template`. `None` (default) omits the kwarg —
+  preserves backward-compat for tokenisers / templates that do not
+  recognise it.
+- **`thinking_history`** is `"strip"` (default) or `"keep"`. Strip
+  removes `<think>...</think>` from the assistant message after
+  natural completion so the next turn's prompt does not re-feed
+  the reasoning; keep preserves the raw decoded reply verbatim.
+- **`implicit_thinking_supported`** is `True` for Qwen3-family
+  templates that prepend `<think>\n` to the assistant slot. Drives
+  the strip helper's `implicit_leading` decision.
+
+Generation methods:
+
+- **`chat(message, *, sampling_params=None, stream_to=None) -> TurnMetrics`** —
   one turn; `stream_to` is an optional `Callable[[str], None]`
-  invoked on each decoded chunk.
-- **`reset() -> None`** — clear conversation history and reset the
-  prefix cache (if attached).
+  invoked on each decoded chunk. On `finish_reason="max_tokens"`
+  under strip mode the assistant message is left raw on
+  `messages[-1]` so a follow-up `continue_last` can resume the
+  open thinking block; the deferred strip fires either when the
+  next `chat()` call lands or when `continue_last` reaches natural
+  completion.
+- **`continue_last(*, sampling_params=None, stream_to=None) -> TurnMetrics`** —
+  CHAT-CLI-RESPONSE-POLICY RP-2. Resume the trailing assistant
+  turn by appending generated tokens to the EXISTING message — no
+  new `(user, assistant)` pair is created. Re-renders the prompt
+  with `apply_chat_template(continue_final_message=True)` so the
+  tokeniser drops the close tag from the assistant slot;
+  Qwen-shaped manual fallback when the tokeniser refuses. Restores
+  the synthetic `<think>\n` prefix on the continuation prompt
+  when the original generation prompt had implicit-leading
+  reasoning. Raises `RuntimeError` when `messages[-1]` is not an
+  assistant turn; the chat-CLI shell guards against truncation
+  status before calling.
+
+Mutation methods:
+
+- **`reset() -> None`** — drop every message except the original
+  system prompt. Clears the deferred-finalise + continuation
+  snapshots.
 - **`replace_messages(messages) -> None`** — wholesale swap of the
-  history, used by `/load` in the chat CLI.
+  history, used by `/load` in the chat CLI. Clears snapshots.
+- **`pop_last_exchange() -> str | None`** — drop the most recent
+  `(user, assistant)` pair, returning the popped user content (or
+  `None` for shapes that cannot be regenerated). Clears snapshots.
 - **`set_prefix_cache(cache) -> None`** — attach / detach a prefix
   cache mid-session.
+- **`set_system_prompt(text) -> None`** — replace or clear the
+  live system prompt; preserves user / assistant turns.
+- **`set_thinking_mode(mode) -> None`** — flip the live session's
+  `enable_thinking` propagation. `/config thinking_mode=on|off` in
+  the chat CLI threads through this.
+- **`set_thinking_history(mode) -> None`** — flip
+  `thinking_history` between `"strip"` and `"keep"`.
+- **`set_implicit_thinking_supported(value) -> None`** — used on
+  `/model` swap to refresh the implicit-leading decision against
+  the new model's family.
 
-Properties: `messages`, `eos_token_ids`, `prefix_cache`.
+Properties: `messages`, `eos_token_ids`, `prefix_cache`,
+`pending_continuation_implicit_leading`.
+
+`messages` returns independent dict copies (deep-ish) so callers
+can snapshot the history before invoking mutator methods —
+`/continue`'s abort-rollback contract relies on this so the
+in-place mutation `continue_last` performs at the end of
+generation cannot corrupt the snapshot the shell holds.
+
+`pending_continuation_implicit_leading` is the truncation-time
+implicit-leading snapshot for `/continue` — set on any
+`finish_reason="max_tokens"` turn (regardless of strip / keep
+policy); cleared on natural completion / new user turn / reset /
+replace / pop. Read by the chat-CLI shell to seed the streaming
+`ThinkingParser` based on the truncation-time fact rather than the
+live `thinking_mode` config (which the user may have flipped
+between turns).
 
 ### `silica.chat.cli`
 
@@ -1713,28 +1798,62 @@ Bundled `prompt_toolkit`-driven REPL — design contract in
 - **`silica.chat.cli.state`** — `ChatCliState` dataclass holding
   live engine metrics, `StreamState` enum, conversation log,
   configuration. All other CLI code reads / writes through this
-  state.
+  state. Notable RP-3 fields: `last_finish_reason` (drives the
+  toolbar's `finish=` field and `/continue`'s truncation guard);
+  `last_turn_reasoning_chars` / `last_turn_visible_chars`
+  (per-turn char split surfaced by `/showcase`; carries across
+  `/continue` boundaries); `total_continuation_chunks`
+  (cumulative `/continue` invocation tally).
 - **`silica.chat.cli.palette`** — `Palette` + `PaletteMode` enum
   (`PLAIN` / `EIGHT` / `TRUE_COLOR`) + capability detection
   (24-bit / 8-colour / `NO_COLOR` fallback).
 - **`silica.chat.cli.toolbar`** — pure-function formatter from
   `ChatCliState` to the bottom-of-terminal status line.
-  `render_toolbar(state, *, palette=None) -> str`,
+  `render_toolbar(state, *, palette=None) -> str` includes the
+  RP-3 `finish=<reason>` field (em-dash before any turn runs);
   `render_codec_hint(state, *, palette=None, threshold_mb=200.0)
   -> str | None` (codec recommendation when prefix store crosses a
-  threshold under fp16), `render_showcase(state, *, palette=None)
-  -> str` (the multi-line `/showcase` session report).
+  threshold under fp16); `render_showcase(state, *, palette=None)
+  -> str` (the multi-line `/showcase` session report — turns,
+  prefix reuse, avg decode, last finish, last-turn char split,
+  `/continue` calls).
 - **`silica.chat.cli.thinking_parser`** — incremental parser that
   separates `<think>` tag content from reply content during
-  streaming. Emits `ThinkChunk` and `ReplyChunk` events.
+  streaming. Emits `EnterThinking` / `ThinkingChunk` /
+  `ExitThinking` / `ReplyChunk` events. Constructor accepts
+  `start_in_thinking: bool` so the chat-CLI shell can seed the
+  parser based on either the implicit-leading decision (Qwen3
+  family with `enable_thinking=True`) or the truncation-time
+  snapshot for `/continue`.
 - **`silica.chat.cli.code_fence`** — incremental parser that
   isolates fenced code blocks for pygments highlighting. Emits
   `PlainText`, `EnterFence`, `ExitFence` events.
-- **`silica.chat.cli.commands`** — slash-command dispatch
-  (`/reset`, `/stats`, `/save`, `/load`, `/model`, `/showcase`,
-  `/exit`).
-- **`silica.chat.cli.config`** — `ChatCliConfig` pydantic model
-  + `--system` / `--kv-codec` parsing.
+- **`silica.chat.cli.commands`** — slash-command dispatch.
+  `is_slash_command(line) -> bool`, `dispatch_command(line, state)
+  -> CommandResult`. Registered commands: `/help`, `/exit`,
+  `/reset`, `/system`, `/config`, `/regenerate`, `/continue`,
+  `/save`, `/load`, `/model`, `/expand`, `/showcase`. The shell
+  reads request flags off `CommandResult` (`request_reset`,
+  `request_regenerate`, `request_continue`, `request_session_save`,
+  `request_session_load`, `request_model_swap`,
+  `request_model_keep_history`, `request_expand_thinking`,
+  `request_showcase`, `request_system_prompt`) and applies the
+  side effects.
+- **`silica.chat.cli.config`** — config schema with parse / render
+  helpers; `parse_config_assignment` validates `/config key=value`
+  inputs against the schema. Notable keys: `temperature`, `top_p`,
+  `top_k`, `max_tokens`, `system_prompt`, `thinking` (display),
+  `thinking_mode` (model), `thinking_history` (history; RP-1),
+  `live_toolbar` (toolbar opt-in; default `off`), `kv_codec_hint_mb`.
+- **`silica.chat.cli.live_toolbar`** — swappable per-token
+  toolbar backend. `make_live_toolbar(palette, output_stream,
+  term, enabled) -> LiveToolbar` returns either the
+  `NullLiveToolbar` (no-op; default) or `AnsiLiveToolbar` (DEC
+  cursor save/restore + per-token redraw). `RollingTokRate`
+  drives the live `tok/s` field. The Ansi backend is opt-in
+  (`SILICA_LIVE_TOOLBAR=1` env or `/config live_toolbar=on`)
+  because cursor save/restore has been observed to drop on real
+  terminal × prompt-toolkit interactions.
 - **`silica.chat.cli.persistence`** — JSON session serialization
   with `SCHEMA_VERSION = 1`. `serialize_session(...)`,
   `save_session(path, ...)`, `load_session(path) -> dict`.
@@ -1743,7 +1862,15 @@ Bundled `prompt_toolkit`-driven REPL — design contract in
 - **`silica.chat.cli.app`** — the prompt_toolkit application shell.
   Owns the event loop, redraws the toolbar at decode boundaries,
   routes input through commands / fence / thinking parsers,
-  emits coloured output via the palette.
+  emits coloured output via the palette. Notable extracted
+  helpers (unit-tested without prompt_toolkit):
+  `_resolve_thinking_mode`, `_resolve_thinking_history`,
+  `_resolve_live_toolbar_enabled`, `_evaluate_continue_request`,
+  `_assistant_ends_in_thinking`, `_print_truncation_marker`,
+  `_capture_rollback_snapshot` / `_apply_rollback_snapshot` (the
+  shared rollback helper for `/regenerate` and `/continue` abort
+  paths), `_apply_system_prompt_request`, `_swap_model`,
+  `_build_prefix_cache`, `_sampling_params_from_state`.
 
 The `state` / `palette` / `toolbar` / `thinking_parser` /
 `code_fence` / `persistence` modules are pure-Python and unit-tested
