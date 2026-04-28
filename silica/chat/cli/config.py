@@ -183,6 +183,7 @@ class ConfigEntry:
 # validation in lockstep.
 THINKING_DISPLAY_CHOICES: tuple[str, ...] = ("auto", "show", "hidden")
 THINKING_HISTORY_CHOICES: tuple[str, ...] = ("strip", "keep")
+LIVE_TOOLBAR_CHOICES: tuple[str, ...] = ("on", "off")
 
 
 CONFIG_SCHEMA: dict[str, ConfigEntry] = {
@@ -254,6 +255,23 @@ CONFIG_SCHEMA: dict[str, ConfigEntry] = {
             "strip = drop reasoning from history so subsequent prompts "
             "stay short (default); keep = preserve raw decoded reply "
             "verbatim — useful for /save-then-archive workflows"
+        ),
+    ),
+    "live_toolbar": ConfigEntry(
+        key="live_toolbar",
+        default="off",
+        parse=lambda raw: _parse_choice(
+            "live_toolbar", raw, LIVE_TOOLBAR_CHOICES
+        ),
+        summary="opt-in live bottom toolbar during generation",
+        valid_help=(
+            "off (default) = post-turn toolbar only via "
+            "PromptSession.bottom_toolbar; on = AnsiLiveToolbar "
+            "redraws per-token. Off by default because cursor "
+            "save/restore is unreliable across terminal × prompt-"
+            "toolkit interactions; SILICA_LIVE_TOOLBAR=1 env var "
+            "is the higher-priority opt-in path. NO_COLOR=1 still "
+            "forces off regardless."
         ),
     ),
     "kv_codec_hint_mb": ConfigEntry(
@@ -354,6 +372,7 @@ __all__ = [
     "CONFIG_SCHEMA",
     "ConfigEntry",
     "ConfigError",
+    "LIVE_TOOLBAR_CHOICES",
     "THINKING_DISPLAY_CHOICES",
     "THINKING_HISTORY_CHOICES",
     "get_default",

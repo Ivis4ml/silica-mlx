@@ -529,15 +529,25 @@ def run_chat(args: argparse.Namespace) -> int:
         state.tokens_generated = 0
         state.max_tokens = int(state.config.get("max_tokens", 1024))
         state.last_turn_thinking = ""
-        # CHAT-CLI-HARDENING-6 (F3): live toolbar backend selection.
-        # ANSI sticky-bottom-line on a capable TTY; no-op fallback
-        # otherwise. ``RollingTokRate`` drives ``state.tok_per_sec``
-        # live during the turn (the post-turn engine snapshot still
-        # overwrites it with the precise figure once chat() returns).
+        # CHAT-CLI-HARDENING-6 (F3) + post-H6 follow-up: live
+        # toolbar backend selection. The Ansi backend is opt-in
+        # (default ``NullLiveToolbar``) because cursor save/restore
+        # has been observed to drop on real terminal × prompt-toolkit
+        # interactions, leaving the toolbar text stuck mid-transcript
+        # (``state=...`` line embedded between assistant turns).
+        # ``_resolve_live_toolbar_enabled`` consults
+        # ``SILICA_LIVE_TOOLBAR=1`` env var and ``/config
+        # live_toolbar=on`` (env wins). The post-turn
+        # ``PromptSession.bottom_toolbar`` still surfaces all metrics
+        # between turns regardless. ``RollingTokRate`` drives
+        # ``state.tok_per_sec`` live during the turn (the post-turn
+        # engine snapshot still overwrites it with the precise
+        # figure once chat() returns).
         live_toolbar = make_live_toolbar(
             palette=palette,
             output_stream=sys.stdout,
             term=os.environ.get("TERM"),
+            enabled=_resolve_live_toolbar_enabled(state),
         )
         tok_rate = RollingTokRate(window=20)
         # Per-token timestamp side-state for live tok/s; reset
@@ -1254,6 +1264,49 @@ def _resolve_thinking_mode(state: ChatCliState) -> bool | None:
     if isinstance(value, bool):
         return value
     return None
+
+
+def _resolve_live_toolbar_enabled(
+    state: ChatCliState,
+    *,
+    env: Any = None,
+) -> bool:
+    """Whether the live (Ansi) toolbar backend should be used this
+    turn.
+
+    Priority (first match wins):
+
+    1. ``SILICA_LIVE_TOOLBAR`` env var. Truthy values
+       (``1`` / ``on`` / ``true``, case-insensitive) force the
+       opt-in regardless of config; falsy values
+       (``0`` / ``off`` / ``false``, empty string is treated as
+       "not set") force the opt-out. Any other value is treated
+       as "not set".
+    2. ``state.config["live_toolbar"]`` — ``"on"`` or ``"off"``.
+       The schema entry's ``parse`` rejects other values at
+       ``/config`` time.
+    3. Default: ``False``. The ``NullLiveToolbar`` factory branch
+       is the safe default; the toolbar still updates between
+       turns via ``PromptSession.bottom_toolbar``.
+
+    ``NO_COLOR=1`` is NOT consulted here — it forces
+    ``Palette.PLAIN`` upstream, and ``make_live_toolbar`` already
+    short-circuits to ``NullLiveToolbar`` for plain palettes.
+    Layering the same check here would be redundant.
+
+    The ``env`` parameter is for testability; production callers
+    leave it ``None`` so ``os.environ`` is consulted.
+    """
+    env_map: Any = env if env is not None else os.environ
+    raw = env_map.get("SILICA_LIVE_TOOLBAR", "")
+    if isinstance(raw, str):
+        normalised = raw.strip().lower()
+        if normalised in ("1", "on", "true"):
+            return True
+        if normalised in ("0", "off", "false"):
+            return False
+    config_value = state.config.get("live_toolbar", "off")
+    return config_value == "on"
 
 
 def _resolve_thinking_history(state: ChatCliState) -> str:

@@ -23,10 +23,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import mlx.core as mx
+import pytest
 
 from silica.chat.cli.app import (
     _apply_system_prompt_request,
     _build_prefix_cache,
+    _resolve_live_toolbar_enabled,
     _resolve_thinking_history,
     _resolve_thinking_mode,
     _sampling_params_from_state,
@@ -458,3 +460,73 @@ def test_resolve_thinking_history_falls_back_on_invalid_value() -> None:
     state2 = ChatCliState()
     state2.config["thinking_history"] = True  # type: ignore[assignment]
     assert _resolve_thinking_history(state2) == "strip"
+
+
+# ---------------------------------------------------------------------------
+# Live-toolbar opt-in — _resolve_live_toolbar_enabled
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_live_toolbar_enabled_default_off() -> None:
+    """Empty env + empty config → live toolbar off. The Ansi
+    backend is opt-in; users with no explicit preference get
+    ``NullLiveToolbar`` and the post-turn ``bottom_toolbar``."""
+    state = ChatCliState()
+    state.config.pop("live_toolbar", None)
+    assert _resolve_live_toolbar_enabled(state, env={}) is False
+
+
+@pytest.mark.parametrize("raw", ["1", "on", "true", "ON", "True", "TRUE"])
+def test_resolve_live_toolbar_enabled_env_truthy_forces_on(raw: str) -> None:
+    """``SILICA_LIVE_TOOLBAR=1|on|true`` (case-insensitive) opts
+    in regardless of ``state.config``."""
+    state = ChatCliState()
+    state.config["live_toolbar"] = "off"
+    assert (
+        _resolve_live_toolbar_enabled(
+            state, env={"SILICA_LIVE_TOOLBAR": raw}
+        )
+        is True
+    )
+
+
+@pytest.mark.parametrize("raw", ["0", "off", "false", "OFF", "False"])
+def test_resolve_live_toolbar_enabled_env_falsy_forces_off(raw: str) -> None:
+    """Explicit env opt-out overrides config opt-in. Lets a user
+    disable for one shell session without editing config."""
+    state = ChatCliState()
+    state.config["live_toolbar"] = "on"
+    assert (
+        _resolve_live_toolbar_enabled(
+            state, env={"SILICA_LIVE_TOOLBAR": raw}
+        )
+        is False
+    )
+
+
+def test_resolve_live_toolbar_enabled_empty_env_defers_to_config() -> None:
+    """Empty / missing env var → consult ``state.config``."""
+    state = ChatCliState()
+    state.config["live_toolbar"] = "on"
+    assert (
+        _resolve_live_toolbar_enabled(state, env={"SILICA_LIVE_TOOLBAR": ""})
+        is True
+    )
+    state.config["live_toolbar"] = "off"
+    assert (
+        _resolve_live_toolbar_enabled(state, env={"SILICA_LIVE_TOOLBAR": ""})
+        is False
+    )
+
+
+def test_resolve_live_toolbar_enabled_unrecognised_env_defers_to_config() -> None:
+    """An env value the resolver does not recognise (e.g.
+    ``maybe``) is treated as "not set" — consult config."""
+    state = ChatCliState()
+    state.config["live_toolbar"] = "on"
+    assert (
+        _resolve_live_toolbar_enabled(
+            state, env={"SILICA_LIVE_TOOLBAR": "maybe"}
+        )
+        is True
+    )

@@ -298,11 +298,18 @@ def make_live_toolbar(
     output_stream: Any = None,
     is_tty: bool | None = None,
     term: str | None = None,
+    enabled: bool = False,
 ) -> LiveToolbar:
     """Construct the right backend for the runtime environment.
 
-    Returns :class:`NullLiveToolbar` when:
+    Returns :class:`NullLiveToolbar` when ANY of these hold:
 
+    - ``enabled`` is ``False`` (the default). The Ansi backend is
+      opt-in because cursor save/restore is unreliable across
+      terminal × prompt-toolkit interactions in the wild — see
+      ``plans/CHAT_CLI_HARDENING.md`` Decision D follow-up. The
+      shell wires ``enabled`` from ``SILICA_LIVE_TOOLBAR=1`` env
+      var or ``/config live_toolbar=on``.
     - ``output_stream`` is not a TTY (capability auto-detect via
       ``isatty()`` when ``is_tty`` is left ``None``); piping the
       chat to a file must not litter ANSI escapes into the
@@ -310,14 +317,18 @@ def make_live_toolbar(
     - ``term`` is ``"dumb"`` or empty; legacy terminals do not
       handle save/restore reliably.
     - ``palette.mode`` is :attr:`PaletteMode.PLAIN`; the user
-      already opted out of colour, so live cursor dancing would
-      surprise them.
+      already opted out of colour (typically via ``NO_COLOR=1``),
+      so live cursor dancing would surprise them. ``NO_COLOR`` is
+      the highest-priority off switch since it is the
+      cross-tool-standard "do not animate / do not colour" signal.
 
-    Returns :class:`AnsiLiveToolbar` otherwise. The render callable
-    closes over ``palette`` so the bound backend can call
-    :func:`render_toolbar` without re-resolving the palette per
-    refresh.
+    Returns :class:`AnsiLiveToolbar` only when all four conditions
+    pass. The render callable closes over ``palette`` so the bound
+    backend can call :func:`render_toolbar` without re-resolving
+    the palette per refresh.
     """
+    if not enabled:
+        return NullLiveToolbar()
     out = output_stream if output_stream is not None else sys.stdout
     if is_tty is None:
         isatty_fn = getattr(out, "isatty", None)

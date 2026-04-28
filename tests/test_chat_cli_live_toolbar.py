@@ -321,6 +321,21 @@ def test_ansi_toolbar_refresh_is_noop_before_enter() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_make_live_toolbar_default_returns_null_when_not_enabled() -> None:
+    """Default ``enabled=False`` short-circuits to Null even when
+    every other capability check would otherwise pass. The Ansi
+    backend is opt-in because cursor save/restore is unreliable
+    across terminal × prompt-toolkit interactions."""
+    out = io.StringIO()
+    bar = make_live_toolbar(
+        palette=Palette.truecolor(),
+        output_stream=out,
+        is_tty=True,
+        term="xterm-256color",
+    )
+    assert isinstance(bar, NullLiveToolbar)
+
+
 def test_make_live_toolbar_returns_null_when_not_a_tty() -> None:
     """Non-TTY output (file redirect, pipe) must use the no-op
     backend — ANSI escapes would litter the captured stream."""
@@ -328,6 +343,7 @@ def test_make_live_toolbar_returns_null_when_not_a_tty() -> None:
     bar = make_live_toolbar(
         palette=Palette.truecolor(),
         output_stream=out,
+        enabled=True,
     )
     assert isinstance(bar, NullLiveToolbar)
 
@@ -341,6 +357,7 @@ def test_make_live_toolbar_returns_null_when_term_is_dumb() -> None:
         output_stream=out,
         is_tty=True,  # force TTY so the term check kicks in
         term="dumb",
+        enabled=True,
     )
     assert isinstance(bar, NullLiveToolbar)
 
@@ -348,24 +365,29 @@ def test_make_live_toolbar_returns_null_when_term_is_dumb() -> None:
 def test_make_live_toolbar_returns_null_when_palette_is_plain() -> None:
     """A plain palette implies the user already opted out of
     colour; live cursor dancing would surprise them. The
-    post-turn toolbar still surfaces final values."""
+    post-turn toolbar still surfaces final values. ``NO_COLOR=1``
+    propagates through ``detect_palette`` to PLAIN, so this is the
+    NO_COLOR-honouring branch."""
     out = io.StringIO()
     bar = make_live_toolbar(
         palette=Palette.plain(),
         output_stream=out,
         is_tty=True,
+        enabled=True,
     )
     assert isinstance(bar, NullLiveToolbar)
 
 
-def test_make_live_toolbar_returns_ansi_when_capable() -> None:
-    """TTY + non-dumb TERM + non-plain palette → ANSI backend."""
+def test_make_live_toolbar_returns_ansi_when_capable_and_enabled() -> None:
+    """TTY + non-dumb TERM + non-plain palette + explicit
+    ``enabled=True`` → ANSI backend."""
     out = io.StringIO()
     bar = make_live_toolbar(
         palette=Palette.truecolor(),
         output_stream=out,
         is_tty=True,
         term="xterm-256color",
+        enabled=True,
     )
     assert isinstance(bar, AnsiLiveToolbar)
 
@@ -380,6 +402,7 @@ def test_make_live_toolbar_ansi_backend_uses_render_toolbar() -> None:
         output_stream=out,
         is_tty=True,
         term="xterm-256color",
+        enabled=True,
     )
     assert isinstance(bar, AnsiLiveToolbar)
     state = ChatCliState(

@@ -34,6 +34,7 @@ def test_schema_has_documented_keys() -> None:
         "thinking",
         "thinking_mode",
         "thinking_history",
+        "live_toolbar",
         "kv_codec_hint_mb",
     }
     assert expected.issubset(set(CONFIG_SCHEMA.keys())), (
@@ -223,6 +224,33 @@ def test_thinking_history_default_is_strip() -> None:
     from silica.chat.cli.config import CONFIG_SCHEMA
 
     assert CONFIG_SCHEMA["thinking_history"].default == "strip"
+
+
+# ---------------------------------------------------------------------------
+# Choice — live_toolbar (post-HARDENING-6 follow-up)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("choice", ["on", "off"])
+def test_live_toolbar_choices_accepted(choice: str) -> None:
+    _, val = parse_config_assignment(f"live_toolbar={choice}")
+    assert val == choice
+
+
+def test_live_toolbar_invalid_choice_rejected() -> None:
+    with pytest.raises(ConfigError, match="expected one of"):
+        parse_config_assignment("live_toolbar=auto")
+
+
+def test_live_toolbar_default_is_off() -> None:
+    """Live toolbar is opt-in; default ``off`` is the safe path
+    because cursor save/restore is unreliable across terminal ×
+    prompt-toolkit interactions. Users who confirm their terminal
+    handles it can flip via ``/config live_toolbar=on`` or the
+    ``SILICA_LIVE_TOOLBAR=1`` env var."""
+    from silica.chat.cli.config import CONFIG_SCHEMA
+
+    assert CONFIG_SCHEMA["live_toolbar"].default == "off"
 
 
 # ---------------------------------------------------------------------------
