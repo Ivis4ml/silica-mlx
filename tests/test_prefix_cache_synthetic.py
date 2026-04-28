@@ -14,8 +14,9 @@ from collections.abc import Sequence
 import mlx.core as mx
 import pytest
 
+from silica.kvcache.codec import IdentityCodec
 from silica.kvcache.manager import PrefixHit
-from silica.kvcache.prefix import RadixPrefixCache
+from silica.kvcache.prefix import PrefixCacheStats, RadixPrefixCache
 from silica.kvcache.store import SyntheticPrefixBlockStore
 
 BLOCK_SIZE = 4
@@ -314,3 +315,106 @@ def test_fetch_detached_blocks_empty_list_returns_empty() -> None:
     store = _store()
     pc = _pc(store)
     assert pc.fetch_detached_blocks([]) == []
+
+
+# --- public stats() API (HARDENING-3 / F6) ---
+
+
+def test_stats_empty_cache_pass_through() -> None:
+    """A freshly constructed cache + pass-through store reports zero
+    blocks / zero bytes / zero hits, ``has_codec=False``."""
+    store = _store()
+    pc = _pc(store)
+    stats = pc.stats()
+    assert isinstance(stats, PrefixCacheStats)
+    assert stats.block_size == BLOCK_SIZE
+    assert stats.hits == 0
+    assert stats.num_blocks == 0
+    assert stats.resident_bytes == 0
+    assert stats.logical_bytes == 0
+    assert stats.has_codec is False
+
+
+def test_stats_after_insert_pass_through_matches_store() -> None:
+    """After inserting 2 blocks on the pass-through path, stats
+    mirror the store's public counterparts."""
+    store = _store()
+    pc = _pc(store)
+    tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+    pc.insert_detached(tokens, _detached_blocks(2))
+    stats = pc.stats()
+    assert stats.num_blocks == 2
+    assert stats.resident_bytes == store.resident_bytes()
+    # Pass-through: logical equals resident.
+    assert stats.logical_bytes == stats.resident_bytes
+    assert stats.has_codec is False
+
+
+def test_stats_codec_path_reports_has_codec_true() -> None:
+    """Under an ``IdentityCodec``-backed store, ``has_codec`` is
+    True and logical bytes equal codec.logical_bytes() arithmetic."""
+    ic = IdentityCodec(
+        block_size=BLOCK_SIZE, n_kv_heads=N_KV_HEADS, head_dim=HEAD_DIM
+    )
+    store = SyntheticPrefixBlockStore(block_size=BLOCK_SIZE, codec=ic)
+    pc = RadixPrefixCache(block_size=BLOCK_SIZE, store=store)
+
+    tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+    pc.insert_detached(tokens, _detached_blocks(2))
+
+    stats = pc.stats()
+    assert stats.has_codec is True
+    assert stats.num_blocks == 2
+    expected_logical = (
+        2  # blocks
+        * N_LAYERS
+        * (
+            ic.logical_bytes(BLOCK_SIZE)
+            + ic.logical_bytes(BLOCK_SIZE)
+        )
+    )
+    assert stats.logical_bytes == expected_logical
+    # Identity codec → resident matches logical bit-for-bit.
+    assert stats.resident_bytes == expected_logical
+
+
+def test_stats_hits_counter_propagates() -> None:
+    """``stats.hits`` reflects ``RadixPrefixCache.hits``; lookups
+    that match increment it."""
+    store = _store()
+    pc = _pc(store)
+    tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+    pc.insert_detached(tokens, _detached_blocks(2))
+
+    assert pc.stats().hits == 0
+    hit = pc.lookup(tokens)
+    pc.release(list(hit.block_ids))
+    assert pc.stats().hits == 1
+
+
+def test_stats_paged_backend_reports_none_for_unsupported_fields() -> None:
+    """The paged backend does not expose ``num_blocks`` / ``resident_bytes``
+    / ``logical_bytes`` / ``has_codec``; stats reports ``None`` for
+    those fields and still returns a valid object."""
+    from silica.kvcache.paged import PagedKVCache
+    from silica.kvcache.store import PagedPrefixBlockStore
+
+    kv = PagedKVCache(
+        num_layers=1,
+        max_batch_size=2,
+        n_kv_heads=1,
+        head_dim=4,
+        num_blocks=4,
+        block_size=BLOCK_SIZE,
+        dtype_bytes=2,
+    )
+    store = PagedPrefixBlockStore(kv)
+    pc = RadixPrefixCache(block_size=BLOCK_SIZE, store=store)
+
+    stats = pc.stats()
+    assert stats.block_size == BLOCK_SIZE
+    assert stats.hits == 0
+    assert stats.num_blocks is None
+    assert stats.resident_bytes is None
+    assert stats.logical_bytes is None
+    assert stats.has_codec is False

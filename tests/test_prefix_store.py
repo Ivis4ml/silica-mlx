@@ -638,3 +638,116 @@ def test_pre_norm_flag_is_independent_of_codec_path() -> None:
     # IdentityCodec round-trips bit-faithfully regardless of pre_norm.
     assert mx.array_equal(fk, k).item()
     assert mx.array_equal(fv, v).item()
+
+
+# --- public stats API (HARDENING-3 / F6) ---
+
+
+def test_num_blocks_zero_when_empty() -> None:
+    """A freshly constructed store has no detached blocks."""
+    store = SyntheticPrefixBlockStore(block_size=4)
+    assert store.num_blocks() == 0
+
+
+def test_num_blocks_tracks_register_and_release() -> None:
+    """``num_blocks()`` mirrors live entries in detached storage:
+    one increment per ``register_detached``, one decrement per
+    ``release_detached``."""
+    store = SyntheticPrefixBlockStore(block_size=4)
+    a = store.allocate_id()
+    store.retain_source(a)
+    store.register_detached(
+        a, _fake_per_layer_kv(n_layers=2, block_size=4)
+    )
+    assert store.num_blocks() == 1
+
+    b = store.allocate_id()
+    store.retain_source(b)
+    store.register_detached(
+        b, _fake_per_layer_kv(n_layers=2, block_size=4)
+    )
+    assert store.num_blocks() == 2
+
+    store.release_detached(a)
+    assert store.num_blocks() == 1
+    store.release_detached(b)
+    assert store.num_blocks() == 0
+
+
+def test_logical_bytes_pass_through_equals_resident() -> None:
+    """Pass-through path (no codec) stores raw fp16 ``mx.array``;
+    logical_bytes equals resident_bytes."""
+    store = SyntheticPrefixBlockStore(block_size=4)
+    bid = store.allocate_id()
+    store.retain_source(bid)
+    store.register_detached(
+        bid, _fake_per_layer_kv(n_layers=3, block_size=4)
+    )
+    assert store.logical_bytes() == store.resident_bytes()
+    assert store.logical_bytes() > 0
+
+
+def test_logical_bytes_zero_before_any_block_codec_path() -> None:
+    """Codec path with no blocks registered yet: ``num_layers`` is
+    unknown until the first ``register_detached`` call, so logical
+    is reported as 0 (consistent with the empty-store reading)."""
+    ic = IdentityCodec(block_size=4, n_kv_heads=2, head_dim=8)
+    store = SyntheticPrefixBlockStore(block_size=4, codec=ic)
+    assert store.num_blocks() == 0
+    assert store.logical_bytes() == 0
+
+
+def test_logical_bytes_codec_path_matches_codec_arithmetic() -> None:
+    """Codec path: ``logical_bytes()`` equals
+    ``num_blocks × num_layers × (k_codec.logical_bytes(block_size) +
+    v_codec.logical_bytes(block_size))``. Under ``IdentityCodec`` the
+    figure equals the fp16 raw nbytes."""
+    n_layers = 3
+    n_blocks = 2
+    n_kv_heads = 2
+    head_dim = 8
+    block_size = 4
+    ic = IdentityCodec(
+        block_size=block_size, n_kv_heads=n_kv_heads, head_dim=head_dim
+    )
+    store = SyntheticPrefixBlockStore(block_size=block_size, codec=ic)
+    for i in range(n_blocks):
+        bid = store.allocate_id()
+        store.retain_source(bid)
+        store.register_detached(
+            bid,
+            _fake_per_layer_kv(
+                n_layers=n_layers,
+                n_kv_heads=n_kv_heads,
+                block_size=block_size,
+                head_dim=head_dim,
+                seed=float(i),
+            ),
+        )
+    expected_per_block = n_layers * (
+        ic.logical_bytes(block_size) + ic.logical_bytes(block_size)
+    )
+    assert store.logical_bytes() == n_blocks * expected_per_block
+    # Identity → logical matches resident.
+    assert store.logical_bytes() == store.resident_bytes()
+
+
+def test_has_codec_pass_through_is_false() -> None:
+    """Pass-through path reports ``has_codec=False``."""
+    store = SyntheticPrefixBlockStore(block_size=4)
+    assert store.has_codec is False
+
+
+def test_has_codec_shorthand_is_true() -> None:
+    """``codec=`` shorthand binds both sides; ``has_codec`` is True."""
+    ic = IdentityCodec(block_size=4, n_kv_heads=2, head_dim=8)
+    store = SyntheticPrefixBlockStore(block_size=4, codec=ic)
+    assert store.has_codec is True
+
+
+def test_has_codec_split_is_true() -> None:
+    """Explicit ``k_codec`` / ``v_codec`` split also reports True."""
+    k = IdentityCodec(block_size=4, n_kv_heads=2, head_dim=8)
+    v = IdentityCodec(block_size=4, n_kv_heads=2, head_dim=8)
+    store = SyntheticPrefixBlockStore(block_size=4, k_codec=k, v_codec=v)
+    assert store.has_codec is True

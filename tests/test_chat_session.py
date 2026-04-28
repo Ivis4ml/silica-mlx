@@ -28,6 +28,7 @@ import pytest
 
 from silica.chat.session import ChatSession, TurnMetrics
 from silica.core.sampling import SamplingParams
+from silica.kvcache.prefix import PrefixCacheStats
 
 # ---------- fakes ----------------------------------------------------
 
@@ -1147,51 +1148,51 @@ def test_set_prefix_cache_to_none_disables_routing() -> None:
     ]
 
 
-class _FakePrefixStoreWithResidentBytes:
-    """Prefix-cache store stub exposing the structural
-    ``resident_bytes()`` method ChatSession reads. Returns a
-    fixed value so the test can assert it propagates to
-    TurnMetrics."""
+class _FakePrefixCacheWithStats:
+    """Minimal prefix cache exposing the public ``stats()`` API
+    (HARDENING-3 / F6). Returns a fixed ``PrefixCacheStats`` so the
+    test can assert that ChatSession reads the public surface and
+    surfaces the figures on TurnMetrics, without poking the store's
+    private attributes."""
 
     def __init__(
-        self, *, resident_bytes: int = 1_234_567
+        self,
+        *,
+        resident_bytes: int = 1_234_567,
+        logical_bytes: int | None = None,
     ) -> None:
-        self._resident = resident_bytes
-        self._detached: dict[int, list[Any]] = {0: []}
-        # Codec slots — _resident_bytes path follows the no-codec
-        # branch when both are None (logical == resident).
-        self._k_codec = None
-        self._v_codec = None
-        self._num_layers = 1
-
-    def resident_bytes(self) -> int:
-        return self._resident
-
-
-class _FakePrefixCacheWithStore:
-    """Minimal prefix cache exposing ``_store.resident_bytes`` so
-    the C-4 / fix follow-up tests can assert ChatSession reads
-    the prefix-store residency and surfaces it on TurnMetrics."""
-
-    def __init__(self) -> None:
         self.block_size = 4
-        self._store = _FakePrefixStoreWithResidentBytes()
         self._hit = _FakePrefixHit()
+        self._stats = PrefixCacheStats(
+            block_size=4,
+            hits=0,
+            num_blocks=1,
+            resident_bytes=resident_bytes,
+            logical_bytes=(
+                resident_bytes
+                if logical_bytes is None
+                else logical_bytes
+            ),
+            has_codec=False,
+        )
 
     def peek(self, tokens: Any) -> _FakePrefixHit:
         return self._hit
 
+    def stats(self) -> PrefixCacheStats:
+        return self._stats
+
 
 def test_turn_metrics_carry_prefix_store_resident_bytes() -> None:
-    """When the prefix-cache store exposes ``resident_bytes()``,
-    ChatSession must read it post-turn and surface the figure on
-    TurnMetrics so the chat-CLI toolbar can show prefix-store
-    occupancy (the ``kv=`` field) instead of the always-zero
-    active-KV figure."""
+    """When the prefix cache exposes ``stats()``, ChatSession must
+    read the public snapshot and surface ``resident_bytes`` /
+    ``logical_bytes`` on TurnMetrics so the chat-CLI toolbar can
+    show prefix-store occupancy (the ``kv=`` field) instead of the
+    always-zero active-KV figure."""
     tok = _FakeTokenizer(eos_token_ids={99})
     adapter = _FakeAdapter(tok)
     engine = _FakeBatchedEngine([65, 66, 67])
-    pc = _FakePrefixCacheWithStore()
+    pc = _FakePrefixCacheWithStats()
     session = ChatSession(
         adapter,
         engine,
@@ -1205,12 +1206,13 @@ def test_turn_metrics_carry_prefix_store_resident_bytes() -> None:
     assert metrics.prefix_store_logical_bytes == 1_234_567
 
 
-def test_turn_metrics_prefix_store_none_when_store_lacks_method() -> None:
-    """PagedPrefixBlockStore (and any future backend that does not
-    track residency) must not break the path — ChatSession's
-    structural ``hasattr`` guard returns None for such stores."""
+def test_turn_metrics_prefix_store_none_when_cache_lacks_stats() -> None:
+    """Backends without ``stats()`` (older shapes, or paged-only
+    caches that have not yet adopted the public API) must not break
+    the path — ChatSession's capability check returns ``None`` for
+    both fields."""
 
-    class _NoBytes:
+    class _NoStats:
         def __init__(self) -> None:
             self.block_size = 4
 
@@ -1220,7 +1222,48 @@ def test_turn_metrics_prefix_store_none_when_store_lacks_method() -> None:
     tok = _FakeTokenizer(eos_token_ids={99})
     adapter = _FakeAdapter(tok)
     engine = _FakeBatchedEngine([65, 66])
-    pc = _NoBytes()
+    pc = _NoStats()
+    session = ChatSession(
+        adapter,
+        engine,
+        prefix_cache=pc,  # type: ignore[arg-type]
+        reset_peak_memory=lambda: None,
+        read_peak_memory_mb=lambda: 0.0,
+    )
+    metrics = session.chat("hi")
+    assert metrics.prefix_store_resident_bytes is None
+    assert metrics.prefix_store_logical_bytes is None
+
+
+def test_turn_metrics_prefix_store_none_when_stats_returns_none_fields() -> (
+    None
+):
+    """``stats()`` may legitimately return ``resident_bytes=None`` /
+    ``logical_bytes=None`` on backends that do not track residency
+    (PagedPrefixBlockStore). ChatSession must propagate ``None``
+    rather than coercing to zero."""
+
+    class _StatsNoneFields:
+        def __init__(self) -> None:
+            self.block_size = 4
+
+        def peek(self, tokens: Any) -> _FakePrefixHit:
+            return _FakePrefixHit()
+
+        def stats(self) -> PrefixCacheStats:
+            return PrefixCacheStats(
+                block_size=4,
+                hits=0,
+                num_blocks=None,
+                resident_bytes=None,
+                logical_bytes=None,
+                has_codec=False,
+            )
+
+    tok = _FakeTokenizer(eos_token_ids={99})
+    adapter = _FakeAdapter(tok)
+    engine = _FakeBatchedEngine([65, 66])
+    pc = _StatsNoneFields()
     session = ChatSession(
         adapter,
         engine,

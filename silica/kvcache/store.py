@@ -578,6 +578,63 @@ class SyntheticPrefixBlockStore:
         )
         return self._num_layers * per_layer
 
+    def num_blocks(self) -> int:
+        """Count of blocks currently held in detached storage.
+
+        Public counterpart to ``len(_detached)`` for consumers that
+        previously poked the private dict (chat-CLI metric path,
+        plans/CHAT_CLI_HARDENING.md F6 / HARDENING-3). The eviction
+        path in ``RadixPrefixCache._evict_node`` calls
+        ``release_detached``, which removes the entry, so this count
+        tracks live detached storage exactly.
+        """
+        return len(self._detached)
+
+    def logical_bytes(self) -> int:
+        """fp16-equivalent bytes for all detached blocks.
+
+        The "logical" baseline is what the same K/V would weigh under
+        plain fp16 with no codec. On the pass-through path (both
+        codec sides ``None``) the stored tensors are already fp16 raw
+        ``mx.array`` references, so logical equals
+        ``resident_bytes()``. On the codec path each side reports its
+        own fp16-equivalent via ``codec.logical_bytes(num_tokens)``;
+        this method aggregates ``num_blocks × num_layers ×
+        (k_codec.logical_bytes(block_size) + v_codec.logical_bytes(block_size))``.
+
+        Returns 0 when no blocks have been registered yet (codec
+        path) — ``_num_layers`` is unknown until the first
+        ``register_detached`` call.
+
+        Parallel observable to ``resident_bytes()`` for the
+        compression-ratio readout in the chat-CLI toolbar
+        (HARDENING-3). Not on the ``PrefixBlockStore`` Protocol for
+        the same reason as ``resident_bytes`` — the paged backend
+        does not model detached K/V residency.
+        """
+        if self._k_codec is None and self._v_codec is None:
+            return self.resident_bytes()
+        if self._num_layers is None:
+            return 0
+        assert self._k_codec is not None
+        assert self._v_codec is not None
+        per_block = self._num_layers * (
+            self._k_codec.logical_bytes(self.block_size)
+            + self._v_codec.logical_bytes(self.block_size)
+        )
+        return len(self._detached) * per_block
+
+    @property
+    def has_codec(self) -> bool:
+        """Whether at least one side codec is bound.
+
+        Public capability flag for consumers that were checking
+        ``store._k_codec is not None`` directly. The synthetic store's
+        constructor enforces both-or-neither, so a single non-``None``
+        side implies both are bound.
+        """
+        return self._k_codec is not None or self._v_codec is not None
+
     def resident_bytes(self) -> int:
         """Sum of per-side ``CodedPayload.resident_bytes`` across all detached blocks.
 

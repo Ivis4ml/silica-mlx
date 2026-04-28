@@ -47,6 +47,7 @@ to "what happens on a hit" travels through one code path.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import mlx.core as mx
@@ -56,6 +57,44 @@ from silica.kvcache.store import PrefixBlockStore
 
 if TYPE_CHECKING:
     from silica.models.recurrent import RecurrentSnapshot
+
+
+@dataclass(frozen=True, slots=True)
+class PrefixCacheStats:
+    """Public snapshot of ``RadixPrefixCache`` + store residency.
+
+    Returned by ``RadixPrefixCache.stats()``. Consolidates the metric
+    surface that prior code had to reach for via private fields
+    (``cache._store``, ``store._detached``, ``store._k_codec``).
+    Closes plans/CHAT_CLI_HARDENING.md F6 (HARDENING-3).
+
+    Fields:
+
+    - ``block_size``: tokens per radix block. Always available.
+    - ``hits``: cumulative hit counter from ``RadixPrefixCache.hits``.
+      Always available.
+    - ``num_blocks``: count of blocks currently held in the store's
+      detached storage. ``None`` on backends without detached storage
+      (PagedPrefixBlockStore).
+    - ``resident_bytes``: physical bytes held across all detached
+      blocks under the active codec(s). ``None`` when the store does
+      not implement ``resident_bytes()``.
+    - ``logical_bytes``: fp16-baseline bytes for the same blocks. On
+      the pass-through / IdentityCodec path, equals ``resident_bytes``;
+      under a non-identity codec it reports the uncompressed baseline
+      (``logical / resident`` is the compression ratio). ``None`` when
+      the store does not implement ``logical_bytes()``.
+    - ``has_codec``: whether at least one side codec is bound to the
+      store. ``False`` for pass-through (raw fp16) and for backends
+      that do not expose the capability flag.
+    """
+
+    block_size: int
+    hits: int
+    num_blocks: int | None
+    resident_bytes: int | None
+    logical_bytes: int | None
+    has_codec: bool
 
 _CHUNK = tuple[int, ...]
 
@@ -456,6 +495,49 @@ class RadixPrefixCache:
             self._evict_node(victim)
             freed += 1
         return freed
+
+    def stats(self) -> PrefixCacheStats:
+        """Public snapshot of cache + store residency.
+
+        Replaces the chat-CLI metric path's previous reach into
+        ``cache._store`` / ``store._detached`` / ``store._k_codec``
+        (plans/CHAT_CLI_HARDENING.md F6 / HARDENING-3). Each store-
+        side field uses a structural capability check (``hasattr`` +
+        ``callable``) so backends that do not implement the metric
+        report ``None`` instead of breaking the call.
+
+        Cheap by construction: ``store.resident_bytes()`` walks the
+        detached dict in Python, and ``store.logical_bytes()`` reads
+        cached integers on the codec path. Safe to call from the
+        per-turn metric collection path.
+        """
+        store = self._store
+
+        num_blocks_fn = getattr(store, "num_blocks", None)
+        num_blocks = (
+            int(num_blocks_fn()) if callable(num_blocks_fn) else None
+        )
+
+        resident_fn = getattr(store, "resident_bytes", None)
+        resident_bytes = (
+            int(resident_fn()) if callable(resident_fn) else None
+        )
+
+        logical_fn = getattr(store, "logical_bytes", None)
+        logical_bytes = (
+            int(logical_fn()) if callable(logical_fn) else None
+        )
+
+        has_codec = bool(getattr(store, "has_codec", False))
+
+        return PrefixCacheStats(
+            block_size=self._block_size,
+            hits=self.hits,
+            num_blocks=num_blocks,
+            resident_bytes=resident_bytes,
+            logical_bytes=logical_bytes,
+            has_codec=has_codec,
+        )
 
     # --- debug / inspection (not part of public API) ---
 

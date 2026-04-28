@@ -445,67 +445,27 @@ class ChatSession:
                 # mask the rest of the turn metrics.
                 pass
 
-        # Prefix-store residency. The cache itself does not expose a
-        # public byte-count getter, but the SyntheticPrefixBlockStore
-        # backing it does (via the structural ``resident_bytes()``
-        # method documented as P-5-A.2's ``MemoryBudgeter`` hook). A
-        # ``hasattr`` guard treats backends that do not implement it
-        # (PagedPrefixBlockStore) as "unknown" rather than zero.
+        # Prefix-store residency. ``RadixPrefixCache.stats()`` is the
+        # public surface (HARDENING-3 / F6); it returns a frozen
+        # ``PrefixCacheStats`` whose ``resident_bytes`` /
+        # ``logical_bytes`` are populated via structural capability
+        # checks against the underlying store. Backends that do not
+        # implement the metric surface (PagedPrefixBlockStore) report
+        # ``None``. A defensive ``hasattr`` guard on ``stats`` itself
+        # tolerates the legacy / fake-cache shape from older tests
+        # that predate this method.
         prefix_store_resident: int | None = None
         prefix_store_logical: int | None = None
         if self._prefix_cache is not None:
-            store = getattr(self._prefix_cache, "_store", None)
-            resident_fn = getattr(store, "resident_bytes", None)
-            if callable(resident_fn):
+            stats_fn = getattr(self._prefix_cache, "stats", None)
+            if callable(stats_fn):
                 try:
-                    prefix_store_resident = int(resident_fn())
+                    pc_stats = stats_fn()
                 except Exception:
-                    prefix_store_resident = None
-            # Logical = fp16 equivalent. The pass-through path
-            # (no codec) makes resident == logical. Under a codec,
-            # the store exposes per-codec ``logical_bytes(num_tokens)``
-            # but a clean public API for the cumulative figure
-            # is not present today; for the chat-CLI's purpose we
-            # approximate logical by walking detached blocks.
-            num_blocks = 0
-            try:
-                num_blocks = len(getattr(store, "_detached", {}))
-            except Exception:
-                pass
-            if (
-                prefix_store_resident is not None
-                and num_blocks > 0
-            ):
-                # Try the codec path first (each codec exposes
-                # ``logical_bytes(num_tokens)``); fall back to
-                # resident == logical for the no-codec path.
-                k_codec = getattr(store, "_k_codec", None)
-                v_codec = getattr(store, "_v_codec", None)
-                num_layers = getattr(store, "_num_layers", None)
-                bs = getattr(self._prefix_cache, "block_size", 0)
-                if (
-                    k_codec is not None
-                    and v_codec is not None
-                    and num_layers is not None
-                    and bs > 0
-                ):
-                    tokens_per_block = bs
-                    try:
-                        per_block_logical = num_layers * (
-                            k_codec.logical_bytes(tokens_per_block)
-                            + v_codec.logical_bytes(tokens_per_block)
-                        )
-                        prefix_store_logical = (
-                            num_blocks * per_block_logical
-                        )
-                    except Exception:
-                        prefix_store_logical = (
-                            prefix_store_resident
-                        )
-                else:
-                    prefix_store_logical = prefix_store_resident
-            elif prefix_store_resident is not None:
-                prefix_store_logical = prefix_store_resident
+                    pc_stats = None
+                if pc_stats is not None:
+                    prefix_store_resident = pc_stats.resident_bytes
+                    prefix_store_logical = pc_stats.logical_bytes
 
         return TurnMetrics(
             reply=reply_text,
