@@ -3,7 +3,7 @@
 | Field | Value |
 | --- | --- |
 | Phase | side track (not numbered; not P-6 / P-7 / P-8) |
-| Status | drafted; pending RP-1 landing |
+| Status | RP-1 landed (split: `4f98648` initial + `d4ea04d` repair); RP-2..RP-3 pending |
 | Last updated | 2026-04-28 |
 | Trigger | Two real-session UX failures observed against Qwen3.5-35B-A3B-4bit + Qwen3-0.6B during interactive use of the post-HARDENING chat REPL (latest code at `51fbcde`) |
 | Scope owner | Xin Zhou |
@@ -249,6 +249,54 @@ behind P-6.0.5. Reopening them is its own decision once the
 dense-perf gate resolves and real-session data shows whether
 the smarter policy bundles are needed in production.
 
+### Decision G — RP-1 landed across two commits (mixed-scope acknowledgement)
+
+**Date:** 2026-04-28.
+
+The original RP-1 implementation (``thinking_history=strip``,
+``ChatSession`` ctor / mutator / state, ``_strip_thinking_block``
+helper, deferred-finalise contract on
+``finish_reason=max_tokens``, app.py ctor pass-through and
+per-turn resync, schema entry, full unit-test suite) landed
+inside commit ``4f98648`` alongside the unrelated DEC
+cursor-save/restore hotfix and an unrelated
+``docs/P5_ACCEPTANCE_SWEEP/real_activation_xcheck.jsonl`` file
+that should have stayed out of the chat side track. The mixed
+scope was an oversight — the canonical separation would have
+been one ``fix(chat): use DEC cursor save/restore`` commit and
+one ``fix(chat): thinking_history=strip + deferred finalise``
+commit, with the ``docs/P5_ACCEPTANCE_SWEEP/`` file deferred to
+its own follow-up.
+
+History is not rewritten because ``origin/sonnet`` already
+contains ``4f98648``; the rewrite cost outweighs the
+narrative-fidelity benefit.
+
+The deferred-finalise contract had three real bugs that the
+mixed-commit pace did not catch in review:
+
+- Snapshot vs live read: implicit-leading strip decision was
+  re-read from live state at finalise time, not snapshotted at
+  truncation. A mid-flight ``/config thinking_mode`` flip would
+  retroactively change which strip shape applied.
+- ``thinking_history=keep`` ignored on deferred path: a user
+  flipping the policy between truncation and the next user
+  message would still see strip applied.
+- ``reset()`` / ``replace_messages()`` / ``pop_last_exchange()``
+  did not clear the pending flag, so subsequent turns could
+  silently strip a now-replaced or now-missing message.
+
+Commit ``d4ea04d`` repairs all three. RP-1 is therefore
+considered landed across the pair ``4f98648`` (initial) +
+``d4ea04d`` (repair). Future side tracks should aim for clean
+single-purpose commits to keep the side-track ledger
+self-explanatory.
+
+The stray ``docs/P5_ACCEPTANCE_SWEEP/real_activation_xcheck.jsonl``
+file in ``4f98648`` is tracked separately as a
+``chore(repo)``-level cleanup to remove (it is unrelated to the
+chat REPL work).
+
 ---
 
 ## 8. Cross-references
@@ -260,6 +308,16 @@ the smarter policy bundles are needed in production.
   acceptance run is recorded against the post-HARDENING code
   state (HEAD as of `51fbcde`) and is independent of RP-1; see
   §5 sequencing note.
+- RP-1 commits: ``4f98648`` (initial; mixed-scope) +
+  ``d4ea04d`` (repair). See Decision G for context. RP-2
+  ``/continue`` builds on the repaired deferred-finalise
+  contract.
+- Toolbar-policy follow-up: ``9bd6edd`` flipped the live
+  toolbar default to opt-in (``SILICA_LIVE_TOOLBAR=1`` env or
+  ``/config live_toolbar=on`` to enable). Independent of RP-1
+  but landed during the same window because the original
+  HARDENING-6 backend's terminal-fragility blocked real-session
+  use.
 - `plans/CHAT_CLI_OPENING.md` — original C-1..C-8 design doc.
 - PLAN.md §10 Q-012 — cross-call prefix-cache consultation;
   RP-1's history-strip change preserves Q-012 reuse because
