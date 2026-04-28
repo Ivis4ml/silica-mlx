@@ -406,19 +406,47 @@ listings, see [`docs/api/index.md`](docs/api/index.md) (or
 
 ## Documentation
 
-- [`docs/_build/html/index.html`](docs/index.md) — the full Sphinx
-  site (`make -C docs html` to build). Bundles the overview, chat-CLI
-  guide, benchmark guide, auto-generated API, manual API, and a
-  curated index into `plans/`.
-- [`plans/PLAN.md`](plans/PLAN.md) — single source of truth for
-  phases, deliverables, acceptance criteria, decisions log, open
-  questions, and empirical findings per sub-commit.
-- [`docs/API.md`](docs/API.md) — hand-curated per-module API
-  reference (also rendered as the *Manual API* page on the docs
-  site).
-- [`docs/plans-index.md`](docs/plans-index.md) — curated entry into
-  `plans/` (per-phase opening / prep / survey / acceptance docs and
-  measurement artifacts).
+Three reading paths depending on how much rendering you want:
+
+**1. Browse on GitHub (no setup).** All design docs and the
+hand-curated API reference live as plain Markdown — readable
+in-browser via the `Code` tab:
+
+- [`README.md`](https://github.com/Ivis4ml/silica-mlx/blob/main/README.md)
+  (this page) — install, quickstart, status board.
+- [`CHAT.README.md`](https://github.com/Ivis4ml/silica-mlx/blob/main/CHAT.README.md)
+  — `silica chat` REPL: install, slash commands, default system
+  prompt, three-axis thinking model, how to disable Qwen3
+  reasoning.
+- [`docs/API.md`](https://github.com/Ivis4ml/silica-mlx/blob/main/docs/API.md)
+  — hand-curated per-module API reference (every public class,
+  function, protocol).
+- [`docs/plans-index.md`](https://github.com/Ivis4ml/silica-mlx/blob/main/docs/plans-index.md)
+  — curated entry into `plans/` (per-phase opening / prep /
+  survey / acceptance docs and side tracks).
+- [`plans/PLAN.md`](https://github.com/Ivis4ml/silica-mlx/blob/main/plans/PLAN.md)
+  — single source of truth for phases, decisions, open questions.
+
+**2. Build the Sphinx site locally** (rendered cross-references,
+search, autodoc):
+
+```bash
+uv pip install -e '.[docs]'
+make -C docs html
+open docs/_build/html/index.html      # macOS; or xdg-open / start
+```
+
+The site bundles the overview, chat-CLI guide, benchmark guide,
+auto-generated API, manual API page, and the curated `plans/`
+index. Files that use MyST `{toctree}` / `{include}` directives
+render best in this mode.
+
+**3. Hosted on Read the Docs** (zero-build, public URL).
+[`.readthedocs.yaml`](.readthedocs.yaml) is committed and
+configured against the `[docs]` extras. Import the repo at
+[readthedocs.org](https://readthedocs.org/) and every push to
+`main` rebuilds the site automatically. The hosted URL appears in
+the badge below once the integration is live.
 
 ---
 

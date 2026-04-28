@@ -28,6 +28,12 @@ dependencies = [
     "pydantic-settings>=2.0",
 ]
 
+[project.urls]
+Repository = "https://github.com/Ivis4ml/silica-mlx"
+Issues = "https://github.com/Ivis4ml/silica-mlx/issues"
+Documentation = "https://github.com/Ivis4ml/silica-mlx/blob/main/docs/API.md"
+Changelog = "https://github.com/Ivis4ml/silica-mlx/blob/main/plans/PLAN.md"
+
 [project.optional-dependencies]
 serve = [
     "fastapi>=0.115",

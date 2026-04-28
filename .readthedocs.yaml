@@ -1,0 +1,32 @@
+# Read the Docs configuration for silica-mlx.
+#
+# Hooks the project up to https://readthedocs.org/ — once the user
+# imports the GitHub repo on their RTD account, every push to the
+# default branch rebuilds the Sphinx site. Free tier covers public
+# repositories.
+#
+# Local equivalent: `make -C docs html` produces docs/_build/html/.
+#
+# Reference: https://docs.readthedocs.io/en/stable/config-file/v2.html
+
+version: 2
+
+build:
+  os: ubuntu-22.04
+  tools:
+    python: "3.12"
+
+sphinx:
+  configuration: docs/conf.py
+  fail_on_warning: false
+
+formats:
+  - pdf
+  - htmlzip
+
+python:
+  install:
+    - method: pip
+      path: .
+      extra_requirements:
+        - docs

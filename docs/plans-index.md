@@ -123,3 +123,32 @@ read in-editor while iterating.
   summarises usage; this doc explains *why* the rewrite happened and
   documents the toolbar field set, palette mode detection, thinking
   parser, and persistence schema.
+
+### CHAT-CLI-HARDENING — F1..F6 closure
+
+- [`CHAT_CLI_HARDENING.md`](../plans/CHAT_CLI_HARDENING.md) — F1..F6
+  GPT-5.5 review findings closed across eight commits: live `/system`
+  propagation, `enable_thinking` template threading,
+  `RadixPrefixCache.stats()` / `PrefixCacheStats` public surface,
+  `/regenerate` rollback, `/model --keep-history`, swappable
+  live-toolbar backend, non-interactive `chat_bench` harness,
+  app-layer unit tests. Decision D records why a full
+  `prompt_toolkit.Application` was deferred.
+- [`CHAT_CLI_HARDENING_ACCEPTANCE.md`](../plans/CHAT_CLI_HARDENING_ACCEPTANCE.md)
+  — manual real-model acceptance template (HARDENING-9). Pending a
+  user-driven on-device run.
+
+### CHAT-CLI-RESPONSE-POLICY — RP-1..RP-3 closure
+
+- [`CHAT_CLI_RESPONSE_POLICY.md`](../plans/CHAT_CLI_RESPONSE_POLICY.md)
+  — `thinking_history=strip` (RP-1, history-side `<think>` strip
+  with deferred-finalise contract on `max_tokens`), `/continue`
+  (RP-2, append-in-place continuation with implicit-leading
+  restoration on the prompt and three-tier finalise fallback),
+  truncation marker + `finish=` toolbar field + per-turn
+  reasoning/visible char split (RP-3). Decision E pins the
+  three-axis thinking model (model / display / history), G / H
+  document RP-1's mixed-scope and RP-2's single-commit landing,
+  I logs the interim exit back to D-021 step 3 / P-6.0.5.
+  RP-4..RP-6 are listed for sequencing visibility but explicitly
+  deferred behind P-6.0.5.
