@@ -146,6 +146,30 @@ class ChatCliState:
     Reprinted by ``/expand``. Empty until the first reasoning turn
     completes."""
 
+    last_turn_reasoning_chars: int = 0
+    """Cumulative character count of ``ThinkingChunk`` events for the
+    current / most-recent turn. CHAT-CLI-RESPONSE-POLICY RP-3 —
+    pairs with :attr:`last_turn_visible_chars` to surface the
+    reasoning-vs-visible split for ``/showcase``. Resets at fresh
+    chat-turn entry; ``/continue`` accumulates across the truncation
+    boundary so the figure reflects the whole turn (mirrors how
+    :attr:`last_turn_thinking` carries forward). Char-level only —
+    token-precise figures need a tokeniser-level intercept that does
+    not exist today (RP-3 design note)."""
+
+    last_turn_visible_chars: int = 0
+    """Cumulative character count of ``ReplyChunk`` events for the
+    current / most-recent turn. CHAT-CLI-RESPONSE-POLICY RP-3 —
+    same lifecycle as :attr:`last_turn_reasoning_chars`."""
+
+    total_continuation_chunks: int = 0
+    """Number of successful ``/continue`` invocations this session.
+    CHAT-CLI-RESPONSE-POLICY RP-3 — surfaced by ``/showcase`` to
+    tell the user how many times they extended a truncated turn.
+    Increments only after ``ChatSession.continue_last`` returns
+    successfully (no guard-fail path, no abort-rollback path).
+    Reset to 0 by ``/reset`` and ``/load`` and ``/model`` swap."""
+
     thinking_started_at: float | None = None
     """Wall-clock seconds (``time.monotonic()``) at which the current
     turn entered ``StreamState.THINKING``; used by the toolbar to

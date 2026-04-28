@@ -272,6 +272,29 @@ def test_swap_clears_last_finish_reason_without_keep_history() -> None:
     assert state.last_finish_reason is None
 
 
+def test_swap_clears_rp3_per_turn_metrics_even_keeping_history() -> None:
+    """RP-3 per-turn char counters and continuation chunk tally
+    describe runtime metrics, not conversation text — clear on
+    every model swap regardless of ``--keep-history`` (same
+    rationale as ``last_finish_reason``)."""
+    state = _seeded_state()
+    state.last_turn_reasoning_chars = 1234
+    state.last_turn_visible_chars = 567
+    state.total_continuation_chunks = 4
+    outcome = _swap(
+        keep_history=True,
+        prior_messages=[
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "reply"},
+        ],
+        state=state,
+    )
+    assert outcome is not None
+    assert state.last_turn_reasoning_chars == 0
+    assert state.last_turn_visible_chars == 0
+    assert state.total_continuation_chunks == 0
+
+
 def test_swap_keep_history_with_empty_prior_is_no_op_on_messages() -> None:
     """A fresh prior session (no user / assistant turns) yields a
     new session whose only message is the system prompt the

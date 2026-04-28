@@ -157,6 +157,7 @@ def test_toolbar_plain_mode_contains_all_static_fields() -> None:
         "compr=",
         "prefix_hit=",
         "turn=",
+        "finish=",
     ):
         assert key in out, f"missing field {key!r} in toolbar: {out!r}"
 
@@ -564,3 +565,112 @@ def test_showcase_plain_mode_has_no_ansi_escapes() -> None:
     st = ChatCliState(model_name="Qwen3-0.6B", turn=1)
     out = render_showcase(st, palette=Palette.plain())
     assert "\x1b[" not in out
+
+
+# ---------------------------------------------------------------------------
+# CHAT-CLI-RESPONSE-POLICY RP-3 — toolbar finish= field
+# ---------------------------------------------------------------------------
+
+
+def test_toolbar_finish_emdash_when_unset() -> None:
+    """A fresh state (no turn run yet) renders ``finish=—``."""
+    out = render_toolbar(_empty_state(), palette=Palette.plain())
+    assert "finish=—" in out
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["max_tokens", "stop_token", "done", "eos", "aborted", "empty"],
+)
+def test_toolbar_finish_renders_each_reason(reason: str) -> None:
+    """The renderer surfaces each known ``last_finish_reason``
+    value plain-text. Forward-compat values (e.g. an unknown
+    engine cancel reason) also render without crashing."""
+    st = ChatCliState(model_name="Qwen3-0.6B")
+    st.last_finish_reason = reason
+    out = render_toolbar(st, palette=Palette.plain())
+    assert f"finish={reason}" in out
+
+
+def test_toolbar_finish_unknown_value_renders_plain() -> None:
+    """A future ``finish_reason`` value not in the colour map
+    renders as plain text rather than crashing — the formatter is
+    forward-compatible."""
+    st = ChatCliState(model_name="Qwen3-0.6B")
+    st.last_finish_reason = "tool_use_pending"  # hypothetical future
+    out = render_toolbar(st, palette=Palette.plain())
+    assert "finish=tool_use_pending" in out
+
+
+# ---------------------------------------------------------------------------
+# CHAT-CLI-RESPONSE-POLICY RP-3 — /showcase finish + chars rendering
+# ---------------------------------------------------------------------------
+
+
+def test_showcase_renders_emdash_for_finish_and_chars_pre_first_turn() -> None:
+    """A fresh session has no last_finish_reason and zero per-turn
+    chars; the showcase shows em-dash for both rather than ``0``
+    so the user can distinguish unmeasured from measured-zero."""
+    st = ChatCliState(model_name="Qwen3-0.6B")
+    out = render_showcase(st, palette=Palette.plain())
+    assert "last finish:     —" in out
+    assert "last turn:       —" in out
+    # /continue counter line is suppressed entirely when zero
+    # to avoid cluttering the showcase for users who never used
+    # /continue.
+    assert "/continue calls" not in out
+
+
+def test_showcase_renders_finish_reason_when_set() -> None:
+    """The most recent ``finish_reason`` shows on the ``last finish:``
+    line; other reasons surface verbatim."""
+    for reason in ("max_tokens", "stop_token", "done", "eos"):
+        st = ChatCliState(model_name="Qwen3-0.6B")
+        st.last_finish_reason = reason
+        out = render_showcase(st, palette=Palette.plain())
+        assert f"last finish:     {reason}" in out
+
+
+def test_showcase_renders_per_turn_char_split() -> None:
+    """``last_turn_reasoning_chars`` and ``last_turn_visible_chars``
+    are rendered as a single line splitting the most recent
+    turn's reasoning vs visible output. Values appear verbatim
+    so the user can eyeball "this turn was 80% reasoning"."""
+    st = ChatCliState(model_name="Qwen3-0.6B")
+    st.last_turn_reasoning_chars = 1234
+    st.last_turn_visible_chars = 567
+    out = render_showcase(st, palette=Palette.plain())
+    assert (
+        "last turn:       1234 reasoning chars / 567 visible chars"
+        in out
+    )
+
+
+def test_showcase_renders_continuation_chunks_when_nonzero() -> None:
+    """``/continue calls`` line appears only when at least one
+    successful continuation has run; suppressed at zero so users
+    who never use the feature do not see the field."""
+    st = ChatCliState(model_name="Qwen3-0.6B")
+    st.total_continuation_chunks = 3
+    out = render_showcase(st, palette=Palette.plain())
+    assert "/continue calls: 3" in out
+
+    st_zero = ChatCliState(model_name="Qwen3-0.6B")
+    out_zero = render_showcase(st_zero, palette=Palette.plain())
+    assert "/continue calls" not in out_zero
+
+
+def test_showcase_renders_chars_only_when_either_nonzero() -> None:
+    """Only one of reasoning/visible nonzero is enough to render
+    the split line — covers the off-mode-no-thinking case
+    (visible > 0, reasoning == 0) and a hypothetical
+    thinking-only turn."""
+    visible_only = ChatCliState(model_name="Qwen3-0.6B")
+    visible_only.last_turn_visible_chars = 100
+    out = render_showcase(visible_only, palette=Palette.plain())
+    assert "0 reasoning chars / 100 visible chars" in out
+
+    reasoning_only = ChatCliState(model_name="Qwen3-0.6B")
+    reasoning_only.last_turn_reasoning_chars = 100
+    out = render_showcase(reasoning_only, palette=Palette.plain())
+    assert "100 reasoning chars / 0 visible chars" in out

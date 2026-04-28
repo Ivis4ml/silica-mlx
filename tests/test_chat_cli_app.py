@@ -30,12 +30,14 @@ from silica.chat.cli.app import (
     _assistant_ends_in_thinking,
     _build_prefix_cache,
     _evaluate_continue_request,
+    _print_truncation_marker,
     _resolve_live_toolbar_enabled,
     _resolve_thinking_history,
     _resolve_thinking_mode,
     _sampling_params_from_state,
 )
 from silica.chat.cli.commands import CommandResult
+from silica.chat.cli.palette import Palette
 from silica.chat.cli.state import ChatCliState
 
 # ---------------------------------------------------------------------------
@@ -815,3 +817,65 @@ def test_continue_parser_start_falls_back_to_live_when_snapshot_none() -> None:
     )
     # implicit_leading=True + content has no </think> → True.
     assert parser_start is True
+
+
+# ---------------------------------------------------------------------------
+# CHAT-CLI-RESPONSE-POLICY RP-3 — per-turn metric defaults + lifecycle
+# ---------------------------------------------------------------------------
+
+
+def test_chat_cli_state_per_turn_chars_default_zero() -> None:
+    """Fresh state — RP-3's per-turn char counters and the
+    cumulative continuation tally start at zero. ``/showcase``
+    reads these to render the reasoning vs visible split."""
+    state = ChatCliState()
+    assert state.last_turn_reasoning_chars == 0
+    assert state.last_turn_visible_chars == 0
+    assert state.total_continuation_chunks == 0
+
+
+# ---------------------------------------------------------------------------
+# CHAT-CLI-RESPONSE-POLICY RP-3 — truncation marker helper
+# ---------------------------------------------------------------------------
+
+
+def test_truncation_marker_prints_on_max_tokens(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``finish_reason="max_tokens"`` renders the marker; the
+    helper returns ``True`` so callers can branch without
+    inspecting stdout."""
+    printed = _print_truncation_marker("max_tokens", Palette.plain())
+    assert printed is True
+    out = capsys.readouterr().out
+    assert "[truncated: /continue]" in out
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["stop_token", "done", "eos", "empty", "aborted", None],
+)
+def test_truncation_marker_silent_on_other_reasons(
+    reason: str | None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Any other finish reason — including ``None`` (the
+    pre-first-turn / post-reset state) — must not print the
+    marker. The helper returns ``False`` and stdout is empty."""
+    printed = _print_truncation_marker(reason, Palette.plain())
+    assert printed is False
+    out = capsys.readouterr().out
+    assert out == ""
+
+
+def test_truncation_marker_does_not_pollute_message_log() -> None:
+    """The marker is rendered via direct ``sys.stdout.write`` and
+    must not be reachable through any path that feeds
+    ``ChatSession.messages``. Static guarantee: the helper only
+    accepts ``finish_reason`` and ``palette`` — there is no
+    chat-session reference to write to. Sanity-checks the helper's
+    signature so future refactors do not silently re-add a path
+    through the streaming protocol."""
+    import inspect
+
+    sig = inspect.signature(_print_truncation_marker)
+    assert set(sig.parameters) == {"finish_reason", "palette"}

@@ -249,6 +249,34 @@ def _print_separator(palette: Palette) -> None:
     sys.stdout.flush()
 
 
+def _print_truncation_marker(
+    finish_reason: str | None, palette: Palette
+) -> bool:
+    """Print the ``[truncated: /continue]`` marker when the most
+    recent turn ended at ``finish_reason="max_tokens"``.
+
+    CHAT-CLI-RESPONSE-POLICY RP-3. Returns ``True`` when the
+    marker was printed (i.e. ``finish_reason == "max_tokens"``),
+    ``False`` otherwise — the boolean lets callers / tests check
+    the branch without inspecting stdout. Direct
+    ``sys.stdout.write`` deliberately bypasses the streaming
+    parser so the marker text never reaches
+    ``chat_session.messages``: routing through the parser would
+    feed the chars into the assistant message and pollute
+    history, breaking the very ``/continue`` flow the marker
+    advertises.
+    """
+    if finish_reason != "max_tokens":
+        return False
+    sys.stdout.write(
+        palette.colorize(
+            "[truncated: /continue]\n", "yellow", dim=True
+        )
+    )
+    sys.stdout.flush()
+    return True
+
+
 def run_chat(args: argparse.Namespace) -> int:
     """Entry point for ``silica chat``.
 
@@ -404,6 +432,8 @@ def run_chat(args: argparse.Namespace) -> int:
         regenerate_text: str | None = None
         regenerate_snapshot: list[dict[str, str]] | None = None
         regenerate_thinking_snapshot: str | None = None
+        regenerate_reasoning_chars_snapshot: int | None = None
+        regenerate_visible_chars_snapshot: int | None = None
         # CHAT-CLI-RESPONSE-POLICY RP-2 (G2): /continue mirrors the
         # /regenerate request flow but invokes ``continue_last``
         # instead of ``chat`` and routes no user_text. The
@@ -412,6 +442,8 @@ def run_chat(args: argparse.Namespace) -> int:
         continue_request: bool = False
         continue_snapshot: list[dict[str, str]] | None = None
         continue_thinking_snapshot: str | None = None
+        continue_reasoning_chars_snapshot: int | None = None
+        continue_visible_chars_snapshot: int | None = None
         if is_slash_command(text):
             result = dispatch_command(text, state)
             _print_lines(_format_feedback(result, palette))
@@ -433,6 +465,9 @@ def run_chat(args: argparse.Namespace) -> int:
                 state.turn = 0
                 state.last_turn_thinking = ""
                 state.last_finish_reason = None
+                state.last_turn_reasoning_chars = 0
+                state.last_turn_visible_chars = 0
+                state.total_continuation_chunks = 0
                 state.prefix_hit_blocks = None
                 state.prefix_hit_max = None
                 state.total_prefix_hit_tokens = 0
@@ -469,11 +504,13 @@ def run_chat(args: argparse.Namespace) -> int:
                 # the no-op and continue to the prompt.
                 # Snapshot before pop so the abort / error branches
                 # in the chat-turn flow can roll back if the
-                # regenerated turn fails. ``messages`` is a shallow
-                # copy of the live list; restore via
-                # ``replace_messages`` which deep-copies entries.
+                # regenerated turn fails. ``messages`` returns
+                # independent dict copies; restore via
+                # ``replace_messages`` which also deep-copies entries.
                 pre_pop_snapshot = chat_session.messages
                 pre_pop_thinking = state.last_turn_thinking
+                pre_pop_reasoning_chars = state.last_turn_reasoning_chars
+                pre_pop_visible_chars = state.last_turn_visible_chars
                 popped = chat_session.pop_last_exchange()
                 if popped is None:
                     sys.stdout.write(
@@ -488,14 +525,20 @@ def run_chat(args: argparse.Namespace) -> int:
                     regenerate_text = popped
                     regenerate_snapshot = pre_pop_snapshot
                     regenerate_thinking_snapshot = pre_pop_thinking
+                    regenerate_reasoning_chars_snapshot = (
+                        pre_pop_reasoning_chars
+                    )
+                    regenerate_visible_chars_snapshot = (
+                        pre_pop_visible_chars
+                    )
             if result.request_continue:
                 # CHAT-CLI-RESPONSE-POLICY RP-2 (G2): the helper
                 # encodes two guards (no-prior-assistant /
                 # last-turn-not-truncated). Either failure prints
                 # a yellow warning and falls through to the prompt
                 # without mutating the session; success snapshots
-                # the messages + thinking buffer for abort
-                # rollback below.
+                # the messages + thinking/char-metric buffers for
+                # abort rollback below.
                 proceed, warning = _evaluate_continue_request(
                     chat_session, state
                 )
@@ -510,6 +553,12 @@ def run_chat(args: argparse.Namespace) -> int:
                     continue_request = True
                     continue_snapshot = chat_session.messages
                     continue_thinking_snapshot = state.last_turn_thinking
+                    continue_reasoning_chars_snapshot = (
+                        state.last_turn_reasoning_chars
+                    )
+                    continue_visible_chars_snapshot = (
+                        state.last_turn_visible_chars
+                    )
             if result.request_session_save:
                 _handle_session_save(
                     result.request_session_save,
@@ -591,8 +640,14 @@ def run_chat(args: argparse.Namespace) -> int:
         # ``+= event.text`` accumulates across the boundary and
         # ``/expand`` shows the full reasoning trace. Fresh chat
         # turns reset to empty as before.
+        # RP-3: same gate for the per-turn char counters — chars
+        # accumulate across /continue boundaries so /showcase
+        # reads the WHOLE truncated turn's reasoning vs visible
+        # split, not just the segment continue_last produced.
         if not continue_request:
             state.last_turn_thinking = ""
+            state.last_turn_reasoning_chars = 0
+            state.last_turn_visible_chars = 0
         # CHAT-CLI-HARDENING-6 (F3) + post-H6 follow-up: live
         # toolbar backend selection. The Ansi backend is opt-in
         # (default ``NullLiveToolbar``) because cursor save/restore
@@ -756,6 +811,12 @@ def run_chat(args: argparse.Namespace) -> int:
                         )
                 elif isinstance(event, ThinkingChunk):
                     state.last_turn_thinking += event.text
+                    # RP-3: count reasoning characters for the
+                    # /showcase split. Chars are a strict superset
+                    # signal of "this turn was thinking-heavy" —
+                    # token-precise figures need a tokeniser-level
+                    # intercept that does not exist today.
+                    state.last_turn_reasoning_chars += len(event.text)
                     if thinking_display == "show":
                         _write_generation_text(
                             palette.colorize(event.text, "grey", dim=True)
@@ -777,6 +838,12 @@ def run_chat(args: argparse.Namespace) -> int:
                 elif isinstance(event, ReplyChunk):
                     if state.stream_state is StreamState.PREFILL:
                         state.stream_state = StreamState.DECODE
+                    # RP-3: count visible characters BEFORE the
+                    # fence parser re-emits them — fence rendering
+                    # adds ANSI escapes that should not inflate
+                    # the count. ``event.text`` is the raw
+                    # post-thinking-parser segment.
+                    state.last_turn_visible_chars += len(event.text)
                     _emit_assistant_prefix_once()
                     _emit_reply_text(event.text)
             # HARDENING-6: refresh the bottom toolbar so the user
@@ -855,20 +922,36 @@ def run_chat(args: argparse.Namespace) -> int:
                         state.last_turn_thinking = (
                             regenerate_thinking_snapshot
                         )
+                    if regenerate_reasoning_chars_snapshot is not None:
+                        state.last_turn_reasoning_chars = (
+                            regenerate_reasoning_chars_snapshot
+                        )
+                    if regenerate_visible_chars_snapshot is not None:
+                        state.last_turn_visible_chars = (
+                            regenerate_visible_chars_snapshot
+                        )
                 # CHAT-CLI-RESPONSE-POLICY RP-2: /continue abort
                 # rollback. Without this, KeyboardInterrupt during
                 # ``continue_last`` would leave the assistant
                 # message containing whatever partial bytes the
                 # session managed to write before the abort, and
                 # ``state.last_turn_thinking`` would carry stray
-                # appended fragments. Restore both to the
-                # pre-continue snapshot so the user can retry or
-                # /continue again cleanly.
+                # appended fragments. Restore those plus RP-3's
+                # per-turn char counters to the pre-continue snapshot
+                # so the user can retry or /continue again cleanly.
                 if continue_snapshot is not None:
                     chat_session.replace_messages(continue_snapshot)
                     if continue_thinking_snapshot is not None:
                         state.last_turn_thinking = (
                             continue_thinking_snapshot
+                        )
+                    if continue_reasoning_chars_snapshot is not None:
+                        state.last_turn_reasoning_chars = (
+                            continue_reasoning_chars_snapshot
+                        )
+                    if continue_visible_chars_snapshot is not None:
+                        state.last_turn_visible_chars = (
+                            continue_visible_chars_snapshot
                         )
                 state.stream_state = StreamState.IDLE
                 continue
@@ -891,11 +974,27 @@ def run_chat(args: argparse.Namespace) -> int:
                         state.last_turn_thinking = (
                             regenerate_thinking_snapshot
                         )
+                    if regenerate_reasoning_chars_snapshot is not None:
+                        state.last_turn_reasoning_chars = (
+                            regenerate_reasoning_chars_snapshot
+                        )
+                    if regenerate_visible_chars_snapshot is not None:
+                        state.last_turn_visible_chars = (
+                            regenerate_visible_chars_snapshot
+                        )
                 if continue_snapshot is not None:
                     chat_session.replace_messages(continue_snapshot)
                     if continue_thinking_snapshot is not None:
                         state.last_turn_thinking = (
                             continue_thinking_snapshot
+                        )
+                    if continue_reasoning_chars_snapshot is not None:
+                        state.last_turn_reasoning_chars = (
+                            continue_reasoning_chars_snapshot
+                        )
+                    if continue_visible_chars_snapshot is not None:
+                        state.last_turn_visible_chars = (
+                            continue_visible_chars_snapshot
                         )
                 state.stream_state = StreamState.IDLE
                 continue
@@ -905,7 +1004,9 @@ def run_chat(args: argparse.Namespace) -> int:
             for event in parser.finish():
                 if isinstance(event, ThinkingChunk):
                     state.last_turn_thinking += event.text
+                    state.last_turn_reasoning_chars += len(event.text)
                 elif isinstance(event, ReplyChunk):
+                    state.last_turn_visible_chars += len(event.text)
                     _emit_assistant_prefix_once()
                     _emit_reply_text(event.text)
             # Drain any text the fence parser held back. A truncated
@@ -972,6 +1073,13 @@ def run_chat(args: argparse.Namespace) -> int:
         # /showcase reflects the real work the session performed.
         if not continue_request:
             state.turn += 1
+        else:
+            # RP-3: count successful /continue invocations. The
+            # bump lives here (after metrics is in hand, before
+            # the post-turn marker) so guard-fail and abort-rollback
+            # paths do not trigger it — both routes ``continue``
+            # before reaching this point.
+            state.total_continuation_chunks += 1
         state.last_ttft_ms = metrics.ttft_ms
         if metrics.peak_memory_mb is not None:
             state.peak_memory_mb = metrics.peak_memory_mb
@@ -1030,6 +1138,9 @@ def run_chat(args: argparse.Namespace) -> int:
         if hint is not None:
             sys.stdout.write(hint + "\n")
             sys.stdout.flush()
+
+        # CHAT-CLI-RESPONSE-POLICY RP-3: truncation marker.
+        _print_truncation_marker(metrics.finish_reason, palette)
 
         _print_separator(palette)
 
@@ -1140,6 +1251,9 @@ def _handle_session_load(
     state.last_ttft_ms = None
     state.tokens_generated = 0
     state.last_finish_reason = None
+    state.last_turn_reasoning_chars = 0
+    state.last_turn_visible_chars = 0
+    state.total_continuation_chunks = 0
 
     sys.stdout.write(
         palette.colorize(
@@ -1269,6 +1383,13 @@ def _swap_model(
     # ``--keep-history`` (the conversation text survives, the
     # finish-reason is not part of that text). See RP-2 commit.
     state.last_finish_reason = None
+    # RP-3: same logic for the per-turn char counters and the
+    # continuation-chunk tally. They describe the previous
+    # session's runtime, not the conversation text — a fresh
+    # model boundary resets them regardless of keep_history.
+    state.last_turn_reasoning_chars = 0
+    state.last_turn_visible_chars = 0
+    state.total_continuation_chunks = 0
     # Conversation-level state: keep iff the history did.
     if not keep_history:
         state.turn = 0

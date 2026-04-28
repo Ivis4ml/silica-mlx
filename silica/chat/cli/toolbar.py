@@ -133,6 +133,39 @@ def _format_turn(state: ChatCliState, palette: Palette) -> str:
     return f"turn={palette.colorize(str(state.turn), 'white', dim=True)}"
 
 
+# CHAT-CLI-RESPONSE-POLICY RP-3 — finish-reason field.
+# Colour coding: ``max_tokens`` is yellow because the user can
+# usually act on it (``/continue``); natural completions render
+# white-dim because they need no follow-up; ``aborted`` /
+# ``empty`` render red-dim to flag a turn that did not produce
+# the expected output. Unknown values fall back to default
+# foreground so a future ``finish_reason`` value (e.g. an
+# engine-side cancel reason) does not break the formatter.
+_FINISH_COLOURS: dict[str, ColorName] = {
+    "max_tokens": "yellow",
+    "stop_token": "white",
+    "done": "white",
+    "eos": "white",
+    "aborted": "red",
+    "empty": "red",
+}
+
+
+def _format_finish(state: ChatCliState, palette: Palette) -> str:
+    """Render the ``finish=<reason>`` toolbar field.
+
+    Surfaces ``state.last_finish_reason``. Em-dash when ``None``
+    (pre-first-turn or post-``/reset`` / ``/load`` / ``/model``
+    swap), so the layout is stable across the full state space.
+    """
+    reason = state.last_finish_reason
+    if reason is None:
+        return f"finish={_EMDASH}"
+    colour = _FINISH_COLOURS.get(reason, "default")
+    dim = reason in ("stop_token", "done", "eos")
+    return f"finish={palette.colorize(reason, colour, dim=dim)}"
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -177,6 +210,7 @@ def render_toolbar(
         _format_compr(state, p),
         _format_prefix_hit(state, p),
         _format_turn(state, p),
+        _format_finish(state, p),
     ]
     return "  ".join(fields)
 
@@ -260,6 +294,28 @@ def render_showcase(
         lines.append(f"  last TTFT:       {state.last_ttft_ms:.0f} ms")
     else:
         lines.append("  last TTFT:       —")
+
+    # CHAT-CLI-RESPONSE-POLICY RP-3: surface the most recent
+    # finish_reason and the per-turn reasoning / visible char
+    # split. Em-dash for unmeasured values matches the existing
+    # field convention.
+    finish = state.last_finish_reason
+    lines.append(f"  last finish:     {finish if finish else '—'}")
+    if (
+        state.last_turn_reasoning_chars > 0
+        or state.last_turn_visible_chars > 0
+    ):
+        lines.append(
+            "  last turn:       "
+            f"{state.last_turn_reasoning_chars} reasoning chars / "
+            f"{state.last_turn_visible_chars} visible chars"
+        )
+    else:
+        lines.append("  last turn:       —")
+    if state.total_continuation_chunks > 0:
+        lines.append(
+            f"  /continue calls: {state.total_continuation_chunks}"
+        )
 
     if state.peak_memory_mb is not None:
         lines.append(
