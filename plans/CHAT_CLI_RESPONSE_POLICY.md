@@ -1,0 +1,269 @@
+# Chat CLI Response Policy — side track opening
+
+| Field | Value |
+| --- | --- |
+| Phase | side track (not numbered; not P-6 / P-7 / P-8) |
+| Status | drafted; pending RP-1 landing |
+| Last updated | 2026-04-28 |
+| Trigger | Two real-session UX failures observed against Qwen3.5-35B-A3B-4bit + Qwen3-0.6B during interactive use of the post-HARDENING chat REPL (latest code at `51fbcde`) |
+| Scope owner | Xin Zhou |
+| Predecessor | `plans/CHAT_CLI_HARDENING.md` (F1-F6 closed in code; HARDENING-9 manual acceptance still pending — see §5 sequencing note) |
+| Successor | resume D-021 step 3 (P-6.0.5 measurement expansion); RP-4..RP-6 wait their turn |
+
+CHAT-CLI-HARDENING closed F1-F6 across eight commits and shipped
+the live toolbar / `/regenerate` / `/model --keep-history` /
+public stats API surface. Two design-level gaps remain that are
+not HARDENING bugs — they sit between the raw model surface
+(``max_tokens``, ``enable_thinking``) and what a user actually
+wants (a complete, readable answer that does not waste budget on
+hidden reasoning). This side track adds a thin Response Policy
+layer between the two.
+
+The full design space (mode-driven policy, smart auto-continue,
+content-aware truncation detection) is large; this opening
+commits only to the smallest batch that closes the two observed
+failures (RP-1 / RP-2 / RP-3). RP-4..RP-6 are listed for
+sequencing visibility but explicitly deferred — they unlock
+after P-6.0.5 lands the dense-perf gate that this whole chain
+is supposed to feed.
+
+---
+
+## 1. What's already solid
+
+- The CHAT-CLI-HARDENING side track closed F1-F6 across eight
+  commits (`cec2c7f`, `9601f64`, `3241ab7`, `52fc44d`, `410db40`,
+  `b79ee58` + `eb337d8`, `df3bd24`, `9a9d5d3`).
+- `ChatSession` already stores per-turn metrics including
+  `finish_reason`, `prompt_tokens`, `output_tokens`,
+  `prefix_hit_blocks`, prefix-store residency.
+- `silica.chat.cli.live_toolbar` exposes a swappable backend;
+  RP-3's truncation marker can route through the same surface.
+- `apply_chat_template` is already threaded with
+  `enable_thinking` (HARDENING-2); RP-1 reuses the same plumbing
+  for the history-strip path.
+- HuggingFace tokenizers expose
+  `apply_chat_template(messages, continue_final_message=True)`
+  for the Qwen3 family — this is the load-bearing primitive RP-2
+  needs.
+
+---
+
+## 2. What's still gappy — the two real-session findings
+
+| # | Severity | File / function | Gap | Symptom |
+| --- | --- | --- | --- | --- |
+| G1 | High | `silica/chat/session.py::ChatSession.chat` (post-decode message append) | `_messages[-1].content` carries the **raw** decoded reply, including any `<think>...</think>` block. The next turn's `_render_prompt` re-tokenises all of that. | Long Qwen3 thinking blocks accumulate in conversation history, inflating prompt length monotonically and slowing every subsequent turn. The CLI's display-side fold (`thinking=hidden` / `auto`) hides them visually but does not stop them from polluting the chat-template input. |
+| G2 | High | `silica/chat/session.py::ChatSession.chat` (terminal `finish_reason`) | When the engine stops with `finish_reason="max_tokens"` the CLI silently ends the turn; there is no "/continue" surface, no marker, no metric distinction between "model finished its thought" and "we hit the cap". | Users hit a hard wall at `max_tokens` (default 1024), have no way to extend the same answer, and have no toolbar/showcase signal to know which turns were truncated. The only workaround is `/config max_tokens=4096`, which moves the wall and inflates worst-case KV reservation. |
+
+---
+
+## 3. Three-layer thinking semantics (Decision E)
+
+The chat CLI's existing knobs conflate three orthogonal axes.
+RP-1 lands the third axis explicitly so users (and downstream
+defaults) can reason about each independently:
+
+| Layer | Knob | Values | Effect | Status |
+| --- | --- | --- | --- | --- |
+| Model side | `thinking_mode` | `True` / `False` / `None` | Threads `enable_thinking` to `apply_chat_template`. Hard switch — the model genuinely does or does not enter reasoning mode. | Landed at HARDENING-2 |
+| Display side | `thinking` | `auto` / `show` / `hidden` | Controls whether the live REPL prints the thinking text inline. Does not affect the model. | Pre-existing |
+| History side | `thinking_history` | `strip` / `keep` | Whether `<think>...</think>` content is written into `_messages[-1].content` after the turn. `strip` (default) keeps history clean; `keep` preserves the raw reply for transcripts that need full reasoning. Does not affect the current turn's display, only what the *next* turn's prompt sees. | **RP-1 (this side track)** |
+
+The three layers compose: a user can run with
+`thinking_mode=on` (model still reasons) +
+`thinking=hidden` (visual fold for the user) +
+`thinking_history=strip` (next turn's prompt does not re-feed
+the reasoning). This is the configuration the side track
+recommends as the chat default after RP-1 lands.
+
+---
+
+## 4. Sub-unit decomposition
+
+Each row is bounded enough to land + verify + pause inside one
+incremental commit. Rows RP-1..RP-3 are the committed scope of
+this opening; RP-4..RP-6 are listed for sequencing visibility
+but deferred per §5.
+
+| ID | Goal | Files touched | Tests added |
+| --- | --- | --- | --- |
+| **RP-1** | `thinking_history=strip` (close G1). Add the `thinking_history` config key (default `strip`) to the chat-CLI config schema; add a matching ``thinking_history`` constructor kwarg + ``set_thinking_history`` mutator on ``ChatSession`` (mirrors the HARDENING-2 ``thinking_mode`` plumbing). ``ChatSession.chat`` strips ``<think>...</think>`` from the reply *only* on natural completion (``finish_reason in {done, eos}``); a ``finish_reason=max_tokens`` turn keeps the raw text on the assistant message because RP-2 ``/continue`` needs that prefix to resume an open ``<think>`` block. The deferred strip fires either when ``/continue`` reaches natural completion OR when the next user message lands (``ChatSession`` finalises the previous truncated turn before appending the new user msg). The full raw reply remains accessible via a new ``TurnMetrics.raw_reply`` field for callers; chat-CLI's ``/expand`` keeps using ``state.last_turn_thinking`` (parsed display-side) — no UX change there. The chat-CLI shell re-syncs ``thinking_history`` from ``state.config`` per turn so ``/config thinking_history=keep`` takes effect on the next turn without a session rebuild (mirrors the per-turn ``thinking_mode`` resync). | `silica/chat/session.py`, `silica/chat/cli/config.py` (schema), `silica/chat/cli/state.py` (default), `silica/chat/cli/app.py` (ctor pass-through + per-turn resync) | `tests/test_chat_session.py` (history-strip on/off; round-trip after multi-turn; deferred-strip semantics on ``finish_reason=max_tokens``); `tests/test_chat_cli_app.py` (per-turn resync mirrors ``thinking_mode``). |
+| **RP-2** | `/continue` (close half of G2). New ``ChatSession.continue_last() -> TurnMetrics`` that re-renders the prompt with ``apply_chat_template(messages, continue_final_message=True)`` (Qwen3 family supports it; ``KeyError``-fallback path for tokenisers that do not is RP-2 acceptance) and appends generated tokens to the **existing** assistant message rather than creating a fresh ``(user, assistant)`` pair. The raw assistant prefix preserved by RP-1's deferred-strip path is what makes byte-equivalent continuation possible — ``/continue`` would silently produce the wrong text if RP-1 stripped truncated turns eagerly. ``continue_last`` finalises the assistant message per ``thinking_history`` only when this continuation reaches natural completion (``finish_reason in {done, eos}``); chained continuations (cap hit twice) carry the raw form forward. New ``/continue`` slash command in ``silica/chat/cli/commands.py``. The chat-CLI shell guards ``/continue`` against (a) the last turn not being assistant-shaped, and (b) the last turn not having ``finish_reason=max_tokens`` (warning + no-op for the latter; the user is told nothing was truncated). Rollback on abort mirrors HARDENING-4's pre-pop snapshot pattern. | `silica/chat/session.py`, `silica/chat/cli/commands.py`, `silica/chat/cli/app.py` | `tests/test_chat_session.py` (``continue_last`` appends; honours ``continue_final_message``; raw prefix preserved across truncation; finalise-strip fires only on natural completion); `tests/test_chat_cli_commands.py` (``/continue`` dispatcher flag); `tests/test_chat_cli_app.py` (no-prior / not-truncated / abort-rollback paths). |
+| **RP-3** | Truncation UX + metrics (close the other half of G2). When ``finish_reason == "max_tokens"``, the chat-CLI shell prints a clear marker (``[truncated at max_tokens; /continue to extend]``) on a fresh line. Toolbar gains a ``finish=`` field surfacing the most recent terminal reason (``done`` / ``max_tokens`` / ``eos`` / ``abort``). ``ChatCliState`` accumulates per-turn ``reasoning_chars`` / ``visible_chars`` / ``continuation_chunks`` for ``/showcase``. **Metric scope**: char-level only — counted from the display-side ``ThinkingParser`` events (``ThinkingChunk`` lengths into ``reasoning_chars``; ``ReplyChunk`` lengths into ``visible_chars``), not from token ids. Token-level reasoning/visible split needs a tokeniser-level intercept that does not exist today and is not in scope for RP-3; if a future bench scenario needs token-precise figures the metric can promote without renaming (chars are a strict superset signal of "this turn was thinking-heavy"). | `silica/chat/cli/app.py`, `silica/chat/cli/state.py`, `silica/chat/cli/toolbar.py` | `tests/test_chat_cli_toolbar.py` (new ``finish=`` field rendering); `tests/test_chat_cli_app.py` (truncation marker on max_tokens; ``reasoning_chars`` / ``visible_chars`` accumulation; ``continuation_chunks`` increment per ``/continue``). |
+| RP-4 | `/mode fast|balanced|deep` policy bundles. Maps mode → `(thinking_mode, chunk_tokens, max_reply_tokens, sampling)`. Default `fast` (thinking off, 768 / 2048). `/mode deep` opt-in for genuinely complex turns. | `silica/chat/cli/commands.py`, `silica/chat/cli/config.py` | dispatcher + integration tests. |
+| RP-5 | `auto_continue=smart`. CLI heuristic detects "obviously incomplete" replies (unclosed code fences, mid-sentence stop, list-prefix-only, model still inside `<think>` at max_tokens) and chains a continuation automatically up to `max_reply_tokens`. | new module `silica/chat/cli/completion_detector.py`, `silica/chat/cli/app.py` | unit tests for the detector; integration test for the auto-continue loop. |
+| RP-6 | Manual real-model acceptance pass. Mirrors HARDENING-9 shape; produces `plans/CHAT_CLI_RESPONSE_POLICY_ACCEPTANCE.md`. | none (acceptance run only). | none. |
+
+---
+
+## 5. Sequencing
+
+Within the committed batch:
+
+```text
+RP-1 (thinking_history=strip + deferred-strip on truncation)
+        │
+        ▼
+RP-2 (/continue, building on RP-1's raw-prefix preservation)
+        │
+        ▼
+RP-3 (truncation UX + metrics)
+        │
+        ▼
+[ side-track interim exit — return to P-6.0.5 ]
+        │
+        ▼
+D-021 step 3 (P-6.0.5 measurement expansion)
+        │
+        ▼
+[ later: RP-4 / RP-5 / RP-6 if user demand justifies ]
+```
+
+**HARDENING-9 status**: the manual acceptance run is still
+pending (template seeded at `6e19542`, amended at `51fbcde`).
+HARDENING-9 does **not** block RP-1 — F1-F6 are closed in code
+and the manual run is recorded against that closed-code state
+as a separate artifact. The acceptance template's §5 F1-F6
+sign-off rows can be filled against the pre-RP code (HEAD as
+of `51fbcde`); RP-1 is allowed to land on top of the same
+HEAD without invalidating that record. The two side tracks
+share a parent commit but their acceptance documents are
+independent.
+
+**Sequencing constraints that DO bind**:
+
+1. **RP-1 before RP-2.** RP-2 ``/continue`` needs RP-1's
+   deferred-strip-on-truncation contract to preserve the raw
+   ``<think>`` prefix across the boundary; eager strip would
+   silently break byte-equivalent continuation when the
+   truncation point sits inside an open thinking block.
+2. **P-6.0.5 takes priority over RP-4..6.** The dense 27B / MoE
+   bench expansion is the load-bearing P-6 work. RP-4..6 are
+   product polish that depends on real-session data RP-1..3
+   already provide; they wait until the dense-perf gate
+   resolves.
+
+Each unit is independently committable; the chain does not lock
+the whole side track on one hard-to-finish item.
+
+---
+
+## 6. Acceptance for the committed batch (RP-1..RP-3)
+
+This side track's *first* exit (the hand-off back to P-6.0.5)
+fires when:
+
+- `thinking_history=strip` is the default; multi-turn Qwen3
+  conversation against ``Qwen/Qwen3-0.6B`` shows turn-N prompt
+  length growing only with **visible** reply text, not with the
+  cumulative thinking budget. A turn that ends with
+  ``finish_reason=max_tokens`` mid-``<think>`` keeps the raw
+  prefix on the assistant message until ``/continue`` finishes
+  it OR the next user message lands; only THEN is the strip
+  applied. ``thinking_history=keep`` round-trip preserves the
+  raw decoded reply byte-equivalently (RP-1 acceptance).
+- ``/continue`` extends a truncated turn without inserting a new
+  user message; ``apply_chat_template(messages, continue_final_message=True)``
+  routes to the same prompt the model would have seen at a
+  higher cap, modulo sampling stochasticity. Chained
+  ``/continue`` (cap hit twice) carries the raw form forward
+  through both calls and only finalises on natural completion
+  (RP-2 acceptance).
+- ``[truncated at max_tokens; /continue to extend]`` appears on
+  any turn that hits the cap; ``finish=`` field renders on the
+  toolbar for ``done`` / ``max_tokens`` / ``eos``; ``/showcase``
+  cumulative counters distinguish ``reasoning_chars`` vs
+  ``visible_chars`` and increment ``continuation_chunks`` on
+  every ``/continue`` invocation (RP-3 acceptance).
+- Full test suite green (no regression to the post-HARDENING
+  2248-test baseline); ruff + mypy clean for production AND
+  test files (the widened mypy invocation HARDENING-7 v2 / -8
+  established).
+
+When all four hold, the side track logs an interim exit and
+the next commit returns to D-021 step 3. RP-4..RP-6 reopen
+under a separate sequencing decision once P-6.0.5 lands.
+
+The full side-track GA (closing RP-4..RP-6 too) does NOT block
+the P-6.0.5 work; it is conditional on user demand observed
+during real-session use after RP-1..RP-3 ship.
+
+---
+
+## 7. Decisions
+
+### Decision E — three-layer thinking semantics (RP-1)
+
+**Date:** 2026-04-28.
+
+The chat CLI before this side track exposed two thinking knobs
+that overlapped in confusing ways: `thinking_mode` (model side,
+HARDENING-2) and `thinking` (display side, pre-existing). Real
+sessions on Qwen3.5-35B-A3B-4bit revealed a third, latent axis:
+even with `thinking_mode=off` and `thinking=hidden`, *previous*
+turns' raw replies (which a user generated under
+`thinking_mode=on` before flipping it off) continue to feed
+into every subsequent prompt's chat-template render, because
+`_messages` stores the raw decoded reply.
+
+The fix splits the third axis out explicitly as
+`thinking_history`. `strip` (the new default) writes only the
+post-thinking visible reply into history; `keep` preserves the
+raw reply for archival use cases (full-trace transcripts).
+Composition with the other two layers is explicit and
+documented in §3.
+
+This decision means the recommended chat CLI default after
+RP-1 lands is:
+
+```text
+thinking_mode=on        # current schema default; bool only
+thinking=hidden         # do not display reasoning live
+thinking_history=strip  # do not re-feed reasoning into next turn
+```
+
+The schema today only accepts ``thinking_mode`` as a bool;
+``auto`` / ``fast`` / ``balanced`` / ``deep`` are RP-4
+territory. Until then, ``thinking_mode=off`` remains the right
+hard-disable for speed-focused use, and ``thinking_history=keep``
+is the right opt-in for ``/save``-then-archive workflows where
+the operator wants the raw decoded text preserved verbatim.
+
+### Decision F — committed scope is RP-1..RP-3 only
+
+**Date:** 2026-04-28.
+
+The original GPT consultation proposed a full Response Policy
+framework (`/mode fast|balanced|deep`, `chunk_tokens` vs
+`max_reply_tokens`, smart auto-continue, content-aware
+truncation detection, per-side budgets) as one piece. Reviewing
+against the broader plan: P-6 dense-perf is the next gating
+deliverable; everything in this side track competes with it for
+sequencing.
+
+This opening commits only to the smallest batch that closes
+the two observed real-session failures (G1 / G2). RP-4..RP-6
+are listed for sequencing visibility but explicitly deferred
+behind P-6.0.5. Reopening them is its own decision once the
+dense-perf gate resolves and real-session data shows whether
+the smarter policy bundles are needed in production.
+
+---
+
+## 8. Cross-references
+
+- `plans/CHAT_CLI_HARDENING.md` — predecessor side track
+  (closed F1-F6).
+- `plans/CHAT_CLI_HARDENING_ACCEPTANCE.md` — HARDENING-9
+  template (still ``draft / pending manual run``). The
+  acceptance run is recorded against the post-HARDENING code
+  state (HEAD as of `51fbcde`) and is independent of RP-1; see
+  §5 sequencing note.
+- `plans/CHAT_CLI_OPENING.md` — original C-1..C-8 design doc.
+- PLAN.md §10 Q-012 — cross-call prefix-cache consultation;
+  RP-1's history-strip change preserves Q-012 reuse because
+  the prefix tokens (system + user messages) are unchanged by
+  the strip — only the assistant message text shrinks.
+- PLAN.md §7 P-6 / D-021 — the dense-perf chain this side
+  track defers to. RP-4..RP-6 wait behind P-6.0.5.
