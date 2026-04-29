@@ -335,42 +335,55 @@ candidate_tokens=verify_k)` API. The microbench therefore
 synthesises the speculative-decoding verify shape directly:
 
 1. Load `mlx-community/Qwen3.5-27B-4bit` once.
-2. Build a fixed prefix (128 tokens) and a candidate slice of
-   length `verify_k`. The full input id sequence is
-   `prefix + candidate_ids` (length `128 + verify_k`).
-3. Time **one full-sequence forward** over `prefix + candidate_ids`
-   from a cold KV state, in the same shape a target would receive
-   when verifying `verify_k` proposed tokens. The `verify_k=1`
-   row is the single-token baseline; the marginal cost of
-   multi-token verify at k=2/4/8 is recovered as
-   `verify_k_marginal_ms = forward_ms[k] - forward_ms[k=1]`.
+2. Build a fixed prefix string (~128 BPE tokens) and a candidate
+   slice of **exactly** `verify_k` token ids. The candidate slice
+   is `[0] * verify_k` so its length is verify-k by construction
+   and not subject to tokenizer drift.
+3. **Prime the prefix KV — untimed.** Build a fresh per-rep
+   `cache_list` via `mlx_cache.make_prompt_cache(model)`, then
+   call `silica.mlx.runner.forward(model, prefix_arr, cache_list)`
+   to write the prefix's K/V state into the cache; force
+   evaluation via `mx.eval(prefix_logits)` so the prefix compute
+   completes before the timer starts.
+4. **Time only the verify forward.** Call
+   `silica.mlx.runner.forward(model, candidate_arr, cache_list)`
+   over the `verify_k`-length candidate array. This is the
+   same forward shape a target would run when verifying
+   `verify_k` proposed tokens with the prefix already in cache.
+   `mx.eval(verify_logits)` materialises the result before the
+   timer stops. The `verify_k=1` row is the single-token
+   baseline; the marginal multi-token verify cost is
+   `verify_k_marginal_ms = forward_ms_p50[k] - forward_ms_p50[k=1]`,
+   looked up by k value (not by run order) so reordering
+   `--verify-ks` does not corrupt the column.
 
-**Cache isolation policy.** Each timed forward starts from a
-freshly built KV cache (`_release_mlx_state` + a clean
-`prefill` of the prefix is acceptable) so successive k values
-do not share warm state across runs and `forward_ms` is a
+**Cache isolation policy.** `cache_list` is rebuilt fresh on
+every rep (warmup and timed alike) via
+`mlx_cache.make_prompt_cache(model)` so successive k values do
+not share warm KV state across runs and `forward_ms` is a
 deterministic function of `verify_k` alone. The cost of the
-prefix prefill is not folded into the timed call — only the
-forward over the candidate slice (issued via the same low-level
-forward used by `decode_step`) is timed. Implementation may
-specialise this via `silica.mlx.forward.forward_batched_full`
-or an equivalent multi-position call; whichever path the
-adapter exposes at land time, the timed segment is the verify
-forward only.
+prefix prefill is **not** folded into the timed call — only the
+forward over the candidate slice is. Bypassing the engine's
+`KVManager` abstraction is intentional and microbench-internal:
+silica's `SimpleKVCache.free()` does not zero the underlying
+mlx-lm cache buffers, so reusing one `KVManager` across reps
+would leak prefix state from rep N into rep N+1's measurement.
 
 **JSONL fields per row:**
 
-| Field                        | Meaning                                                                  |
-| ---------------------------- | ------------------------------------------------------------------------ |
-| `verify_k`                   | candidate tokens being verified in this forward                          |
-| `forward_ms_p50`             | median wall time of one verify forward (N=10 reps after 2 warmups)       |
-| `forward_ms_p95`             | p95 (variance signal)                                                    |
-| `peak_memory_mb`             | peak memory during the verify forward                                    |
-| `verify_k_marginal_ms`       | `forward_ms_p50[k] - forward_ms_p50[k=1]` — derived at write             |
-| `kv_bytes_read_estimate`     | derived from `seqlen × per-layer KV bytes` (analytic, not measured)      |
-| `weight_bytes_read_estimate` | derived from model weight footprint (analytic)                           |
-| `prefix_token_count`         | actual tokenised prefix length (drift signal)                            |
-| `seed`                       | sampler-irrelevant; recorded for reproducibility                         |
+| Field                        | Meaning                                                                                                       |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `verify_k`                   | candidate tokens being verified in this forward                                                               |
+| `candidate_token_count`      | exact number of token ids in the timed candidate array; equals `verify_k` by construction (no tokenizer drift) |
+| `forward_ms_p50`             | median wall time of the **verify-only** forward (N=10 reps after 2 warmups; prefix prime not folded in)       |
+| `forward_ms_p95`             | p95 (variance signal)                                                                                         |
+| `peak_memory_mb`             | peak memory during the verify forward                                                                         |
+| `verify_k_marginal_ms`       | `forward_ms_p50[k] - forward_ms_p50[k=1]`, baseline looked up by k value                                      |
+| `kv_bytes_read_estimate`     | derived from `prefix_token_count × per-layer KV bytes` (analytic, not measured)                               |
+| `weight_bytes_read_estimate` | derived from model weight footprint (analytic)                                                                |
+| `prefix_token_count`         | actual tokenised prefix length (drift signal)                                                                 |
+| `seed`                       | sampler-irrelevant; recorded for reproducibility                                                              |
+| `n_warmup_reps_discarded` / `n_timed_reps` | rep counts (default 2 / 10), for reproducing the p50 / p95 envelope                             |
 
 **Why `verify_k=1` is mandatory.** Without it, the verification
 overhead at k=2/4/8 cannot be attributed cleanly between (a)
