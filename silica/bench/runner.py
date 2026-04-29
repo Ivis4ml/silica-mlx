@@ -803,6 +803,21 @@ class BenchRunner:
                 oracle_input = warm_decode_collected
                 wd_tokens, _ = warm_decode_collected
                 total_tokens = sum(len(row) for row in wd_tokens.values())
+            elif scenario.oracle == OracleKind.WARM_TTFT_PAIR:
+                # P-6.0.5 sub-unit 6. Two prompts issued sequentially
+                # through the same Engine; prompt 2's TTFT is the warm
+                # number reported by the §6 TTFT scenarios. Collector
+                # captures per-prompt wall-clock TTFT directly via
+                # ``time.perf_counter`` (engine.metrics overwrites per
+                # prompt and would lose prompt 1's TTFT).
+                ttft_pair_collected, oracle_context = _run_warm_ttft_pair(
+                    scenario, engine, adapter
+                )
+                oracle_input = ttft_pair_collected
+                # total_tokens for this oracle counts the two first
+                # tokens we consumed (one per prompt) — the runner
+                # only times TTFT, not full generations.
+                total_tokens = 2
             elif scenario.oracle == OracleKind.PPL:
                 # PPL bypasses engine.generate_batch entirely — the
                 # oracle is teacher-forced and needs positional logits,
@@ -953,6 +968,22 @@ class BenchRunner:
                     cold = rows_meta[0].get("cold_ttft_ms")
                     if isinstance(cold, (int, float)):
                         ttft_ms = float(cold)
+        if (
+            ok
+            and scenario.oracle == OracleKind.WARM_TTFT_PAIR
+        ):
+            # P-6.0.5 sub-unit 6: promote ``warm_ttft_ms`` (the
+            # post-compile prompt-2 TTFT, the §6 warm number) into
+            # ``ScenarioResult.ttft_ms`` so the JSONL row's
+            # canonical ``ttft_ms`` field carries the warm number.
+            # Engine.metrics.ttft_ms after two consecutive
+            # single-request generates is overwritten per call and
+            # would only carry prompt 2's value by accident; reading
+            # explicitly from the oracle's own measurement keeps the
+            # contract independent of MetricsRegistry behaviour.
+            warm_ttft = metadata.get("warm_ttft_ms")
+            if isinstance(warm_ttft, (int, float)):
+                ttft_ms = float(warm_ttft)
 
         # Runner-injected execution-dimension keys (``seed``,
         # ``codec_id``) win if an oracle accidentally writes them:
@@ -1239,6 +1270,48 @@ def _validate_workload_for_oracle(
                 f" + warmup_rolling_window={warmup_rolling_window} + "
                 f"measurement_steps_min={measurement_steps_min} + 1), "
                 f"got max_tokens={wl.max_tokens}"
+            )
+    elif oracle == OracleKind.WARM_TTFT_PAIR:
+        # P-6.0.5 sub-unit 6 — two-prompt warm-TTFT measurement.
+        # Front-load shape validation here so authoring errors fail
+        # before the model loads; runtime ``_run_warm_ttft_pair``
+        # also re-checks but a cheap pre-flight saves a multi-GB
+        # download on a typo.
+        if wl.max_batch_size != 1:
+            return (
+                f"oracle {oracle.value!r} requires max_batch_size=1, "
+                f"got {wl.max_batch_size} — warm-TTFT runs two single-"
+                f"request prompts sequentially, not batched dispatch"
+            )
+        if len(wl.prompts) != 2:
+            return (
+                f"oracle {oracle.value!r} requires exactly 2 prompts "
+                f"(prompt 1 cold + prompt 2 warm), got {len(wl.prompts)}"
+            )
+        if wl.prompts[0] == wl.prompts[1]:
+            return (
+                f"oracle {oracle.value!r} gate row requires distinct "
+                f"prompts so prefix_hit_tokens stays structurally 0; "
+                f"identical prompts belong to the deferred "
+                f"-shared-prefix variant"
+            )
+        if wl.prefix_cache:
+            return (
+                f"oracle {oracle.value!r} gate row requires "
+                f"prefix_cache=False so warm TTFT is uncontaminated by "
+                f"prefix-cache reuse — see plans/P6_0_5_OPENING.md §3.6"
+            )
+        if wl.kv_codec is not None:
+            return (
+                f"oracle {oracle.value!r} requires kv_codec=None — "
+                f"codec-on warm-TTFT is an orthogonal lever; the "
+                f"baseline this oracle measures is the codec-free path"
+            )
+        if wl.max_tokens < 1:
+            return (
+                f"oracle {oracle.value!r} requires max_tokens >= 1; "
+                f"only the first token per prompt is consumed for the "
+                f"TTFT measurement"
             )
     elif oracle == OracleKind.STORAGE:
         # Pre-load validation mirrors DECODE_TOK_S_WITH_PREFIX_HIT
@@ -1650,6 +1723,73 @@ def _run_warm_decode(
         context["prompt_token_counts"] = prompt_token_counts
         context["max_tokens"] = wl.max_tokens
     return (tokens, token_ts_ms), context
+
+
+def _run_warm_ttft_pair(
+    scenario: Scenario,
+    engine: Engine,
+    adapter: ModelAdapter,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Drive the P-6.0.5 ``WARM_TTFT_PAIR`` workload.
+
+    Two prompts issued sequentially through the same ``Engine``
+    instance so prompt 1 amortises kernel-compile cost and prompt 2's
+    TTFT is the warm number. Wall-clock TTFT is captured per-prompt
+    via ``time.perf_counter`` (mirrors ``_collect_warm_decode_b1``)
+    rather than via ``engine.metrics`` because the metrics counter is
+    overwritten per prompt and would lose prompt 1's TTFT.
+
+    Workload-shape validation already happened in
+    ``_validate_workload_for_oracle``; this function relies on those
+    invariants and only computes the measurements.
+    """
+    wl = scenario.workload
+    params = _build_sampling_params(wl, adapter)
+    tokenizer = adapter.tokenizer()
+    prompt1_tokens = len(tokenizer.encode(wl.prompts[0]))
+    prompt2_tokens = len(tokenizer.encode(wl.prompts[1]))
+
+    prompt1_ttft_ms = _collect_warm_ttft_one(engine, wl.prompts[0], params)
+    prompt2_ttft_ms = _collect_warm_ttft_one(engine, wl.prompts[1], params)
+
+    collected: dict[str, Any] = {
+        "prompt1_ttft_ms": prompt1_ttft_ms,
+        "prompt2_ttft_ms": prompt2_ttft_ms,
+        "prompt1_tokens": prompt1_tokens,
+        "prompt2_tokens": prompt2_tokens,
+    }
+    # Gate row pins ``prefix_cache=False`` (see validation), so the
+    # diagnostic prefix-hit count is structurally 0. The field is
+    # populated unconditionally for JSONL homogeneity with the
+    # eventual -shared-prefix variant.
+    context: dict[str, Any] = {"prefix_hit_tokens": 0}
+    return collected, context
+
+
+def _collect_warm_ttft_one(
+    engine: Engine,
+    prompt: str,
+    params: SamplingParams,
+) -> float:
+    """Drive ``Engine.generate`` until the first token; return TTFT in ms.
+
+    TTFT = wall-clock from ``generate`` invocation to first yielded
+    token. Drains the rest of the iterator so the engine state is
+    cleanly released before the next call (the iterator owns KV
+    state until exhaustion). With ``params.max_tokens`` small (~4),
+    the drain cost is a few decode steps, which is dwarfed by the
+    cold prompt-1 prefill anyway.
+    """
+    t_start = time.perf_counter()
+    iterator = engine.generate(prompt, params)
+    first_token = next(iterator)
+    ttft_ms = (time.perf_counter() - t_start) * 1000.0
+    # Drain the iterator so the engine releases KV / sampler state
+    # cleanly before the next prompt.
+    for _ in iterator:
+        pass
+    del first_token  # unused; we only timed it
+    return ttft_ms
 
 
 def _collect_warm_decode_b1(

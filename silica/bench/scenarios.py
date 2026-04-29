@@ -2303,6 +2303,127 @@ _QWEN3_5_MOE_WARM_DECODE_B1_4K = Scenario(
 )
 
 
+# --- P-6.0.5 measurement expansion (D-021 step 3) warm-TTFT pair ----------
+#
+# Per plans/P6_0_5_OPENING.md §3.6: two prompts issued sequentially
+# through the same Engine; prompt 1 amortises kernel compile, prompt
+# 2's TTFT is the warm number. Distinct prompts (matched length) on
+# the gate row so prefix_hit_tokens stays structurally 0. The
+# prefix-cache-on / shared-prefix variant is deferred to a follow-up.
+
+# Two paragraphs of ~95 English words each, hand-calibrated to land
+# near 128 BPE tokens on the Qwen3 / Qwen3.5 family tokenizer
+# (typical English BPE ratio ~1.3 tokens / word). The exact token
+# count is asserted within a ±15% bound by the catalog test
+# ``test_warm_ttft_pair_prompts_target_128_tokens``; tokenizer
+# drift across the dense and MoE checkpoints is surfaced into the
+# JSONL row's ``prompt1_tokens`` / ``prompt2_tokens`` fields rather
+# than silently absorbed.
+
+_WARM_TTFT_PAIR_PROMPT_1 = (
+    "Memory bandwidth has emerged as the dominant constraint in "
+    "single-stream autoregressive decoding for large language "
+    "models on consumer hardware platforms. Each decode step must "
+    "read the entire active parameter set from unified memory "
+    "before any computation can begin. On Apple Silicon the "
+    "available bandwidth caps the achievable tokens per second "
+    "well below what arithmetic throughput would otherwise allow. "
+    "As model parameter counts continue to grow, this bottleneck "
+    "becomes more pronounced. Hardware vendors are responding "
+    "with wider memory interfaces and dedicated neural acceleration "
+    "units, while frameworks such as MLX try to extract every "
+    "available cycle through aggressive kernel fusion and tensor "
+    "reuse strategies."
+)
+
+_WARM_TTFT_PAIR_PROMPT_2 = (
+    "Dense Transformer language models route every token through "
+    "every parameter at inference time, while mixture-of-experts "
+    "variants partition the feed-forward layer into many "
+    "specialized expert sub-modules and dispatch each token to a "
+    "small subset chosen by a learned router. Switch Transformer "
+    "was an early example with one expert per token, while later "
+    "designs increase the number of experts activated per token in "
+    "exchange for additional all-to-all communication and a more "
+    "nuanced load-balancing problem. The result is a model that is "
+    "much larger in parameter count yet much cheaper at inference, "
+    "in exchange for routing overhead and harder distributed "
+    "training dynamics."
+)
+
+
+def _warm_ttft_pair_workload(prompt1: str, prompt2: str) -> Workload:
+    """Build a two-prompt warm-TTFT pair workload.
+
+    Pinned shape: ``max_batch_size=1`` (sequential single-request
+    issuance), exactly 2 distinct prompts (gate-row contract; see
+    ``OracleKind.WARM_TTFT_PAIR`` docstring), small ``max_tokens=4``
+    so the iterator drains naturally without bloating wall time.
+    The runner only consumes the first token per prompt for the
+    TTFT measurement; the remaining tokens are discarded.
+    """
+    if prompt1 == prompt2:
+        raise ValueError(
+            "WARM_TTFT_PAIR gate-row workload requires distinct "
+            "prompts so prefix_hit_tokens stays structurally 0; "
+            "identical prompts belong to the deferred -shared-prefix "
+            "variant"
+        )
+    return Workload(
+        name="warm-ttft-pair",
+        prompts=(prompt1, prompt2),
+        max_tokens=4,
+        max_batch_size=1,
+        prefix_cache=False,
+        temperature=0.0,
+        top_p=1.0,
+    )
+
+
+_QWEN3_5_27B_WARM_TTFT_PAIR = Scenario(
+    id="qwen3.5-27b-warm-ttft-pair",
+    repo="mlx-community/Qwen3.5-27B-4bit",
+    workload=_warm_ttft_pair_workload(
+        _WARM_TTFT_PAIR_PROMPT_1, _WARM_TTFT_PAIR_PROMPT_2
+    ),
+    oracle=OracleKind.WARM_TTFT_PAIR,
+    gate_env_var="SILICA_REAL_QWEN3_5_27B",
+    description=(
+        "**P-6.0.5 sub-unit 6 (D-021 step 3) — warm-TTFT pair on "
+        "dense 27B.** Two prompts issued sequentially through the "
+        "same Engine; prompt 1 amortises kernel-compile cost, "
+        "prompt 2's TTFT is the warm number reported by the §6 TTFT "
+        "scenarios. Two distinct paragraphs hand-calibrated to ~128 "
+        "BPE tokens each (asserted within ±15% by the catalog "
+        "tokenizer test); distinct content keeps "
+        "``prefix_hit_tokens`` structurally 0 on the gate row. "
+        "Dual-gated on SILICA_REAL_QWEN3_5_27B — same checkpoint as "
+        "the existing dense 27B warm-decode rows. See "
+        "plans/P6_0_5_OPENING.md §3.6."
+    ),
+)
+
+
+_QWEN3_5_MOE_WARM_TTFT_PAIR = Scenario(
+    id="qwen3.5-moe-35b-a3b-warm-ttft-pair",
+    repo="mlx-community/Qwen3.5-35B-A3B-4bit",
+    workload=_warm_ttft_pair_workload(
+        _WARM_TTFT_PAIR_PROMPT_1, _WARM_TTFT_PAIR_PROMPT_2
+    ),
+    oracle=OracleKind.WARM_TTFT_PAIR,
+    gate_env_var="SILICA_REAL_QWEN3_5_MOE",
+    description=(
+        "**P-6.0.5 sub-unit 6 (D-021 step 3) — warm-TTFT pair on "
+        "MoE 35B-A3B.** MoE counterpart to "
+        "``qwen3.5-27b-warm-ttft-pair``; identical prompt pair so "
+        "the cross-family warm-TTFT delta is a clean architecture-"
+        "only signal. Dual-gated on SILICA_REAL_QWEN3_5_MOE — same "
+        "checkpoint as the existing MoE warm-decode rows. See "
+        "plans/P6_0_5_OPENING.md §3.6."
+    ),
+)
+
+
 BUILTIN_SCENARIOS: dict[str, Scenario] = {
     _QWEN3_0_6B_SMOKE.id: _QWEN3_0_6B_SMOKE,
     _QWEN3_0_6B_B1_PARITY.id: _QWEN3_0_6B_B1_PARITY,
@@ -2384,6 +2505,8 @@ BUILTIN_SCENARIOS: dict[str, Scenario] = {
     _QWEN3_5_27B_WARM_DECODE_B2.id: _QWEN3_5_27B_WARM_DECODE_B2,
     _QWEN3_5_MOE_WARM_DECODE_B3.id: _QWEN3_5_MOE_WARM_DECODE_B3,
     _QWEN3_5_MOE_WARM_DECODE_B1_4K.id: _QWEN3_5_MOE_WARM_DECODE_B1_4K,
+    _QWEN3_5_27B_WARM_TTFT_PAIR.id: _QWEN3_5_27B_WARM_TTFT_PAIR,
+    _QWEN3_5_MOE_WARM_TTFT_PAIR.id: _QWEN3_5_MOE_WARM_TTFT_PAIR,
 }
 
 

@@ -200,10 +200,66 @@ class OracleKind(str, Enum):
     # Note on ``ttft_warm_ms``: warm TTFT (post-kernel-compile first
     # forward) is not measured by this oracle's single-pass workload —
     # the only TTFT it sees is the cold one (compile-included), which
-    # is recorded as ``cold_ttft_ms`` in per-row metadata. A separate
-    # warm-TTFT scenario shape (two consecutive prompts, second's TTFT
-    # measured) is a P-6.0 follow-up; not blocking the gate.
+    # is recorded as ``cold_ttft_ms`` in per-row metadata. The warm-
+    # TTFT scenario shape (two consecutive prompts, second's TTFT
+    # measured) lands as ``WARM_TTFT_PAIR`` below (P-6.0.5 sub-unit 6).
     WARM_DECODE = "warm_decode"
+    # P-6.0.5 (D-021 step 3) sub-unit 6 — warm-TTFT pair. Two prompts
+    # issued sequentially through the same ``Engine`` instance;
+    # prompt 1 amortises one-time kernel compile / cache warmup,
+    # prompt 2's TTFT is the warm number reported by the §6 TTFT
+    # scenarios. The oracle returns one row per pair.
+    #
+    # Workload contract (validated at scenario-author time by
+    # ``_validate_workload_for_oracle`` and at run time by
+    # ``_run_warm_ttft_pair``):
+    #
+    #   * ``max_batch_size`` == 1 — sequential single-request issuance,
+    #     not batched dispatch.
+    #   * ``len(prompts)`` == 2 — prompt 1 and prompt 2 in author order.
+    #   * ``prompts[0]`` != ``prompts[1]`` — gate row enforces distinct
+    #     prompts so ``prefix_hit_tokens`` is structurally 0 and the
+    #     warm TTFT is uncontaminated by prefix-cache reuse.
+    #   * ``prefix_cache`` == False — gate row disables prefix cache;
+    #     prefix-cache effect on warm TTFT is a follow-up
+    #     ``-shared-prefix`` variant scope (deferred per
+    #     ``plans/P6_0_5_OPENING.md`` §3.6 OQ-2).
+    #   * ``kv_codec`` is None — codec-free baseline; codec-on
+    #     warm-TTFT is an orthogonal lever.
+    #   * ``max_tokens`` >= 1 — only the first token per prompt is
+    #     consumed for the TTFT measurement; ``max_tokens`` above 1
+    #     just lets the iterator drain naturally before the next
+    #     prompt fires.
+    #
+    # ``oracle_config`` is unused on the gate row (room reserved for a
+    # future ``-shared-prefix`` variant's prefix-hit knobs).
+    #
+    # ``collected`` shape: ``dict`` with keys ``prompt1_ttft_ms`` /
+    # ``prompt2_ttft_ms`` / ``prompt1_tokens`` / ``prompt2_tokens``.
+    # Wall-clock timing is captured by the runner via
+    # ``time.perf_counter`` immediately before each
+    # ``Engine.generate`` call and read at the first-token yield
+    # (mirrors ``_collect_warm_decode_b1``); not via
+    # ``engine.metrics`` because that counter is overwritten per
+    # prompt and would lose prompt 1's TTFT.
+    #
+    # Oracle metadata (on success):
+    #
+    #   * ``warm_ttft_ms`` (float) — alias for ``prompt2_ttft_ms``;
+    #     promoted to ``ScenarioResult.ttft_ms`` for JSONL homogeneity.
+    #   * ``prompt1_ttft_ms`` (float) — cold + compile cost.
+    #   * ``prompt2_ttft_ms`` (float) — warm number (= warm_ttft_ms).
+    #   * ``compile_amortized_ms`` (float) — diagnostic
+    #     ``prompt1_ttft_ms - prompt2_ttft_ms``; positive means kernel
+    #     compile dominated cold TTFT.
+    #   * ``prompt1_tokens`` / ``prompt2_tokens`` (int) — tokenised
+    #     prompt lengths so prompt-length asymmetry is observable
+    #     rather than silently absorbed.
+    #   * ``prefix_hit_tokens`` (int) — radix-prefix-cache hit count
+    #     on prompt 2 (always 0 on the gate row by
+    #     ``prefix_cache=False``; room for a ``-shared-prefix``
+    #     variant to populate).
+    WARM_TTFT_PAIR = "warm_ttft_pair"
 
 
 @dataclass(frozen=True)

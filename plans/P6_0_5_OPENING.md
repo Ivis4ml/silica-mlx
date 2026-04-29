@@ -291,10 +291,23 @@ contamination rather than silently absorbing it.
 
 **Scenario registrations (two):**
 
-- `qwen3.5-27b-warm-ttft-pair` — dense 27B, fixed 128-token
-  prompt 1 + 128-token prompt 2 (distinct prompts to keep
-  `prefix_hit_tokens=0` on the §6 anchor row).
-- `qwen3.5-moe-35b-a3b-warm-ttft-pair` — MoE counterpart.
+- `qwen3.5-27b-warm-ttft-pair` — dense 27B, two distinct
+  paragraphs hand-calibrated to ~128 BPE tokens each on the
+  Qwen3 / Qwen3.5 tokenizer. The "128-token target" is a design
+  anchor, not a hard equality: the tokenizer drift between the
+  dense Qwen3.5-27B and the MoE Qwen3.5-35B-A3B checkpoints
+  prevents an exact match across families. The catalog
+  tokenizer-gated test asserts both prompts fall within ±15%
+  (i.e. 109–147 tokens) on the dense Qwen3 tokenizer; the runner
+  surfaces the **actual** measured `prompt1_tokens` /
+  `prompt2_tokens` into every JSONL row so downstream consumers
+  read ground truth rather than the design anchor. Distinct
+  content keeps `prefix_hit_tokens` structurally 0 on the gate
+  row.
+- `qwen3.5-moe-35b-a3b-warm-ttft-pair` — MoE counterpart;
+  identical prompt pair so cross-family warm-TTFT delta is a
+  clean architecture-only signal modulo the tokenizer-induced
+  prompt-length drift the JSONL row records.
 
 A single optional **`-shared-prefix`** variant per family records
 the case `prompt2 = prompt1` to expose the prefix-cache effect

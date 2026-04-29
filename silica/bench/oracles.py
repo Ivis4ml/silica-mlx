@@ -1326,6 +1326,88 @@ def warm_decode_oracle(
     return (True, None, metadata)
 
 
+def warm_ttft_pair_oracle(
+    scenario: Scenario, collected: Any, context: Any
+) -> tuple[bool, str | None, dict[str, Any]]:
+    """P-6.0.5 sub-unit 6 oracle: warm-TTFT pair measurement.
+
+    Two prompts issued sequentially through the same ``Engine``
+    instance; prompt 1 amortises one-time kernel-compile cost,
+    prompt 2's TTFT is the warm number reported by the §6 TTFT
+    scenarios. The oracle synthesises one JSONL row from the
+    collector's per-prompt timings + tokenised lengths, computes
+    ``compile_amortized_ms`` and ``warm_ttft_ms`` derived fields,
+    and surfaces ``prefix_hit_tokens`` from the runner's context.
+
+    See :class:`OracleKind.WARM_TTFT_PAIR` for the full workload
+    contract and JSONL field shapes. The oracle reports the
+    measurement; it does not enforce a target. Decision Gate 1
+    (D-021 step 4) reads the warm TTFT against any §6 acceptance
+    framing it lands on.
+    """
+    if not isinstance(collected, dict):
+        return (False, "warm_ttft_pair_collected_shape_mismatch", {})
+    required_keys = (
+        "prompt1_ttft_ms",
+        "prompt2_ttft_ms",
+        "prompt1_tokens",
+        "prompt2_tokens",
+    )
+    for key in required_keys:
+        if key not in collected:
+            return (
+                False,
+                f"warm_ttft_pair_collected_missing_key:{key}",
+                {"keys_present": sorted(collected)},
+            )
+    try:
+        prompt1_ttft_ms = float(collected["prompt1_ttft_ms"])
+        prompt2_ttft_ms = float(collected["prompt2_ttft_ms"])
+        prompt1_tokens = int(collected["prompt1_tokens"])
+        prompt2_tokens = int(collected["prompt2_tokens"])
+    except (TypeError, ValueError) as exc:
+        return (
+            False,
+            f"warm_ttft_pair_collected_type_error:{type(exc).__name__}",
+            {},
+        )
+    if prompt1_ttft_ms <= 0.0 or prompt2_ttft_ms <= 0.0:
+        return (
+            False,
+            (
+                f"warm_ttft_pair_non_positive_ttft:"
+                f"p1={prompt1_ttft_ms},p2={prompt2_ttft_ms}"
+            ),
+            {},
+        )
+    if prompt1_tokens <= 0 or prompt2_tokens <= 0:
+        return (
+            False,
+            (
+                f"warm_ttft_pair_non_positive_prompt_tokens:"
+                f"p1={prompt1_tokens},p2={prompt2_tokens}"
+            ),
+            {},
+        )
+
+    prefix_hit_tokens = 0
+    if isinstance(context, dict):
+        ctx_hit = context.get("prefix_hit_tokens")
+        if isinstance(ctx_hit, int):
+            prefix_hit_tokens = ctx_hit
+
+    metadata: dict[str, Any] = {
+        "prompt1_ttft_ms": prompt1_ttft_ms,
+        "prompt2_ttft_ms": prompt2_ttft_ms,
+        "warm_ttft_ms": prompt2_ttft_ms,
+        "compile_amortized_ms": prompt1_ttft_ms - prompt2_ttft_ms,
+        "prompt1_tokens": prompt1_tokens,
+        "prompt2_tokens": prompt2_tokens,
+        "prefix_hit_tokens": prefix_hit_tokens,
+    }
+    return (True, None, metadata)
+
+
 ORACLES: dict[OracleKind, OracleFn] = {
     OracleKind.SMOKE: smoke_oracle,
     OracleKind.B1_PARITY_VS_SINGLE: b1_parity_oracle,
@@ -1336,6 +1418,7 @@ ORACLES: dict[OracleKind, OracleFn] = {
     OracleKind.STORAGE: storage_oracle,
     OracleKind.ADMISSION_HEADROOM: admission_headroom_oracle,
     OracleKind.WARM_DECODE: warm_decode_oracle,
+    OracleKind.WARM_TTFT_PAIR: warm_ttft_pair_oracle,
 }
 
 
@@ -1349,5 +1432,6 @@ __all__ = [
     "storage_oracle",
     "admission_headroom_oracle",
     "warm_decode_oracle",
+    "warm_ttft_pair_oracle",
     "ORACLES",
 ]

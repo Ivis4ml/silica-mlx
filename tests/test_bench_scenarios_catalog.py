@@ -97,6 +97,11 @@ def test_catalog_entry_shape_invariants(
         OracleKind.DECODE_TOK_S_WITH_PREFIX_HIT,
         OracleKind.STORAGE,
     }
+    # P-6.0.5 sub-unit 6 — WARM_TTFT_PAIR's gate row uses two
+    # distinct prompts at max_batch_size=1 so the warm TTFT is
+    # uncontaminated by prefix-cache reuse. The distinct-prompt
+    # invariant is the inverse of _SHARED_PREFIX_ORACLES.
+    _TWO_PROMPT_DISTINCT_ORACLES = {OracleKind.WARM_TTFT_PAIR}
 
     if scenario.oracle in _PROMPTLESS_ORACLES:
         # PPL rows bypass engine.generate_batch; the runner drives
@@ -135,6 +140,32 @@ def test_catalog_entry_shape_invariants(
             f"{scenario.id}: {scenario.oracle.value!r} requires "
             f"identical prompts to drive shared-prefix row 1 "
             f"through the full-match hit path"
+        )
+    elif scenario.oracle in _TWO_PROMPT_DISTINCT_ORACLES:
+        # WARM_TTFT_PAIR: exactly 2 distinct prompts at
+        # max_batch_size=1; prefix_cache=False on the gate row.
+        assert wl.max_tokens >= 1, (
+            f"{scenario.id}: {scenario.oracle.value!r} runs "
+            f"engine.generate twice and needs max_tokens>=1, got "
+            f"{wl.max_tokens}"
+        )
+        assert wl.max_batch_size == 1, (
+            f"{scenario.id}: {scenario.oracle.value!r} requires "
+            f"max_batch_size=1, got {wl.max_batch_size}"
+        )
+        assert len(wl.prompts) == 2, (
+            f"{scenario.id}: {scenario.oracle.value!r} requires "
+            f"exactly 2 prompts, got {len(wl.prompts)}"
+        )
+        assert wl.prompts[0] != wl.prompts[1], (
+            f"{scenario.id}: {scenario.oracle.value!r} gate row "
+            f"requires distinct prompts so prefix_hit_tokens stays "
+            f"structurally 0; identical prompts belong to the "
+            f"deferred -shared-prefix variant"
+        )
+        assert not wl.prefix_cache, (
+            f"{scenario.id}: {scenario.oracle.value!r} gate row "
+            f"requires prefix_cache=False"
         )
     else:
         # Default shape: every other oracle runs generate_batch
@@ -538,6 +569,60 @@ def test_qwen3_0_6b_long_in_short_out_prompt_tokenizes_long() -> None:
     )
 
 
+@pytest.mark.skipif(
+    not hf_cache_path_for_repo("Qwen/Qwen3-0.6B").exists(),
+    reason=(
+        "Qwen3-0.6B weights not cached — the warm-TTFT pair's "
+        "~128-token prompt-length contract is a tokenized-length "
+        "claim and needs the real Qwen3 BPE tokenizer to verify"
+    ),
+)
+def test_warm_ttft_pair_prompts_target_128_tokens() -> None:
+    """P-6.0.5 sub-unit 6 contract: both warm-TTFT prompts target
+    ~128 BPE tokens on the Qwen3 tokenizer (±15% drift).
+
+    The opening doc §3.6 spec says ~128 tokens each. We use the
+    cheap Qwen3-0.6B tokenizer (same family as Qwen3.5-27B) as the
+    reference; cross-family drift to the Qwen3.5-MoE tokenizer is
+    bounded but not exactly zero, which is why the contract is a
+    band rather than equality. The runner records the actual
+    measured token counts into every JSONL row; this test pins
+    the design anchor so a future edit that strays out of band
+    surfaces here rather than as a quietly mis-targeted artefact.
+    """
+    from silica.models.factory import adapter_for_repo
+
+    # Both warm-TTFT-pair scenarios share the same prompt pair —
+    # see test_qwen3_5_27b_warm_ttft_pair_is_dual_gated. Reading
+    # from the dense scenario only is sufficient.
+    scenario = get_scenario("qwen3.5-27b-warm-ttft-pair")
+    adapter, _ = adapter_for_repo("Qwen/Qwen3-0.6B")
+    tokenizer = adapter.tokenizer()
+
+    prompt1, prompt2 = scenario.workload.prompts
+    p1_tokens = len(list(tokenizer.encode(prompt1)))
+    p2_tokens = len(list(tokenizer.encode(prompt2)))
+
+    # ±15% band around 128: 109..147 inclusive.
+    assert 109 <= p1_tokens <= 147, (
+        f"prompt 1 tokenizes to {p1_tokens} BPE tokens on Qwen3 "
+        "tokenizer — outside the [109, 147] band (target 128 ±15%)"
+    )
+    assert 109 <= p2_tokens <= 147, (
+        f"prompt 2 tokenizes to {p2_tokens} BPE tokens on Qwen3 "
+        "tokenizer — outside the [109, 147] band (target 128 ±15%)"
+    )
+    # Roughly matched lengths so the cold-vs-warm comparison is
+    # not polluted by prompt-length asymmetry.
+    asymmetry = abs(p1_tokens - p2_tokens) / max(p1_tokens, p2_tokens)
+    assert asymmetry < 0.15, (
+        f"prompt 1 ({p1_tokens} tokens) and prompt 2 "
+        f"({p2_tokens} tokens) differ by {asymmetry:.1%} — exceeds "
+        "the 15% length-asymmetry budget the warm-TTFT contract "
+        "implies"
+    )
+
+
 # ---------- P-6.0.5 sub-unit lock-ins ----------------------------------
 
 
@@ -667,6 +752,71 @@ def test_qwen3_5_moe_35b_a3b_warm_decode_b1_4k_is_dual_gated() -> None:
             "qwen3.5-moe-35b-a3b-warm-decode-b2",
             "qwen3.5-moe-35b-a3b-warm-decode-b3",
             "qwen3.5-moe-35b-a3b-warm-decode-b4",
+        )
+    }
+    assert moe_gates == {"SILICA_REAL_QWEN3_5_MOE"}
+
+
+def test_qwen3_5_27b_warm_ttft_pair_is_dual_gated() -> None:
+    """P-6.0.5 sub-unit 6 — dense 27B warm-TTFT pair gate row.
+
+    Pins the gate-row contract that the parametrize sweep cannot
+    derive on its own:
+
+    * the two prompts differ in tokenised content (not just by
+      whitespace) so prefix_hit_tokens stays structurally 0;
+    * the dense and MoE TTFT-pair scenarios share the same prompt
+      pair so the cross-family warm-TTFT delta is a clean
+      architecture-only signal;
+    * gate_env_var SILICA_REAL_QWEN3_5_27B (single toggle per
+      checkpoint, shared with the dense 27B warm-decode rows).
+    """
+    scenario = get_scenario("qwen3.5-27b-warm-ttft-pair")
+    assert scenario.repo == "mlx-community/Qwen3.5-27B-4bit"
+    assert scenario.gate_env_var == "SILICA_REAL_QWEN3_5_27B"
+    assert scenario.oracle == OracleKind.WARM_TTFT_PAIR
+    assert scenario.workload.max_batch_size == 1
+    assert len(scenario.workload.prompts) == 2
+    assert scenario.workload.prompts[0] != scenario.workload.prompts[1]
+    assert scenario.workload.prefix_cache is False
+    assert scenario.workload.kv_codec is None
+
+    # Cross-family prompt-pair parity: dense and MoE TTFT-pair
+    # scenarios must use the identical prompt pair so cross-family
+    # warm-TTFT comparisons isolate architectural differences.
+    moe = get_scenario("qwen3.5-moe-35b-a3b-warm-ttft-pair")
+    assert scenario.workload.prompts == moe.workload.prompts
+
+
+def test_qwen3_5_moe_35b_a3b_warm_ttft_pair_is_dual_gated() -> None:
+    """P-6.0.5 sub-unit 6 — MoE 35B-A3B warm-TTFT pair gate row.
+
+    Mirror of the dense lock-in. Pins MoE-side env-var (single
+    toggle across all six MoE 35B-A3B rows) and the same workload
+    invariants the dense row pins.
+    """
+    scenario = get_scenario("qwen3.5-moe-35b-a3b-warm-ttft-pair")
+    assert scenario.repo == "mlx-community/Qwen3.5-35B-A3B-4bit"
+    assert scenario.gate_env_var == "SILICA_REAL_QWEN3_5_MOE"
+    assert scenario.oracle == OracleKind.WARM_TTFT_PAIR
+    assert scenario.workload.max_batch_size == 1
+    assert len(scenario.workload.prompts) == 2
+    assert scenario.workload.prompts[0] != scenario.workload.prompts[1]
+    assert scenario.workload.prefix_cache is False
+    assert scenario.workload.kv_codec is None
+
+    # All six MoE 35B-A3B rows now share the SILICA_REAL_QWEN3_5_MOE
+    # gate so opt-in is a single per-checkpoint toggle, not per
+    # batch-size or per oracle.
+    moe_gates = {
+        get_scenario(sid).gate_env_var
+        for sid in (
+            "qwen3.5-moe-35b-a3b-warm-decode-b1",
+            "qwen3.5-moe-35b-a3b-warm-decode-b1-4k",
+            "qwen3.5-moe-35b-a3b-warm-decode-b2",
+            "qwen3.5-moe-35b-a3b-warm-decode-b3",
+            "qwen3.5-moe-35b-a3b-warm-decode-b4",
+            "qwen3.5-moe-35b-a3b-warm-ttft-pair",
         )
     }
     assert moe_gates == {"SILICA_REAL_QWEN3_5_MOE"}

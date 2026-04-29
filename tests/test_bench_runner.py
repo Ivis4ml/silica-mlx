@@ -3076,3 +3076,149 @@ class TestVqbenchXcheckGapInMetadata:
         assert md["vqbench_delta_ppl_gap"] == pytest.approx(0.01)
         # pct gap = 0 (matched), ppl gap 0.01 < 0.5 → no warning.
         assert md["vqbench_divergence_warning"] is False
+
+
+# ---------- P-6.0.5 sub-unit 6 — WARM_TTFT_PAIR runner dispatch -------
+
+
+def test_warm_ttft_pair_dispatches_two_prompts_in_order(
+    fake_home_cache: Path,
+) -> None:
+    """End-to-end runner path for ``OracleKind.WARM_TTFT_PAIR``.
+
+    Pins the dispatch contract that the new oracle's pure-function
+    test (``tests/test_bench_warm_ttft_pair_oracle.py``) cannot
+    cover:
+
+    * two prompts dispatched in author order (prompt 1, then
+      prompt 2) through ``Engine.generate`` — sequential single-
+      request issuance, not batched dispatch;
+    * ``ScenarioResult.total_tokens == 2`` (one first-token per
+      prompt; the runner only times TTFT and discards the rest);
+    * ``ScenarioResult.metadata`` carries every documented
+      ``WARM_TTFT_PAIR`` field with realistic values;
+    * ``ScenarioResult.ttft_ms`` is promoted from
+      ``metadata.warm_ttft_ms`` (which equals
+      ``metadata.prompt2_ttft_ms``) — the JSONL row's canonical
+      ``ttft_ms`` field carries the warm number, not whatever
+      ``engine.metrics.ttft_ms`` happens to retain after two
+      consecutive ``generate`` calls.
+    """
+    repo = "test-owner/warm-ttft-pair"
+    _create_cache_dir(repo)
+
+    seen_prompts: list[str] = []
+
+    class _RecordingEngine(_FakeEngine):
+        def generate(self, prompt: str, params: Any) -> Iterator[int]:
+            seen_prompts.append(prompt)
+            return super().generate(prompt, params)
+
+    adapter = _FakeAdapter(vocab_size=512)
+    # Engine yields a few tokens per generate call so the iterator
+    # has more than one element to drain; the runner consumes only
+    # the first for the TTFT measurement and drains the rest.
+    engine = _RecordingEngine([7, 8, 9, 10])
+
+    # Two distinct prompts of intentionally different fake-tokenizer
+    # length (encode is one-id-per-char) so the test can verify
+    # prompt1_tokens != prompt2_tokens and that they reflect the
+    # author-order assignment, not a swap.
+    prompt1 = "alpha-prompt-one"  # 16 chars → 16 fake tokens
+    prompt2 = "beta"  # 4 chars → 4 fake tokens
+    scenario = Scenario(
+        id="fake-warm-ttft-pair",
+        repo=repo,
+        workload=Workload(
+            name="fake-warm-ttft-pair",
+            prompts=(prompt1, prompt2),
+            max_tokens=4,
+            max_batch_size=1,
+            prefix_cache=False,
+        ),
+        oracle=OracleKind.WARM_TTFT_PAIR,
+    )
+
+    runner = BenchRunner(
+        engine_factory=_factory_returning(adapter, engine),
+        reset_peak=lambda: None,
+        read_peak_mb=lambda: None,
+    )
+    [result] = runner.run([scenario])
+
+    assert result.status == "ok"
+    assert result.reason is None
+    # One first-token timed per prompt; runner records 2.
+    assert result.total_tokens == 2
+
+    # Two prompts dispatched in author order (not swapped, not
+    # batched, not duplicated).
+    assert seen_prompts == [prompt1, prompt2]
+
+    md = result.metadata
+    expected_keys = {
+        "prompt1_ttft_ms",
+        "prompt2_ttft_ms",
+        "warm_ttft_ms",
+        "compile_amortized_ms",
+        "prompt1_tokens",
+        "prompt2_tokens",
+        "prefix_hit_tokens",
+    }
+    assert expected_keys.issubset(md), (
+        f"missing WARM_TTFT_PAIR metadata keys: "
+        f"{expected_keys - set(md)}"
+    )
+
+    # Token counts read from the fake tokenizer (one id per char).
+    assert md["prompt1_tokens"] == len(prompt1)
+    assert md["prompt2_tokens"] == len(prompt2)
+
+    # Gate row pins prefix_cache=False → prefix_hit_tokens
+    # structurally 0.
+    assert md["prefix_hit_tokens"] == 0
+
+    # Derived fields.
+    assert md["warm_ttft_ms"] == md["prompt2_ttft_ms"]
+    assert md["compile_amortized_ms"] == pytest.approx(
+        md["prompt1_ttft_ms"] - md["prompt2_ttft_ms"]
+    )
+
+    # ScenarioResult.ttft_ms promoted from metadata.warm_ttft_ms
+    # — independent of MetricsRegistry's per-prompt overwrite.
+    assert result.ttft_ms == pytest.approx(md["warm_ttft_ms"])
+
+
+def test_warm_ttft_pair_authoring_error_identical_prompts_fails(
+    fake_home_cache: Path,
+) -> None:
+    """Workload validation must catch the gate-row distinct-prompts
+    contract before the engine loads. Two identical prompts fail
+    at ``_validate_workload_for_oracle`` with a structured reason."""
+    repo = "test-owner/ttft-pair-bad"
+    _create_cache_dir(repo)
+
+    adapter = _FakeAdapter(vocab_size=64)
+    engine = _FakeEngine([1, 2])
+    scenario = Scenario(
+        id="bad-ttft-pair-identical",
+        repo=repo,
+        workload=Workload(
+            name="bad-ttft-pair-identical",
+            prompts=("same", "same"),
+            max_tokens=4,
+            max_batch_size=1,
+            prefix_cache=False,
+        ),
+        oracle=OracleKind.WARM_TTFT_PAIR,
+    )
+    runner = BenchRunner(
+        engine_factory=_factory_returning(adapter, engine),
+        reset_peak=lambda: None,
+        read_peak_mb=lambda: None,
+    )
+    [result] = runner.run([scenario])
+    assert result.status == "failed"
+    assert result.reason is not None
+    assert "warm_ttft_pair" in result.reason
+    assert "distinct" in result.reason
