@@ -1,0 +1,4 @@
+Fetching 13 files:   0%|          | 0/13 [00:00<?, ?it/s]Fetching 13 files: 100%|██████████| 13/13 [00:00<00:00, 340787.20it/s]
+| id | codec | seed | status | reason | ttft_ms | decode_tok_s | resident_mb | peak_mb | wall_s | tokens |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| qwen3.5-27b-warm-ttft-pair |  | 0 | ok |  | 317.2 | 17.2 | 170.7 | 15693.4 | 3.836 | 2 |

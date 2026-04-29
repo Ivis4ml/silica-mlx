@@ -1,0 +1,3 @@
+Fetching 13 files:   0%|          | 0/13 [00:00<?, ?it/s]Fetching 13 files: 100%|██████████| 13/13 [00:00<00:00, 25539.09it/s]
+wrote 4 rows to plans/P6_0_5_BASELINE/target_verify_microbench.jsonl
+wrote markdown report to plans/P6_0_5_BASELINE/target_verify_microbench.md

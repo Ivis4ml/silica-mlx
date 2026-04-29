@@ -1,0 +1,4 @@
+Fetching 14 files:   0%|          | 0/14 [00:00<?, ?it/s]Fetching 14 files: 100%|██████████| 14/14 [00:00<00:00, 106764.10it/s]
+| id | codec | seed | status | reason | ttft_ms | decode_tok_s | resident_mb | peak_mb | wall_s | tokens |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| qwen3.5-moe-35b-a3b-warm-ttft-pair |  | 0 | ok |  | 169.3 | 80.8 | 69.6 | 19818.9 | 5.235 | 2 |

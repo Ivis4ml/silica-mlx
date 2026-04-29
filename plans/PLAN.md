@@ -2,9 +2,9 @@
 
 | Field        | Value                                                                      |
 | ------------ | -------------------------------------------------------------------------- |
-| Version      | v1.7.16                                                                    |
-| Last updated | 2026-04-27                                                                 |
-| Status       | P-5 complete; P-5 Acceptance (1)–(4) closed at v1.7.4; (a-real) real-activation xcheck closed at v1.7.5; P-3-C5 closed in slice-prefill regime (C5.5 α-MVP); P-3-E4 batched MoE smoke + scheduler-glue parity closed at v1.7.9; P-5-F pre-RoPE production routing closed at v1.7.6 via the (3b) projection-output capture path (F.1-F.4); (b-static) Qwen3.5-4B PPL vs vqbench REPORT.md baseline closed at v1.7.7; slice-regime + pre_norm hybrid Qwen3.5-0.8B E2E discriminator closed at v1.7.8; per-head Haar rotation landed as opt-in (default OFF) at v1.7.8; per-head D.2a 3-seed re-measurement at v1.7.10 — \|mean_gap\| 0.150 → 0.066 PPL (56% reduction); per-head (b-static) Qwen3.5-4B production-path re-measurement at v1.7.11 — std 5.3× tighter, mean unchanged in SEM, default flip is now an administrative landing, not an empirical question; **P-6 re-scoped from "Weight Streaming" to "Performance Phase" at v1.7.13 per D-017 / D-018 / D-019 — dense Qwen3.5-27B-4bit ≥60 tok/s primary target + MoE Qwen3.5-35B-A3B-4bit ≥100 tok/s stretch validator on 48 GB M5 Pro; P-7 Speculative promoted from T2 to T1; dense layer-streaming deferred to v0.2; Track C speculative grows to five sub-units per D-020 (C.1 draft-target, C.2 ReDrafter, C.3 MTP, C.4 DFlash, C.5 DDTree) and to six sub-units at v1.7.14 round-2 review (C.6 QuantSpec-like self-spec exploratory); P-6.0 measurement gate landed at v1.7.13 (8 scenarios + REPORT in `plans/P6_0_BASELINE/`); **P-6 contract sync at v1.7.14 per D-021** — dense gate split into (1a) ≥40 tok/s engineering (must pass) + (1b) ≥60 tok/s stretch (contingent on C.4/C.5 ≥2.5×); MoE acceptance split into (2a) ≥100 tok/s anchor (cleared at baseline) + (2b) ≥150 aggregate or ≥100 per-row stretch; execution order rewritten to foundation-first (P5.9 hardening → P-6.0.5 → Decision Gate 1 → spec foundation → C.4 spike → B → A); v1.7.14 round-3 review absorbed via stale-text cleanup; **P5.9 hardening complete at v1.7.15** — eight D-021 step 2 sub-units (a..h) closed across commits `0bd931a` / `bbdb7f7` / `9a9bff9` / `2483715` / `aa85e1c` / `dc5ba59` / `5d0f474` / `c385837`: probe double-load fix (27B/31B peaks corrected ~30.5→~15.3/~17.5 GB), Q-012 initial-cohort prefix consultation, Qwen3.5 pre-draft recurrent rollback, sustained 4K/8K context probes, D-009 hot-path audit lock-in, speculative metrics schema, operationalised (4-b) regression gate, full toolchain re-run attestation (2108 passed / 7 skipped, +82 P5.9 tests over the v1.7.13 baseline); see `plans/P6_OPENING.md` and `plans/P6_REVIEW_HANDOFF.md`** |
+| Version      | v1.7.17                                                                    |
+| Last updated | 2026-04-29                                                                 |
+| Status       | P-5 complete; P-5 Acceptance (1)–(4) closed at v1.7.4; (a-real) real-activation xcheck closed at v1.7.5; P-3-C5 closed in slice-prefill regime (C5.5 α-MVP); P-3-E4 batched MoE smoke + scheduler-glue parity closed at v1.7.9; P-5-F pre-RoPE production routing closed at v1.7.6 via the (3b) projection-output capture path (F.1-F.4); (b-static) Qwen3.5-4B PPL vs vqbench REPORT.md baseline closed at v1.7.7; slice-regime + pre_norm hybrid Qwen3.5-0.8B E2E discriminator closed at v1.7.8; per-head Haar rotation landed as opt-in (default OFF) at v1.7.8; per-head D.2a 3-seed re-measurement at v1.7.10 — \|mean_gap\| 0.150 → 0.066 PPL (56% reduction); per-head (b-static) Qwen3.5-4B production-path re-measurement at v1.7.11 — std 5.3× tighter, mean unchanged in SEM, default flip is now an administrative landing, not an empirical question; **P-6 re-scoped from "Weight Streaming" to "Performance Phase" at v1.7.13 per D-017 / D-018 / D-019 — dense Qwen3.5-27B-4bit ≥60 tok/s primary target + MoE Qwen3.5-35B-A3B-4bit ≥100 tok/s stretch validator on 48 GB M5 Pro; P-7 Speculative promoted from T2 to T1; dense layer-streaming deferred to v0.2; Track C speculative grows to five sub-units per D-020 (C.1 draft-target, C.2 ReDrafter, C.3 MTP, C.4 DFlash, C.5 DDTree) and to six sub-units at v1.7.14 round-2 review (C.6 QuantSpec-like self-spec exploratory); P-6.0 measurement gate landed at v1.7.13 (8 scenarios + REPORT in `plans/P6_0_BASELINE/`); **P-6 contract sync at v1.7.14 per D-021** — dense gate split into (1a) ≥40 tok/s engineering (must pass) + (1b) ≥60 tok/s stretch (contingent on C.4/C.5 ≥2.5×); MoE acceptance split into (2a) ≥100 tok/s anchor (cleared at baseline) + (2b) ≥150 aggregate or ≥100 per-row stretch; execution order rewritten to foundation-first (P5.9 hardening → P-6.0.5 → Decision Gate 1 → spec foundation → C.4 spike → B → A); v1.7.14 round-3 review absorbed via stale-text cleanup; **P5.9 hardening complete at v1.7.15** — eight D-021 step 2 sub-units (a..h) closed across commits `0bd931a` / `bbdb7f7` / `9a9bff9` / `2483715` / `aa85e1c` / `dc5ba59` / `5d0f474` / `c385837`: probe double-load fix (27B/31B peaks corrected ~30.5→~15.3/~17.5 GB), Q-012 initial-cohort prefix consultation, Qwen3.5 pre-draft recurrent rollback, sustained 4K/8K context probes, D-009 hot-path audit lock-in, speculative metrics schema, operationalised (4-b) regression gate, full toolchain re-run attestation (2108 passed / 7 skipped, +82 P5.9 tests over the v1.7.13 baseline); see `plans/P6_OPENING.md` and `plans/P6_REVIEW_HANDOFF.md`; **P-6.0.5 measurement expansion complete at v1.7.17 per D-021 step 3** — eight artefact rows landed in `plans/P6_0_5_BASELINE/` (5 mandatory warm-decode + 2 warm-TTFT-pair + 1 target-verify microbench; both opt-in B=4 OOM-flagged rows completed without OOM): dense 27B B=4 = 42.17 ± 0.21 tok/s @ 52% util (2-run; bandwidth util uses runtime-measured 15.13 GB weight footprint, +12% vs v1.7.13's 13.5 GB anchor — see REPORT.md "Weight-footprint reconciliation"; batch-only path to 60 dead, KV-traffic-bound), MoE 35B-A3B B=4 = 188.5 tok/s @ 92% util (still climbing, OOM-safe at 20.6 GB peak; MoE retains 1.5 GB active-weight anchor), MoE 4K peak 23.6 GB (RAM gate clears with 35% margin), warm-TTFT 317 ms dense / 169 ms MoE (3-run reproducibility ±0.3 ms warm), verify-k target-side / zero-drafter-cost ceiling 2.93× at k=8 linear (constrains C.4 / C.5 upper-band claims; real spec gain falls below this by drafter cost + acceptance + bonus-token rule); cross-row REPORT.md closes §1 Q1-Q4 and constitutes the Decision Gate 1 (D-021 step 4) input set; see `plans/P6_0_5_OPENING.md` and `plans/P6_0_5_BASELINE/REPORT.md`** |
 | Maintainer   | Xin Zhou                                                                   |
 | Source       | `plans/PLAN.md` (single source of truth)                                    |
 
@@ -1455,7 +1455,24 @@ Append-only. New decisions go at the end; old ones are not edited. Revocations /
      and a target-verification microbench (target forward
      verifying 2 / 4 / 8 candidate tokens, simulating
      speculative verify cost). The microbench is the prerequisite
-     for credible Track C ROI estimation.
+     for credible Track C ROI estimation. **Status: complete at
+     v1.7.17.** All eight artefact rows landed in
+     `plans/P6_0_5_BASELINE/`; both opt-in B=4 rows completed
+     without OOM (dense 17.10 GB peak, MoE 20.62 GB peak). Headline
+     numbers: dense 27B B=4 = 42.17 ± 0.21 tok/s @ 52% util
+     (2-run; bandwidth util on runtime-measured 15.13 GB weight
+     footprint per `target_verify_microbench.md` reconciliation;
+     batch-only path to 60 tok/s dead); MoE B=4 = 188.5 tok/s @ 92% util
+     (cleanly climbing, (2b) ≥150 aggregate stretch already
+     cleared at B=3); MoE 4K-context peak 23.6 GB (§6(4) gate
+     clears with 35% margin); warm-TTFT 317 ms dense / 169 ms MoE
+     (3-run reproducibility ±0.3 ms on warm number); verify-k
+     target-side / zero-drafter-cost ceiling 2.93× at k=8 linear
+     (constrains C.4 / C.5 upper-band claims; sweet spot k=4 with
+     36% break-even acceptance).
+     Cross-row REPORT.md at `plans/P6_0_5_BASELINE/REPORT.md`
+     closes §1 Q1-Q4 and is the Decision Gate 1 (step 4 below)
+     input set.
   4. **Decision Gate 1** — based on P-6.0.5 evidence, fix the
      dense gate framing. If verify-k microbench shows target
      verification scales well, keep (1b) and proceed to
@@ -1914,6 +1931,93 @@ Local reference implementations sit at the repo root. **Algorithm / architecture
 ---
 
 ## 13. Changelog
+
+- **v1.7.17** (2026-04-29): **P-6.0.5 measurement expansion
+  complete (D-021 step 3).** Eight artefact rows landed in
+  `plans/P6_0_5_BASELINE/`; cross-row `REPORT.md` closes §1
+  Q1-Q4 and constitutes the Decision Gate 1 (D-021 step 4) input
+  set. Both opt-in B=4 OOM-flagged rows completed without OOM.
+
+  **Mandatory rows (5):** dense 27B B=2 = 31.22 tok/s (97% of
+  ideal 2× linear, 76.9% util on corrected 15.13 GB anchor / 68.7%
+  on v1.7.13 13.5 GB anchor); MoE 35B-A3B B=3 = 163.5 tok/s (90%
+  of B=2→B=3 linear, 80% util on 1.5 GB MoE active-weight anchor);
+  MoE 35B-A3B B=1 4K-context = 85.0 tok/s @ 23.6 GB peak (§6(4)
+  RAM gate clears with 35% margin); warm-TTFT pair dense = 317 ms
+  warm / 433 ms compile-amortised (3-run reproducibility ±0.3 ms
+  on warm); warm-TTFT pair MoE = 169 ms warm / 1361 ms
+  compile-amortised.
+
+  **Opt-in rows (2):** dense 27B B=4 = 42.17 ± 0.21 tok/s @ 52.0%
+  util on the corrected 15.13 GB anchor (2-run, peak 17.10 GB, no
+  OOM) — bandwidth utilisation **drops** from 79.1% (B=1) to 52.0%
+  (B=4), KV-traffic-bound at B≥4, batch-only path to §6(1)
+  ≥60 tok/s gate dead (residual gap 17.83 tok/s);
+  MoE 35B-A3B B=4 = 188.5 tok/s @ 92% util (peak 20.62 GB, no
+  OOM) — bandwidth utilisation **climbs** from 37% (B=1) to 92%
+  (B=4), still scaling cleanly, §6(2) gate exceeded by 88%.
+
+  **Microbench (1):** target-verify-k cost curve on dense
+  Qwen3.5-27B-4bit, k=1/2/4/8: bandwidth utilisation drops 83% →
+  30% across the curve (corrected 15.13 GB anchor; v1.7.13
+  anchor reads 74% → 27%), regime transition between k=2 and
+  k=4; **target-side / zero-drafter-cost ceiling 2.93×** at k=8
+  linear (assumes perfect drafter and zero drafter forward cost;
+  real spec gain falls below this by drafter cost + acceptance +
+  bonus-token rule) constrains the upper end of PLAN.md §1.3
+  conservative MLX bands for C.4 (2.0–4.0×) and C.5 (2.5–5.0×).
+  C.4's 4× upper-band is provably unreachable at k=8 linear;
+  C.5's 5× requires tree-shape amortisation structurally beyond
+  what the linear-k microbench measures.
+
+  **Cross-family contrast (load-bearing for Decision Gate 1):**
+  the same hypothesis "does utilisation climb with batch?" splits
+  dense (drops, KV-traffic-bound) and MoE (climbs, weight-read
+  ground) onto opposite arms — the dense and MoE acceptance
+  reframings cannot share a single pattern. Dense had no
+  bandwidth headroom at B=1 (already 79.1% util on the corrected
+  15.13 GB weight footprint, with the v1.7.13 13.5 GB anchor
+  reading 70.6% — see REPORT.md "Weight-footprint reconciliation"
+  for provenance); MoE had abundant headroom (37.1% util on 1.5
+  GB active-weight read).
+
+  **Decision Gate 1 (D-021 step 4) input summary:**
+  - Dense §6(1) ≥60 tok/s gate is reachable only via the
+    composite **A + B + (C.4 or C.5)** stack; batch-only and
+    spec-only paths individually fall short. Decision arms remain
+    (1a) lower the gate to ≥40 tok/s reachable from A+B vs (1b)
+    keep ≥60 and require C.4/C.5 in upper half of MLX-conservative
+    bands.
+  - MoE §6(2) ≥100 tok/s gate is exceeded by 88% at B=4. The
+    (2b) reframing is empirically warranted with the **aggregate
+    variant** (≥150 already cleared, threshold could rise to
+    ≥175 / ≥200 to keep gate informative beyond B=4); the per-row
+    arm is structurally unreachable and should be retired.
+  - §6(4) RAM-headroom gate: not stressed at any measured shape
+    (max 23.6 GB at MoE 4K B=1); no ratification needed.
+  - §6(3) TTFT-under-concurrency gate: B=1 anchors landed (317 /
+    169 ms warm); B>1 / shared-prefix concurrency TTFT remains
+    Track D scope and is deferred.
+
+  **OOM evidence schema fix (concurrent doc-fix at v1.7.17):**
+  the opening doc had promised an `oom=true` JSONL field that
+  `BenchRunner` does not write; replaced with the actual evidence
+  form (`status="failed"` with memory-class `reason` from the
+  exception-boundary path; hard-OOM kernel-SIGKILL fallback uses
+  run log + `.md`). Doc-only; no schema or runner change.
+
+  **Toolchain attestation at v1.7.17:** ruff clean (silica +
+  tests + scripts); mypy clean; bench test sub-suite **229
+  passed / 1 skipped** (cache-gated tokenizer test for
+  warm-TTFT-pair prompt length, expected skip on hosts without
+  the model in HF cache). No new code in `silica.*` between
+  v1.7.16 and v1.7.17 closure beyond the P-6.0.5 step 2-7
+  scenario / oracle / runner / microbench landings recorded
+  across commits in §10 sub-unit landing order.
+
+  No PLAN-level decision change. v1.7.17 closes the **measurement
+  prerequisite** for Decision Gate 1; the gate writeup itself is
+  step 4 (post-this-phase).
 
 - **v1.7.16** (2026-04-27): **P5.9.1 — validator hardening before
   P-6.0.5.** Two soundness gaps caught by GPT-5.5 review against
