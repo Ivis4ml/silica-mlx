@@ -615,3 +615,58 @@ def test_qwen3_5_moe_35b_a3b_warm_decode_b3_is_dual_gated() -> None:
     assert scenario.workload.temperature == b2.workload.temperature
     assert scenario.workload.top_p == b2.workload.top_p
     assert scenario.workload.prompts[0] == b2.workload.prompts[0]
+
+
+def test_qwen3_5_moe_35b_a3b_warm_decode_b1_4k_is_dual_gated() -> None:
+    """P-6.0.5 sub-unit 5 — MoE 35B-A3B B=1 sustained 4K-context probe.
+
+    First MoE 4K row in the catalog. Pins:
+
+    * the four oracle_config / workload knobs that define the 4K
+      envelope (``target_context_tokens=4096``,
+      ``expected_total_context_floor=3500``, ``max_tokens=600``,
+      ``max_batch_size=1``);
+    * cross-family shape parity with the dense 27B 4K row
+      (P5.9 step 2(d)) so the §6(4) RAM-headroom gate reads from
+      the same envelope on both branches;
+    * gate_env_var share across the now-five MoE 35B-A3B rows
+      (B=1, B=1-4K, B=2, B=3, B=4) so opt-in is single-toggle per
+      checkpoint, not per-context-length-or-batch.
+    """
+    scenario = get_scenario("qwen3.5-moe-35b-a3b-warm-decode-b1-4k")
+    assert scenario.repo == "mlx-community/Qwen3.5-35B-A3B-4bit"
+    assert scenario.gate_env_var == "SILICA_REAL_QWEN3_5_MOE"
+    assert scenario.oracle == OracleKind.WARM_DECODE
+    assert scenario.workload.max_batch_size == 1
+    assert scenario.workload.max_tokens == 600
+    assert scenario.oracle_config is not None
+    assert scenario.oracle_config["target_context_tokens"] == 4096
+    assert scenario.oracle_config["expected_total_context_floor"] == 3500
+
+    # Mirror dense 27B 4K shape so cross-family 4K comparisons are
+    # fair (same envelope, same diagnostic floor, same generation
+    # cap). A future drift on either side surfaces here.
+    dense_4k = get_scenario("qwen3.5-27b-warm-decode-b1-4k")
+    assert scenario.workload.max_tokens == dense_4k.workload.max_tokens
+    assert dense_4k.oracle_config is not None
+    assert (
+        scenario.oracle_config["target_context_tokens"]
+        == dense_4k.oracle_config["target_context_tokens"]
+    )
+    assert (
+        scenario.oracle_config["expected_total_context_floor"]
+        == dense_4k.oracle_config["expected_total_context_floor"]
+    )
+
+    # All five MoE 35B-A3B rows must opt-in together.
+    moe_gates = {
+        get_scenario(sid).gate_env_var
+        for sid in (
+            "qwen3.5-moe-35b-a3b-warm-decode-b1",
+            "qwen3.5-moe-35b-a3b-warm-decode-b1-4k",
+            "qwen3.5-moe-35b-a3b-warm-decode-b2",
+            "qwen3.5-moe-35b-a3b-warm-decode-b3",
+            "qwen3.5-moe-35b-a3b-warm-decode-b4",
+        )
+    }
+    assert moe_gates == {"SILICA_REAL_QWEN3_5_MOE"}

@@ -2142,8 +2142,10 @@ _GEMMA4_MOE_WARM_DECODE_B1 = Scenario(
 # B=4 / sustained MoE / Gemma4-MoE 4K-8K rows are deliberately not
 # registered in this step — D-021 step 2(d) targets dense 27B / 31B
 # at 4K and 8K only. Extending to MoE happens in P-6.0.5 measurement
-# expansion (D-021 step 3) when target-verification microbench data
-# settles the C.x track ROI.
+# expansion (D-021 step 3): MoE B=1 4K landed below in the
+# P-6.0.5 section as ``qwen3.5-moe-35b-a3b-warm-decode-b1-4k``;
+# Gemma4-MoE 4K, sustained MoE at B>1, and all MoE 8K rows remain
+# deferred.
 
 _QWEN3_5_27B_WARM_DECODE_B1_4K = Scenario(
     id="qwen3.5-27b-warm-decode-b1-4k",
@@ -2259,6 +2261,48 @@ _GEMMA4_31B_WARM_DECODE_B1_8K = Scenario(
 )
 
 
+# --- P-6.0.5 measurement expansion (D-021 step 3) extended-context rows ----
+#
+# Per plans/P6_0_5_OPENING.md §3.5: the §6(4) RAM headroom gate
+# is currently anchored on dense 27B at 4K (registered at
+# v1.7.15 P5.9 step 2(d), above). MoE 4K is the unmeasured
+# surface; this section adds it. Workload shape mirrors the
+# dense 27B 4K row (max_tokens=600, target_context_tokens=4096)
+# so cross-family 4K comparisons read from the same envelope.
+
+_QWEN3_5_MOE_WARM_DECODE_B1_4K = Scenario(
+    id="qwen3.5-moe-35b-a3b-warm-decode-b1-4k",
+    repo="mlx-community/Qwen3.5-35B-A3B-4bit",
+    workload=_warm_decode_workload_extended(
+        max_batch_size=1,
+        max_tokens=600,
+        target_context_tokens=4096,
+    ),
+    oracle=OracleKind.WARM_DECODE,
+    oracle_config={
+        "target_context_tokens": 4096,
+        "expected_total_context_floor": 3500,
+    },
+    gate_env_var="SILICA_REAL_QWEN3_5_MOE",
+    description=(
+        "**P-6.0.5 sub-unit 5 (D-021 step 3) — MoE 35B-A3B B=1 "
+        "sustained 4K-context probe.** First MoE 4K row in the "
+        "catalog. Mirrors the dense 27B 4K row (P5.9 step 2(d), "
+        "``qwen3.5-27b-warm-decode-b1-4k``) on workload shape "
+        "(``max_tokens=600``, ``target_context_tokens=4096``) so "
+        "cross-family 4K comparisons read from the same envelope. "
+        "Surfaces the §6(4) RAM-headroom gate under the MoE "
+        "routing-state + KV-growth path, which has a materially "
+        "different memory profile from dense (256 experts × top-8, "
+        "19.4 GB peak at 384 tokens). Validates that the MoE B=1 "
+        "baseline path is safe at 4K context before any (2b) "
+        "stretch reframing on B>1 is contemplated. Dual-gated on "
+        "SILICA_REAL_QWEN3_5_MOE — same checkpoint as the existing "
+        "MoE rows. See plans/P6_0_5_OPENING.md §3.5."
+    ),
+)
+
+
 BUILTIN_SCENARIOS: dict[str, Scenario] = {
     _QWEN3_0_6B_SMOKE.id: _QWEN3_0_6B_SMOKE,
     _QWEN3_0_6B_B1_PARITY.id: _QWEN3_0_6B_B1_PARITY,
@@ -2339,6 +2383,7 @@ BUILTIN_SCENARIOS: dict[str, Scenario] = {
     # real models. See plans/P6_0_5_OPENING.md.
     _QWEN3_5_27B_WARM_DECODE_B2.id: _QWEN3_5_27B_WARM_DECODE_B2,
     _QWEN3_5_MOE_WARM_DECODE_B3.id: _QWEN3_5_MOE_WARM_DECODE_B3,
+    _QWEN3_5_MOE_WARM_DECODE_B1_4K.id: _QWEN3_5_MOE_WARM_DECODE_B1_4K,
 }
 
 
