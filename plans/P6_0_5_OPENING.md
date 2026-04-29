@@ -185,8 +185,12 @@ activations sit uncomfortably close to the 48 GB envelope. **Run
 sequence:** validate B=2 first; only then run B=4 on a freshly
 booted Mac with no other GPU consumers, ideally with
 `mx.metal.set_memory_limit(~42 GB)` set to fail fast rather than
-let macOS swap. If B=4 OOMs, the row is recorded as `oom=true` in
-the JSONL and the §6 gate falls back to B=2.
+let macOS swap. If B=4 OOMs, the row lands as `status="failed"`
+with the MLX exception class plus message in `reason` (the runner's
+standard exception-boundary write in `BenchRunner._run_one`; there
+is no dedicated `oom` field in the JSONL schema). The `.md`
+interpretation paragraph names that row as the OOM-attempted
+evidence and the §6 gate falls back to B=2.
 
 **Artefact:** `plans/P6_0_5_BASELINE/qwen3.5-27b-warm-decode-b4.{jsonl,md}`.
 
@@ -234,9 +238,11 @@ fast rather than letting macOS swap.
 
 **Acceptance:** identical shape to sub-unit 3 — the JSONL row
 either records standard `WARM_DECODE` fields and an aggregate
-tok/s number, or records `oom=true` (with a non-empty `reason`
-field) if the run does not fit. Either outcome closes the
-artefact slot for this sub-unit.
+tok/s number, or records `status="failed"` with a memory-class
+`reason` (the MLX exception class plus message; e.g. a
+`RuntimeError` from the metal allocator when the
+`mx.metal.set_memory_limit` guard trips) if the run does not fit.
+Either outcome closes the artefact slot for this sub-unit.
 
 **Artefact:** `plans/P6_0_5_BASELINE/qwen3.5-moe-35b-a3b-warm-decode-b4.{jsonl,md}`.
 
@@ -421,10 +427,20 @@ Each artefact must satisfy:
    D-021 step 4.
 
 Opt-in artefacts 2 (`qwen3.5-27b-warm-decode-b4`) and 4
-(`qwen3.5-moe-35b-a3b-warm-decode-b4`) are allowed to record
-`oom=true`; in those cases the JSONL row stands as
-"attempted, OOM" rather than missing data, and the §6 gate
-falls back to B=2 / B=3 (per §3.2 and §3.4).
+(`qwen3.5-moe-35b-a3b-warm-decode-b4`) are allowed to fail under
+OOM. The JSONL schema has no dedicated `oom` field; the
+OOM-attempted evidence is a `status="failed"` row whose `reason`
+carries the MLX exception class plus message (the standard
+exception-boundary write in `BenchRunner._run_one`, including the
+`RuntimeError` raised by the metal allocator when the
+`mx.metal.set_memory_limit` guard trips). In that case the JSONL
+row stands as "attempted, OOM" rather than missing data, and the
+§6 gate falls back to B=2 / B=3 (per §3.2 and §3.4). If the kernel
+SIGKILLs the process before the row writes (hard OOM, no
+exception path runs), the audit evidence is the run log under
+`plans/P6_0_5_BASELINE/logs/` plus a manually-authored `.md`
+naming the kill and pointing to that log; the `.jsonl` may be
+absent in that case only.
 
 The Decision Gate 1 (D-021 step 4) writeup happens **after**
 this phase exit. P-6.0.5 produces the inputs only.
@@ -505,9 +521,15 @@ acceptance question.
    units 3 and 5 succeed and a second fresh Mac boot is
    available. Same `mx.metal.set_memory_limit` guard as unit 2.
 
-If unit 2 or unit 4 OOMs, record `oom=true` in the JSONL and
-stop — do not retry with smaller settings; the OOM is itself
-the answer.
+If unit 2 or unit 4 OOMs, the runner's exception-boundary path in
+`BenchRunner._run_one` writes a `status="failed"` row with the MLX
+exception class plus message in `reason`; that row is itself the
+answer. Do not retry with smaller settings. If the process is
+SIGKILLed before the row writes (hard OOM), capture the run log
+to `plans/P6_0_5_BASELINE/logs/` and note the kill in the
+sub-unit's `.md` writeup with a path back to the log — the `.md`
+interpretation paragraph (per §4) becomes the audit evidence in
+place of a missing `.jsonl` row.
 
 ---
 
