@@ -536,3 +536,43 @@ def test_qwen3_0_6b_long_in_short_out_prompt_tokenizes_long() -> None:
         f"prefill/decode token ratio is {ratio:.1f} — too small to "
         "call this row prefill-dominated"
     )
+
+
+# ---------- P-6.0.5 sub-unit lock-ins ----------------------------------
+
+
+def test_qwen3_5_27b_warm_decode_b2_is_dual_gated() -> None:
+    """P-6.0.5 sub-unit 1 — dense 27B B=2 batch-scaling row.
+
+    Pins the contract that this row shares ``max_tokens`` and
+    ``gate_env_var`` with ``qwen3.5-27b-warm-decode-b1``. Both
+    invariants are P-6.0.5 §3.1 acceptance gates that the
+    parametrized ``test_catalog_entry_shape_invariants`` sweep does
+    not cover: a future tuning of one row's ``max_tokens`` would
+    silently break the per-token throughput comparison the §6 dense
+    gate reads, and a future split of the env var would silently
+    decouple opt-in for two views of the same checkpoint.
+    """
+    scenario = get_scenario("qwen3.5-27b-warm-decode-b2")
+    assert scenario.repo == "mlx-community/Qwen3.5-27B-4bit"
+    assert scenario.gate_env_var == "SILICA_REAL_QWEN3_5_27B"
+    assert scenario.oracle == OracleKind.WARM_DECODE
+    assert scenario.workload.max_batch_size == 2
+
+    b1 = get_scenario("qwen3.5-27b-warm-decode-b1")
+    assert scenario.workload.max_tokens == b1.workload.max_tokens, (
+        "B=1 and B=2 must share max_tokens so per-token throughput "
+        "comparisons across batch sizes stay fair"
+    )
+    assert scenario.gate_env_var == b1.gate_env_var, (
+        "all dense 27B rows share SILICA_REAL_QWEN3_5_27B so opt-in "
+        "is single-toggle per checkpoint, not per-batch-size"
+    )
+    # Sampling shape must also match B=1 so the only deliberately
+    # different axis is ``max_batch_size``.
+    assert scenario.workload.temperature == b1.workload.temperature
+    assert scenario.workload.top_p == b1.workload.top_p
+    assert scenario.workload.prompts[0] == b1.workload.prompts[0], (
+        "B=2 row's first prompt must match B=1's prompt so the "
+        "fixed-shape warm-decode workload is identical modulo batch"
+    )

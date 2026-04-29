@@ -1970,6 +1970,31 @@ _QWEN3_5_27B_WARM_DECODE_B1 = Scenario(
 )
 
 
+_QWEN3_5_27B_WARM_DECODE_B2 = Scenario(
+    id="qwen3.5-27b-warm-decode-b2",
+    repo="mlx-community/Qwen3.5-27B-4bit",
+    workload=_warm_decode_workload(max_batch_size=2, max_tokens=384),
+    oracle=OracleKind.WARM_DECODE,
+    gate_env_var="SILICA_REAL_QWEN3_5_27B",
+    description=(
+        "**P-6.0.5 sub-unit 1 (D-021 step 3) — dense 27B B=2 "
+        "batch-scaling row.** Reads against the 27B B=1 baseline at "
+        "16.05 tok/s @ 70.6% bandwidth utilisation (see "
+        "plans/P6_0_BASELINE/REPORT.md §1). If aggregate tok/s rises "
+        "with B (utilisation rises toward 90%+), KV / activation "
+        "traffic was the slack and Track C ROI estimates must be "
+        "adjusted; if aggregate stalls, the chip is bandwidth-bound "
+        "even with batch and (1b) ≥60 tok/s is harder to reach. The "
+        "workload shape and ``max_tokens=384`` mirror "
+        "``qwen3.5-27b-warm-decode-b1`` exactly so per-token "
+        "throughput is comparable across batch sizes. Dual-gated on "
+        "SILICA_REAL_QWEN3_5_27B — same checkpoint as the existing "
+        "B=1 / 4K / 8K rows, single-toggle per checkpoint. See "
+        "plans/P6_0_5_OPENING.md §3.1."
+    ),
+)
+
+
 _GEMMA4_31B_WARM_DECODE_B1 = Scenario(
     id="gemma4-31b-warm-decode-b1",
     repo="mlx-community/gemma-4-31b-4bit",
@@ -2285,6 +2310,9 @@ BUILTIN_SCENARIOS: dict[str, Scenario] = {
     _QWEN3_5_27B_WARM_DECODE_B1_8K.id: _QWEN3_5_27B_WARM_DECODE_B1_8K,
     _GEMMA4_31B_WARM_DECODE_B1_4K.id: _GEMMA4_31B_WARM_DECODE_B1_4K,
     _GEMMA4_31B_WARM_DECODE_B1_8K.id: _GEMMA4_31B_WARM_DECODE_B1_8K,
+    # P-6.0.5 measurement expansion (D-021 step 3) — dual-gated,
+    # real models. See plans/P6_0_5_OPENING.md.
+    _QWEN3_5_27B_WARM_DECODE_B2.id: _QWEN3_5_27B_WARM_DECODE_B2,
 }
 
 
