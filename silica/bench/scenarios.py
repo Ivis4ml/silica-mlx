@@ -2053,6 +2053,31 @@ _QWEN3_5_MOE_WARM_DECODE_B2 = Scenario(
 )
 
 
+_QWEN3_5_MOE_WARM_DECODE_B3 = Scenario(
+    id="qwen3.5-moe-35b-a3b-warm-decode-b3",
+    repo="mlx-community/Qwen3.5-35B-A3B-4bit",
+    workload=_warm_decode_workload(max_batch_size=3, max_tokens=384),
+    oracle=OracleKind.WARM_DECODE,
+    gate_env_var="SILICA_REAL_QWEN3_5_MOE",
+    description=(
+        "**P-6.0.5 sub-unit 3 (D-021 step 3) — MoE 35B-A3B B=3 "
+        "saturation row.** Intermediate row between B=2 (120.93 "
+        "tok/s aggregate, 59.1% bandwidth utilisation, 19.68 GB "
+        "peak — see plans/P6_0_BASELINE/REPORT.md §1) and B=4 "
+        "(opt-in, OOM-flagged at v1.7.13). Tells whether MoE "
+        "saturates before B=4: if B=3 lifts aggregate above "
+        "~150 tok/s, the (2b) stretch can be reframed to a per-row "
+        "quantity; if B=3 stalls near B=2, MoE acceptance shape is "
+        "set by B=2. Workload mirrors the B=1 / B=2 / B=4 rows on "
+        "this checkpoint exactly (same prompt, ``max_tokens=384``) "
+        "so per-token throughput is comparable across batch sizes. "
+        "Dual-gated on SILICA_REAL_QWEN3_5_MOE — same checkpoint as "
+        "the existing MoE rows, single-toggle per checkpoint. See "
+        "plans/P6_0_5_OPENING.md §3.3."
+    ),
+)
+
+
 _QWEN3_5_MOE_WARM_DECODE_B4 = Scenario(
     id="qwen3.5-moe-35b-a3b-warm-decode-b4",
     repo="mlx-community/Qwen3.5-35B-A3B-4bit",
@@ -2313,6 +2338,7 @@ BUILTIN_SCENARIOS: dict[str, Scenario] = {
     # P-6.0.5 measurement expansion (D-021 step 3) — dual-gated,
     # real models. See plans/P6_0_5_OPENING.md.
     _QWEN3_5_27B_WARM_DECODE_B2.id: _QWEN3_5_27B_WARM_DECODE_B2,
+    _QWEN3_5_MOE_WARM_DECODE_B3.id: _QWEN3_5_MOE_WARM_DECODE_B3,
 }
 
 

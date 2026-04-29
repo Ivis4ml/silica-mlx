@@ -576,3 +576,42 @@ def test_qwen3_5_27b_warm_decode_b2_is_dual_gated() -> None:
         "B=2 row's first prompt must match B=1's prompt so the "
         "fixed-shape warm-decode workload is identical modulo batch"
     )
+
+
+def test_qwen3_5_moe_35b_a3b_warm_decode_b3_is_dual_gated() -> None:
+    """P-6.0.5 sub-unit 3 — MoE 35B-A3B B=3 saturation row.
+
+    Sits between B=2 (validated at v1.7.13) and B=4 (opt-in,
+    OOM-flagged). Pins ``max_tokens`` and ``gate_env_var`` shared
+    with the B=1 / B=2 / B=4 rows so the P-6.0.5 batch-saturation
+    comparison stays fair across all four MoE rows and so opt-in
+    for the entire MoE family is single-toggle per checkpoint.
+    """
+    scenario = get_scenario("qwen3.5-moe-35b-a3b-warm-decode-b3")
+    assert scenario.repo == "mlx-community/Qwen3.5-35B-A3B-4bit"
+    assert scenario.gate_env_var == "SILICA_REAL_QWEN3_5_MOE"
+    assert scenario.oracle == OracleKind.WARM_DECODE
+    assert scenario.workload.max_batch_size == 3
+
+    b2 = get_scenario("qwen3.5-moe-35b-a3b-warm-decode-b2")
+    assert scenario.workload.max_tokens == b2.workload.max_tokens, (
+        "B=2 and B=3 must share max_tokens so per-token throughput "
+        "comparisons across batch sizes stay fair"
+    )
+    # All four MoE 35B-A3B rows must opt-in together — single
+    # toggle per checkpoint, not per-batch-size.
+    moe_gates = {
+        get_scenario(sid).gate_env_var
+        for sid in (
+            "qwen3.5-moe-35b-a3b-warm-decode-b1",
+            "qwen3.5-moe-35b-a3b-warm-decode-b2",
+            "qwen3.5-moe-35b-a3b-warm-decode-b3",
+            "qwen3.5-moe-35b-a3b-warm-decode-b4",
+        )
+    }
+    assert moe_gates == {"SILICA_REAL_QWEN3_5_MOE"}
+    # Sampling shape must also match B=2 so the only deliberately
+    # different axis is ``max_batch_size``.
+    assert scenario.workload.temperature == b2.workload.temperature
+    assert scenario.workload.top_p == b2.workload.top_p
+    assert scenario.workload.prompts[0] == b2.workload.prompts[0]
