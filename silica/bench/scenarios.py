@@ -1995,6 +1995,36 @@ _QWEN3_5_27B_WARM_DECODE_B2 = Scenario(
 )
 
 
+_QWEN3_5_27B_WARM_DECODE_B4 = Scenario(
+    id="qwen3.5-27b-warm-decode-b4",
+    repo="mlx-community/Qwen3.5-27B-4bit",
+    workload=_warm_decode_workload(max_batch_size=4, max_tokens=384),
+    oracle=OracleKind.WARM_DECODE,
+    gate_env_var="SILICA_REAL_QWEN3_5_27B",
+    description=(
+        "**P-6.0.5 sub-unit 2 (D-021 step 3) — dense 27B B=4 "
+        "opt-in (OOM risk).** Same checkpoint as the existing B=1 / "
+        "B=2 dense rows but pushes 4x batched activation state on "
+        "top of a 13.5 GB weight footprint, uncomfortably close to "
+        "the 48 GB system envelope. **B=4 has not been validated "
+        "on real hardware**: dense Qwen3.5-27B has only been "
+        "exercised at B=1 (P-6.0 baseline) and B=2 (P-6.0.5 "
+        "sub-unit 1). If this scenario OOMs the user sees an opaque "
+        "MLX error mid-decode; treat it as opt-in stretch and fall "
+        "back to the B=2 row for the §6 batch-scaling reading. Run "
+        "sequence: validate B=2 first (sub-unit 1); only then run "
+        "B=4 on a freshly booted Mac with no other GPU consumers, "
+        "ideally with ``mx.metal.set_memory_limit`` set to ~42 GB "
+        "to fail fast rather than letting macOS swap. Workload "
+        "shape and ``max_tokens=384`` mirror the B=1 / B=2 rows on "
+        "this checkpoint exactly so per-token throughput is "
+        "comparable across batch sizes. Dual-gated on "
+        "SILICA_REAL_QWEN3_5_27B — same checkpoint as the existing "
+        "dense 27B rows. See plans/P6_0_5_OPENING.md §3.2."
+    ),
+)
+
+
 _GEMMA4_31B_WARM_DECODE_B1 = Scenario(
     id="gemma4-31b-warm-decode-b1",
     repo="mlx-community/gemma-4-31b-4bit",
@@ -2503,6 +2533,7 @@ BUILTIN_SCENARIOS: dict[str, Scenario] = {
     # P-6.0.5 measurement expansion (D-021 step 3) — dual-gated,
     # real models. See plans/P6_0_5_OPENING.md.
     _QWEN3_5_27B_WARM_DECODE_B2.id: _QWEN3_5_27B_WARM_DECODE_B2,
+    _QWEN3_5_27B_WARM_DECODE_B4.id: _QWEN3_5_27B_WARM_DECODE_B4,
     _QWEN3_5_MOE_WARM_DECODE_B3.id: _QWEN3_5_MOE_WARM_DECODE_B3,
     _QWEN3_5_MOE_WARM_DECODE_B1_4K.id: _QWEN3_5_MOE_WARM_DECODE_B1_4K,
     _QWEN3_5_27B_WARM_TTFT_PAIR.id: _QWEN3_5_27B_WARM_TTFT_PAIR,

@@ -31,10 +31,10 @@ P-6.0.5 lands seven measurement artefacts:
    OOM-flagged; mirrors the MoE B=4 run sequence).
 3. `qwen3.5-moe-35b-a3b-warm-decode-b3.{jsonl,md}` — MoE B=3.
 4. `qwen3.5-moe-35b-a3b-warm-decode-b4.{jsonl,md}` — MoE B=4
-   (opt-in, OOM-flagged). **No new code** — scenario already
-   registered at v1.7.13 (`silica/bench/scenarios.py:2032`); only
-   the data row is missing from `plans/P6_0_BASELINE/` and lands
-   here.
+   (opt-in, OOM-flagged). **No new code** — scenario
+   `qwen3.5-moe-35b-a3b-warm-decode-b4` already registered at
+   v1.7.13; only the data row is missing from
+   `plans/P6_0_BASELINE/` and lands here.
 5. `qwen3.5-moe-35b-a3b-warm-decode-b1-4k.{jsonl,md}` — MoE B=1
    sustained 4K-context probe.
 6. `qwen3.5-27b-warm-ttft-pair.{jsonl,md}` (and one MoE counterpart)
@@ -102,7 +102,7 @@ P-6.0.5 closes all four with measurement only; no engine change.
 | 1 | `qwen3.5-27b-warm-decode-b2.{jsonl,md}`                   | scenario registration only                                                  |
 | 2 | `qwen3.5-27b-warm-decode-b4.{jsonl,md}` (opt-in)          | scenario registration only                                                  |
 | 3 | `qwen3.5-moe-35b-a3b-warm-decode-b3.{jsonl,md}`           | scenario registration only                                                  |
-| 4 | `qwen3.5-moe-35b-a3b-warm-decode-b4.{jsonl,md}` (opt-in)  | **none** — scenario exists at `silica/bench/scenarios.py:2032`; data only   |
+| 4 | `qwen3.5-moe-35b-a3b-warm-decode-b4.{jsonl,md}` (opt-in)  | **none** — scenario `qwen3.5-moe-35b-a3b-warm-decode-b4` already registered (v1.7.13); data only |
 | 5 | `qwen3.5-moe-35b-a3b-warm-decode-b1-4k.{jsonl,md}`        | scenario registration only (reuses extended-ctx workload)                   |
 | 6 | `qwen3.5-27b-warm-ttft-pair.{jsonl,md}` + MoE counterpart | new `WARM_TTFT_PAIR` oracle + scenario registration                         |
 | 7 | `target_verify_microbench.{jsonl,md}`                     | independent harness; not a `Scenario`                                       |
@@ -117,12 +117,13 @@ P-6.0.5 closes all four with measurement only; no engine change.
   > Dense 27B B=2 4K is explicitly out-of-scope unless B=2 / B=4
   > scaling or memory data reveals a contradiction.
 
-  Rationale: the §6(4) RAM-headroom gate already has its anchor in
-  `qwen3.5-27b-warm-decode-b1-4k` (registered v1.7.15 at
-  `silica/bench/scenarios.py:2098`). The unmeasured surface is
-  MoE 4K (per the inline comment at the same file lines 2092-2096).
-  P-6.0.5's purpose is to fill measurement gaps that block Decision
-  Gate 1, not to widen the dense long-context matrix.
+  Rationale: the §6(4) RAM-headroom gate already has its anchor
+  in scenario `qwen3.5-27b-warm-decode-b1-4k` (registered v1.7.15).
+  The unmeasured surface is MoE 4K (per the inline comment in
+  `silica/bench/scenarios.py` adjacent to the P5.9 step 2(d)
+  extended-context section). P-6.0.5's purpose is to fill
+  measurement gaps that block Decision Gate 1, not to widen the
+  dense long-context matrix.
 
 - **MoE B=3 4K.** Sustained MoE long-context at B>1 stays deferred;
   if MoE B=3 short-context shows any §6(4) tension, we revisit.
@@ -210,7 +211,7 @@ is set by B=2.
 ### 3.4 Sub-unit 4 — MoE 35B-A3B B=4 (opt-in, no new code)
 
 **Scenario id:** `qwen3.5-moe-35b-a3b-warm-decode-b4` (already
-registered at `silica/bench/scenarios.py:2032`, v1.7.13).
+registered at v1.7.13).
 **Code surface:** **none** in this sub-unit. The scenario was
 landed at v1.7.13 with the OOM-flagged description text already
 in place; it was deliberately not run as part of the P-6.0
@@ -470,10 +471,10 @@ Mirror-of: `plans/P6_0_BASELINE/`.
 | `tests/test_bench_warm_ttft_pair_oracle.py` (new)           | Test surface for `WARM_TTFT_PAIR` (no real-model dep; mirrors `test_bench_prefix_hit_decode_oracle.py`) |
 | `tests/test_bench_scenarios_catalog.py`                     | Append cases that the 6 new scenarios appear under `--list`                                   |
 
-Sub-unit 4 (MoE B=4) has **no code** in this column — its
-scenario already exists at `silica/bench/scenarios.py:2032` from
-v1.7.13; only the data row under `plans/P6_0_5_BASELINE/`
-lands in P-6.0.5. Sub-unit 7 (microbench) likewise registers no
+Sub-unit 4 (MoE B=4) has **no code** in this column — scenario
+`qwen3.5-moe-35b-a3b-warm-decode-b4` already exists from v1.7.13;
+only the data row under `plans/P6_0_5_BASELINE/` lands in
+P-6.0.5. Sub-unit 7 (microbench) likewise registers no
 `Scenario`; its harness is independent.
 
 No engine, scheduler, KV, codec, or model code changes. No P-5
@@ -550,11 +551,15 @@ implementation time.
 - **`plans/P6_0_BASELINE/REPORT.md`** — v1.7.13 baseline numbers
   P-6.0.5 reads against (dense 27B 16.05 tok/s @ 70.6%; MoE
   120.93 tok/s aggregate @ 59.1%).
-- **`silica/bench/scenarios.py:2098-2196`** — P5.9 step 2(d)
-  extended-context registrations (`-b1-4k`, `-b1-8k`); sub-unit 5
-  reuses the same `_warm_decode_workload_extended` helper.
-- **`silica/bench/scenarios.py:2031-2052`** — `_QWEN3_5_MOE_WARM_DECODE_B4`;
-  sub-unit 2 description text mirrors this OOM-flagged shape.
+- **P5.9 step 2(d) extended-context registrations** in
+  `silica/bench/scenarios.py` — `qwen3.5-27b-warm-decode-b1-4k` /
+  `qwen3.5-27b-warm-decode-b1-8k` /
+  `gemma4-31b-warm-decode-b1-4k` / `gemma4-31b-warm-decode-b1-8k`;
+  sub-unit 5 reuses the same `_warm_decode_workload_extended`
+  helper.
+- **`qwen3.5-moe-35b-a3b-warm-decode-b4`** registration in
+  `silica/bench/scenarios.py`; sub-unit 2 description text
+  mirrors its OOM-flagged shape.
 - **`docs/plans-index.md`** — P-6 section; add a P-6.0.5 row at
   doc-sync time (not in this opening).
 
@@ -581,9 +586,9 @@ commit, the user reviews before the next sub-unit starts.
 
 Steps 2-7 are pure code (scenario registration + new oracle +
 microbench harness + tests); they can land before any real-model
-run. Sub-unit 4 (MoE B=4) carries no code-landing step — the
-scenario already exists at `silica/bench/scenarios.py:2032`, so
-it appears only inside step 8 as a data row. Step 9 is the
+run. Sub-unit 4 (MoE B=4) carries no code-landing step — scenario
+`qwen3.5-moe-35b-a3b-warm-decode-b4` already exists from v1.7.13,
+so it appears only inside step 8 as a data row. Step 9 is the
 cross-row interpretation that D-021 step 4 reads.
 
 ---

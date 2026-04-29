@@ -663,6 +663,49 @@ def test_qwen3_5_27b_warm_decode_b2_is_dual_gated() -> None:
     )
 
 
+def test_qwen3_5_27b_warm_decode_b4_is_dual_gated() -> None:
+    """P-6.0.5 sub-unit 2 — dense 27B B=4 opt-in (OOM-flagged) row.
+
+    Pins the contract that this row shares ``max_tokens`` and
+    ``gate_env_var`` with the existing B=1 / B=2 / 4K / 8K rows on
+    the same checkpoint. The shared ``max_tokens`` keeps per-token
+    throughput comparable across batch sizes; the shared env var
+    keeps opt-in single-toggle per checkpoint. ``max_batch_size=4``
+    is the only deliberately different axis from B=1 / B=2.
+    """
+    scenario = get_scenario("qwen3.5-27b-warm-decode-b4")
+    assert scenario.repo == "mlx-community/Qwen3.5-27B-4bit"
+    assert scenario.gate_env_var == "SILICA_REAL_QWEN3_5_27B"
+    assert scenario.oracle == OracleKind.WARM_DECODE
+    assert scenario.workload.max_batch_size == 4
+
+    b2 = get_scenario("qwen3.5-27b-warm-decode-b2")
+    assert scenario.workload.max_tokens == b2.workload.max_tokens, (
+        "B=2 and B=4 must share max_tokens so per-token throughput "
+        "comparisons across batch sizes stay fair"
+    )
+    # All five dense 27B short-context rows + the two extended-
+    # context probes must opt-in together — single toggle per
+    # checkpoint, not per-batch-size or per-context-length.
+    dense_27b_gates = {
+        get_scenario(sid).gate_env_var
+        for sid in (
+            "qwen3.5-27b-warm-decode-b1",
+            "qwen3.5-27b-warm-decode-b1-4k",
+            "qwen3.5-27b-warm-decode-b1-8k",
+            "qwen3.5-27b-warm-decode-b2",
+            "qwen3.5-27b-warm-decode-b4",
+            "qwen3.5-27b-warm-ttft-pair",
+        )
+    }
+    assert dense_27b_gates == {"SILICA_REAL_QWEN3_5_27B"}
+    # Sampling shape matches B=2 so the only deliberately different
+    # axis is ``max_batch_size``.
+    assert scenario.workload.temperature == b2.workload.temperature
+    assert scenario.workload.top_p == b2.workload.top_p
+    assert scenario.workload.prompts[0] == b2.workload.prompts[0]
+
+
 def test_qwen3_5_moe_35b_a3b_warm_decode_b3_is_dual_gated() -> None:
     """P-6.0.5 sub-unit 3 — MoE 35B-A3B B=3 saturation row.
 
