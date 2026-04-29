@@ -2,9 +2,9 @@
 
 | Field        | Value                                                                      |
 | ------------ | -------------------------------------------------------------------------- |
-| Version      | v1.7.17                                                                    |
+| Version      | v1.7.18                                                                    |
 | Last updated | 2026-04-29                                                                 |
-| Status       | P-5 complete; P-5 Acceptance (1)–(4) closed at v1.7.4; (a-real) real-activation xcheck closed at v1.7.5; P-3-C5 closed in slice-prefill regime (C5.5 α-MVP); P-3-E4 batched MoE smoke + scheduler-glue parity closed at v1.7.9; P-5-F pre-RoPE production routing closed at v1.7.6 via the (3b) projection-output capture path (F.1-F.4); (b-static) Qwen3.5-4B PPL vs vqbench REPORT.md baseline closed at v1.7.7; slice-regime + pre_norm hybrid Qwen3.5-0.8B E2E discriminator closed at v1.7.8; per-head Haar rotation landed as opt-in (default OFF) at v1.7.8; per-head D.2a 3-seed re-measurement at v1.7.10 — \|mean_gap\| 0.150 → 0.066 PPL (56% reduction); per-head (b-static) Qwen3.5-4B production-path re-measurement at v1.7.11 — std 5.3× tighter, mean unchanged in SEM, default flip is now an administrative landing, not an empirical question; **P-6 re-scoped from "Weight Streaming" to "Performance Phase" at v1.7.13 per D-017 / D-018 / D-019 — dense Qwen3.5-27B-4bit ≥60 tok/s primary target + MoE Qwen3.5-35B-A3B-4bit ≥100 tok/s stretch validator on 48 GB M5 Pro; P-7 Speculative promoted from T2 to T1; dense layer-streaming deferred to v0.2; Track C speculative grows to five sub-units per D-020 (C.1 draft-target, C.2 ReDrafter, C.3 MTP, C.4 DFlash, C.5 DDTree) and to six sub-units at v1.7.14 round-2 review (C.6 QuantSpec-like self-spec exploratory); P-6.0 measurement gate landed at v1.7.13 (8 scenarios + REPORT in `plans/P6_0_BASELINE/`); **P-6 contract sync at v1.7.14 per D-021** — dense gate split into (1a) ≥40 tok/s engineering (must pass) + (1b) ≥60 tok/s stretch (contingent on C.4/C.5 ≥2.5×); MoE acceptance split into (2a) ≥100 tok/s anchor (cleared at baseline) + (2b) ≥150 aggregate or ≥100 per-row stretch; execution order rewritten to foundation-first (P5.9 hardening → P-6.0.5 → Decision Gate 1 → spec foundation → C.4 spike → B → A); v1.7.14 round-3 review absorbed via stale-text cleanup; **P5.9 hardening complete at v1.7.15** — eight D-021 step 2 sub-units (a..h) closed across commits `0bd931a` / `bbdb7f7` / `9a9bff9` / `2483715` / `aa85e1c` / `dc5ba59` / `5d0f474` / `c385837`: probe double-load fix (27B/31B peaks corrected ~30.5→~15.3/~17.5 GB), Q-012 initial-cohort prefix consultation, Qwen3.5 pre-draft recurrent rollback, sustained 4K/8K context probes, D-009 hot-path audit lock-in, speculative metrics schema, operationalised (4-b) regression gate, full toolchain re-run attestation (2108 passed / 7 skipped, +82 P5.9 tests over the v1.7.13 baseline); see `plans/P6_OPENING.md` and `plans/P6_REVIEW_HANDOFF.md`; **P-6.0.5 measurement expansion complete at v1.7.17 per D-021 step 3** — eight artefact rows landed in `plans/P6_0_5_BASELINE/` (5 mandatory warm-decode + 2 warm-TTFT-pair + 1 target-verify microbench; both opt-in B=4 OOM-flagged rows completed without OOM): dense 27B B=4 = 42.17 ± 0.21 tok/s @ 52% util (2-run; bandwidth util uses runtime-measured 15.13 GB weight footprint, +12% vs v1.7.13's 13.5 GB anchor — see REPORT.md "Weight-footprint reconciliation"; batch-only path to 60 dead, KV-traffic-bound), MoE 35B-A3B B=4 = 188.5 tok/s @ 92% util (still climbing, OOM-safe at 20.6 GB peak; MoE retains 1.5 GB active-weight anchor), MoE 4K peak 23.6 GB (RAM gate clears with 35% margin), warm-TTFT 317 ms dense / 169 ms MoE (3-run reproducibility ±0.3 ms warm), verify-k target-side / zero-drafter-cost ceiling 2.93× at k=8 linear (constrains C.4 / C.5 upper-band claims; real spec gain falls below this by drafter cost + acceptance + bonus-token rule); cross-row REPORT.md closes §1 Q1-Q4 and constitutes the Decision Gate 1 (D-021 step 4) input set; see `plans/P6_0_5_OPENING.md` and `plans/P6_0_5_BASELINE/REPORT.md`** |
+| Status       | P-5 complete; P-5 Acceptance (1)–(4) closed at v1.7.4; (a-real) real-activation xcheck closed at v1.7.5; P-3-C5 closed in slice-prefill regime (C5.5 α-MVP); P-3-E4 batched MoE smoke + scheduler-glue parity closed at v1.7.9; P-5-F pre-RoPE production routing closed at v1.7.6 via the (3b) projection-output capture path (F.1-F.4); (b-static) Qwen3.5-4B PPL vs vqbench REPORT.md baseline closed at v1.7.7; slice-regime + pre_norm hybrid Qwen3.5-0.8B E2E discriminator closed at v1.7.8; per-head Haar rotation landed as opt-in (default OFF) at v1.7.8; per-head D.2a 3-seed re-measurement at v1.7.10 — \|mean_gap\| 0.150 → 0.066 PPL (56% reduction); per-head (b-static) Qwen3.5-4B production-path re-measurement at v1.7.11 — std 5.3× tighter, mean unchanged in SEM, default flip is now an administrative landing, not an empirical question; **P-6 re-scoped from "Weight Streaming" to "Performance Phase" at v1.7.13 per D-017 / D-018 / D-019 — dense Qwen3.5-27B-4bit ≥60 tok/s primary target + MoE Qwen3.5-35B-A3B-4bit ≥100 tok/s stretch validator on 48 GB M5 Pro; P-7 Speculative promoted from T2 to T1; dense layer-streaming deferred to v0.2; Track C speculative grows to five sub-units per D-020 (C.1 draft-target, C.2 ReDrafter, C.3 MTP, C.4 DFlash, C.5 DDTree) and to six sub-units at v1.7.14 round-2 review (C.6 QuantSpec-like self-spec exploratory); P-6.0 measurement gate landed at v1.7.13 (8 scenarios + REPORT in `plans/P6_0_BASELINE/`); **P-6 contract sync at v1.7.14 per D-021** — dense gate split into (1a) ≥40 tok/s engineering (must pass) + (1b) ≥60 tok/s stretch (contingent on C.4/C.5 ≥2.5×); MoE acceptance split into (2a) ≥100 tok/s anchor (cleared at baseline) + (2b) ≥150 aggregate or ≥100 per-row stretch; execution order rewritten to foundation-first (P5.9 hardening → P-6.0.5 → Decision Gate 1 → spec foundation → C.4 spike → B → A); v1.7.14 round-3 review absorbed via stale-text cleanup; **P5.9 hardening complete at v1.7.15** — eight D-021 step 2 sub-units (a..h) closed across commits `0bd931a` / `bbdb7f7` / `9a9bff9` / `2483715` / `aa85e1c` / `dc5ba59` / `5d0f474` / `c385837`: probe double-load fix (27B/31B peaks corrected ~30.5→~15.3/~17.5 GB), Q-012 initial-cohort prefix consultation, Qwen3.5 pre-draft recurrent rollback, sustained 4K/8K context probes, D-009 hot-path audit lock-in, speculative metrics schema, operationalised (4-b) regression gate, full toolchain re-run attestation (2108 passed / 7 skipped, +82 P5.9 tests over the v1.7.13 baseline); see `plans/P6_OPENING.md` and `plans/P6_REVIEW_HANDOFF.md`; **P-6.0.5 measurement expansion complete at v1.7.17 per D-021 step 3** — eight artefact rows landed in `plans/P6_0_5_BASELINE/` (5 mandatory warm-decode + 2 warm-TTFT-pair + 1 target-verify microbench; both opt-in B=4 OOM-flagged rows completed without OOM): dense 27B B=4 = 42.17 ± 0.21 tok/s @ 52% util (2-run; bandwidth util uses runtime-measured 15.13 GB weight footprint, +12% vs v1.7.13's 13.5 GB anchor — see REPORT.md "Weight-footprint reconciliation"; batch-only path to 60 dead, KV-traffic-bound), MoE 35B-A3B B=4 = 188.5 tok/s @ 92% util (still climbing, OOM-safe at 20.6 GB peak; MoE retains 1.5 GB active-weight anchor), MoE 4K peak 23.6 GB (RAM gate clears with 35% margin), warm-TTFT 317 ms dense / 169 ms MoE (3-run reproducibility ±0.3 ms warm), verify-k target-side / zero-drafter-cost ceiling 2.93× at k=8 linear (constrains C.4 / C.5 upper-band claims; real spec gain falls below this by drafter cost + acceptance + bonus-token rule); cross-row REPORT.md closes §1 Q1-Q4 and constitutes the Decision Gate 1 (D-021 step 4) input set; see `plans/P6_0_5_OPENING.md` and `plans/P6_0_5_BASELINE/REPORT.md`; **Decision Gate 1 (D-021 step 4) closed at v1.7.18 per `plans/P6_0_DECISION_GATE_1_OPENING.md`** — (1a) ≥40 tok/s primary unchanged; (1b) ≥60 tok/s reframed as stretch with two-condition survival rule (full-stack measurement clears ≥60, OR Track C.5 tree-shape spike shows headroom beyond the linear k=8 verify ceiling sufficient to make the full-stack projection ≥60 credible; C.4 alone — even at upper-band 2.9× — does not settle (1b)); (2a) ≥100 tok/s aggregate stays as cleared anchor; (2b) reduced to single variant ≥175 tok/s aggregate at B≥3 (per-row variant retired as structurally unreachable, ≥150 thin since cleared at B=3, ≥200 rejected since B≥5 sits in diminishing returns at 92% util); §6 / §7 D-021 step 4 / step 6 / step 8 live-contract sync at v1.7.18, not §13-history-only** |
 | Maintainer   | Xin Zhou                                                                   |
 | Source       | `plans/PLAN.md` (single source of truth)                                    |
 
@@ -731,14 +731,21 @@ Each Phase uses the same structure: `ID / Goal / Scope / Strategy / Deliverables
   - [ ] **(1b) Dense stretch / primary-challenge gate —
     Qwen3.5-27B-4bit ≥60 tok/s (stretch).** Same workload as (1a)
     but pinning the original v0.1 user-stated framing. **Reaching
-    this requires Track C.4 DFlash or C.5 DDTree to land in the
-    upper half of their MLX-conservative bands (≥2.5×
-    silica-integrated speedup over the C.1 baseline).** Per Q-C
-    resolution the phase explicitly does not commit to (1b) until
-    Decision Gate 1 (D-021) measures C.4/C.5 spike numbers; if
-    Decision Gate 1 shows ≤1.8× combined Track C.4 silica speedup,
-    (1b) is documented as out-of-reach and the phase exits on (1a)
-    + a Decision Log entry naming the empirical floor.
+    this requires either (i) a measured full stack on the (1a)
+    workload (Track A × Track B × Track C with C.4 or C.5 landed)
+    clearing ≥60 tok/s, or (ii) a Track C.5 tree-shape spike
+    demonstrating headroom over the linear k=8 verify ceiling
+    (P-6.0.5 Unit 7, 2.93× target-side / zero-drafter-cost)
+    sufficient to make the full-stack projection ≥60 credible.
+    C.4 alone — even at the upper end of its conservative MLX
+    2.0–2.9× band — does not settle (1b); only the full-stack
+    measurement or the C.5 spike does.** Decision Gate 1 (D-021
+    step 4, closed at v1.7.18 — see
+    `plans/P6_0_DECISION_GATE_1_OPENING.md`) reframed (1b) from
+    the v1.7.14 generic "C.4/C.5 ≥2.5×" wording to this
+    two-condition survival rule. If neither trigger fires by
+    end-of-P-6, (1b) retires with a Decision Log entry naming
+    the empirical floor.
   - [x] **(2a) MoE anchor — Qwen3.5-35B-A3B-4bit ≥100 tok/s
     aggregate (already cleared at v1.7.13 baseline).** Sustained
     warm-start aggregate `decode_tok_s` on
@@ -748,17 +755,29 @@ Each Phase uses the same structure: `ID / Goal / Scope / Strategy / Deliverables
     runs cleanly end-to-end on the hardest engine path silica
     supports; it is the floor every later track measurement on the
     MoE path is compared against.
-  - [ ] **(2b) MoE stretch — Qwen3.5-35B-A3B-4bit ≥150 tok/s
-    aggregate at B=2 OR ≥100 tok/s per-row at B=2.** Either form
-    of the gate clears it; both demonstrate that silica's
-    MoE-batched throughput is competitive with the GPU-class
-    numbers vllm-mlx publishes (127.7 tok/s on M4 Max single-row).
-    Reachable via Track A sync collapse (the +30-80% leverage band
-    on compute-bound MoE applies here) plus B=2 → B=3 if memory
-    fits. Status: **stretch** — failing it records a Decision Log
-    entry but does not fail the phase. Phase exits on (1a) + (3) +
-    (4) + (5) + (6); (2a) is preserved baseline evidence; (1b) and
-    (2b) are stretch slots celebrated when met.
+  - [ ] **(2b) MoE stretch — Qwen3.5-35B-A3B-4bit ≥175 tok/s
+    aggregate at B≥3.** Demonstrates that silica's MoE-batched
+    throughput is competitive with the GPU-class numbers vllm-mlx
+    publishes (127.7 tok/s on M4 Max single-row). Decision Gate 1
+    (D-021 step 4, closed at v1.7.18) reduced the v1.7.14
+    OR-clause `≥150 aggregate at B=2 OR ≥100 per-row at B=2` to
+    this single threshold: P-6.0.5 Unit 4 measured B=4 = 188.5
+    tok/s aggregate at 92% bandwidth utilisation, and ≥175 leaves
+    a 13.5 tok/s margin (~7.7%) for run-to-run variance while
+    remaining informative beyond the cleared (2a) anchor. The
+    per-row variant retires as structurally unreachable (per-row
+    falls 76 → 60 → 54 → 47 across B=1/2/3/4 on this checkpoint);
+    ≥150 is thin (already cleared at B=3 = 163.5); ≥200 was
+    rejected (would require B≥5 in the diminishing-returns
+    region above 92% util, or unscheduled C-on-MoE work — see
+    `plans/P6_0_DECISION_GATE_1_OPENING.md` §4.2). Reachable via
+    Track A sync collapse (the +30-80% leverage band on
+    compute-bound MoE applies here) plus B=3 / B=4 already
+    measured at 163.5 / 188.5. Status: **stretch** — failing it
+    records a Decision Log entry but does not fail the phase.
+    Phase exits on (1a) + (3) + (4) + (5) + (6); (2a) is
+    preserved baseline evidence; (1b) and (2b) are stretch slots
+    celebrated when met.
   - [ ] **(3) TTFT under concurrency.** New
     `qwen3.5-27b-ttft-under-concurrency-warm` scenario: short
     requests' TTFT ≤ 2× their solo TTFT in the presence of one long
@@ -1479,7 +1498,16 @@ Append-only. New decisions go at the end; old ones are not edited. Revocations /
      C.4 / C.5; if scaling is poor, retire (1b) to stretch-only,
      anchor on (1a) ≥40 tok/s, and update the MoE stretch from
      ≥100 tok/s aggregate (already met) to ≥150 tok/s aggregate
-     or ≥100 tok/s per-row at B=2.
+     or ≥100 tok/s per-row at B=2. **Status: complete at
+     v1.7.18.** Decision: (1a) primary unchanged; (1b) reframed
+     as stretch with a two-condition survival rule (full-stack
+     measured ≥60 OR C.5 tree-shape spike shows headroom beyond
+     the linear k=8 ceiling — see (1b) §6 entry); (2b) reduced
+     to ≥175 aggregate at B≥3 (per-row variant retired). Audit
+     trail at `plans/P6_0_DECISION_GATE_1_OPENING.md`; gate (1b)
+     is now contingent on either step 6 outcome (full-stack
+     leg) or the C.5 tree-shape spike (downstream of step 8 —
+     see OQ-3 in the opening for the step-ordering question).
   5. **Speculative foundation** — `silica.speculative.DraftEngine`
      and `DraftTargetEngine` wired into the engine main loop
      (greedy spec-on / spec-off byte-exact parity gate);
@@ -1491,9 +1519,14 @@ Append-only. New decisions go at the end; old ones are not edited. Revocations /
   6. **C.4 DFlash spike** — minimal closed-loop integration:
      drafter wired, fixed P-6.0 prompt / scenario, output
      speedup + acceptance + draft overhead + peak memory +
-     quality parity. Gate: ≥1.8× silica-integrated speedup
-     continues; ≥2.5× justifies pursuing the (1b) stretch;
-     ≤1.8× retires (1b).
+     quality parity. Gate (per Decision Gate 1 v1.7.18 reframe):
+     ≥1.8× silica-integrated speedup continues; ≥2.5× is one
+     component of the (1b) two-condition survival rule (feeding
+     the **full-stack measurement** leg) and also motivates the
+     C.5 tree-shape spike (the second leg, see step 8); ≤1.8×
+     retires (1b) only if no C.5 spike is pursued. C.4 alone
+     does not settle (1b) — only the full-stack measurement or
+     the C.5 spike does.
   7. **Track B 3-bit weights** — loader + PPL oracle first
      (no runtime change), pass quality gate, then 27B 3-bit
      warm-decode. If 3-bit lifts dense from 16 → 21-24 tok/s,
@@ -1502,10 +1535,20 @@ Append-only. New decisions go at the end; old ones are not edited. Revocations /
   8. **C.5 / C.2 / C.3 selection — and C.6 QuantSpec-like
      self-spec exploratory option.** Driven by C.4 outcome.
      If C.4 acceptance is high, C.5 reuses the same drafter and
-     adds the tree-verification path. If C.4 draft quality is
-     mediocre, try MTP head (C.3) or ReDrafter (C.2). C.2 KD
-     pass only if C.1 / C.4 are insufficient and (1b) is still
-     in pursuit.
+     adds the tree-verification path. The **C.5 tree-shape
+     spike** is the second-leg trigger of the (1b) two-condition
+     survival rule (per Decision Gate 1 v1.7.18 reframe — see
+     `plans/P6_0_DECISION_GATE_1_OPENING.md` §2.3): if the
+     spike shows headroom over the linear k=8 verify ceiling
+     (P-6.0.5 Unit 7, 2.93× target-side / zero-drafter-cost)
+     sufficient to make the full-stack projection ≥60 credible,
+     (1b) survives. The existing C.5 description below
+     ("If C.4 acceptance is high, C.5 reuses the same drafter
+     and adds the tree-verification path") becomes prerequisite
+     framing for the spike rather than the gate itself. If C.4
+     draft quality is mediocre, try MTP head (C.3) or ReDrafter
+     (C.2). C.2 KD pass only if C.1 / C.4 are insufficient and
+     (1b) is still in pursuit.
      **C.6 (exploratory) — same-model low-precision self-spec.**
      QuantSpec (ICML 2025, Tiwari et al.) reports ~2.5× speedup
      and ~1.3× memory reduction by drafting with hierarchical
@@ -1931,6 +1974,87 @@ Local reference implementations sit at the repo root. **Algorithm / architecture
 ---
 
 ## 13. Changelog
+
+- **v1.7.18** (2026-04-29): **Decision Gate 1 closed (D-021
+  step 4).** Doc-only phase, no silica.* code change. Audit
+  trail at `plans/P6_0_DECISION_GATE_1_OPENING.md` (commit
+  `38c61da`). Live-contract sync touches §1 status header,
+  §6 (1b) / (2b) entries, §7 D-021 steps 4 / 6 / 8, and this
+  changelog.
+
+  **Recommended call (consolidated):**
+
+  - **(1a) ≥40 tok/s** remains the must-pass dense primary
+    gate. No wording change.
+  - **(1b) ≥60 tok/s** is reframed as a stretch gate with a
+    **two-condition survival rule** — either (i) a measured
+    full stack on the (1a) workload (Track A × Track B ×
+    Track C with C.4 or C.5 landed) clears ≥60, or (ii) a
+    Track C.5 tree-shape spike demonstrates headroom over the
+    linear k=8 verify ceiling (P-6.0.5 Unit 7, 2.93×
+    target-side / zero-drafter-cost) sufficient to make the
+    full-stack projection ≥60 credible. C.4 alone — even at
+    upper-band 2.9× — does not settle (1b); only the
+    full-stack measurement or the C.5 spike does. The v1.7.14
+    wording's "C.4 or C.5 ≥2.5× alone clears (1b)" is what
+    this reframe tightens away from.
+  - **(2a) ≥100 tok/s aggregate** stays as the cleared anchor
+    at the v1.7.13 B=2 baseline.
+  - **(2b)** is reduced to a single variant **≥175 tok/s
+    aggregate at B≥3**. The v1.7.14 OR-clause and the per-row
+    ≥100 arm are removed. The per-row variant retires as
+    structurally unreachable (per-row falls 76 → 60 → 54 → 47
+    across B=1/2/3/4 on this checkpoint); ≥150 was thin
+    (already cleared at B=3 = 163.5); ≥200 was rejected
+    because clearing it requires either B≥5 in the
+    diminishing-returns region above 92% util or unscheduled
+    C-on-MoE work. ≥175 leaves a 13.5 tok/s margin (~7.7%)
+    against the measured B=4 = 188.5.
+
+  **Rejected arms** (compressed; full reasoning in opening §2):
+
+  - (D1) keep v1.7.14 generic "C.4 or C.5 ≥2.5×" wording —
+    too permissive; binds (1b) to a single component speedup
+    rather than the actual reachable path.
+  - (D2) retire (1b) entirely — premature; C.5 tree-shape
+    unmeasured and full-stack arithmetic at upper band still
+    leaves 60 reachable
+    (`1.15 × 1.30 × 2.9 × 16.05 ≈ 69.6 tok/s`).
+  - (M1) keep both (2b) arms — per-row arm is structurally
+    unreachable; misleads readers.
+  - (M4) ratchet (2b) to ≥200 — diminishing-returns at
+    92% util and scope creep into C-on-MoE territory.
+  - (S1) §13 changelog only, leave §6 / §7 stale — would
+    de-sync the live contract for downstream Track A / B / C
+    work.
+
+  **Counter-arguments named** (opening §4): full-stack
+  arithmetic at upper band still reaches 60, so spec-only
+  ceiling math does not justify retirement; ≥175 over ≥200
+  trades stretch-validation against engineering-target
+  semantics; live-contract sync over history-only avoids
+  silent §6 / §7 drift.
+
+  **One open question carried forward (OQ-1):** the C.5 spike
+  ROI threshold for the second-leg trigger ("headroom
+  sufficient to make full-stack projection ≥60 credible")
+  remains qualitative; the C.5 spike opening doc fixes the
+  quantitative threshold (multiplier over linear ceiling,
+  ratio to measured C.4 outcome, or back-computed minimum).
+  OQ-2 (whether ≥175 ratchets up if MoE B≥5 work happens
+  later) and OQ-3 (§7 step 6 vs C.5 sub-step ordering) are
+  flagged for the relevant downstream phases; not blockers
+  for step 4 closure.
+
+  **Toolchain attestation at v1.7.18:** no code change between
+  v1.7.17 and v1.7.18; bench tests stay 229 passed / 1
+  skipped. ruff / mypy unchanged.
+
+  No PLAN-level decision change beyond what the recommended
+  call records. v1.7.18 closes the **decision-resolution
+  prerequisite** for Track C work (D-021 step 5+); future
+  Track A / B / C / D work reads §6 (1b) / (2b) as the live
+  targets, not the v1.7.14 wording.
 
 - **v1.7.17** (2026-04-29): **P-6.0.5 measurement expansion
   complete (D-021 step 3).** Eight artefact rows landed in

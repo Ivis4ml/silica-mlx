@@ -149,8 +149,8 @@ variable-length SDPA kernel.
 | P-4 | Unified bench harness — runner, oracles, 15 scenarios, JSONL + Markdown reports, vqbench subprocess PPL | ✅ complete |
 | P-4.5 | P-4 exit bridge — chunked-prefill minimal + VectorCodec runtime integration spike | ✅ complete (v1.6.9) |
 | P-5 | VQ KV compression (BlockTQ / RaBitQ) | ✅ complete (v1.7.4 — Acceptance (1)–(4) closed; P-5-F production routing closed at v1.7.6; (b-static) Qwen3.5-4B baseline closed at v1.7.7; per-head opt-in + measurements at v1.7.8 / v1.7.10 / v1.7.11) |
-| P-6 | Weight streaming (dense + per-expert MoE residency) | Stub (`ResidentWeightProvider` today) |
-| P-7 | Speculative decoding (DraftTarget / EAGLE / Medusa) | Stub (`NoopDraftEngine` today) |
+| P-6 | Performance phase (dense Qwen3.5-27B-4bit ≥40 tok/s primary, ≥60 stretch; MoE 35B-A3B ≥100 anchor cleared, ≥175 aggregate stretch) | In progress — P-6.0 baseline (v1.7.13) + P-6.0.5 measurement expansion (v1.7.17) closed; Decision Gate 1 (D-021 step 4) closed at v1.7.18; Tracks A / B / C / D queued. Dense layer-streaming deferred to v0.2 per D-018. |
+| P-7 | Speculative decoding (DraftTarget / EAGLE / Medusa) | Promoted to T1 at v1.7.13; `DraftEngine` interface frozen, `NoopDraftEngine` is the today-stub. Foundation lands at D-021 step 5; Track C.4 / C.5 spikes follow Decision Gate 1. |
 | P-8 | OpenAI-compatible HTTP server + session layer | ⏳ planned (T1 tail, after P-5) |
 
 Legend: ✅ shipped · Stub = wired as the baseline implementation
@@ -485,11 +485,26 @@ the structural picture only.
   / v1.7.11. The single intentionally-deferred deliverable is
   `PagedPrefixBlockStore` codec injection — waiting on the paged-
   attention kernel track per D-003.
-- **P-6** *(planned)* — weight streaming. Per-expert residency for
-  MoE checkpoints + layer streaming for dense models, driven by the
-  `WeightProvider` interface already in place.
-- **P-7** *(planned)* — speculative decoding behind the
-  `DraftEngine` interface (DraftTarget / EAGLE / Medusa).
+- **P-6** *(in progress)* — performance phase. Re-scoped at v1.7.13
+  (D-017 / D-018 / D-019) from "weight streaming" to engineering
+  silica to a dense Qwen3.5-27B-4bit primary of ≥40 tok/s on M5 Pro
+  48 GB plus a MoE 35B-A3B ≥175 tok/s aggregate stretch. P-6.0
+  measurement gate landed at v1.7.13 (8 scenarios + REPORT in
+  `plans/P6_0_BASELINE/`); P-6.0.5 measurement expansion landed at
+  v1.7.17 (8 artefacts in `plans/P6_0_5_BASELINE/` covering dense /
+  MoE batch scaling, 4K-context, warm-TTFT, and a target-verify
+  microbench); Decision Gate 1 (D-021 step 4) closed at v1.7.18 with
+  a two-condition (1b) survival rule (full-stack measurement clears
+  ≥60, OR Track C.5 tree-shape spike beats the linear k=8 verify
+  ceiling) — see `plans/P6_0_DECISION_GATE_1_OPENING.md`. Tracks A
+  (engine fusion), B (3-bit weights), C (speculative C.1–C.6), D
+  (concurrency TTFT), E (paged-attention) queued behind the gate.
+  Dense layer-streaming and per-expert MoE residency deferred to
+  v0.2 per D-018; the `WeightProvider` interface stays frozen.
+- **P-7** *(in progress, T1 at v1.7.13)* — speculative decoding
+  behind the `DraftEngine` interface (DraftTarget / EAGLE / Medusa).
+  Track C.1–C.6 in P-6 covers the v0.1 speculative implementations;
+  EAGLE / Medusa-style full ports stay deferred to v0.2 per D-020.
 - **P-8** *(planned)* — OpenAI-compatible HTTP server + session
   layer wrapping `ChatSession` with routing, auth, streaming SSE /
   WebSocket. Leaning T1 tail per Q-002, sequenced so the HTTP
