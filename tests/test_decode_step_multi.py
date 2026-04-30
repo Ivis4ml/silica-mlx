@@ -222,8 +222,8 @@ def test_real_adapter_declares_decode_step_multi(adapter_cls: type) -> None:
 
 @pytest.mark.parametrize(
     "adapter_cls",
-    [Qwen3_5Adapter],
-    ids=["qwen3_5"],
+    [Qwen3_5Adapter, Qwen3_5MoeAdapter],
+    ids=["qwen3_5", "qwen3_5_moe"],
 )
 def test_real_adapter_decode_step_multi_raises_not_implemented(
     adapter_cls: type,
@@ -232,8 +232,40 @@ def test_real_adapter_decode_step_multi_raises_not_implemented(
     # with a real forward must still raise NotImplementedError so
     # ``silica.speculative.verify.run_verify_forward`` falls back. As
     # subsequent slices land real implementations the parametrize list
-    # shrinks; when empty, this test is removed entirely. Slice-2 has
-    # promoted Qwen3 / Gemma4 to real ``forward_full`` calls, so only
-    # the hybrid Qwen3.5 path remains a placeholder here.
+    # shrinks; when empty, this test is removed entirely. Slice-2
+    # promoted Qwen3 / Gemma4 to real ``forward_full`` calls; slice-3
+    # propagates Gemma4 to its MoE subclass via inheritance. Only the
+    # hybrid Qwen3.5 path (and its inheriting MoE subclass) remains a
+    # placeholder here, dropping out at the hybrid sub-slice.
     with pytest.raises(NotImplementedError, match=r"sub-unit \(a2\)"):
         adapter_cls.decode_step_multi(None, None, None)  # type: ignore[arg-type]
+
+
+# --- MoE inheritance pins (slice 3) -----------------------------------------
+
+
+def test_gemma4_moe_inherits_real_decode_step_multi_from_parent() -> None:
+    # Slice 3 of (a2): Gemma4MoeAdapter inherits its decode_step_multi
+    # directly from Gemma4Adapter, which slice 2 promoted to a real
+    # ``forward_full`` call. This identity check is the load-bearing
+    # pin — if a future refactor accidentally overrides
+    # decode_step_multi on the MoE subclass without also propagating
+    # the real forward, this test catches it.
+    assert (
+        Gemma4MoeAdapter.decode_step_multi
+        is Gemma4Adapter.decode_step_multi
+    )
+
+
+def test_qwen3_5_moe_inherits_placeholder_decode_step_multi_from_parent() -> None:
+    # Slice 3 of (a2): Qwen3_5MoeAdapter still inherits the
+    # NotImplementedError placeholder from Qwen3_5Adapter; the hybrid
+    # sub-slice will replace the parent's stub, after which this
+    # identity (currently to a placeholder) will resolve to the real
+    # hybrid forward automatically. Pinning the inheritance link here
+    # ensures the MoE subclass joins the real path on hybrid landing
+    # without a separate edit.
+    assert (
+        Qwen3_5MoeAdapter.decode_step_multi
+        is Qwen3_5Adapter.decode_step_multi
+    )
