@@ -1,8 +1,8 @@
 """Real-model greedy-equivalence tests for ``decode_step_multi``.
 
-D-021 step 5 sub-unit (a2) plain-adapter slice (slice 2) and inherited
-MoE slice (slice 3). Each test asserts that
-``adapter.decode_step_multi(tokens, kv_handle)`` produces logits
+D-021 step 5 sub-unit (a2) plain-adapter slice (slice 2), inherited
+MoE slice (slice 3), and hybrid sub-slice (slice 4). Each test asserts
+that ``adapter.decode_step_multi(tokens, kv_handle)`` produces logits
 position-for-position equal to a sequential ``decode_step`` loop on
 the same model — within numerical tolerance — across the v0.1
 verify_k=4 window plus boundary T values.
@@ -12,20 +12,23 @@ sub-unit (a2) calls out: if a multi-token forward over T positions
 diverges from T sequential single-token forwards, the spec verify
 silently produces wrong tokens.
 
-Two test gates with different cost profiles:
+Three test gates with different cost profiles:
 
   - Plain Qwen3-0.6B (cache-only skip; no env-var gate). Always-on
-    when the small fixture is available locally — runs in CI dev
-    machines, exercises the shared ``forward_full`` helper that
-    Qwen3 and Gemma4 both consume.
+    when the small fixture is available locally — exercises the
+    shared ``forward_full`` helper that Qwen3 and Gemma4 both
+    consume on the plain-attention path.
+  - Hybrid Qwen3.5-0.8B (cache-only skip; no env-var gate). Pins
+    that the same ``forward_full`` helper produces position-aligned
+    logits when the model mixes DeltaNet recurrent layers and full
+    attention. Slightly larger fp16 reduction-order drift than the
+    plain path (max rel ~3.3% vs ~0.6% on the probe), still inside
+    rtol=0.02 + atol=0.5.
   - Gemma4-26B-A4B MoE (dual-gated: cache hit AND
     ``SILICA_REAL_GEMMA4_MOE=1``). Opt-in only — the 16 GB load
-    plus dense+MoE forward per call is heavier than the dense
-    plain-adapter row, so it does not run on every local test
+    plus dense+MoE forward per call is heavier than the plain
+    adapter row, so it does not run on every local test
     invocation. Same equivalence contract.
-
-The hybrid Qwen3.5 path (with DeltaNet) lands its own sub-slice and
-greedy-equivalence pin then.
 
 Test pattern: build two independent ``(adapter, kv)`` instances
 loaded from the same repo. On instance A, run ``decode_step_multi``
@@ -49,8 +52,10 @@ import pytest
 from silica.kvcache.manager import KVHandle
 from silica.models.factory import adapter_for_repo
 from silica.models.qwen3 import Qwen3Adapter
+from silica.models.qwen3_5 import Qwen3_5Adapter
 
 REPO = "Qwen/Qwen3-0.6B"
+QWEN3_5_REPO = "Qwen/Qwen3.5-0.8B"
 GEMMA4_MOE_REPO = "mlx-community/gemma-4-26b-a4b-4bit"
 
 _QWEN3_CACHE = (
@@ -61,6 +66,22 @@ _SKIP_REASON = (
     "scripts/probe_p2_preload.py to populate it."
 )
 _SKIP = not _QWEN3_CACHE.exists() or bool(
+    os.environ.get("SILICA_SKIP_MODEL_TESTS")
+)
+
+
+_QWEN3_5_CACHE = (
+    Path.home()
+    / ".cache"
+    / "huggingface"
+    / "hub"
+    / "models--Qwen--Qwen3.5-0.8B"
+)
+_QWEN3_5_SKIP_REASON = (
+    f"Qwen3.5-0.8B not cached at {_QWEN3_5_CACHE}; pull via "
+    "huggingface-cli or any test that loads the 0.8B fixture."
+)
+_QWEN3_5_SKIP = not _QWEN3_5_CACHE.exists() or bool(
     os.environ.get("SILICA_SKIP_MODEL_TESTS")
 )
 
@@ -171,6 +192,43 @@ def test_qwen3_decode_step_multi_matches_decode_step_loop(T: int) -> None:
     # padded above ``config.vocab_size`` (151936 vs 151643), so we
     # assert against the loop path's per-step shape rather than the
     # config — both forwards consume the same model and must agree.
+    assert multi_logits.shape[0] == T
+    assert multi_logits.shape[1] == loop_logits[0].shape[0]
+
+    _greedy_equivalence_window(multi_logits, loop_logits)
+
+
+@pytest.mark.skipif(_QWEN3_5_SKIP, reason=_QWEN3_5_SKIP_REASON)
+@pytest.mark.parametrize("T", [1, 2, 4])
+def test_qwen3_5_decode_step_multi_matches_decode_step_loop(T: int) -> None:
+    # Hybrid Qwen3.5-0.8B: DeltaNet recurrent layers interleaved with
+    # full-attention layers. Slice 4 of (a2) promotes
+    # Qwen3_5Adapter.decode_step_multi to a real ``forward_full`` call;
+    # mlx-lm's ``gated_delta_update`` natively consumes the (B, S, H, D)
+    # q/k/v and advances the recurrent state by S in one kernel call.
+    # This test pins that the per-position output matches a sequential
+    # ``decode_step`` loop, the load-bearing greedy contract.
+    adapter_multi, kv_multi = Qwen3_5Adapter.from_hf_repo(QWEN3_5_REPO)
+    adapter_loop, kv_loop = Qwen3_5Adapter.from_hf_repo(QWEN3_5_REPO)
+
+    req_id = "spec-eq-test-qwen3-5"
+    handle_multi = KVHandle(req_id=req_id)
+    handle_loop = KVHandle(req_id=req_id)
+
+    kv_multi.reserve_for_prefill(req_id, [])  # type: ignore[arg-type]
+    kv_loop.reserve_for_prefill(req_id, [])  # type: ignore[arg-type]
+
+    token_ids = [101, 202, 303, 404][:T]
+
+    tokens_arr = mx.array(token_ids, dtype=mx.int32)
+    multi_logits, _ = adapter_multi.decode_step_multi(tokens_arr, handle_multi)
+
+    loop_logits: list[mx.array] = []
+    for tid in token_ids:
+        single_arr = mx.array([tid], dtype=mx.int32)
+        per_step_logits, _ = adapter_loop.decode_step(single_arr, handle_loop)
+        loop_logits.append(per_step_logits)
+
     assert multi_logits.shape[0] == T
     assert multi_logits.shape[1] == loop_logits[0].shape[0]
 

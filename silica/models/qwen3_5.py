@@ -44,7 +44,7 @@ from mlx_lm.utils import load as _mlx_lm_load
 
 from silica.kvcache.manager import KVHandle
 from silica.kvcache.simple import SimpleKVCache
-from silica.mlx.runner import forward
+from silica.mlx.runner import forward, forward_full
 from silica.models.adapter import (
     AttentionKind,
     AttentionPattern,
@@ -189,19 +189,28 @@ class Qwen3_5Adapter:
     def decode_step_multi(
         self, tokens: mx.array, kv_handle: KVHandle
     ) -> tuple[mx.array, StateDelta]:
-        # D-021 step 5 sub-unit (a2) contract slice — the Qwen3.5 hybrid
-        # multi-token verify forward needs DeltaNet T-step recurrent
-        # advancement aligned with full-attention batched forward; that
-        # lands in the dedicated hybrid sub-slice. Until then callers
-        # route through ``silica.speculative.verify.run_verify_forward``
-        # for a sequential ``decode_step`` fallback. Inherited by
-        # ``Qwen3_5MoeAdapter``.
-        raise NotImplementedError(
-            "Qwen3_5Adapter.decode_step_multi: stub at D-021 step 5 sub-"
-            "unit (a2) contract slice — hybrid DeltaNet + GQA forward "
-            "lands in the hybrid sub-slice; use "
-            "silica.speculative.verify.run_verify_forward for the "
-            "temporary decode_step-loop fallback."
+        # D-021 step 5 sub-unit (a2) hybrid sub-slice. Inherited by
+        # ``Qwen3_5MoeAdapter``. Multi-token verify forward over T
+        # tokens, returning logits at every input position (shape
+        # (T, V)).
+        #
+        # Hybrid Qwen3.5 mixes DeltaNet recurrent layers and full
+        # attention, but mlx-lm's ``Qwen3_5TextModel.__call__`` accepts
+        # ``(B, S)`` input uniformly: the DeltaNet path's
+        # ``gated_delta_update`` natively consumes ``(B, S, H, D)``
+        # q / k / v and advances the recurrent state by S in one
+        # kernel call, while the full-attention path runs the standard
+        # ``(B, S)`` batched attention. ``cache.advance(S)`` (not just
+        # ``+1``) lands the per-layer state at the post-S position
+        # exactly as T sequential ``decode_step`` calls would, modulo
+        # fp16 reduction-order noise. Probe verified greedy-
+        # equivalence on cached Qwen/Qwen3.5-0.8B before this slice
+        # landed; the cache-only test in
+        # ``tests/test_decode_step_multi_real.py`` pins the contract.
+        cache_list = self._kv_manager.cache_list(kv_handle.req_id)
+        logits = forward_full(self._model, tokens, cache_list)
+        return logits, StateDelta(
+            _recurrent_bytes=self._recurrent_state_bytes(cache_list)
         )
 
     # --- P-5-F F.1: PreNormCaptureAdapter implementation ---
