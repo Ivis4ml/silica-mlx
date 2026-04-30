@@ -226,6 +226,21 @@ class Gemma4Adapter:
         logits = forward(self._model, token, cache_list)
         return logits, StateDelta()
 
+    def decode_step_multi(
+        self, tokens: mx.array, kv_handle: KVHandle
+    ) -> tuple[mx.array, StateDelta]:
+        # D-021 step 5 sub-unit (a2) contract slice — Gemma4 forward for
+        # the multi-token verify path lands in the plain-adapter slice.
+        # Inherited by ``Gemma4MoeAdapter``. Until then callers route
+        # through ``silica.speculative.verify.run_verify_forward``.
+        raise NotImplementedError(
+            "Gemma4Adapter.decode_step_multi: stub at D-021 step 5 sub-"
+            "unit (a2) contract slice — adapter forward lands in a "
+            "follow-up slice; use silica.speculative.verify."
+            "run_verify_forward for the temporary decode_step-loop "
+            "fallback."
+        )
+
     # --- P-5-F F.1: PreNormCaptureAdapter implementation ---
 
     def install_pre_norm_capture(

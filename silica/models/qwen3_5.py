@@ -186,6 +186,24 @@ class Qwen3_5Adapter:
             _recurrent_bytes=self._recurrent_state_bytes(cache_list)
         )
 
+    def decode_step_multi(
+        self, tokens: mx.array, kv_handle: KVHandle
+    ) -> tuple[mx.array, StateDelta]:
+        # D-021 step 5 sub-unit (a2) contract slice — the Qwen3.5 hybrid
+        # multi-token verify forward needs DeltaNet T-step recurrent
+        # advancement aligned with full-attention batched forward; that
+        # lands in the dedicated hybrid sub-slice. Until then callers
+        # route through ``silica.speculative.verify.run_verify_forward``
+        # for a sequential ``decode_step`` fallback. Inherited by
+        # ``Qwen3_5MoeAdapter``.
+        raise NotImplementedError(
+            "Qwen3_5Adapter.decode_step_multi: stub at D-021 step 5 sub-"
+            "unit (a2) contract slice — hybrid DeltaNet + GQA forward "
+            "lands in the hybrid sub-slice; use "
+            "silica.speculative.verify.run_verify_forward for the "
+            "temporary decode_step-loop fallback."
+        )
+
     # --- P-5-F F.1: PreNormCaptureAdapter implementation ---
 
     def install_pre_norm_capture(

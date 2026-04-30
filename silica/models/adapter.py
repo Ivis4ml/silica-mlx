@@ -177,6 +177,10 @@ class ModelAdapter(Protocol):
         self, token: mx.array, kv_handle: KVHandle
     ) -> tuple[mx.array, StateDelta]: ...
 
+    def decode_step_multi(
+        self, tokens: mx.array, kv_handle: KVHandle
+    ) -> tuple[mx.array, StateDelta]: ...
+
     def capabilities(self) -> ModelCapabilities: ...
 
 
@@ -252,6 +256,18 @@ class StubModelAdapter:
         self, token: mx.array, kv_handle: KVHandle
     ) -> tuple[mx.array, StateDelta]:
         logits = mx.zeros((self.config.vocab_size,), dtype=mx.float16)
+        return logits, StateDelta()
+
+    def decode_step_multi(
+        self, tokens: mx.array, kv_handle: KVHandle
+    ) -> tuple[mx.array, StateDelta]:
+        # D-021 step 5 sub-unit (a2): the spec engine's verify forward
+        # consumes ``T`` tokens and reads logits at every input position.
+        # Returns ``(T, V)`` zero logits to satisfy the shape contract;
+        # `tokens.size` may be 0 only if the caller is misusing the API
+        # (verify_input must be non-empty per `run_verify_forward`).
+        T = int(tokens.size)
+        logits = mx.zeros((T, self.config.vocab_size), dtype=mx.float16)
         return logits, StateDelta()
 
     def capabilities(self) -> ModelCapabilities:

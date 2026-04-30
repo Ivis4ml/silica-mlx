@@ -150,6 +150,21 @@ class Qwen3Adapter:
         logits = forward(self._model, token, cache_list)
         return logits, StateDelta()
 
+    def decode_step_multi(
+        self, tokens: mx.array, kv_handle: KVHandle
+    ) -> tuple[mx.array, StateDelta]:
+        # D-021 step 5 sub-unit (a2) contract slice — Qwen3-family forward
+        # for the multi-token verify path lands in a follow-up plain-adapter
+        # slice. Until then, callers should route through
+        # ``silica.speculative.verify.run_verify_forward``, which catches
+        # this raise and falls back to a sequential ``decode_step`` loop.
+        raise NotImplementedError(
+            "Qwen3Adapter.decode_step_multi: stub at D-021 step 5 sub-unit "
+            "(a2) contract slice — adapter forward lands in a follow-up "
+            "slice; use silica.speculative.verify.run_verify_forward for "
+            "the temporary decode_step-loop fallback."
+        )
+
     # --- P-5-F F.1: PreNormCaptureAdapter implementation ---
 
     def install_pre_norm_capture(
