@@ -19,8 +19,8 @@ locked in ``plans/P6_SPEC_FOUNDATION_C_ORIENTATION.md`` §5:
     ``silica/engine/__init__.py:283-305``: full-accept / partial /
     full-reject / fewer-than-γ / stop-token mid-yield / max_tokens
     mid-yield all key on yielded_count, not verifier accept_len.
-  - Slice-1 scope: B=1 spec-on. Multi-row spec-active raises
-    ``NotImplementedError("D-021 (c) slice 2b ...")``.
+  - Slice-2b scope: B>1 spec-on cohorts run one padded verify forward
+    and trim per row with ``right_padding=[...]``.
 
 Spec-off byte-identical regression is covered by the existing
 ``tests/test_batcher.py`` fixtures running unchanged on this
@@ -65,11 +65,12 @@ _HEAD_DIM = 4
 class _SpecScriptedModel:
     """Per-call scripted model.
 
-    Each script entry is a sequence of length ``T`` of per-position
-    argmax targets; the model returns ``(B, T, V)`` one-hot logits at
-    those targets and grows the (single-layer) BatchKVCache by ``T``
-    positions of zeros so the cache's offset / _idx ledger advances
-    realistically. ``B`` is always 1 in slice 1.
+    Each script entry is either a sequence of length ``T`` of
+    per-position argmax targets (broadcast to every row), or a
+    ``B``-length sequence of ``T``-length per-row target sequences. The
+    model returns ``(B, T, V)`` one-hot logits at those targets and grows
+    the (single-layer) BatchKVCache by ``T`` positions of zeros so the
+    cache's offset / _idx ledger advances realistically.
 
     The test fixture pre-populates the script with one entry per
     forward the batcher will issue: typically one prefill entry of
@@ -77,28 +78,31 @@ class _SpecScriptedModel:
     ``T = verify_k`` per decode step.
     """
 
-    def __init__(
-        self, script: Sequence[Sequence[int]] | list[list[int]]
-    ) -> None:
-        self.script: list[list[int]] = [list(s) for s in script]
+    def __init__(self, script: Sequence[Any]) -> None:
+        self.script: list[Any] = [list(s) for s in script]
         self.calls = 0
         self.recorded_inputs: list[list[int]] = []
+        self.recorded_inputs_batched: list[list[list[int]]] = []
 
     def __call__(
         self, tokens: mx.array, cache: list[Any] | None = None
     ) -> mx.array:
         self.calls += 1
         B, T = tokens.shape
-        # B=1 in slice 1; record token sequence for verify-input asserts.
-        flat: list[int] = []
+        # Keep the legacy first-row recording and also retain the whole
+        # batch for slice-2b assertions.
+        rows: list[list[int]] = []
         raw = tokens.tolist()
         if isinstance(raw, list) and raw and isinstance(raw[0], list):
-            inner = raw[0]
-            assert isinstance(inner, list)
-            for x in inner:
-                assert isinstance(x, int | float)
-                flat.append(int(x))
-        self.recorded_inputs.append(flat)
+            for inner in raw:
+                assert isinstance(inner, list)
+                row: list[int] = []
+                for x in inner:
+                    assert isinstance(x, int | float)
+                    row.append(int(x))
+                rows.append(row)
+        self.recorded_inputs_batched.append(rows)
+        self.recorded_inputs.append(rows[0] if rows else [])
 
         # Advance the (single) BatchKVCache so the offset ledger stays
         # honest. Slice-1 GLOBAL-only gate guarantees layer 0 is the
@@ -113,16 +117,28 @@ class _SpecScriptedModel:
                 f"_SpecScriptedModel script exhausted at call {self.calls}; "
                 f"expected another entry of length T={T}"
             )
-        targets = self.script.pop(0)
-        if len(targets) != T:
+        targets_raw = self.script.pop(0)
+        if targets_raw and isinstance(targets_raw[0], (list, tuple)):
+            targets_by_row = [list(row) for row in targets_raw]
+            if len(targets_by_row) != B:
+                raise AssertionError(
+                    f"script entry has {len(targets_by_row)} rows but "
+                    f"forward received B={B}"
+                )
+        else:
+            targets = list(targets_raw)
+            targets_by_row = [targets for _ in range(B)]
+        if any(len(row) != T for row in targets_by_row):
             raise AssertionError(
-                f"script entry has {len(targets)} targets but forward "
+                f"script entry has row lengths "
+                f"{[len(row) for row in targets_by_row]} but forward "
                 f"received T={T}"
             )
-        # Build (B=1, T, V) one-hot logits at per-position targets.
+        # Build (B, T, V) one-hot logits at per-position targets.
         logits = mx.zeros((B, T, _VOCAB), dtype=mx.float32)
-        for t, tgt in enumerate(targets):
-            logits[0, t, tgt] = 1.0
+        for b, targets in enumerate(targets_by_row):
+            for t, tgt in enumerate(targets):
+                logits[b, t, tgt] = 1.0
         return logits
 
 
@@ -131,7 +147,7 @@ class _SpecScriptedAdapter:
 
     def __init__(
         self,
-        script: Sequence[Sequence[int]],
+        script: Sequence[Any],
         *,
         n_layers: int = 1,
         attention_pattern: AttentionPattern | None = None,
@@ -235,6 +251,7 @@ class _ScriptedDraftEngine:
         # commit-side stale-ctx finding).
         self.commit_output_ids: list[list[int]] = []
         self.reset_calls: int = 0
+        self.reset_req_ids: list[str | None] = []
 
     def propose(self, ctx: RequestState, k: int) -> DraftTokens:
         # Pin the transient ctx shape: token_ids tuple, the
@@ -256,8 +273,9 @@ class _ScriptedDraftEngine:
         self.commits.append(accepted_len)
         self.commit_output_ids.append(list(ctx.output_token_ids))
 
-    def reset(self) -> None:
+    def reset(self, req_id: str | None = None) -> None:
         self.reset_calls += 1
+        self.reset_req_ids.append(req_id)
 
 
 def _greedy(
@@ -274,6 +292,15 @@ def _drain_tokens(events: Sequence[BatchEvent]) -> list[int]:
         if e.kind == "token":
             assert e.token_id is not None
             out.append(e.token_id)
+    return out
+
+
+def _tokens_by_req(events: Sequence[BatchEvent]) -> dict[int, list[int]]:
+    out: dict[int, list[int]] = {}
+    for e in events:
+        if e.kind == "token":
+            assert e.token_id is not None
+            out.setdefault(e.req_index, []).append(e.token_id)
     return out
 
 
@@ -355,18 +382,21 @@ def test_global_only_gate_admits_hybrid_deltanet_under_spec_off() -> None:
     ContinuousBatcher(adapter)
 
 
-# --- Slice-1 scope guard ----------------------------------------------------
+# --- Slice-2b multi-row cohort -----------------------------------------------
 
 
-def test_multi_row_spec_active_raises_with_slice_2b_marker() -> None:
-    """B>1 spec-active raises ``NotImplementedError`` with slice-2b text."""
-    # Prefill targets first sample for both rows (T=1 each, broadcast
-    # via per-row script). Cohort prep batches to (B=2, T=1) prefill.
+def test_multi_row_spec_active_runs_one_padded_verify_forward() -> None:
+    """B>1 spec-active rows verify together and trim independently."""
     adapter = _SpecScriptedAdapter(
-        script=[[7, 7]],  # one prefill entry, B=2 rows expect targets
+        script=[
+            [[40, 40], [50, 50]],                    # prefill B=2, T=2
+            [[101, 102, 103, 200], [201, 999, 203, 300]],
+        ],
         n_layers=1,
     )
-    drafter = _ScriptedDraftEngine(proposes=[(8, 9, 10)])
+    drafter = _ScriptedDraftEngine(
+        proposes=[(101, 102, 103), (201, 202, 203)]
+    )
     batcher = ContinuousBatcher(
         adapter,
         draft_engine=drafter,
@@ -375,13 +405,66 @@ def test_multi_row_spec_active_raises_with_slice_2b_marker() -> None:
     )
     batcher.add_request(0, [1, 2], _greedy())
     batcher.add_request(1, [3, 4], _greedy())
-    # The first step runs prefill; the second step would run spec
-    # decode on B=2 rows — that is the call that must raise.
     batcher.step()  # prefill
-    with pytest.raises(
-        NotImplementedError, match=r"slice 2b — multi-row"
-    ):
-        batcher.step()
+    decode_events = batcher.step()
+
+    assert _tokens_by_req(decode_events) == {
+        0: [101, 102, 103, 200],
+        1: [201, 999],
+    }
+    assert drafter.commits == [3, 1]
+    assert drafter.commit_output_ids == [
+        [40, 101, 102, 103],
+        [50, 201],
+    ]
+    # Both rows shared one (B=2, T=4) verify forward. Row 1's rejected
+    # tail rolls back by 2 while row 0 keeps the whole verify slice.
+    assert adapter._model.recorded_inputs_batched[1] == [
+        [40, 101, 102, 103],
+        [50, 201, 202, 203],
+    ]
+    cache = batcher._batch_cache
+    assert cache is not None
+    layer = cache[0]
+    assert [int(x) for x in layer.offset.tolist()] == [6, 4]
+    assert [int(x) for x in layer.left_padding.tolist()] == [0, 2]
+    assert [ctx[3] for ctx in drafter.recorded_ctx] == ["req-0", "req-1"]
+
+
+def test_multi_row_reclaim_resets_only_terminated_req_id() -> None:
+    """A terminal row reset must not clear another active row's draft KV."""
+    adapter = _SpecScriptedAdapter(
+        script=[
+            [[42, 42], [52, 52]],                    # prefill B=2
+            [[66, 67, 68, 200], [201, 202, 203, 300]],
+            [301, 302, 303, 400],                    # surviving req-1
+        ],
+        n_layers=1,
+    )
+    drafter = _ScriptedDraftEngine(
+        proposes=[
+            (66, 67, 68),       # req-0: stop on first accepted draft
+            (201, 202, 203),    # req-1: survives
+            (301, 302, 303),    # req-1 after req-0 reclaim
+        ]
+    )
+    batcher = ContinuousBatcher(
+        adapter,
+        draft_engine=drafter,
+        verify_k=4,
+        max_batch_size=2,
+    )
+    batcher.add_request(0, [1, 2], _greedy(stop=(66,)))
+    batcher.add_request(1, [3, 4], _greedy(max_tokens=16))
+    batcher.step()  # prefill
+    first_decode = batcher.step()
+    assert _drain_dones(first_decode) == ["stop_token"]
+
+    second_decode = batcher.step()  # reclaim req-0, then decode req-1
+    assert drafter.reset_req_ids == ["req-0"]
+    assert _tokens_by_req(second_decode) == {
+        1: [301, 302, 303, 400],
+    }
 
 
 # --- Single-cycle contract pins ---------------------------------------------
@@ -777,6 +860,7 @@ def test_terminal_reclaim_resets_draft_engine() -> None:
     # Next step triggers _reclaim_terminated which fires reset.
     batcher.step()
     assert drafter.reset_calls == 1
+    assert drafter.reset_req_ids == ["req-0"]
 
 
 def test_terminal_reclaim_does_not_reset_under_spec_off() -> None:

@@ -207,7 +207,7 @@ class _BatchRow:
     # live cache as before. Empty for legacy ``pre_norm=False`` rows
     # so the memory cost is bounded to active (3b) deployments.
     k_pre_per_block: dict[int, list[mx.array]] = field(default_factory=dict)
-    # D-021 step 5 sub-unit (c) slice-1 spec scratch state. All three
+    # D-021 step 5 sub-unit (c) spec scratch state. All three
     # fields populate inside ``_decode_phase_spec`` and reset to their
     # default-empty values at the end of each cycle. They sit on the row
     # rather than as locals so future slices (2b multi-row cohort, 3
@@ -223,13 +223,13 @@ class _BatchRow:
 class ContinuousBatcher:
     """P-2 scheduler step loop — Units 16a (B=1) + 16b (fixed-cohort B>1).
 
-    D-021 step 5 sub-unit (c) slice 1 (added 2026-04-30) extends the
+    D-021 step 5 sub-unit (c) (added 2026-04-30) extends the
     constructor with optional ``draft_engine`` + ``verify_k`` kwargs to
     drive speculative decoding through the existing decode phase. The
     spec-active path is gated to ``attention_kinds == {GLOBAL}`` (slice-1
     constraint per ``plans/P6_SPEC_FOUNDATION_C_ORIENTATION.md`` [F-4] /
-    O-6) and currently supports only B=1 spec-on cohorts; multi-row
-    spec-active raises ``NotImplementedError`` with a slice-2b marker.
+    O-6) and supports B>1 cohorts via one padded verify forward plus
+    per-row right-padding rollback (slice 2b).
     Default ``draft_engine=None`` resolves to ``NoopDraftEngine`` so
     every existing call site remains spec-off and byte-identical.
     """
@@ -714,18 +714,16 @@ class ContinuousBatcher:
             for row_idx in terminated:
                 self._budgeter.release(self._rows[row_idx].req_id)
 
-        # D-021 step 5 sub-unit (c) slice 1: drop draft-side state for
+        # D-021 step 5 sub-unit (c): drop draft-side state for
         # the terminating row. ``DraftTargetEngine.reset`` releases the
         # draft's KV slot and zeros its bookkeeping; without it the
         # next admitted row (queued or via a later ``add_request``
         # cycle) would inherit the prior request's ``_draft_kv_pos``
         # and produce wrong drafts from cycle 0. Mirrors
-        # ``Engine._drive``'s ``finally`` cleanup at
-        # ``silica/engine/__init__.py:138-141``. Slice-1 keeps a
-        # single ``DraftEngine`` instance, so a per-row reset on the
-        # shared instance is correct under the B=1 spec-active
-        # constraint; slice 2a's per-``req_id`` refactor adds a
-        # ``reset(req_id)`` overload to support multi-row reuse.
+        # ``Engine._drive``'s ``finally`` cleanup. Slice 2a made
+        # ``DraftTargetEngine`` per-``req_id`` keyed, so reclaim must
+        # reset exactly the terminated rows and leave surviving rows'
+        # draft KV intact.
         # ``reset`` is not on the I-5 Protocol surface (it is a
         # lifecycle convenience on ``DraftTargetEngine``); guard via
         # ``getattr`` so ``NoopDraftEngine`` and any other Protocol
@@ -735,7 +733,8 @@ class ContinuousBatcher:
         if self._spec_active() and terminated:
             reset = getattr(self._draft_engine, "reset", None)
             if reset is not None:
-                reset()
+                for row_idx in terminated:
+                    reset(self._rows[row_idx].req_id)
 
         if not kept:
             # Every row terminated in the last step. The batched cache
@@ -1701,232 +1700,182 @@ class ContinuousBatcher:
         return self._sample_and_emit_batched(logits, is_prefill=False)
 
     def _decode_phase_spec(self) -> list[BatchEvent]:
-        """Spec-active decode phase — D-021 step 5 sub-unit (c) slice 1.
+        """Spec-active decode phase — D-021 step 5 sub-unit (c).
 
-        Slice-1 scope: B=1 spec-on. Multi-row spec-active raises
-        ``NotImplementedError`` with a slice-2b marker so a future
-        cohort that exercises the wrong shape fails loud.
+        Slice 2b widens the slice-1 B=1 helper to an arbitrary
+        GLOBAL-only cohort. Every row gets one verify input of fixed
+        width ``verify_k``:
 
-        Per-cycle structure (mirrors ``Engine._drive``'s spec branch
-        at ``silica/engine/__init__.py:200-321``):
+        ``[anchor] + drafts[:γ] + pad`` where ``γ = verify_k - 1``.
 
-          1. Build a transient ``RequestState`` (per O-5 / [F-1]) so
-             ``DraftEngine.propose`` sees ``prompt + emitted history``
-             without mutating the persistent ``row.state``.
-          2. ``draft_engine.propose(ctx, γ)`` returns up to γ drafts.
-             Reject ``> γ`` loud (Protocol violation).
-          3. Build ``verify_input`` of length ``verify_k = γ + 1``,
-             padding with ``_pad_token_id`` when the drafter returned
-             fewer than γ. Run one ``forward_batched_full`` over
-             ``(1, verify_k)`` and slice to ``(verify_k, V)``.
-          4. ``greedy_verify(drafts, verify_logits)`` counts accepted
-             drafts; the per-cycle yield emits up to ``accepted_len``
-             accepted drafts capped by ``max_tokens`` / stop-token.
-          5. Per-row right-padding rollback: trim the live cache by
-             ``(verify_k - 1) - yielded_count`` positions via
-             ``BatchKVCache.prepare(right_padding=...) + finalize()``.
-             The ``(verify_k - 1) - yielded_count`` formula unifies
-             rejected drafts and pad slots into a single trim count
-             ([F-5]).
-          6. ``draft_engine.commit(ctx, yielded_count)`` keys the
-             drafter on the engine-side committed count, NOT verifier
-             ``accepted_len`` — matches the sub-unit (b) fix at
-             ``silica/engine/__init__.py:283-305``.
-          7. Sample the bonus token from ``verify_logits[bonus_idx]``;
-             on partial accept ``bonus_idx = yielded_count`` (the
-             rejected draft's slot), on full accept of the returned
-             drafts ``bonus_idx = draft_count`` (prediction past the
-             last accepted draft, regardless of pad-slot count).
+        The single ``forward_batched_full`` call advances every row's
+        target KV by ``verify_k`` positions. We then compute each row's
+        ``yielded_count`` independently and issue one per-layer
+        ``prepare(right_padding=[...]) + finalize()`` pass with
+        ``right_padding_i = γ - yielded_count_i``. That trims rejected
+        drafts and pad slots while preserving rows that accepted all
+        drafts.
 
-        The spec-off path is structurally inaccessible from here —
-        ``_decode_phase`` only routes to this helper when
-        ``_spec_active`` is True.
+        Event ordering note: accepted draft tokens are emitted during
+        the per-row verify/yield pass, while bonus tokens are emitted in
+        a tail pass after the shared right-trim and drafter commits. The
+        batched trim must happen before bonus sampling so every row's
+        target KV is back at its committed prefix first.
         """
         assert self._batch_cache is not None
-
-        if len(self._rows) > 1:
-            raise NotImplementedError(
-                f"D-021 (c) slice 2b — multi-row spec cohort. Slice 1 "
-                f"supports B=1 spec-on only; got {len(self._rows)} "
-                f"active rows. See "
-                f"plans/P6_SPEC_FOUNDATION_C_ORIENTATION.md §5."
-            )
         if not self._rows:
             return []
-        row = self._rows[0]
-        # ``_decode_phase`` only runs when ``has_active`` is True and
-        # no row is PREFILL; ``_reclaim_terminated`` has already
-        # dropped terminal rows. The defensive guard below handles
-        # an unexpected race (e.g. external mutation between phases)
-        # by returning empty events rather than feeding a forward
-        # over a stale row.
-        if row.state.is_terminal:
+        # ``_reclaim_terminated`` runs before decode, so terminal rows
+        # should not be present. If external mutation creates one, avoid
+        # feeding stale rows through a verify forward.
+        if any(row.state.is_terminal for row in self._rows):
             return []
 
-        # [F-1] / O-5: transient ctx. ``row.state`` stays untouched.
-        ctx = RequestState(
-            request=Request(
-                prompt="",
-                sampling_params=row.params,
-                request_id=row.req_id,
-                token_ids=tuple(row.prompt_ids),
-            ),
-        )
-        ctx.output_token_ids = list(row.generated)
-
-        # Anchor = last sampled token (cycle 0: first prefill sample;
-        # subsequent cycles: previous cycle's bonus). ``row.generated``
-        # is non-empty here because ``_prefill_phase`` populated it
-        # before the first ``_decode_phase`` runs.
-        anchor = row.generated[-1]
-        row.pending_anchor = anchor
-
-        # Step 2 — propose γ drafts, validate the count.
         gamma = self._verify_k - 1
-        drafts = self._draft_engine.propose(ctx, gamma)
-        draft_count = len(drafts.token_ids)
-        if draft_count > gamma:
-            raise RuntimeError(
-                f"draft engine returned {draft_count} drafts but the "
-                f"batcher asked for at most γ = {gamma} (verify_k - 1); "
-                f"propose contract is 'up to k' "
-                f"(silica/speculative/engine.py I-5 docstring)."
-            )
-        row.pending_drafts = tuple(drafts.token_ids)
-        row.last_propose_count = draft_count
-
-        # Step 3 — build the (1, verify_k) input, pad with the same
-        # placeholder ``_decode_phase`` uses for terminated slots so
-        # the model sees a uniform pad token.
         pad_id = self._pad_token_id()
-        verify_tokens = (
-            [anchor]
-            + list(drafts.token_ids)
-            + [pad_id] * (gamma - draft_count)
-        )
-        assert len(verify_tokens) == self._verify_k
-        verify_input = mx.array(verify_tokens, dtype=mx.int32)[None]
+
+        ctxs: list[RequestState] = []
+        draft_ids_by_row: list[tuple[int, ...]] = []
+        draft_counts: list[int] = []
+        verify_rows: list[list[int]] = []
+
+        for row in self._rows:
+            # [F-1] / O-5: transient ctx. ``row.state`` stays untouched.
+            ctx = RequestState(
+                request=Request(
+                    prompt="",
+                    sampling_params=row.params,
+                    request_id=row.req_id,
+                    token_ids=tuple(row.prompt_ids),
+                ),
+            )
+            ctx.output_token_ids = list(row.generated)
+            ctxs.append(ctx)
+
+            # Anchor = last sampled token (cycle 0: first prefill sample;
+            # subsequent cycles: previous cycle's bonus).
+            anchor = row.generated[-1]
+            row.pending_anchor = anchor
+
+            drafts = self._draft_engine.propose(ctx, gamma)
+            draft_ids = tuple(drafts.token_ids)
+            draft_count = len(draft_ids)
+            if draft_count > gamma:
+                raise RuntimeError(
+                    f"draft engine returned {draft_count} drafts but the "
+                    f"batcher asked for at most γ = {gamma} (verify_k - 1); "
+                    f"propose contract is 'up to k' "
+                    f"(silica/speculative/engine.py I-5 docstring)."
+                )
+            row.pending_drafts = draft_ids
+            row.last_propose_count = draft_count
+            draft_ids_by_row.append(draft_ids)
+            draft_counts.append(draft_count)
+
+            verify_tokens = (
+                [anchor] + list(draft_ids) + [pad_id] * (gamma - draft_count)
+            )
+            assert len(verify_tokens) == self._verify_k
+            verify_rows.append(verify_tokens)
+
+        verify_input = mx.array(verify_rows, dtype=mx.int32)
         verify_logits_full = forward_batched_full(
             self._model, verify_input, list(self._batch_cache)
-        )  # (1, verify_k, V)
-        verify_logits = verify_logits_full[0]  # (verify_k, V)
+        )  # (B, verify_k, V)
 
-        # Step 4 — greedy verify on the actual draft_count drafts.
-        # The pad-slot logits at indices [draft_count + 1, verify_k)
-        # are ignored.
-        accepted_len = greedy_verify(drafts.token_ids, verify_logits)
-
-        # Yield up to ``accepted_len`` drafts; cap by ``max_tokens``
-        # and bail on a stop token mid-yield. ``yielded_count`` is
-        # the engine-level count both KV rollback and
-        # ``draft_engine.commit`` key on, NOT ``accepted_len``.
         events: list[BatchEvent] = []
-        yielded_count = 0
-        stop_hit = False
-        for j in range(accepted_len):
-            if len(row.generated) >= row.params.max_tokens:
-                row.state.transition(
-                    RequestStatus.DONE, reason="max_tokens"
+        right_padding: list[int] = []
+        commit_items: list[tuple[_BatchRow, RequestState, int]] = []
+        bonus_items: list[tuple[_BatchRow, mx.array, int, int]] = []
+
+        for row, ctx, draft_ids, draft_count, verify_logits in zip(
+            self._rows,
+            ctxs,
+            draft_ids_by_row,
+            draft_counts,
+            verify_logits_full,
+            strict=True,
+        ):
+            accepted_len = greedy_verify(draft_ids, verify_logits)
+            yielded_count = 0
+            row_halted = False
+
+            for j in range(accepted_len):
+                if len(row.generated) >= row.params.max_tokens:
+                    row.state.transition(
+                        RequestStatus.DONE, reason="max_tokens"
+                    )
+                    events.append(BatchEvent.done(row.req_index, "max_tokens"))
+                    row_halted = True
+                    break
+                accepted_tok = draft_ids[j]
+                row.generated.append(accepted_tok)
+                events.append(BatchEvent.token(row.req_index, accepted_tok))
+                yielded_count += 1
+                if accepted_tok in row.params.stop_token_ids:
+                    row.state.transition(
+                        RequestStatus.DONE, reason="stop_token"
+                    )
+                    events.append(BatchEvent.done(row.req_index, "stop_token"))
+                    row_halted = True
+                    break
+                if len(row.generated) >= row.params.max_tokens:
+                    row.state.transition(
+                        RequestStatus.DONE, reason="max_tokens"
+                    )
+                    events.append(BatchEvent.done(row.req_index, "max_tokens"))
+                    row_halted = True
+                    break
+
+            right_padding.append(gamma - yielded_count)
+            ctx.output_token_ids = list(row.generated)
+            commit_items.append((row, ctx, yielded_count))
+            if not row_halted:
+                bonus_items.append(
+                    (row, verify_logits, yielded_count, draft_count)
                 )
-                events.append(
-                    BatchEvent.done(row.req_index, "max_tokens")
-                )
-                stop_hit = True
-                break
-            accepted_tok = drafts.token_ids[j]
-            row.generated.append(accepted_tok)
-            events.append(BatchEvent.token(row.req_index, accepted_tok))
-            yielded_count += 1
-            if accepted_tok in row.params.stop_token_ids:
+
+        if max(right_padding, default=0) > 0:
+            for layer_cache in self._batch_cache:
+                # Slice 2b remains under the GLOBAL-only gate, so every
+                # layer exposes BatchKVCache's per-row right_padding
+                # primitive. Hybrid / sliding cache rollback lands later.
+                layer_cache.prepare(right_padding=right_padding)
+                layer_cache.finalize()
+
+        for row, ctx, yielded_count in commit_items:
+            self._draft_engine.commit(ctx, yielded_count)
+            row.pending_anchor = None
+            row.pending_drafts = ()
+            row.last_propose_count = 0
+
+        for row, verify_logits, yielded_count, draft_count in bonus_items:
+            bonus_idx = (
+                yielded_count
+                if yielded_count < draft_count
+                else draft_count
+            )
+            bonus_logits = verify_logits[bonus_idx]  # (V,)
+            history = mx.array(
+                list(row.prompt_ids) + list(row.generated), dtype=mx.int32
+            )
+            bonus_scalar = self._sampler.sample(
+                bonus_logits, history, row.params
+            )
+            bonus = int(bonus_scalar.item())
+            row.generated.append(bonus)
+            events.append(BatchEvent.token(row.req_index, bonus))
+
+            if bonus in row.params.stop_token_ids:
                 row.state.transition(
                     RequestStatus.DONE, reason="stop_token"
                 )
-                events.append(
-                    BatchEvent.done(row.req_index, "stop_token")
-                )
-                stop_hit = True
-                break
-            if len(row.generated) >= row.params.max_tokens:
+                events.append(BatchEvent.done(row.req_index, "stop_token"))
+            elif len(row.generated) >= row.params.max_tokens:
                 row.state.transition(
                     RequestStatus.DONE, reason="max_tokens"
                 )
-                events.append(
-                    BatchEvent.done(row.req_index, "max_tokens")
-                )
-                stop_hit = True
-                break
-
-        # Step 5 — per-row right-padding rollback. The ``(verify_k - 1)
-        # - yielded_count`` formula unifies rejected drafts and pad
-        # slots; ``max(...) > 0`` short-circuits the no-op case so a
-        # full-accept cycle is byte-identical to no rollback at all.
-        right_padding = (self._verify_k - 1) - yielded_count
-        if right_padding > 0:
-            for layer_cache in self._batch_cache:
-                # B=1 cohort: single-element list. Layers may be
-                # heterogeneous (BatchKVCache + ArraysCache + ...) in
-                # later slices; the slice-1 GLOBAL-only gate
-                # guarantees every layer is BatchKVCache here.
-                layer_cache.prepare(right_padding=[right_padding])
-                layer_cache.finalize()
-
-        # Step 6 — drafter commit keys on yielded_count. Slice-1
-        # ``DraftTargetEngine`` commit also rolls the draft's own KV
-        # by ``γ - yielded_count`` (silica/speculative/draft_target.py:
-        # 222-242), keeping draft and target in lockstep. Sync ctx's
-        # ``output_token_ids`` to ``row.generated`` first so the
-        # drafter sees the post-yield committed history (the engine
-        # path mirrors this at silica/engine/__init__.py:268: every
-        # accepted draft is appended to ``ctx.output_token_ids``
-        # before commit fires). ``DraftTargetEngine.commit`` ignores
-        # ``ctx`` today, but the I-5 Protocol surface includes it
-        # explicitly and slice 2a's per-``req_id`` refactor will
-        # consume it.
-        ctx.output_token_ids = list(row.generated)
-        self._draft_engine.commit(ctx, yielded_count)
-
-        # Reset the per-cycle scratch fields so the next cycle (or a
-        # spec-off restart on a fresh row) sees a clean state.
-        row.pending_anchor = None
-        row.pending_drafts = ()
-        row.last_propose_count = 0
-
-        if stop_hit:
-            return events
-
-        # Step 7 — sample the bonus token. Partial accept: bonus from
-        # the rejected draft's slot (``verify_logits[yielded_count]``).
-        # Full accept of all returned drafts: bonus from the prediction
-        # past the last accepted draft (``verify_logits[draft_count]``).
-        # Mirrors silica/engine/__init__.py:301-305 modulo the
-        # ``draft_count`` rename (the engine uses ``verify_input.size
-        # - 1`` which equals ``draft_count`` since it does not pad).
-        bonus_idx = (
-            yielded_count
-            if yielded_count < draft_count
-            else draft_count
-        )
-        bonus_logits = verify_logits[bonus_idx]  # (V,)
-        history = mx.array(
-            list(row.prompt_ids) + list(row.generated), dtype=mx.int32
-        )
-        bonus_scalar = self._sampler.sample(
-            bonus_logits, history, row.params
-        )
-        bonus = int(bonus_scalar.item())
-        row.generated.append(bonus)
-        events.append(BatchEvent.token(row.req_index, bonus))
-
-        if bonus in row.params.stop_token_ids:
-            row.state.transition(
-                RequestStatus.DONE, reason="stop_token"
-            )
-            events.append(BatchEvent.done(row.req_index, "stop_token"))
-        elif len(row.generated) >= row.params.max_tokens:
-            row.state.transition(
-                RequestStatus.DONE, reason="max_tokens"
-            )
-            events.append(BatchEvent.done(row.req_index, "max_tokens"))
+                events.append(BatchEvent.done(row.req_index, "max_tokens"))
 
         return events
 

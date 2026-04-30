@@ -138,7 +138,7 @@ class Engine:
             # Protocol conformer without a reset method still work.
             reset = getattr(self._draft_engine, "reset", None)
             if reset is not None:
-                reset()
+                reset(handle.req_id)
 
     # --- private ---
 

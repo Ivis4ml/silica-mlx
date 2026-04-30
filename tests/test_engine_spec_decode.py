@@ -176,6 +176,7 @@ class _ScriptedDraftEngine:
         self.propose_calls: list[int] = []  # γ values
         self.commit_calls: list[int] = []  # accepted_len values
         self.reset_calls: int = 0
+        self.reset_req_ids: list[str | None] = []
 
     def propose(self, ctx: RequestState, k: int) -> DraftTokens:
         self.propose_calls.append(int(k))
@@ -190,8 +191,9 @@ class _ScriptedDraftEngine:
     def commit(self, ctx: RequestState, accepted_len: int) -> None:
         self.commit_calls.append(int(accepted_len))
 
-    def reset(self) -> None:
+    def reset(self, req_id: str | None = None) -> None:
         self.reset_calls += 1
+        self.reset_req_ids.append(req_id)
 
 
 class _TrackedKVManager(NullKVManager):
@@ -504,8 +506,10 @@ def test_draft_engine_reset_called_on_finally() -> None:
     engine = Engine(adapter, kv, draft_engine=drafter, verify_k=4)
     list(engine.generate("hi", _greedy(max_tokens=1)))
     assert drafter.reset_calls == 1
+    assert drafter.reset_req_ids == ["req-0"]
     # Run a second generate; reset must run again.
     adapter2 = _ScriptedSpecAdapter(prefill_argmax=0)
     engine2 = Engine(adapter2, _TrackedKVManager(), draft_engine=drafter)
     list(engine2.generate("hi", _greedy(max_tokens=1)))
     assert drafter.reset_calls == 2
+    assert drafter.reset_req_ids == ["req-0", "req-0"]
