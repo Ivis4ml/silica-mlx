@@ -1,0 +1,506 @@
+"""Tests for ``Engine`` speculative-decode wiring (D-021 step 5 sub-unit b).
+
+Single-request engine main-loop integration. Covers:
+  - Spec-off (default ``NoopDraftEngine``) byte-identical to the
+    pre-spec single-token decode loop.
+  - Full accept: γ drafts all match target argmax; engine yields γ + 1
+    tokens, KV rollback not called, ``commit(γ)`` invoked.
+  - Partial accept: j < γ drafts match; engine yields j drafts + 1
+    bonus, ``rollback(γ - j)`` called, ``commit(j)`` invoked.
+  - Full reject: 0 drafts match; engine yields 1 bonus, ``rollback(γ)``
+    called, ``commit(0)`` invoked.
+  - max_tokens cap mid-accept: yielded_count < accepted_len; KV
+    rollback covers (γ - yielded_count); no bonus sampled.
+  - Stop token mid-accept: same KV bookkeeping; no bonus.
+  - Spec + temperature > 0 raises NotImplementedError.
+  - Engine constructor rejects verify_k < 1.
+  - Draft engine ``reset`` called at generate-cleanup.
+
+Uses synthetic adapter + draft engine — no real model. Real-model
+parity is sub-unit (f); this slice pins the wiring contract only.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterator, Sequence
+from typing import Any
+
+import mlx.core as mx
+import pytest
+
+from silica.core.events import BatchEvent  # noqa: F401 — keeps import order stable
+from silica.core.request import RequestState
+from silica.core.sampling import SamplingParams
+from silica.engine import Engine, _greedy_verify
+from silica.kvcache.manager import (
+    BlockList,
+    KVHandle,
+    MemoryBudget,
+    NullKVManager,
+    PrefixHit,
+)
+from silica.models.adapter import (
+    AttentionKind,
+    AttentionPattern,
+    KVLayout,
+    ModelConfig,
+    StateDelta,
+)
+from silica.models.capabilities import capabilities_from_attention_pattern
+from silica.speculative.engine import DraftTokens, NoopDraftEngine
+
+# --- shared fakes ----------------------------------------------------------
+
+
+class _ScriptedTokenizer:
+    """Tokenizer that returns a fixed token list for any non-empty prompt."""
+
+    def __init__(self, ids: Sequence[int] = (10, 11)) -> None:
+        self._ids = list(ids)
+
+    def encode(self, text: str) -> list[int]:
+        return [] if text == "" else list(self._ids)
+
+    def decode(self, ids: Any) -> str:
+        return ""
+
+
+class _ScriptedSpecAdapter:
+    """Fake adapter that returns peaked logits scripted per call type.
+
+    ``prefill`` consumes the next ``prefill_logits[i]``; ``decode_step``
+    consumes the next ``decode_logits[i]``; ``decode_step_multi``
+    consumes the next ``verify_logits[i]`` — a ``(T, V)`` array
+    constructed from per-position argmax targets the test specifies.
+    """
+
+    VOCAB = 1024
+
+    def __init__(
+        self,
+        *,
+        prefill_argmax: int,
+        decode_argmaxes: Sequence[int] = (),
+        verify_logits: Sequence[Sequence[int]] = (),
+    ) -> None:
+        # ``verify_logits`` is a list of per-call argmax targets, one
+        # per ``decode_step_multi`` invocation; each entry is a list of
+        # length T (the verify_input size for that call).
+        self._prefill_q: list[int] = [prefill_argmax]
+        self._decode_q: list[int] = list(decode_argmaxes)
+        self._verify_q: list[list[int]] = [list(row) for row in verify_logits]
+
+        self.prefill_calls: int = 0
+        self.decode_calls: int = 0
+        self.decode_multi_calls: int = 0
+        self.last_verify_input: mx.array | None = None
+
+        self.config = ModelConfig(
+            model_name="scripted-spec",
+            num_layers=1,
+            hidden_size=4,
+            vocab_size=self.VOCAB,
+        )
+        self._tokenizer = _ScriptedTokenizer()
+
+    # --- ModelAdapter surface (only what Engine consumes) ---
+
+    def build(self, weight_provider: Any) -> Any:
+        del weight_provider
+        return object()
+
+    def kv_layout(self) -> KVLayout:
+        return KVLayout(num_layers=1, n_kv_heads=1, head_dim=4, dtype=mx.float16)
+
+    def attention_pattern(self) -> AttentionPattern:
+        return AttentionPattern(per_layer=(AttentionKind.GLOBAL,))
+
+    def capabilities(self) -> Any:
+        return capabilities_from_attention_pattern(self.attention_pattern())
+
+    def tokenizer(self) -> _ScriptedTokenizer:
+        return self._tokenizer
+
+    def prefill(
+        self, tokens: mx.array, kv_handle: KVHandle
+    ) -> tuple[mx.array, StateDelta]:
+        self.prefill_calls += 1
+        target = self._prefill_q.pop(0) if self._prefill_q else 0
+        return self._one_hot_1d(target), StateDelta()
+
+    def decode_step(
+        self, token: mx.array, kv_handle: KVHandle
+    ) -> tuple[mx.array, StateDelta]:
+        self.decode_calls += 1
+        target = self._decode_q.pop(0) if self._decode_q else 0
+        return self._one_hot_1d(target), StateDelta()
+
+    def decode_step_multi(
+        self, tokens: mx.array, kv_handle: KVHandle
+    ) -> tuple[mx.array, StateDelta]:
+        self.decode_multi_calls += 1
+        self.last_verify_input = tokens
+        targets = self._verify_q.pop(0) if self._verify_q else [0] * int(tokens.size)
+        T = int(tokens.size)
+        assert len(targets) == T, (
+            f"verify_logits[{self.decode_multi_calls - 1}] has length "
+            f"{len(targets)} but verify_input has {T} tokens"
+        )
+        rows = [self._one_hot_1d(t) for t in targets]
+        return mx.stack(rows), StateDelta()
+
+    def _one_hot_1d(self, target: int) -> mx.array:
+        scores = [0.0] * self.VOCAB
+        scores[target] = 5.0
+        return mx.array(scores, dtype=mx.float32)
+
+
+class _ScriptedDraftEngine:
+    """Draft engine whose proposals come from a scripted queue.
+
+    Each ``propose`` pops the next ``(token_ids, draft_logprobs)`` row
+    off the queue. Empty rows return empty drafts (Noop-equivalent).
+    Tracks every ``propose`` / ``commit`` / ``reset`` call so tests can
+    assert the engine drove it correctly.
+    """
+
+    def __init__(
+        self, proposals: Sequence[Sequence[int]] = ()
+    ) -> None:
+        self._queue: list[list[int]] = [list(row) for row in proposals]
+        self.propose_calls: list[int] = []  # γ values
+        self.commit_calls: list[int] = []  # accepted_len values
+        self.reset_calls: int = 0
+
+    def propose(self, ctx: RequestState, k: int) -> DraftTokens:
+        self.propose_calls.append(int(k))
+        if not self._queue:
+            return DraftTokens(token_ids=())
+        ids = self._queue.pop(0)
+        return DraftTokens(
+            token_ids=tuple(ids),
+            draft_logprobs=tuple([-0.5] * len(ids)) if ids else None,
+        )
+
+    def commit(self, ctx: RequestState, accepted_len: int) -> None:
+        self.commit_calls.append(int(accepted_len))
+
+    def reset(self) -> None:
+        self.reset_calls += 1
+
+
+class _TrackedKVManager(NullKVManager):
+    """``NullKVManager`` plus rollback / reserve call recording."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reserved: list[str] = []
+        self.freed: list[str] = []
+        self.rollback_calls: list[tuple[str, int]] = []
+
+    def reserve_for_prefill(
+        self, req_id: str, token_ids: Sequence[int]
+    ) -> BlockList:
+        self.reserved.append(req_id)
+        return super().reserve_for_prefill(req_id, token_ids)
+
+    def rollback(self, req_id: str, n_reject: int) -> None:
+        self.rollback_calls.append((req_id, int(n_reject)))
+        super().rollback(req_id, n_reject)
+
+    def free(self, req_id: str) -> None:
+        self.freed.append(req_id)
+        super().free(req_id)
+
+    def get_computed_blocks(self, token_ids: Sequence[int]) -> PrefixHit:
+        return PrefixHit()
+
+    def budget(self) -> MemoryBudget:
+        return MemoryBudget()
+
+
+def _collect(it: Iterator[int]) -> list[int]:
+    return list(it)
+
+
+def _greedy(max_tokens: int = 16) -> SamplingParams:
+    return SamplingParams(temperature=0.0, max_tokens=max_tokens)
+
+
+# --- _greedy_verify helper unit tests --------------------------------------
+
+
+def test_greedy_verify_full_accept() -> None:
+    drafts = (5, 6, 7)
+    # verify_logits[i] argmax = drafts[i] for all i → full accept.
+    rows = [
+        mx.array([0.0] * 16, dtype=mx.float32).at[d].add(5.0)
+        for d in drafts
+    ]
+    verify_logits = mx.stack(rows)
+    assert _greedy_verify(drafts, verify_logits) == 3
+
+
+def test_greedy_verify_partial_accept() -> None:
+    drafts = (5, 6, 7)
+    # First 2 match, third diverges (target wants 9 instead of 7).
+    targets = [5, 6, 9]
+    rows = [
+        mx.array([0.0] * 16, dtype=mx.float32).at[t].add(5.0)
+        for t in targets
+    ]
+    verify_logits = mx.stack(rows)
+    assert _greedy_verify(drafts, verify_logits) == 2
+
+
+def test_greedy_verify_full_reject() -> None:
+    drafts = (5, 6, 7)
+    targets = [9, 9, 9]
+    rows = [
+        mx.array([0.0] * 16, dtype=mx.float32).at[t].add(5.0)
+        for t in targets
+    ]
+    verify_logits = mx.stack(rows)
+    assert _greedy_verify(drafts, verify_logits) == 0
+
+
+# --- spec-off byte-identical -----------------------------------------------
+
+
+def test_spec_off_default_is_noop_draft_engine() -> None:
+    # Default ``draft_engine`` is NoopDraftEngine; verify_k = 4 default.
+    adapter = _ScriptedSpecAdapter(
+        prefill_argmax=5,
+        decode_argmaxes=[6, 7],
+    )
+    kv = _TrackedKVManager()
+    engine = Engine(adapter, kv)
+    out = _collect(engine.generate("hi", _greedy(max_tokens=3)))
+    assert out == [5, 6, 7]
+    # Spec branch never entered: no decode_step_multi, no rollback.
+    assert adapter.decode_multi_calls == 0
+    assert kv.rollback_calls == []
+
+
+def test_spec_off_with_explicit_noop_matches_default() -> None:
+    adapter = _ScriptedSpecAdapter(
+        prefill_argmax=1, decode_argmaxes=[2]
+    )
+    kv = _TrackedKVManager()
+    engine = Engine(adapter, kv, draft_engine=NoopDraftEngine())
+    out = _collect(engine.generate("hi", _greedy(max_tokens=2)))
+    assert out == [1, 2]
+
+
+# --- spec-on full accept ---------------------------------------------------
+
+
+def test_spec_on_full_accept_yields_gamma_plus_one() -> None:
+    # verify_k = 4 → γ = 3. Anchor = prefill argmax = 100. Drafts =
+    # [200, 201, 202]. Verify input = [100, 200, 201, 202]. Adapter
+    # argmax at each position = [200, 201, 202, 250] → all 3 drafts
+    # accepted, bonus = 250.
+    adapter = _ScriptedSpecAdapter(
+        prefill_argmax=100,
+        verify_logits=[[200, 201, 202, 250]],
+    )
+    kv = _TrackedKVManager()
+    drafter = _ScriptedDraftEngine(proposals=[[200, 201, 202]])
+    engine = Engine(adapter, kv, draft_engine=drafter, verify_k=4)
+    out = _collect(engine.generate("hi", _greedy(max_tokens=5)))
+    # Yielded: anchor (100), 3 accepted drafts (200, 201, 202), bonus (250).
+    assert out == [100, 200, 201, 202, 250]
+    # Single decode_step_multi call; no decode_step (spec branch only).
+    assert adapter.decode_multi_calls == 1
+    assert adapter.decode_calls == 0
+    # Full accept: no rollback.
+    assert kv.rollback_calls == []
+    # Draft engine: propose called once with γ = 3; commit called with
+    # accepted_len = 3 (full accept; engine yielded all drafts).
+    assert drafter.propose_calls == [3]
+    assert drafter.commit_calls == [3]
+
+
+# --- spec-on partial accept ------------------------------------------------
+
+
+def test_spec_on_partial_accept_rolls_back_and_yields_bonus() -> None:
+    # γ = 3. Drafts = [200, 201, 202]. Adapter argmax targets =
+    # [200, 201, 999, ...] → first 2 match, draft[2] rejected. Bonus
+    # sampled from verify_logits[2] (argmax 999).
+    adapter = _ScriptedSpecAdapter(
+        prefill_argmax=100,
+        verify_logits=[[200, 201, 999, 0]],
+    )
+    kv = _TrackedKVManager()
+    drafter = _ScriptedDraftEngine(proposals=[[200, 201, 202]])
+    engine = Engine(adapter, kv, draft_engine=drafter, verify_k=4)
+    out = _collect(engine.generate("hi", _greedy(max_tokens=4)))
+    # Yielded: anchor (100), 2 accepted drafts (200, 201), bonus (999).
+    assert out == [100, 200, 201, 999]
+    # Rolled back 1 rejected draft (γ - yielded_count = 3 - 2 = 1).
+    assert kv.rollback_calls == [("req-0", 1)]
+    # commit(yielded_count = 2).
+    assert drafter.commit_calls == [2]
+
+
+# --- spec-on full reject ---------------------------------------------------
+
+
+def test_spec_on_full_reject_yields_only_bonus() -> None:
+    # γ = 3. Drafts = [200, 201, 202]. Adapter argmax = [777, ...] →
+    # draft[0] rejected, no further drafts checked. Bonus from
+    # verify_logits[0] = 777.
+    adapter = _ScriptedSpecAdapter(
+        prefill_argmax=100,
+        verify_logits=[[777, 0, 0, 0]],
+    )
+    kv = _TrackedKVManager()
+    drafter = _ScriptedDraftEngine(proposals=[[200, 201, 202]])
+    engine = Engine(adapter, kv, draft_engine=drafter, verify_k=4)
+    out = _collect(engine.generate("hi", _greedy(max_tokens=2)))
+    assert out == [100, 777]
+    # Rolled back all γ = 3 drafts.
+    assert kv.rollback_calls == [("req-0", 3)]
+    # commit(0).
+    assert drafter.commit_calls == [0]
+
+
+# --- spec-on max_tokens / stop-token cap -----------------------------------
+
+
+def test_spec_on_max_tokens_cap_mid_accept_skips_bonus() -> None:
+    # γ = 3. Drafts = [200, 201, 202]; all would be accepted, but
+    # max_tokens = 3 caps after yielding [anchor=100, draft0=200,
+    # draft1=201]. yielded_count = 2. Rollback covers γ - 2 = 1.
+    # No bonus sampled because we hit max_tokens mid-accept.
+    adapter = _ScriptedSpecAdapter(
+        prefill_argmax=100,
+        verify_logits=[[200, 201, 202, 250]],
+    )
+    kv = _TrackedKVManager()
+    drafter = _ScriptedDraftEngine(proposals=[[200, 201, 202]])
+    engine = Engine(adapter, kv, draft_engine=drafter, verify_k=4)
+    out = _collect(engine.generate("hi", _greedy(max_tokens=3)))
+    assert out == [100, 200, 201]
+    # Rollback covers the un-yielded slots (the 3rd accepted draft 202
+    # plus its position in the cache).
+    assert kv.rollback_calls == [("req-0", 1)]
+    # commit(yielded_count = 2), not commit(accepted_len = 3).
+    assert drafter.commit_calls == [2]
+
+
+def test_spec_on_stop_token_mid_accept_skips_bonus() -> None:
+    # γ = 3. Drafts all match target argmax, but draft[1] = 13 is in
+    # stop_token_ids. Engine yields [anchor=100, draft0=12, draft1=13]
+    # then stops. yielded_count = 2; rollback γ - 2 = 1; commit(2).
+    adapter = _ScriptedSpecAdapter(
+        prefill_argmax=100,
+        verify_logits=[[12, 13, 14, 15]],
+    )
+    kv = _TrackedKVManager()
+    drafter = _ScriptedDraftEngine(proposals=[[12, 13, 14]])
+    engine = Engine(adapter, kv, draft_engine=drafter, verify_k=4)
+    params = SamplingParams(
+        temperature=0.0, max_tokens=8, stop_token_ids=(13,)
+    )
+    out = _collect(engine.generate("hi", params))
+    assert out == [100, 12, 13]
+    assert kv.rollback_calls == [("req-0", 1)]
+    assert drafter.commit_calls == [2]
+
+
+# --- fewer-than-γ proposals (Protocol allows "up to k") --------------------
+
+
+def test_spec_on_fewer_than_gamma_full_accept_no_rollback() -> None:
+    # γ = 3 (verify_k = 4) but the drafter legitimately returns only
+    # 2 drafts. verify_input = [anchor=100, 200, 201] (3 tokens, NOT
+    # 4). Both drafts argmax-match. Full accept of the actual returned
+    # drafts → KV rollback must NOT fire (un_committed = 2 - 2 = 0);
+    # bonus comes from verify_logits[verify_input.size - 1] = idx 2.
+    adapter = _ScriptedSpecAdapter(
+        prefill_argmax=100,
+        verify_logits=[[200, 201, 250]],
+    )
+    kv = _TrackedKVManager()
+    drafter = _ScriptedDraftEngine(proposals=[[200, 201]])
+    engine = Engine(adapter, kv, draft_engine=drafter, verify_k=4)
+    out = _collect(engine.generate("hi", _greedy(max_tokens=4)))
+    # Yielded: anchor (100), 2 drafts (200, 201), bonus (250).
+    assert out == [100, 200, 201, 250]
+    assert kv.rollback_calls == []
+    # commit(yielded_count = 2). propose was called with γ = 3 but the
+    # drafter returned only 2 — the engine respects that.
+    assert drafter.propose_calls == [3]
+    assert drafter.commit_calls == [2]
+    # Verify forward consumed exactly draft_count + 1 = 3 tokens, not
+    # verify_k = 4 — the verify input is sized to the actual drafts.
+    assert adapter.last_verify_input is not None
+    assert int(adapter.last_verify_input.size) == 3
+
+
+def test_spec_on_fewer_than_gamma_partial_accept_rolls_back_only_actual() -> None:
+    # γ = 3, drafter returns 2 drafts; verify rejects the second.
+    # un_committed = draft_count - yielded_count = 2 - 1 = 1, NOT
+    # γ - yielded_count = 2.
+    adapter = _ScriptedSpecAdapter(
+        prefill_argmax=100,
+        verify_logits=[[200, 999, 0]],
+    )
+    kv = _TrackedKVManager()
+    drafter = _ScriptedDraftEngine(proposals=[[200, 201]])
+    engine = Engine(adapter, kv, draft_engine=drafter, verify_k=4)
+    out = _collect(engine.generate("hi", _greedy(max_tokens=3)))
+    assert out == [100, 200, 999]
+    assert kv.rollback_calls == [("req-0", 1)]
+    assert drafter.commit_calls == [1]
+
+
+def test_spec_on_more_than_gamma_drafts_raises() -> None:
+    # γ = 2 (verify_k = 3). A buggy drafter returns 3 drafts —
+    # violates the I-5 propose contract ("up to k"). Engine must
+    # refuse loud rather than silently corrupt KV state.
+    adapter = _ScriptedSpecAdapter(
+        prefill_argmax=100,
+        verify_logits=[[200, 201, 202, 203]],  # never reached
+    )
+    kv = _TrackedKVManager()
+    drafter = _ScriptedDraftEngine(proposals=[[200, 201, 202]])
+    engine = Engine(adapter, kv, draft_engine=drafter, verify_k=3)
+    with pytest.raises(RuntimeError, match=r"propose contract"):
+        list(engine.generate("hi", _greedy(max_tokens=4)))
+
+
+# --- defensive raises + lifecycle ------------------------------------------
+
+
+def test_engine_rejects_verify_k_below_one() -> None:
+    adapter = _ScriptedSpecAdapter(prefill_argmax=0)
+    kv = _TrackedKVManager()
+    with pytest.raises(ValueError, match=r"verify_k must be >= 1"):
+        Engine(adapter, kv, verify_k=0)
+
+
+def test_spec_on_with_temperature_above_zero_raises() -> None:
+    adapter = _ScriptedSpecAdapter(prefill_argmax=0)
+    kv = _TrackedKVManager()
+    drafter = _ScriptedDraftEngine(proposals=[[1, 2, 3]])
+    engine = Engine(adapter, kv, draft_engine=drafter, verify_k=4)
+    params = SamplingParams(temperature=0.7, max_tokens=4)
+    with pytest.raises(NotImplementedError, match=r"greedy-only"):
+        list(engine.generate("hi", params))
+
+
+def test_draft_engine_reset_called_on_finally() -> None:
+    adapter = _ScriptedSpecAdapter(prefill_argmax=0)
+    kv = _TrackedKVManager()
+    drafter = _ScriptedDraftEngine()  # no proposals → spec branch never enters
+    engine = Engine(adapter, kv, draft_engine=drafter, verify_k=4)
+    list(engine.generate("hi", _greedy(max_tokens=1)))
+    assert drafter.reset_calls == 1
+    # Run a second generate; reset must run again.
+    adapter2 = _ScriptedSpecAdapter(prefill_argmax=0)
+    engine2 = Engine(adapter2, _TrackedKVManager(), draft_engine=drafter)
+    list(engine2.generate("hi", _greedy(max_tokens=1)))
+    assert drafter.reset_calls == 2

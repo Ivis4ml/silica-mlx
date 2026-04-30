@@ -48,12 +48,15 @@ import mlx.core as mx
 
 from silica.core.events import BatchEvent
 from silica.core.profiler import MetricsRegistry
+from silica.core.request import Request, RequestState
 from silica.core.sampler import Sampler
 from silica.core.sampling import SamplingParams
 from silica.kvcache.manager import KVHandle, KVManager
 from silica.kvcache.prefix import RadixPrefixCache
 from silica.models.adapter import ModelAdapter
 from silica.scheduler.batcher import ContinuousBatcher
+from silica.speculative.engine import DraftEngine, NoopDraftEngine
+from silica.speculative.verify import run_verify_forward
 
 
 class Engine:
@@ -69,12 +72,28 @@ class Engine:
         kv_manager: KVManager,
         sampler: Sampler | None = None,
         metrics: MetricsRegistry | None = None,
+        *,
+        draft_engine: DraftEngine | None = None,
+        verify_k: int = 4,
     ) -> None:
+        # D-021 step 5 sub-unit (b): single-request spec wiring.
+        # ``draft_engine`` defaults to ``NoopDraftEngine`` so spec-off is
+        # the path of zero overhead and byte-identical to the pre-spec
+        # decode loop. ``verify_k`` is the target verify forward input
+        # length (γ = verify_k - 1 actual draft proposals per cycle;
+        # see plans/P6_SPEC_FOUNDATION_OPENING.md §4.5). v0.1 default 4
+        # matches the Unit-7 microbench's regime-transition sweet spot;
+        # values < 1 are rejected loud so a misconfiguration cannot
+        # silently disable spec.
+        if verify_k < 1:
+            raise ValueError(f"verify_k must be >= 1, got {verify_k}")
         self._adapter = adapter
         self._kv_manager = kv_manager
         self._sampler = sampler or Sampler()
         self.metrics = metrics or MetricsRegistry()
         self._req_counter = 0
+        self._draft_engine: DraftEngine = draft_engine or NoopDraftEngine()
+        self._verify_k = verify_k
 
     @property
     def kv_manager(self) -> KVManager:
@@ -111,6 +130,15 @@ class Engine:
             yield from self._drive(prompt_ids, handle, effective)
         finally:
             self._kv_manager.free(req_id)
+            # Drop any draft-side state held over from this request so
+            # the next ``generate`` enters its cycle 0 cleanly.
+            # ``reset`` is not on the I-5 Protocol surface (it is a
+            # lifecycle convenience on ``DraftTargetEngine``); guard
+            # via hasattr so ``NoopDraftEngine`` and any other
+            # Protocol conformer without a reset method still work.
+            reset = getattr(self._draft_engine, "reset", None)
+            if reset is not None:
+                reset()
 
     # --- private ---
 
@@ -120,6 +148,17 @@ class Engine:
         handle: KVHandle,
         params: SamplingParams,
     ) -> Iterator[int]:
+        # v0.1 spec is greedy-only. Reject non-greedy spec at entry so
+        # the spec branch below cannot silently produce wrong tokens
+        # under a sampler the verify path does not honour.
+        spec_active = not isinstance(self._draft_engine, NoopDraftEngine)
+        if spec_active and params.temperature != 0.0:
+            raise NotImplementedError(
+                "Speculative decoding under temperature > 0 is a P-7 v0.2 "
+                "feature; v0.1 D-021 step 5 is greedy-only "
+                "(see plans/P6_SPEC_FOUNDATION_OPENING.md §4.3)."
+            )
+
         prompt_arr = mx.array(prompt_ids, dtype=mx.int32)
 
         # Prefill + first sample — measured as a single TTFT block.
@@ -142,19 +181,138 @@ class Engine:
             self._record_tail_metrics(decode_count=0, decode_start=t_first)
             return
 
+        # Build a minimal RequestState the draft engine can consult.
+        # ``NoopDraftEngine.propose`` ignores ``ctx``; ``DraftTargetEngine``
+        # reads ``ctx.request.token_ids + ctx.output_token_ids`` for KV
+        # catch-up bookkeeping. Both are kept in lockstep with
+        # ``history`` (prompt + yielded tokens) on every cycle below.
+        ctx = RequestState(
+            request=Request(
+                prompt="",
+                sampling_params=params,
+                token_ids=tuple(prompt_ids),
+            )
+        )
+        ctx.output_token_ids = [tok_int]
+
+        gamma = self._verify_k - 1
         decode_count = 0
         n = 1
         while n < params.max_tokens:
-            step_in = mx.array([tok_int], dtype=mx.int32)
-            logits, _ = self._adapter.decode_step(step_in, handle)
-            token_scalar = self._sampler.sample(
-                logits, mx.array(history, dtype=mx.int32), params
+            drafts = self._draft_engine.propose(ctx, gamma)
+            if not drafts.token_ids:
+                # Spec-off (NoopDraftEngine) or draft engine declined
+                # to propose this cycle. Single-token decode — byte-
+                # identical to the pre-spec loop.
+                step_in = mx.array([tok_int], dtype=mx.int32)
+                logits, _ = self._adapter.decode_step(step_in, handle)
+                token_scalar = self._sampler.sample(
+                    logits, mx.array(history, dtype=mx.int32), params
+                )
+                tok_int = int(token_scalar.item())
+                yield tok_int
+                n += 1
+                decode_count += 1
+                history.append(tok_int)
+                ctx.output_token_ids.append(tok_int)
+                if tok_int in params.stop_token_ids:
+                    break
+                continue
+
+            # Spec path. The Protocol allows ``propose`` to return up to
+            # γ drafts but fewer is legal (silica/speculative/engine.py
+            # §I-5 docstring). All KV / commit / bonus math below keys
+            # on the **actual** ``draft_count`` returned, not on the
+            # propose-budget γ — using γ over-rolls back when the
+            # drafter returns fewer items than asked. A drafter that
+            # returns more than γ violates the Protocol; reject loud
+            # rather than silently corrupting KV state.
+            draft_count = len(drafts.token_ids)
+            if draft_count > gamma:
+                raise RuntimeError(
+                    f"draft engine returned {draft_count} drafts but the "
+                    f"Engine asked for at most γ = {gamma} (verify_k - 1); "
+                    f"propose contract is 'up to k', see "
+                    f"silica/speculative/engine.py I-5 docstring."
+                )
+            # verify_input = [anchor] + draft_count drafts (length
+            # ``draft_count + 1``, ≤ verify_k). The verify forward
+            # fills KV for all input positions in one batched call;
+            # per-position logits feed greedy verification below.
+            verify_input = mx.array(
+                [tok_int] + list(drafts.token_ids), dtype=mx.int32
             )
-            tok_int = int(token_scalar.item())
+            verify_logits, _ = run_verify_forward(
+                self._adapter, verify_input, handle
+            )
+            accepted_len = _greedy_verify(drafts.token_ids, verify_logits)
+
+            # Yield up to ``accepted_len`` drafts, but cap at the
+            # ``max_tokens`` budget and bail on a stop token mid-yield.
+            # ``yielded_count`` is the engine-level count (NOT the
+            # verify-level ``accepted_len``) — both KV rollback below
+            # and ``draft_engine.commit`` below key on it so the cache
+            # state stays in sync with what was actually committed
+            # to ``ctx.output_token_ids``.
+            yielded_count = 0
+            stop_hit = False
+            for j in range(accepted_len):
+                if n >= params.max_tokens:
+                    stop_hit = True
+                    break
+                accepted_tok = drafts.token_ids[j]
+                yield accepted_tok
+                n += 1
+                decode_count += 1
+                history.append(accepted_tok)
+                ctx.output_token_ids.append(accepted_tok)
+                yielded_count += 1
+                if accepted_tok in params.stop_token_ids:
+                    stop_hit = True
+                    break
+
+            # KV rollback: undo every draft slot past ``yielded_count``
+            # in the verify forward — the (draft_count - accepted_len)
+            # drafts the verifier rejected, plus any (accepted_len -
+            # yielded_count) accepted-but-not-yielded drafts (which
+            # only happens when ``max_tokens`` or a stop token cut the
+            # yield short). Keys on ``draft_count`` (the actual count
+            # returned by ``propose``), NOT on γ — a drafter returning
+            # fewer than γ would otherwise have its committed prefix
+            # over-trimmed.
+            un_committed = draft_count - yielded_count
+            if un_committed > 0:
+                self._kv_manager.rollback(handle.req_id, un_committed)
+
+            # Inform the draft engine. ``yielded_count`` (not
+            # ``accepted_len``) is the count the draft's own KV must
+            # roll back to so it tracks the engine's committed state.
+            self._draft_engine.commit(ctx, yielded_count)
+
+            if stop_hit:
+                break
+
+            # Sample the bonus token. On partial accept (``yielded_count
+            # < draft_count``) the bonus comes from the rejected
+            # draft's logits at index ``yielded_count``. On full accept
+            # of all returned drafts it comes from the prediction past
+            # the last accepted draft — the last position of the
+            # verify input.
+            bonus_idx = (
+                yielded_count
+                if yielded_count < draft_count
+                else int(verify_input.size) - 1
+            )
+            bonus_logits = verify_logits[bonus_idx]
+            bonus_scalar = self._sampler.sample(
+                bonus_logits, mx.array(history, dtype=mx.int32), params
+            )
+            tok_int = int(bonus_scalar.item())
             yield tok_int
             n += 1
             decode_count += 1
             history.append(tok_int)
+            ctx.output_token_ids.append(tok_int)
             if tok_int in params.stop_token_ids:
                 break
 
@@ -454,6 +612,35 @@ def _resolve_batch_params(
         f"params must be SamplingParams | list[SamplingParams] | None, "
         f"got {type(params).__name__}"
     )
+
+
+def _greedy_verify(
+    drafts: tuple[int, ...], verify_logits: mx.array
+) -> int:
+    """Count how many leading drafts the target's argmax accepts.
+
+    D-021 step 5 sub-unit (b) helper. Let ``n = len(drafts)`` be the
+    number of drafts actually returned by ``DraftEngine.propose`` (the
+    Protocol allows up to γ but fewer is legal — see
+    ``silica/speculative/engine.py`` I-5 docstring). The verify input
+    fed to the target was ``[anchor] + drafts`` (length ``n + 1``);
+    ``verify_logits`` has shape ``(n + 1, V)``.
+    ``verify_logits[i]`` predicts the token at the position immediately
+    following input slot ``i`` — i.e., for ``i in 0..n-1``,
+    ``verify_logits[i]`` predicts the token in slot ``i + 1``, which is
+    ``drafts[i]``. So ``drafts[i]`` is verified against
+    ``argmax(verify_logits[i])``. Returns the largest prefix length in
+    ``[0, n]`` for which every draft matched.
+
+    Module-level so the test suite can pin the alignment without
+    constructing a full ``Engine``.
+    """
+    n = len(drafts)
+    for i in range(n):
+        target_top1 = int(mx.argmax(verify_logits[i]).item())
+        if target_top1 != drafts[i]:
+            return i
+    return n
 
 
 __all__ = ["Engine"]
