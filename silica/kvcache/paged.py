@@ -21,9 +21,13 @@ What this unit does *not* own:
     (ContinuousBatcher).
   - ``get_computed_blocks`` returns an empty ``PrefixHit`` until Unit #14
     (RadixPrefixCache) plugs in.
-  - Speculative commit / rollback at the physical layer. The Protocol
-    methods validate the request exists but do not touch K / V; the
-    batcher handles physical trim via mlx-lm's primitives at P-7.
+  - Speculative physical-layer trim. ``rollback`` updates the page-table
+    bookkeeping (token count + trailing-block release) but never touches
+    K / V tensors; the batcher handles physical trim via
+    ``BatchKVCache.prepare(right_padding=...) + finalize()`` at the
+    decode-spec phase. ``commit`` is a Protocol-shape no-op — accepted
+    drafts already sit in the page table from the verify-cycle's prior
+    ``append_slot``.
 
 Refcount semantics mirror the opening doc: a block's refcount counts
 **retention sources** (owning request + any prefix-cache references). The
@@ -251,8 +255,39 @@ class PagedKVCache:
         self._require_reserved(req_id)
 
     def rollback(self, req_id: str, n_reject: int) -> None:
-        """Speculative reject (P-7 forward-compat; bookkeeping no-op in P-2)."""
+        """Speculative reject — shrink ``req_id``'s page table by ``n_reject`` tokens.
+
+        Drops the trailing ``n_reject`` tokens from the request's logical
+        count and releases any block that, after the shrink, sits fully
+        past the new tail. Released blocks return to the free pool via
+        ``decref`` (which honours refcount > 1, so prefix-cache-pinned
+        blocks survive). Physical K / V tensor trim is the batcher's job
+        at the ``BatchKVCache`` layer — this method updates only the
+        bookkeeping needed by the memory budget and the prefix cache.
+
+        Idempotent for ``n_reject <= 0`` (mirrors ``SimpleKVCache``).
+        Raises ``ValueError`` (D-011 loud-failure) when ``n_reject``
+        exceeds the request's current token count. This manager tracks
+        the current logical extent, not a separate prefill floor; callers
+        are responsible for passing only the speculative tail length.
+        """
         self._require_reserved(req_id)
+        if n_reject <= 0:
+            return
+        current = self._num_tokens[req_id]
+        if n_reject > current:
+            raise ValueError(
+                f"{req_id!r}: cannot rollback {n_reject} tokens "
+                f"(only {current} held; rollback must not exceed the "
+                f"current request extent)"
+            )
+        new_total = current - n_reject
+        needed_blocks = self._blocks_needed(new_total)
+        page_table = self._page_table[req_id]
+        while len(page_table) > needed_blocks:
+            block = page_table.pop()
+            self.decref(block)
+        self._num_tokens[req_id] = new_total
 
     def free(self, req_id: str) -> None:
         """Release ``req_id``'s slot and decrement each of its block refs.

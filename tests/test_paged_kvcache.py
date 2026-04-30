@@ -261,7 +261,7 @@ def test_decref_returns_block_to_pool_when_refcount_hits_zero() -> None:
     assert block in kv._free_blocks  # type: ignore[attr-defined]
 
 
-# --- commit / rollback (forward-compat no-ops) ---
+# --- commit (forward-compat no-op) ---
 
 
 def test_commit_validates_request() -> None:
@@ -272,12 +272,137 @@ def test_commit_validates_request() -> None:
         kv.commit("ghost", 1)
 
 
+# --- rollback (D-021 step 5 sub-unit (d) — concrete bookkeeping) ---
+
+
 def test_rollback_validates_request() -> None:
     kv = _kv()
     kv.reserve_for_prefill("r", [0])
-    kv.rollback("r", 1)  # no raise
+    kv.rollback("r", 1)  # no raise; shrinks num_tokens to 0
     with pytest.raises(KeyError, match="not reserved"):
         kv.rollback("ghost", 1)
+
+
+def test_rollback_no_op_for_non_positive_n_reject() -> None:
+    kv = _kv(num_blocks=4, block_size=4)
+    kv.reserve_for_prefill("r", list(range(8)))  # 2 blocks, 8 tokens
+    free_before = kv.available_blocks()
+
+    kv.rollback("r", 0)
+    assert kv.num_tokens("r") == 8
+    assert kv.available_blocks() == free_before
+
+    kv.rollback("r", -3)
+    assert kv.num_tokens("r") == 8
+    assert kv.available_blocks() == free_before
+
+
+def test_rollback_within_block_keeps_blocks() -> None:
+    """Shrinking inside the last block: count drops, page table unchanged."""
+    kv = _kv(num_blocks=8, block_size=4)
+    blist = kv.reserve_for_prefill("r", list(range(10)))  # 3 blocks (10 in 4+4+2)
+    assert len(blist) == 3
+    free_before = kv.available_blocks()
+
+    kv.rollback("r", 1)  # 9 tokens still need 3 blocks
+    assert kv.num_tokens("r") == 9
+    assert kv.available_blocks() == free_before
+    # block ids unchanged
+    assert kv._page_table["r"] == list(blist.block_ids)  # type: ignore[attr-defined]
+
+
+def test_rollback_at_block_boundary_releases_trailing_block() -> None:
+    """Rolling back to an exact block boundary releases the now-empty block."""
+    kv = _kv(num_blocks=8, block_size=4)
+    blist = kv.reserve_for_prefill("r", list(range(10)))  # 3 blocks
+    free_before = kv.available_blocks()
+    last_block = blist.block_ids[-1]
+
+    kv.rollback("r", 2)  # 8 tokens fit in 2 blocks
+    assert kv.num_tokens("r") == 8
+    assert kv.available_blocks() == free_before + 1
+    assert last_block in kv._free_blocks  # type: ignore[attr-defined]
+    assert kv._page_table["r"] == list(blist.block_ids[:-1])  # type: ignore[attr-defined]
+
+
+def test_rollback_releases_multiple_trailing_blocks() -> None:
+    kv = _kv(num_blocks=8, block_size=4)
+    blist = kv.reserve_for_prefill("r", list(range(12)))  # 3 blocks, full
+    free_before = kv.available_blocks()
+    released = list(blist.block_ids[1:])
+
+    kv.rollback("r", 8)  # back to 4 tokens => 1 block
+    assert kv.num_tokens("r") == 4
+    assert kv.available_blocks() == free_before + 2
+    for b in released:
+        assert b in kv._free_blocks  # type: ignore[attr-defined]
+    assert kv._page_table["r"] == [blist.block_ids[0]]  # type: ignore[attr-defined]
+
+
+def test_rollback_to_zero_releases_all_blocks() -> None:
+    kv = _kv(num_blocks=8, block_size=4)
+    kv.reserve_for_prefill("r", list(range(8)))  # 2 blocks
+    kv.rollback("r", 8)  # full drain (mathematically valid; engine will not do this)
+    assert kv.num_tokens("r") == 0
+    assert kv.available_blocks() == 8
+    assert kv._page_table["r"] == []  # type: ignore[attr-defined]
+    # Slot is still RESERVED — rollback only touches blocks, not the slot.
+    assert kv.row_states()[kv.slot_of("r")] == RowState.RESERVED
+
+
+def test_rollback_over_cap_raises_loud() -> None:
+    kv = _kv(num_blocks=8, block_size=4)
+    kv.reserve_for_prefill("r", list(range(4)))
+    with pytest.raises(ValueError, match="cannot rollback 5 tokens"):
+        kv.rollback("r", 5)
+    # State unchanged on raise.
+    assert kv.num_tokens("r") == 4
+    assert len(kv._page_table["r"]) == 1  # type: ignore[attr-defined]
+
+
+def test_rollback_preserves_blocks_pinned_by_prefix_cache() -> None:
+    """A trailing block held by both the request and a prefix-cache pin
+    survives rollback's decref (refcount drops to 1, not 0)."""
+    kv = _kv(num_blocks=8, block_size=4)
+    blist = kv.reserve_for_prefill("r", list(range(12)))  # 3 blocks
+    pinned = blist.block_ids[-1]
+    kv.incref(pinned)  # prefix cache references the trailing block
+
+    kv.rollback("r", 8)  # pops trailing 2 blocks
+    # Pinned block stays out of the free pool until the prefix cache decrefs.
+    assert pinned not in kv._free_blocks  # type: ignore[attr-defined]
+    # The other popped block (refcount 0) returned to the pool.
+    assert blist.block_ids[1] in kv._free_blocks  # type: ignore[attr-defined]
+
+    kv.decref(pinned)
+    assert pinned in kv._free_blocks  # type: ignore[attr-defined]
+
+
+def test_rollback_then_append_reuses_freed_blocks() -> None:
+    """After rollback releases a block, append_slot can claim it again."""
+    kv = _kv(num_blocks=4, block_size=4)
+    kv.reserve_for_prefill("r", list(range(8)))  # 2 blocks
+    kv.rollback("r", 4)  # back to 1 block
+    free_after_rollback = kv.available_blocks()
+
+    appended = kv.append_slot("r", 4)  # need 1 more block
+    assert len(appended) == 1
+    assert kv.available_blocks() == free_after_rollback - 1
+    assert kv.num_tokens("r") == 8
+
+
+def test_rollback_then_append_within_existing_block_no_realloc() -> None:
+    """Rolling back inside the last block, then re-extending into the same
+    block, must not allocate a new block."""
+    kv = _kv(num_blocks=4, block_size=4)
+    kv.reserve_for_prefill("r", list(range(6)))  # 2 blocks (4+2)
+    free_before = kv.available_blocks()
+
+    kv.rollback("r", 1)  # still 2 blocks, 5 tokens
+    appended = kv.append_slot("r", 1)  # back to 6 tokens, still 2 blocks
+    assert len(appended) == 0
+    assert kv.available_blocks() == free_before
+    assert kv.num_tokens("r") == 6
 
 
 # --- get_computed_blocks (until Unit #14 plugs in) ---
