@@ -64,6 +64,35 @@ def run_verify_forward(
         return _decode_step_loop_fallback(adapter, verify_input, kv_handle)
 
 
+def greedy_verify(
+    drafts: tuple[int, ...], verify_logits: mx.array
+) -> int:
+    """Count how many leading drafts the target's argmax accepts.
+
+    Shared between ``silica.engine`` (single-request spec, sub-unit b)
+    and ``silica.scheduler.batcher`` (multi-request spec, sub-unit c).
+    Let ``n = len(drafts)`` be the number of drafts actually returned
+    by ``DraftEngine.propose`` (the I-5 Protocol allows up to ``k`` but
+    fewer is legal). The verify input fed to the target was
+    ``[anchor] + drafts + (optional pad)``; ``verify_logits`` has shape
+    ``(>= n + 1, V)``. ``verify_logits[i]`` predicts the token at the
+    position immediately following input slot ``i`` — i.e. for
+    ``i in 0..n-1``, ``verify_logits[i]`` predicts the token at slot
+    ``i + 1``, which is ``drafts[i]``. So ``drafts[i]`` is verified
+    against ``argmax(verify_logits[i])``. Returns the largest prefix
+    length in ``[0, n]`` for which every draft matched.
+
+    Module-level so the test suite can pin the alignment without
+    constructing a full ``Engine`` or ``ContinuousBatcher``.
+    """
+    n = len(drafts)
+    for i in range(n):
+        target_top1 = int(mx.argmax(verify_logits[i]).item())
+        if target_top1 != drafts[i]:
+            return i
+    return n
+
+
 def _decode_step_loop_fallback(
     adapter: ModelAdapter,
     verify_input: mx.array,
@@ -89,4 +118,4 @@ def _decode_step_loop_fallback(
     return mx.stack(per_position_logits), last_delta
 
 
-__all__ = ["run_verify_forward"]
+__all__ = ["greedy_verify", "run_verify_forward"]

@@ -31,7 +31,7 @@ import pytest
 from silica.core.events import BatchEvent  # noqa: F401 — keeps import order stable
 from silica.core.request import RequestState
 from silica.core.sampling import SamplingParams
-from silica.engine import Engine, _greedy_verify
+from silica.engine import Engine
 from silica.kvcache.manager import (
     BlockList,
     KVHandle,
@@ -45,9 +45,11 @@ from silica.models.adapter import (
     KVLayout,
     ModelConfig,
     StateDelta,
+    Tokenizer,
 )
 from silica.models.capabilities import capabilities_from_attention_pattern
 from silica.speculative.engine import DraftTokens, NoopDraftEngine
+from silica.speculative.verify import greedy_verify
 
 # --- shared fakes ----------------------------------------------------------
 
@@ -55,13 +57,16 @@ from silica.speculative.engine import DraftTokens, NoopDraftEngine
 class _ScriptedTokenizer:
     """Tokenizer that returns a fixed token list for any non-empty prompt."""
 
+    vocab_size: int = 1024
+
     def __init__(self, ids: Sequence[int] = (10, 11)) -> None:
         self._ids = list(ids)
 
     def encode(self, text: str) -> list[int]:
         return [] if text == "" else list(self._ids)
 
-    def decode(self, ids: Any) -> str:
+    def decode(self, token_ids: Sequence[int]) -> str:
+        del token_ids
         return ""
 
 
@@ -118,7 +123,7 @@ class _ScriptedSpecAdapter:
     def capabilities(self) -> Any:
         return capabilities_from_attention_pattern(self.attention_pattern())
 
-    def tokenizer(self) -> _ScriptedTokenizer:
+    def tokenizer(self) -> Tokenizer:
         return self._tokenizer
 
     def prefill(
@@ -227,7 +232,7 @@ def _greedy(max_tokens: int = 16) -> SamplingParams:
     return SamplingParams(temperature=0.0, max_tokens=max_tokens)
 
 
-# --- _greedy_verify helper unit tests --------------------------------------
+# --- greedy_verify helper unit tests ---------------------------------------
 
 
 def test_greedy_verify_full_accept() -> None:
@@ -238,7 +243,7 @@ def test_greedy_verify_full_accept() -> None:
         for d in drafts
     ]
     verify_logits = mx.stack(rows)
-    assert _greedy_verify(drafts, verify_logits) == 3
+    assert greedy_verify(drafts, verify_logits) == 3
 
 
 def test_greedy_verify_partial_accept() -> None:
@@ -250,7 +255,7 @@ def test_greedy_verify_partial_accept() -> None:
         for t in targets
     ]
     verify_logits = mx.stack(rows)
-    assert _greedy_verify(drafts, verify_logits) == 2
+    assert greedy_verify(drafts, verify_logits) == 2
 
 
 def test_greedy_verify_full_reject() -> None:
@@ -261,7 +266,7 @@ def test_greedy_verify_full_reject() -> None:
         for t in targets
     ]
     verify_logits = mx.stack(rows)
-    assert _greedy_verify(drafts, verify_logits) == 0
+    assert greedy_verify(drafts, verify_logits) == 0
 
 
 # --- spec-off byte-identical -----------------------------------------------

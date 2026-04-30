@@ -56,7 +56,7 @@ from silica.kvcache.prefix import RadixPrefixCache
 from silica.models.adapter import ModelAdapter
 from silica.scheduler.batcher import ContinuousBatcher
 from silica.speculative.engine import DraftEngine, NoopDraftEngine
-from silica.speculative.verify import run_verify_forward
+from silica.speculative.verify import greedy_verify, run_verify_forward
 
 
 class Engine:
@@ -245,7 +245,7 @@ class Engine:
             verify_logits, _ = run_verify_forward(
                 self._adapter, verify_input, handle
             )
-            accepted_len = _greedy_verify(drafts.token_ids, verify_logits)
+            accepted_len = greedy_verify(drafts.token_ids, verify_logits)
 
             # Yield up to ``accepted_len`` drafts, but cap at the
             # ``max_tokens`` budget and bail on a stop token mid-yield.
@@ -463,6 +463,15 @@ class Engine:
             sampler=self._sampler,
             max_batch_size=effective_batch_size,
             prefix_cache=prefix_cache,
+            # D-021 step 5 sub-unit (c) slice 1: pass spec-decoding
+            # config through to the batcher so ``Engine(...,
+            # draft_engine=real)`` reaches both ``generate`` and
+            # ``generate_batch`` symmetrically. Without the
+            # pass-through ``generate_batch`` would silently degrade
+            # to spec-off regardless of the engine-level config —
+            # constructing the batcher with NoopDraftEngine.
+            draft_engine=self._draft_engine,
+            verify_k=self._verify_k,
         )
         # Pre-step admits seal the initial cohort. ``req_index`` on each
         # tuple is the ORIGINAL user-supplied index (unchanged by the
@@ -612,35 +621,6 @@ def _resolve_batch_params(
         f"params must be SamplingParams | list[SamplingParams] | None, "
         f"got {type(params).__name__}"
     )
-
-
-def _greedy_verify(
-    drafts: tuple[int, ...], verify_logits: mx.array
-) -> int:
-    """Count how many leading drafts the target's argmax accepts.
-
-    D-021 step 5 sub-unit (b) helper. Let ``n = len(drafts)`` be the
-    number of drafts actually returned by ``DraftEngine.propose`` (the
-    Protocol allows up to γ but fewer is legal — see
-    ``silica/speculative/engine.py`` I-5 docstring). The verify input
-    fed to the target was ``[anchor] + drafts`` (length ``n + 1``);
-    ``verify_logits`` has shape ``(n + 1, V)``.
-    ``verify_logits[i]`` predicts the token at the position immediately
-    following input slot ``i`` — i.e., for ``i in 0..n-1``,
-    ``verify_logits[i]`` predicts the token in slot ``i + 1``, which is
-    ``drafts[i]``. So ``drafts[i]`` is verified against
-    ``argmax(verify_logits[i])``. Returns the largest prefix length in
-    ``[0, n]`` for which every draft matched.
-
-    Module-level so the test suite can pin the alignment without
-    constructing a full ``Engine``.
-    """
-    n = len(drafts)
-    for i in range(n):
-        target_top1 = int(mx.argmax(verify_logits[i]).item())
-        if target_top1 != drafts[i]:
-            return i
-    return n
 
 
 __all__ = ["Engine"]
