@@ -222,16 +222,18 @@ def test_real_adapter_declares_decode_step_multi(adapter_cls: type) -> None:
 
 @pytest.mark.parametrize(
     "adapter_cls",
-    [Qwen3Adapter, Qwen3_5Adapter, Gemma4Adapter],
-    ids=["qwen3", "qwen3_5", "gemma4"],
+    [Qwen3_5Adapter],
+    ids=["qwen3_5"],
 )
 def test_real_adapter_decode_step_multi_raises_not_implemented(
     adapter_cls: type,
 ) -> None:
-    # Call the unbound method with `None` for self / args — we never
-    # touch any state inside the placeholder body, so this works without
-    # constructing a real model. The method must raise
-    # NotImplementedError loud so callers know to route through the
-    # fallback.
+    # Adapters whose ``decode_step_multi`` has NOT yet been replaced
+    # with a real forward must still raise NotImplementedError so
+    # ``silica.speculative.verify.run_verify_forward`` falls back. As
+    # subsequent slices land real implementations the parametrize list
+    # shrinks; when empty, this test is removed entirely. Slice-2 has
+    # promoted Qwen3 / Gemma4 to real ``forward_full`` calls, so only
+    # the hybrid Qwen3.5 path remains a placeholder here.
     with pytest.raises(NotImplementedError, match=r"sub-unit \(a2\)"):
         adapter_cls.decode_step_multi(None, None, None)  # type: ignore[arg-type]

@@ -8,7 +8,12 @@ import mlx.core as mx
 import pytest
 from mlx_lm.models.cache import BatchKVCache, KVCache
 
-from silica.mlx.runner import forward, forward_batched, forward_batched_full
+from silica.mlx.runner import (
+    forward,
+    forward_batched,
+    forward_batched_full,
+    forward_full,
+)
 
 
 class _TracedBatchKVCache(BatchKVCache):
@@ -157,6 +162,65 @@ def test_forward_rejects_empty_input() -> None:
     model = _SingleRequestModel()
     with pytest.raises(ValueError, match="non-empty"):
         forward(model, mx.array([], dtype=mx.int32), [_UnbatchedKV()])
+
+
+# --- forward_full (1-D wrapper, all-position logits) ------------------------
+
+
+def test_forward_full_single_request_returns_T_V() -> None:
+    model = _SingleRequestModel()
+    cache = [_UnbatchedKV()]
+    tokens = mx.array([1, 2, 3, 4], dtype=mx.int32)
+    logits = forward_full(model, tokens, cache)
+    assert tuple(logits.shape) == (4, model.VOCAB)
+
+
+@pytest.mark.parametrize("T", [1, 2, 4, 8])
+def test_forward_full_shape_is_T_V_across_lengths(T: int) -> None:
+    model = _SingleRequestModel()
+    cache = [_UnbatchedKV()]
+    tokens = mx.zeros((T,), dtype=mx.int32)
+    logits = forward_full(model, tokens, cache)
+    assert tuple(logits.shape) == (T, model.VOCAB)
+
+
+def test_forward_full_drives_underlying_cache_once_per_call() -> None:
+    # ``forward_full`` is a thin B=1 wrapper over ``forward_batched_full``;
+    # one call must produce one model invocation regardless of T (no
+    # internal looping that would defeat verify amortisation).
+    model = _SingleRequestModel()
+    traced = _UnbatchedKV()
+    forward_full(model, mx.zeros((5,), dtype=mx.int32), [traced])
+    assert traced.calls == 1
+
+
+def test_forward_full_rejects_2d_input() -> None:
+    model = _SingleRequestModel()
+    with pytest.raises(ValueError, match="expected 1-D tokens"):
+        forward_full(model, mx.zeros((1, 3), dtype=mx.int32), [_UnbatchedKV()])
+
+
+def test_forward_full_rejects_empty_input() -> None:
+    model = _SingleRequestModel()
+    with pytest.raises(ValueError, match="non-empty"):
+        forward_full(model, mx.array([], dtype=mx.int32), [_UnbatchedKV()])
+
+
+def test_forward_full_and_forward_share_last_position() -> None:
+    # ``forward_full(...)[T-1]`` must equal ``forward(...)`` element-for-
+    # element on the same input — both paths run the same underlying
+    # model call, just sliced differently. This pins the invariant that
+    # the spec verify and the autoregressive decode see consistent
+    # last-position logits when called on the same tokens.
+    model = _SingleRequestModel()
+    tokens = mx.array([1, 2, 3], dtype=mx.int32)
+
+    last_via_forward = forward(model, tokens, [_UnbatchedKV()])
+    full = forward_full(model, tokens, [_UnbatchedKV()])
+    last_via_full = full[full.shape[0] - 1]
+
+    assert tuple(last_via_forward.shape) == tuple(last_via_full.shape)
+    assert mx.all(last_via_forward == last_via_full).item()
 
 
 # ---------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 """silica.mlx.runner — low-level MLX forward wrappers.
 
 Thin bridge between Silica's I-1 ``ModelAdapter`` and mlx-lm's duck-typed
-``model(tokens, cache=...)`` forward call. Three entry points:
+``model(tokens, cache=...)`` forward call. Four entry points:
 
 - ``forward_batched_full`` takes 2-D ``(B, T)`` tokens and returns the
   full positional logits ``(B, T, V)`` that mlx-lm produces. This is
@@ -16,6 +16,10 @@ Thin bridge between Silica's I-1 ``ModelAdapter`` and mlx-lm's duck-typed
 - ``forward`` takes 1-D ``(T,)`` tokens and returns ``(V,)`` — a thin
   adapter over ``forward_batched`` kept so P-1's ``Engine.generate``
   path is unchanged.
+- ``forward_full`` takes 1-D ``(T,)`` tokens and returns ``(T, V)`` —
+  the all-position single-request companion to ``forward``, consumed
+  by ``ModelAdapter.decode_step_multi`` for the spec verify path
+  (D-021 step 5 sub-unit a2). Wraps ``forward_batched_full`` at B=1.
 
 Deliberately small. Does not own:
   - Sampling (Silica's P-0 ``Sampler`` is called by ``Engine`` or
@@ -128,4 +132,33 @@ def forward(
         raise ValueError("tokens must be non-empty")
 
     batched = forward_batched(model, tokens[None], cache_list)  # (1, V)
+    return batched[0]  # type: ignore[no-any-return]
+
+
+def forward_full(
+    model: Any,
+    tokens: mx.array,
+    cache_list: list[Any],
+) -> mx.array:
+    """Single-request forward returning all-position logits.
+
+    Companion to :func:`forward` for the speculative verify path
+    (D-021 step 5 sub-unit a2): callers pass 1-D ``(T,)`` tokens and
+    receive ``(T, V)`` logits — the prediction at every input position,
+    not just the last. Wraps :func:`forward_batched_full` at ``B=1`` so
+    the two single-request entry points share one model-call site.
+
+    Concrete adapters' ``decode_step_multi`` implementations consume
+    this helper for the verify forward; ``prefill`` continues to use
+    :func:`forward` because the engine sampler only needs the
+    last-position logit and the prefill path predates the spec verify.
+    """
+    if tokens.ndim != 1:
+        raise ValueError(
+            f"expected 1-D tokens (T,), got shape {tuple(tokens.shape)}"
+        )
+    if tokens.size == 0:
+        raise ValueError("tokens must be non-empty")
+
+    batched = forward_batched_full(model, tokens[None], cache_list)  # (1, T, V)
     return batched[0]  # type: ignore[no-any-return]

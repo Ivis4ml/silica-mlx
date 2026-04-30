@@ -1,5 +1,15 @@
 """silica.mlx — MLX / mlx-lm integration shims (P-1 D-010 clean path)."""
 
-from silica.mlx.runner import forward, forward_batched, forward_batched_full
+from silica.mlx.runner import (
+    forward,
+    forward_batched,
+    forward_batched_full,
+    forward_full,
+)
 
-__all__ = ["forward", "forward_batched", "forward_batched_full"]
+__all__ = [
+    "forward",
+    "forward_batched",
+    "forward_batched_full",
+    "forward_full",
+]

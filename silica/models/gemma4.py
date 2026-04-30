@@ -52,7 +52,7 @@ from mlx_lm.utils import load as _mlx_lm_load
 
 from silica.kvcache.manager import KVHandle
 from silica.kvcache.simple import SimpleKVCache
-from silica.mlx.runner import forward
+from silica.mlx.runner import forward, forward_full
 from silica.models.adapter import (
     AttentionKind,
     AttentionPattern,
@@ -229,17 +229,16 @@ class Gemma4Adapter:
     def decode_step_multi(
         self, tokens: mx.array, kv_handle: KVHandle
     ) -> tuple[mx.array, StateDelta]:
-        # D-021 step 5 sub-unit (a2) contract slice — Gemma4 forward for
-        # the multi-token verify path lands in the plain-adapter slice.
-        # Inherited by ``Gemma4MoeAdapter``. Until then callers route
-        # through ``silica.speculative.verify.run_verify_forward``.
-        raise NotImplementedError(
-            "Gemma4Adapter.decode_step_multi: stub at D-021 step 5 sub-"
-            "unit (a2) contract slice — adapter forward lands in a "
-            "follow-up slice; use silica.speculative.verify."
-            "run_verify_forward for the temporary decode_step-loop "
-            "fallback."
-        )
+        # D-021 step 5 sub-unit (a2) plain-adapter slice. Inherited by
+        # ``Gemma4MoeAdapter``. Multi-token verify forward over T tokens,
+        # returning logits at every input position (shape (T, V)).
+        # Gemma4's sliding-window + global attention pattern is handled
+        # by mlx-lm's per-layer attention mask: feeding T tokens at once
+        # produces position-aligned logits identical to T sequential
+        # ``decode_step`` calls, because the mask is set up per-position.
+        cache_list = self._kv_manager.cache_list(kv_handle.req_id)
+        logits = forward_full(self._model, tokens, cache_list)
+        return logits, StateDelta()
 
     # --- P-5-F F.1: PreNormCaptureAdapter implementation ---
 

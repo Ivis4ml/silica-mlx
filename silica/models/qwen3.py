@@ -40,7 +40,7 @@ from mlx_lm.utils import load as _mlx_lm_load
 
 from silica.kvcache.manager import KVHandle
 from silica.kvcache.simple import SimpleKVCache
-from silica.mlx.runner import forward
+from silica.mlx.runner import forward, forward_full
 from silica.models.adapter import (
     AttentionKind,
     AttentionPattern,
@@ -153,17 +153,17 @@ class Qwen3Adapter:
     def decode_step_multi(
         self, tokens: mx.array, kv_handle: KVHandle
     ) -> tuple[mx.array, StateDelta]:
-        # D-021 step 5 sub-unit (a2) contract slice — Qwen3-family forward
-        # for the multi-token verify path lands in a follow-up plain-adapter
-        # slice. Until then, callers should route through
-        # ``silica.speculative.verify.run_verify_forward``, which catches
-        # this raise and falls back to a sequential ``decode_step`` loop.
-        raise NotImplementedError(
-            "Qwen3Adapter.decode_step_multi: stub at D-021 step 5 sub-unit "
-            "(a2) contract slice — adapter forward lands in a follow-up "
-            "slice; use silica.speculative.verify.run_verify_forward for "
-            "the temporary decode_step-loop fallback."
-        )
+        # D-021 step 5 sub-unit (a2) plain-adapter slice. Multi-token
+        # verify forward over T tokens, returning logits at every input
+        # position (shape (T, V)) for greedy verification by the spec
+        # engine. Plain Qwen3 has no recurrent layers — every layer is
+        # full attention — so a single ``forward_full`` call advances
+        # the per-layer ``KVCache`` by exactly T positions, identical
+        # in effect to T sequential ``decode_step`` calls but in one
+        # batched forward.
+        cache_list = self._kv_manager.cache_list(kv_handle.req_id)
+        logits = forward_full(self._model, tokens, cache_list)
+        return logits, StateDelta()
 
     # --- P-5-F F.1: PreNormCaptureAdapter implementation ---
 
