@@ -186,10 +186,14 @@ class Engine:
         # reads ``ctx.request.token_ids + ctx.output_token_ids`` for KV
         # catch-up bookkeeping. Both are kept in lockstep with
         # ``history`` (prompt + yielded tokens) on every cycle below.
+        # ``request_id=handle.req_id`` matches the engine's allocated
+        # id so slice 2a's per-``req_id`` keying inside the drafter
+        # is predictable across cycles within one ``generate`` call.
         ctx = RequestState(
             request=Request(
                 prompt="",
                 sampling_params=params,
+                request_id=handle.req_id,
                 token_ids=tuple(prompt_ids),
             )
         )

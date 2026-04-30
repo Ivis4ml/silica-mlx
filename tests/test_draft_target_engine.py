@@ -169,13 +169,31 @@ def adapter(kv: _FakeKV) -> _FakeAdapter:
 
 @pytest.fixture
 def engine(adapter: _FakeAdapter, kv: _FakeKV) -> DraftTargetEngine:
-    return DraftTargetEngine(adapter, kv, req_id="test-draft")  # type: ignore[arg-type]
+    return DraftTargetEngine(adapter, kv)  # type: ignore[arg-type]
 
 
-def _ctx_with(prompt: tuple[int, ...], output: tuple[int, ...]) -> RequestState:
+_DEFAULT_TEST_REQ_ID = "test-draft"
+
+
+def _ctx_with(
+    prompt: tuple[int, ...],
+    output: tuple[int, ...],
+    *,
+    request_id: str = _DEFAULT_TEST_REQ_ID,
+) -> RequestState:
+    """Build a ``RequestState`` for the drafter under test.
+
+    ``request_id`` is set explicitly so slice 2a's per-``req_id`` keying
+    inside ``DraftTargetEngine`` produces predictable bookkeeping; the
+    default matches the legacy single-request fixture so existing tests
+    that compare ``draft_kv_pos`` / ``last_propose_count`` against the
+    sole active ``req_id`` keep reading the same values via the
+    ``draft_kv_pos_for(_DEFAULT_TEST_REQ_ID)`` accessor.
+    """
     req = Request(
         prompt="",
         sampling_params=SamplingParams(),
+        request_id=request_id,
         token_ids=prompt,
     )
     state = RequestState(request=req)
@@ -214,8 +232,8 @@ def test_propose_cycle_zero_prefills_and_drafts(
     assert n_tokens == [6, 1, 1, 1]
 
     # Draft KV ended at 6 + 3 = 9.
-    assert engine.draft_kv_pos == 9
-    assert engine.last_propose_count == 3
+    assert engine.draft_kv_pos_for(_DEFAULT_TEST_REQ_ID) == 9
+    assert engine.last_propose_count_for(_DEFAULT_TEST_REQ_ID) == 3
 
 
 def test_propose_cycle_zero_argmax_chain_is_predictable(
@@ -241,7 +259,7 @@ def test_propose_with_nonpositive_k_returns_empty_no_forward(
     assert drafts.token_ids == ()
     assert drafts.draft_logprobs is None
     assert adapter.calls == []
-    assert engine.last_propose_count == 0
+    assert engine.last_propose_count_for(_DEFAULT_TEST_REQ_ID) == 0
 
 
 def test_commit_with_no_active_propose_is_noop(
@@ -264,14 +282,14 @@ def test_partial_accept_rolls_back_kv_and_clears_cached_logits(
     ctx = _ctx_with(prompt=(10, 11), output=(99,))
     drafts = engine.propose(ctx, k=4)
     assert drafts.token_ids == (4, 5, 6, 7)  # depths 3,4,5,6 → +1
-    assert engine.draft_kv_pos == 7  # 3 prefill + 4 drafts
+    assert engine.draft_kv_pos_for(_DEFAULT_TEST_REQ_ID) == 7  # 3 prefill + 4 drafts
 
     # Engine "accepts" 2 of 4 drafts, rejects 2. Bonus is something the
     # engine sampled from verify_logits[2] — append it to ctx.output.
     engine.commit(ctx, accepted_len=2)
     assert kv.rollback_calls == [("test-draft", 2)]  # γ - accepted_len = 2
-    assert engine.draft_kv_pos == 5  # 7 - 2 rejected
-    assert engine.last_propose_count == 0  # commit resets the counter
+    assert engine.draft_kv_pos_for(_DEFAULT_TEST_REQ_ID) == 5  # 7 - 2 rejected
+    assert engine.last_propose_count_for(_DEFAULT_TEST_REQ_ID) == 0  # commit resets the counter
 
     # Engine commits accepted drafts + bonus into ctx.output_token_ids.
     # output is now (99, 4, 5, BONUS) — total target_committed = 2 + 4 = 6.
@@ -289,7 +307,7 @@ def test_partial_accept_rolls_back_kv_and_clears_cached_logits(
         "decode_step",  # draft 3
     ]
     assert len(drafts2.token_ids) == 3
-    assert engine.draft_kv_pos == 9  # 5 + 1 catch-up + 3 drafts
+    assert engine.draft_kv_pos_for(_DEFAULT_TEST_REQ_ID) == 9  # 5 + 1 catch-up + 3 drafts
 
 
 # --- full-accept commit (no rollback) ---------------------------------------
@@ -302,7 +320,7 @@ def test_full_accept_does_not_rollback(
     engine.propose(ctx, k=3)
     engine.commit(ctx, accepted_len=3)  # all γ accepted
     assert kv.rollback_calls == []
-    assert engine.last_propose_count == 0
+    assert engine.last_propose_count_for(_DEFAULT_TEST_REQ_ID) == 0
 
 
 def test_full_accept_then_propose_consumes_only_bonus(
@@ -374,7 +392,7 @@ def test_reset_releases_kv_and_trims_underlying_cache(
     ctx = _ctx_with(prompt=(10,), output=(99,))
     engine.propose(ctx, k=2)
     assert kv._owner == "test-draft"
-    assert engine.draft_kv_pos == 4
+    assert engine.draft_kv_pos_for(_DEFAULT_TEST_REQ_ID) == 4
     assert kv.depth == 4
     rollback_calls_before_reset = list(kv.rollback_calls)
 
@@ -385,8 +403,8 @@ def test_reset_releases_kv_and_trims_underlying_cache(
     # stale KV state and produce contaminated draft logits.
     assert kv._owner is None
     assert kv.depth == 0
-    assert engine.draft_kv_pos == 0
-    assert engine.last_propose_count == 0
+    assert engine.draft_kv_pos_for(_DEFAULT_TEST_REQ_ID) == 0
+    assert engine.last_propose_count_for(_DEFAULT_TEST_REQ_ID) == 0
     # Reset issued exactly one rollback for the full draft_kv_pos.
     new_rollback = kv.rollback_calls[len(rollback_calls_before_reset):]
     assert new_rollback == [("test-draft", 4)]
@@ -401,7 +419,7 @@ def test_reset_without_prior_propose_is_safe(
     assert kv._owner is None
     assert kv.depth == 0
     assert kv.rollback_calls == []
-    assert engine.draft_kv_pos == 0
+    assert engine.draft_kv_pos_for(_DEFAULT_TEST_REQ_ID) == 0
 
 
 def test_reset_then_new_request_does_not_carry_old_kv(
@@ -427,3 +445,297 @@ def test_reset_then_new_request_does_not_carry_old_kv(
     assert ops[0] == "prefill"  # cycle-0 path entered again
     # depth_after_prefill = 0 (post-reset) + 2 = 2, then draft = 3.
     assert drafts2.token_ids == (3,)
+
+
+# --- D-021 (c) slice 2a: multi-req_id concurrent reservations --------------
+
+
+class _MultiFakeKV:
+    """Multi-request fake KV: per-``req_id`` depth + reservation set.
+
+    Slice 2a fixture for A→B→A switching tests. Unlike single-owner
+    ``_FakeKV``, this supports concurrent reservations from any number
+    of ``req_id``s without raising on a second claim. The fake adapter
+    paired with this KV (``_MultiFakeAdapter``) reads / writes per-row
+    depth via ``kv_handle.req_id`` so the drafter's per-cycle forwards
+    operate on the correct request's bookkeeping.
+    """
+
+    block_size: int = 256
+
+    def __init__(self) -> None:
+        self.reserved: set[str] = set()
+        self.depths: dict[str, int] = {}
+        self.rollback_calls: list[tuple[str, int]] = []
+        self.free_calls: list[str] = []
+
+    def reserve_for_prefill(
+        self, req_id: str, token_ids: Sequence[int]
+    ) -> BlockList:
+        del token_ids
+        if req_id in self.reserved:
+            raise ValueError(
+                f"_MultiFakeKV: req_id {req_id!r} already reserved"
+            )
+        self.reserved.add(req_id)
+        self.depths[req_id] = 0
+        return BlockList()
+
+    def append_slot(self, req_id: str, n: int) -> BlockList:
+        del n
+        if req_id not in self.reserved:
+            raise ValueError(f"req_id {req_id!r} not reserved")
+        return BlockList()
+
+    def commit(self, req_id: str, n_accepted: int) -> None:
+        del n_accepted
+        if req_id not in self.reserved:
+            raise ValueError(f"req_id {req_id!r} not reserved")
+
+    def rollback(self, req_id: str, n_reject: int) -> None:
+        if req_id not in self.reserved:
+            raise ValueError(
+                f"_MultiFakeKV: rollback for un-reserved req_id "
+                f"{req_id!r}"
+            )
+        self.rollback_calls.append((req_id, n_reject))
+        self.depths[req_id] = max(0, self.depths.get(req_id, 0) - n_reject)
+
+    def free(self, req_id: str) -> None:
+        self.free_calls.append(req_id)
+        self.reserved.discard(req_id)
+        self.depths.pop(req_id, None)
+
+    def get_computed_blocks(self, token_ids: Sequence[int]) -> PrefixHit:
+        del token_ids
+        return PrefixHit()
+
+    def available_blocks(self) -> int:
+        return 0
+
+    def budget(self) -> MemoryBudget:
+        return MemoryBudget()
+
+
+class _MultiFakeAdapter:
+    """Per-``req_id`` depth-driven scripted adapter for slice 2a tests."""
+
+    VOCAB = 64
+
+    def __init__(self, fake_kv: _MultiFakeKV) -> None:
+        self._kv = fake_kv
+        # (req_id, op, n_tokens, depth_after) per call.
+        self.calls: list[tuple[str, str, int, int]] = []
+
+    def _logits_for_depth(self, depth: int) -> mx.array:
+        target = (depth + 1) % self.VOCAB
+        scores = [0.0] * self.VOCAB
+        scores[target] = 5.0
+        return mx.array(scores, dtype=mx.float32)
+
+    def prefill(
+        self, tokens: mx.array, kv_handle: KVHandle
+    ) -> tuple[mx.array, StateDelta]:
+        rid = kv_handle.req_id
+        n = int(tokens.size)
+        self._kv.depths[rid] += n
+        self.calls.append((rid, "prefill", n, self._kv.depths[rid]))
+        return self._logits_for_depth(self._kv.depths[rid]), StateDelta()
+
+    def decode_step(
+        self, token: mx.array, kv_handle: KVHandle
+    ) -> tuple[mx.array, StateDelta]:
+        rid = kv_handle.req_id
+        n = int(token.size)
+        self._kv.depths[rid] += n
+        self.calls.append((rid, "decode_step", n, self._kv.depths[rid]))
+        return self._logits_for_depth(self._kv.depths[rid]), StateDelta()
+
+    def kv_layout(self) -> Any:
+        raise NotImplementedError("multi fake adapter")
+
+    def attention_pattern(self) -> Any:
+        raise NotImplementedError("multi fake adapter")
+
+    def tokenizer(self) -> Any:
+        raise NotImplementedError("multi fake adapter")
+
+    def capabilities(self) -> Any:
+        raise NotImplementedError("multi fake adapter")
+
+
+def test_a_b_a_switching_preserves_each_request_state() -> None:
+    """A→B→A propose sequence keeps each req_id's draft KV intact.
+
+    Without per-``req_id`` keying, request B's propose would either
+    over-write A's cache_kv_pos / cached_last_logits or trigger a
+    full re-prefill on the resume-A call. Slice 2a's per-``req_id``
+    dicts make A→B→A a no-overhead context switch: each propose
+    consults its own dict entry and the underlying ``_MultiFakeKV``
+    holds two concurrent depth counters.
+    """
+    kv = _MultiFakeKV()
+    adapter = _MultiFakeAdapter(kv)
+    engine = DraftTargetEngine(adapter, kv)  # type: ignore[arg-type]
+
+    # Request A — prompt len 3, anchor 99 ⇒ committed = 4 tokens.
+    ctx_a0 = _ctx_with(
+        prompt=(10, 11, 12), output=(99,), request_id="req-A"
+    )
+    drafts_a0 = engine.propose(ctx_a0, k=2)
+    # Cycle-0 for A: depths["req-A"] = 0 → prefill 4 → 4 → draft 5,
+    # decode_step(5) → 5 → draft 6.
+    assert drafts_a0.token_ids == (5, 6)
+    assert engine.draft_kv_pos_for("req-A") == 6
+    assert engine.draft_kv_pos_for("req-B") == 0
+    engine.commit(ctx_a0, accepted_len=2)  # full accept
+
+    # Request B — completely separate prompt; cycle-0 for B starts from
+    # its own depth 0, NOT from A's depth.
+    ctx_b0 = _ctx_with(
+        prompt=(40, 41), output=(77,), request_id="req-B"
+    )
+    drafts_b0 = engine.propose(ctx_b0, k=1)
+    # Cycle-0 for B: depths["req-B"] = 0 → prefill 3 → 3 → draft 4.
+    assert drafts_b0.token_ids == (4,)
+    # A's bookkeeping survived the B interlude.
+    assert engine.draft_kv_pos_for("req-A") == 6
+    assert engine.draft_kv_pos_for("req-B") == 4
+    engine.commit(ctx_b0, accepted_len=1)  # full accept
+
+    # Both reservations live concurrently in _MultiFakeKV.
+    assert engine.active_req_ids() == frozenset({"req-A", "req-B"})
+    assert kv.reserved == {"req-A", "req-B"}
+
+    # Resume A — engine commits cycle-0 bonus 7 (the post-cycle bonus
+    # the engine sampled would have been from verify_logits[γ-1]; for
+    # the A→B→A test we just hand-carry it via output_token_ids).
+    # Catch-up branch on A: target_committed = prompt(3) + output(3
+    # = anchor 99 + drafts 5, 6 + bonus 7) = 7. draft_kv_pos for A is
+    # 6 from cycle 0; n_to_consume = 1 (the bonus). One decode_step
+    # advances A to depth 7, then γ=1 draft.
+    ctx_a1 = _ctx_with(
+        prompt=(10, 11, 12), output=(99, 5, 6, 7), request_id="req-A"
+    )
+    adapter.calls.clear()
+    drafts_a1 = engine.propose(ctx_a1, k=1)
+    # Catch-up: decode_step on A at depth 6 → 7 → draft 8;
+    # autoregressive draft loop advances A to 8 then draft = 9
+    # … but γ=1 so only one draft is produced: token = 8 (the catch-up
+    # logits) and the autoregressive forward advances A to depth 8.
+    assert drafts_a1.token_ids == (8,)
+    # Adapter calls only touched req-A (catch-up + γ=1 draft = 2 calls).
+    rids = [rid for rid, _, _, _ in adapter.calls]
+    assert rids == ["req-A", "req-A"]
+    assert engine.draft_kv_pos_for("req-A") == 8
+    # B's state is untouched by A's resume.
+    assert engine.draft_kv_pos_for("req-B") == 4
+
+
+def test_per_req_id_reset_only_clears_named_request() -> None:
+    """``reset(req_id)`` clears only that req_id; others survive."""
+    kv = _MultiFakeKV()
+    adapter = _MultiFakeAdapter(kv)
+    engine = DraftTargetEngine(adapter, kv)  # type: ignore[arg-type]
+
+    engine.propose(
+        _ctx_with(prompt=(1,), output=(2,), request_id="req-A"), k=1
+    )
+    engine.commit(
+        _ctx_with(prompt=(1,), output=(2,), request_id="req-A"),
+        accepted_len=1,
+    )
+    engine.propose(
+        _ctx_with(prompt=(3,), output=(4,), request_id="req-B"), k=1
+    )
+    engine.commit(
+        _ctx_with(prompt=(3,), output=(4,), request_id="req-B"),
+        accepted_len=1,
+    )
+    assert engine.active_req_ids() == frozenset({"req-A", "req-B"})
+
+    engine.reset("req-A")
+    assert engine.active_req_ids() == frozenset({"req-B"})
+    assert engine.draft_kv_pos_for("req-A") == 0
+    assert engine.draft_kv_pos_for("req-B") > 0
+    # Underlying KV freed only req-A.
+    assert "req-A" in kv.free_calls
+    assert "req-B" not in kv.free_calls
+
+
+def test_reset_no_arg_sweeps_every_active_request() -> None:
+    """``reset()`` (no arg) tears down every active req_id."""
+    kv = _MultiFakeKV()
+    adapter = _MultiFakeAdapter(kv)
+    engine = DraftTargetEngine(adapter, kv)  # type: ignore[arg-type]
+
+    for rid in ("req-A", "req-B", "req-C"):
+        engine.propose(
+            _ctx_with(prompt=(1,), output=(2,), request_id=rid), k=1
+        )
+        engine.commit(
+            _ctx_with(prompt=(1,), output=(2,), request_id=rid),
+            accepted_len=1,
+        )
+    assert engine.active_req_ids() == frozenset(
+        {"req-A", "req-B", "req-C"}
+    )
+
+    engine.reset()  # No arg ⇒ sweep all.
+    assert engine.active_req_ids() == frozenset()
+    assert kv.reserved == set()
+    # Each req_id's free was called exactly once.
+    assert sorted(kv.free_calls) == ["req-A", "req-B", "req-C"]
+
+
+def test_reset_named_unknown_req_id_is_idempotent() -> None:
+    """``reset("unknown")`` is a no-op — never raises, never frees others."""
+    kv = _MultiFakeKV()
+    adapter = _MultiFakeAdapter(kv)
+    engine = DraftTargetEngine(adapter, kv)  # type: ignore[arg-type]
+
+    engine.propose(
+        _ctx_with(prompt=(1,), output=(2,), request_id="req-A"), k=1
+    )
+    engine.commit(
+        _ctx_with(prompt=(1,), output=(2,), request_id="req-A"),
+        accepted_len=1,
+    )
+
+    engine.reset("never-seen-this-id")
+    # req-A still active.
+    assert engine.active_req_ids() == frozenset({"req-A"})
+    assert "req-A" in kv.reserved
+
+
+def test_partial_accept_only_rolls_back_named_request() -> None:
+    """commit's KV rollback affects only the request named in ctx."""
+    kv = _MultiFakeKV()
+    adapter = _MultiFakeAdapter(kv)
+    engine = DraftTargetEngine(adapter, kv)  # type: ignore[arg-type]
+
+    # Propose for A and B; both end with γ drafts in flight.
+    engine.propose(
+        _ctx_with(prompt=(1, 2), output=(3,), request_id="req-A"), k=2
+    )
+    engine.propose(
+        _ctx_with(prompt=(1, 2), output=(3,), request_id="req-B"), k=2
+    )
+    pos_a_after_propose = engine.draft_kv_pos_for("req-A")
+    pos_b_after_propose = engine.draft_kv_pos_for("req-B")
+    assert pos_a_after_propose == pos_b_after_propose  # same shape
+
+    # Partial-accept commit for B only.
+    engine.commit(
+        _ctx_with(prompt=(1, 2), output=(3,), request_id="req-B"),
+        accepted_len=1,
+    )
+    # B's KV rolled back by 1; A's untouched.
+    assert (
+        engine.draft_kv_pos_for("req-B") == pos_b_after_propose - 1
+    )
+    assert (
+        engine.draft_kv_pos_for("req-A") == pos_a_after_propose
+    )
+    # Underlying KV recorded the rollback for B alone.
+    assert kv.rollback_calls == [("req-B", 1)]
