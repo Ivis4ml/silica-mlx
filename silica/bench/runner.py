@@ -287,9 +287,11 @@ def _check_gates(
     on rows whose ``spec_config.kind == "dflash"``. C.1 rows
     (``kind == "draft_target"``) drop to spec-off in that mode; C.4
     rows similarly drop to spec-off under ``draft_target`` or
-    ``none``. Skip reasons distinguish ``draft_cache_missing`` /
-    ``draft_env_var_not_set`` / ``spec_kind_mismatch`` so CI logs
-    surface the exact branch.
+    ``none``. The kind-mismatch path returns ``None`` (the row runs
+    spec-off as plain warm-decode); only the cache / env paths surface
+    explicit skip reasons (``draft_cache_missing:`` /
+    ``draft_env_var_not_set:``) so CI logs distinguish the runnable
+    spec-off case from the gated-out case.
     """
     cache = hf_cache_path_for_repo(scenario.repo)
     if not cache.exists():
