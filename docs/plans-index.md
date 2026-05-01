@@ -155,14 +155,19 @@ read in-editor while iterating.
 ### D-021 step 6 — C.4 DFlash spike (orientation)
 
 - [`P6_C4_DFLASH_OPENING.md`](../plans/P6_C4_DFLASH_OPENING.md) —
-  opening for the **drafter-only** C.4 block-diffusion spike. PLAN.md
-  §13 step 6 gate quoted verbatim (≥1.8× engineering / ≥2.5× one
-  component of (1b) survival rule); spike shape B=1 mirroring
-  step 5 (h); `DraftEngine` Protocol unchanged (cost-model spike with
-  `commit` no-op + stateless re-forward); upstream tape-replay verify
-  + `verify_qmm` int4 Metal kernel are explicit non-goals (deferred
-  full-DFlash port). Seven sub-units (α..η) starting with
-  native-runtime + Python-API verification of `bstnxbt/dflash-mlx`.
+  opening for the C.4 block-diffusion spike. PLAN.md §13 step 6 gate
+  quoted verbatim (≥1.8× engineering / ≥2.5× one component of (1b)
+  survival rule); spike shape B=1 mirroring step 5 (h); `DraftEngine`
+  Protocol-signature unchanged. (α) closed favourably (MIT, no torch,
+  Python API + `DRAFT_REGISTRY` 4-bit-target pairing confirmed) and
+  surfaced F-1: upstream's drafter is **target-conditioned** with a
+  per-layer streaming `ContextOnlyDraftKVCache` and
+  `commit`-updates-`target_hidden` semantics — not a stateless small
+  LM. Eight sub-units (α, αβ, β..η); (αβ) added between α and β to
+  install the target-hidden capture path on `Qwen3_5Adapter` /
+  `qwen3_5_moe.py` (analogous to P-5-F (3b)). Upstream tape-replay
+  verify, `verify_qmm` int4 Metal kernel, and target speculative
+  hooks remain explicit non-goals (deferred full-DFlash port).
 
 ## Side track: chat CLI redesign
 

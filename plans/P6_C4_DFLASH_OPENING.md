@@ -3,8 +3,8 @@
 | Field         | Value                                                                                                        |
 | ------------- | ------------------------------------------------------------------------------------------------------------ |
 | Phase         | P-6 (Performance Phase) — D-021 step 6                                                                       |
-| Status        | orientation drafted; no code on disk; awaits user review before sub-unit (a) begins                          |
-| Last updated  | 2026-05-01                                                                                                   |
+| Status        | (α) closed favourably (see §5.8); F-1 architecture finding triggered §0 / §1 / §2 / §3 / §4 revision; new sub-unit (αβ) added between α and β; awaits user review before (αβ) begins |
+| Last updated  | 2026-05-01 (post-α revision)                                                                                 |
 | Scope owner   | Xin Zhou                                                                                                     |
 | Predecessors  | D-021 step 5 spec foundation closed at v1.7.19 (`plans/P6_SPEC_FOUNDATION_OPENING.md` §6.1)                  |
 | Successors    | D-021 step 7 (Track B 3-bit weights); D-021 step 8 (C.5 tree-shape spike, conditional on C.4 outcome)        |
@@ -30,26 +30,55 @@ production integration.
 
 ## 0. TL;DR
 
-C.4 is a **drafter-only spike**: it wires the
-[`bstnxbt/dflash-mlx`](https://github.com/bstnxbt/dflash-mlx)
-block-diffusion drafter into silica's existing
-`silica.speculative.DraftEngine` Protocol. The I-5 protocol does **not**
-change; the only thing that changes inside silica is the drafter's
-**cost model** — one drafter forward emits a K-token block instead of γ
-autoregressive forwards.
+C.4 is a **drafter-only spike** in the sense that the upstream
+verify-side optimisations (`verify_qmm` int4 Metal kernel +
+tape-replay verify) are explicitly out of scope (see below). However,
+the (α) closure findings (§5.8) established a structural fact that
+the pre-α framing missed: **`bstnxbt/dflash-mlx`'s drafter is
+target-conditioned**. `DFlashDraftModel.__call__` requires the
+target's hidden states at specific captured layer ids as input, plus
+a per-layer streaming `ContextOnlyDraftKVCache` that accumulates
+those hidden states across cycles. The drafter is closer to a
+C.3-style MTP head with a block-diffusion forward than to a small
+autoregressive draft LM.
 
-Two upstream-DFlash mechanisms are **explicitly out of scope** for this
-spike: (a) the **tape-replay rollback** is upstream's *target-side*
-GatedDeltaNet replacement, not a drafter-side concern (see upstream
-README quote in §4.1); silica's existing recurrent rollback path
-(`Qwen3_5Adapter.rollback_state`, step 5 sub-unit (e)) and target-side
-KV rollback (`PagedKVCache.rollback`, step 5 sub-unit (d)) handle
-rejection unchanged. (b) The upstream `verify_qmm` int4 Metal kernel
-that accelerates the M=16 quantised matmul during target verification
-is also not ported — silica's verify path runs through stock MLX
-`mx.quantized_matmul`. Both deferrals shrink the upstream "5.2×
-HumanEval" claim band considerably for the silica-integrated number;
-see §1 for the adjusted prediction.
+Concretely, the drafter state machine the spike must support is:
+
+1. **`propose(ctx, k)`** — read the stored `target_hidden` for this
+   `req_id`; call `DFlashDraftModel(noise_embedding=…, target_hidden=…,
+   cache=draft_cache)`. The draft forward internally appends only
+   the *target-hidden-derived context keys/values* (length `ctx_len`)
+   to `draft_cache` via `ContextOnlyDraftKVCache.append_context`. The
+   K mask tokens' noise keys/values are used for attention but never
+   written to the cache. Returns the K - 1 drafted token ids.
+2. **target verify** — silica's verify forward runs `decode_step_multi(k)`
+   AND simultaneously captures hidden states at the layer ids the
+   drafter consumes. This capture path is the new architectural
+   surface (see sub-unit (αβ) in §3).
+3. **`commit(ctx, yielded_count)`** — slice the captured verify
+   hiddens to `1 + yielded_count` positions and store as the new
+   `target_hidden` for this `req_id`. This is the *only* draft-side
+   commit work; rejected drafts were never in the draft cache, so
+   draft-side "rollback" is implicit (rejected positions were noise,
+   never written).
+
+Three upstream-DFlash mechanisms remain **explicitly out of scope**
+for this spike: (a) the **tape-replay verify rollback** is upstream's
+*target-side* GatedDeltaNet snapshot/restore replacement (see
+upstream README quote in §4.1); silica's existing recurrent rollback
+path (`Qwen3_5Adapter.rollback_state`, step 5 sub-unit (e)) and
+target-side KV rollback (`PagedKVCache.rollback`, step 5 sub-unit
+(d)) handle target rejection unchanged. (b) The upstream `verify_qmm`
+int4 Metal kernel that accelerates the M=16 quantised matmul during
+target verification is also not ported — silica's verify path runs
+through stock MLX `mx.quantized_matmul`. (c) The upstream-default
+`load_target_bundle(...)` patches the target with
+`_install_target_speculative_hooks(model)` and optionally with
+packed weights / a custom full-attention split — silica does **not**
+install those patches; it runs its own target adapters unchanged
+from step 5. All three deferrals shrink the upstream "5.2× HumanEval"
+claim band considerably for the silica-integrated number; see §1
+for the adjusted prediction.
 
 The spike's exit gate is the Decision Gate 1 v1.7.18 reframe quoted
 from PLAN.md §13 D-021 step 6 verbatim:
@@ -88,39 +117,48 @@ silica needs to close (40 → 60 tok/s requires ≈1.5× full-stack uplift).
 C.1 is bandwidth-bound on the target verify (verify forward at k=4 is
 1.494× a single target forward at 55% utilisation; raising k diminishes
 returns sublinearly under the corrected 15.13 GB anchor). The single
-lever C.4's **drafter-only** scope introduces is **drafter cost
-reduction**: a block-diffusion drafter that emits K tokens in one
-forward instead of γ = K - 1 autoregressive forwards turns the speedup
-denominator from `γ * c_draft + c_verify(k)` into
-`c_draft_block + c_verify(k)` for the same yielded-tokens expectation
-`(1 - α^k) / (1 - α)`. The two upstream verify-side mechanisms
-(tape-replay and the verify_qmm int4 Metal kernel; see §0 and §4.1)
+lever C.4's spike scope introduces is **drafter cost reduction**: a
+block-diffusion drafter that emits K tokens in one forward instead of
+γ = K - 1 autoregressive forwards turns the speedup denominator from
+`γ * c_draft + c_verify(k)` into
+`c_draft_block + c_capture_hidden(k) + c_verify(k)` for the same
+yielded-tokens expectation `(1 - α^k) / (1 - α)`. The new
+`c_capture_hidden(k)` term is the cost of capturing target hidden
+states at the drafter-consumed layer ids during the verify forward
+(per the F-1 finding in §5.8); whether it is materially additive or
+amortises into the existing verify forward depends on MLX's ability
+to expose intermediate hidden states without a second pass, which
+sub-unit (αβ) microbenches. The three upstream verify-side
+mechanisms (tape-replay, the `verify_qmm` int4 Metal kernel, and the
+`_install_target_speculative_hooks` target patches; see §0 and §4.1)
 are deferred — the spike does **not** harvest them, so silica's
 `c_verify(k)` and recurrent rollback cost stay at their step-5 anchors.
 
 Under that scope, the predicted speedup band is bounded by what
-drafter-cost reduction alone delivers: **roughly 1.5-2.2×** at α ∈
-[0.5, 0.7], not the 2-3× a full-DFlash port would predict. The band
-also assumes the **stateless-drafter** wrapper (§4.1) — every
-`propose` re-runs the block-diffusion forward from the committed
-prefix, so `c_draft_block` is paid in full per cycle regardless of
-partial accept. A future stateful re-drafting hook (OQ-5) would
-*widen* this band, not narrow it; the spike's gate decision uses the
-worst-case estimate. Upstream's "5.2× single-request HumanEval" claim
-is on a stack that includes both the verify_qmm kernel and tape-replay
-verify on a CUDA target; the silica-integrated number for a
-drafter-only spike is materially lower and lands closer to the C.1
-baseline than the upstream headline suggests.
+drafter-cost reduction alone delivers: **roughly 1.4-2.0×** at α ∈
+[0.5, 0.7], shifted ~10% lower than the pre-α "1.5-2.2×" estimate
+to reflect the new `c_capture_hidden(k)` term. The drafter is
+**stateful per `req_id`** by design (target-conditioned with a
+streaming draft KV cache; see §4.1) — `c_draft_block` is paid in
+full per cycle, but the cache amortises target-hidden context across
+cycles so the cumulative drafter cost stays sublinear in cycle count.
+Upstream's "5.2× single-request HumanEval" claim is on a stack that
+includes both the `verify_qmm` kernel and tape-replay verify on a
+CUDA target; the silica-integrated number for a *drafter-only*
+spike (no upstream verify-side optimisations) is materially lower
+and lands closer to the C.1 baseline than the upstream headline
+suggests.
 
 The spike is the smallest experiment that turns "predicted band" into
 "silica-integrated number." If the integrated number lands ≥1.8×, C.4
 becomes a viable dense (1a)-survival lever and step 7 (Track B 3-bit)
-stacks on it. If it lands ≥2.5× *with this drafter-only scope*, that is
-a strongly positive surprise and triggers a separate full-DFlash-port
-proposal beyond step 6. If it lands ≤1.8×, (1b) retires unless the C.5
-spike rescues it independently — and a "port the verify-side kernels
-too" follow-up may be reconsidered if the drafter-only number sits
-just below the gate (≥1.5×).
+stacks on it. If it lands ≥2.5× under the drafter-only-with-hidden-capture
+scope, that is a strongly positive surprise and triggers a separate
+full-DFlash-port proposal beyond step 6. If it lands ≤1.8×, (1b)
+retires unless the C.5 spike rescues it independently — and a "port
+the verify-side kernels too" follow-up may be reconsidered if the
+drafter-only-with-hidden-capture number sits just below the gate
+(≥1.4×).
 
 ---
 
@@ -133,25 +171,43 @@ just below the gate (≥1.5×).
   No changes to `silica.*` for users without `dflash-mlx` installed —
   spec-on `--speculative draft_target` continues to work via the
   autoregressive C.1 path.
+- **Extend silica's target adapters with intermediate hidden-state
+  capture (sub-unit (αβ)).** `Qwen3_5Adapter` and `qwen3_5_moe.py`
+  grow a capture-enabled variant of `decode_step_multi(k)` that
+  returns both verify logits and selected-layer hidden states (at
+  the layer ids the dflash drafter consumes, configurable per
+  drafter checkpoint). Pattern is analogous to the P-5-F (3b)
+  projection-output capture path step 5 inherited. Other adapters
+  (`qwen3.py`, `gemma4.py`, `gemma4_moe.py`) gain a
+  `NotImplementedError` stub for the capture path — they are out of
+  scope for C.4 because no dflash drafter exists for those families
+  in the upstream registry.
 - **Add `silica.speculative.dflash_drafter.DFlashDrafter`** implementing
   the existing `DraftEngine` Protocol: `propose(ctx, k) -> DraftTokens`,
-  `commit(ctx, accepted_len) -> None`. The K=16 block forward is hidden
-  behind `propose`; what changes is `propose` cost (one drafter forward),
-  not the protocol surface. Accept-rule + verification continue to use
-  `silica.speculative.verify.greedy_verify`.
-- **Drafter-stateless `commit` semantics.** The wrapper treats the
-  block-diffusion drafter as **stateless across `propose` calls** — each
-  `propose(ctx, k)` re-runs the block-diffusion forward conditioned on
-  the committed prefix, regardless of which tokens of the previous
-  block survived verification. Silica's existing rollback paths
-  (`PagedKVCache.rollback` for target KV; `Qwen3_5Adapter.rollback_state`
-  for target recurrent state) handle rejection on the target side
-  unchanged from step 5. `DFlashDrafter.commit(ctx, accepted_len)` is a
-  no-op in the spike. If upstream `dflash-mlx` exposes a stateful
-  re-drafting hook that lets a partially-accepted block resume from
-  position `accepted_len` instead of re-forwarding from scratch, that
-  becomes a step-6 follow-up optimisation, not a spike requirement.
-  See OQ-5 in §5 and §4.1 for the rationale.
+  `commit(ctx, yielded_count) -> None`. Per-`req_id` state holds the
+  stored `target_hidden` and the per-layer `ContextOnlyDraftKVCache`s.
+  The K=16 block forward is hidden behind `propose`; the capture path
+  feeds `target_hidden` for the next cycle. Accept-rule + verification
+  continue to use `silica.speculative.verify.greedy_verify`.
+- **Target-conditioned drafter with `commit`-updates-`target_hidden`
+  semantics.** The wrapper holds, per `req_id`, the stored
+  `target_hidden` (an `mx.array` of shape `(1, ctx_len, hidden_dim)`
+  at the layer ids the drafter was trained against) and the per-layer
+  `ContextOnlyDraftKVCache`s. Each `propose(ctx, k)` reads the stored
+  `target_hidden` and calls `DFlashDraftModel(noise_embedding=…,
+  target_hidden=…, cache=draft_caches)`; the draft forward internally
+  appends the target-hidden-derived context to the draft caches via
+  `append_context`. Each `commit(ctx, yielded_count)` slices the
+  verify forward's captured hidden states to `1 + yielded_count`
+  positions and stores them as the new `target_hidden` for the next
+  cycle. Rejected drafts were never written to the draft cache (only
+  the noise keys/values for them existed, and those are not appended)
+  — so draft-side "rollback" is implicit: simply slicing the new
+  `target_hidden` to the committed length keeps the drafter's state
+  consistent with what the engine emitted. Silica's existing
+  target-side rollback paths (`PagedKVCache.rollback`,
+  `Qwen3_5Adapter.rollback_state`) handle target rejection unchanged
+  from step 5. See §4.1 for the full state-machine.
 - **Add `--speculative dflash` to `python -m scripts.bench`** alongside
   the existing `none` / `draft_target` choices. Quad-gate the two
   spec-on scenarios on (target HF cache, target env, drafter HF cache,
@@ -253,11 +309,13 @@ just below the gate (≥1.5×).
   KV via `PagedKVCache.rollback` / `SimpleKVCache` per-layer trim;
   target recurrent state via `Qwen3_5Adapter.snapshot_pre_draft_state`
   / `rollback_state`; draft-side via the drafter's `commit`. The
-  drafter-only spike sets `DFlashDrafter.commit` to a no-op and
-  relies on `propose` re-forwarding from the committed prefix — see
-  §4.1 stateless-drafter invariant. The DFlash upstream tape-replay
-  mechanism is *target-side*, not drafter-side, and is out of scope
-  per §2.2.
+  C.4 spike's draft-side `commit(ctx, yielded_count)` only updates
+  the per-`req_id` stored `target_hidden` to
+  `captured_hidden[:, :1 + yielded_count, :]`; the
+  `ContextOnlyDraftKVCache` does not require trimming because
+  rejected drafts' noise keys/values were never appended to it (see
+  §4.1 state-machine). The DFlash upstream tape-replay mechanism is
+  *target-side*, not drafter-side, and is out of scope per §2.2.
 - **Lossless-verifier invariant (two tiers).** Per upstream's
   guarantee, every emitted token must equal the target's greedy
   argmax at verification time. The spike enforces this in two tiers
@@ -272,37 +330,68 @@ just below the gate (≥1.5×).
 
 ## 3. Sub-unit decomposition (preview)
 
-The spike decomposes into seven sub-units. Each lands as one commit and
-pauses for user review per the project's incremental-execution rule.
+The spike decomposes into eight sub-units (post-α revision: added
+(αβ) before β). Each lands as one commit and pauses for user review
+per the project's incremental-execution rule.
 
-1. **(α) Native-runtime + license verification of `bstnxbt/dflash-mlx`.**
-   `pip install dflash-mlx` into a throwaway venv; grep package source
-   for `import torch`; verify MIT license matches Apache-2.0
-   compatibility; record installed version. Lands as a §5.1 closure
-   block in this document, not a code commit. Closes OQ-1.
-2. **(β) `silica.speculative.dflash_drafter` skeleton.** A
+1. **(α) Native-runtime + license + Python-API verification of
+   `bstnxbt/dflash-mlx`.** `pip install dflash-mlx` into a throwaway
+   venv; grep package source for `import torch`; verify MIT license
+   matches Apache-2.0 compatibility; record installed version;
+   identify the public Python API for invoking the drafter forward;
+   discover the target-conditioning architecture. Lands as the §5.8
+   closure block in this document, not a code commit. **Closed
+   2026-05-01** — closes OQ-1, OQ-2, OQ-3, OQ-7 favourably; surfaces
+   F-1 architecture finding that triggered this opening revision.
+2. **(αβ) Target-hidden capture path on silica's target adapters.**
+   Extend `Qwen3_5Adapter` and `qwen3_5_moe.py` with a capture-enabled
+   variant of `decode_step_multi(k)` that returns both verify logits
+   and selected-layer hidden states. Pattern follows the P-5-F (3b)
+   projection-output capture surface (capture proxy installed at
+   load time, layer ids configurable). Microbench
+   `c_capture_hidden(k=16)` — the additive cost vs the existing
+   verify forward — and record into `plans/P6_C4_DFLASH/REPORT.md`
+   as a precondition row. Tests: capture-disabled path is byte-exact
+   with the v1.7.19 `decode_step_multi(k)` baseline; capture-enabled
+   path returns hidden-state slices at the requested layer ids whose
+   shapes match `(1, k, hidden_dim)`. Other adapters
+   (`qwen3.py`, `gemma4.py`, `gemma4_moe.py`) gain a
+   `NotImplementedError` stub on the capture path; out-of-scope
+   adapters surface a clear error rather than silent fallback.
+3. **(β) `silica.speculative.dflash_drafter` skeleton.** A
    `DFlashDrafter` class implementing `DraftEngine` whose `__init__`
-   takes a drafter checkpoint identifier and a target tokenizer
-   reference; `propose` and `commit` raise `NotImplementedError` with
-   wiring docstrings. Empty test asserting Protocol conformance via
-   `runtime_checkable`. Lands the package extras marker
+   takes a drafter checkpoint identifier, a target adapter handle
+   (for the hidden-state capture callback), and a target tokenizer
+   reference; per-`req_id` state holds stored `target_hidden` and
+   per-layer `ContextOnlyDraftKVCache`s. `propose` and `commit`
+   raise `NotImplementedError` with wiring docstrings referencing
+   the §4.1 state-machine. Empty test asserting Protocol conformance
+   via `runtime_checkable`. Lands the package extras marker
    (`pyproject.toml`) and the import-gating skipif marker for tests.
-3. **(γ) `propose` implementation — synthetic drafter (§6.2 tier 1).**
-   A scripted block-diffusion drafter that, given a fixed prefix,
-   emits a deterministic K=16 token block. Drives the **tier-1
+4. **(γ) `propose` + `commit` against a synthetic drafter (§6.2 tier 1).**
+   A scripted block-diffusion drafter that returns a deterministic
+   `(target_hidden, K, hidden_dim)` → K-token mapping for a fixed
+   prefix. The synthetic drafter has the same call shape as
+   `DFlashDraftModel.__call__` — it consumes `target_hidden` and
+   returns `(noise hidden, drafted token ids)` — but its block-diffusion
+   forward is a programmatic look-up. Drives the **tier-1
    correctness gate** (§6.2): on a cached small target (e.g.
-   `Qwen/Qwen3-0.6B`), spec-on cycle-1 token sequences must be
-   byte-equivalent to spec-off greedy under fixed seed. Cycle 1 has
-   no batched-vs-sequential KV reduction-order divergence, so byte
-   equality is achievable. This sub-unit is **not** a fallback for
-   absent real-model checkpoints — it is the structural-correctness
-   tier of the gate in its own right and runs unconditionally as part
-   of the test suite.
-4. **(δ) `propose` implementation — real DFlash forward (§6.2 tier 2).**
-   Wires the `dflash-mlx` package's actual block-diffusion forward
-   (Python API discovery is sub-unit (α)'s second deliverable; if no
-   Python API exists, this sub-unit becomes a thin wrapper around
-   the package's internal module path — see OQ-2). Returns
+   `Qwen/Qwen3-0.6B`) with capture enabled via (αβ), spec-on cycle-1
+   token sequences must be byte-equivalent to spec-off greedy under
+   fixed seed. Cycle 1 has no batched-vs-sequential KV reduction-order
+   divergence, so byte equality is achievable. This sub-unit is
+   **not** a fallback for absent real-model checkpoints — it is the
+   structural-correctness tier of the gate in its own right and runs
+   unconditionally as part of the test suite. Also bound: a
+   `commit(ctx, yielded_count)` test that asserts the next `propose`
+   uses a `target_hidden` of length `1 + yielded_count`, regardless
+   of what the previous block proposed.
+5. **(δ) `propose` implementation — real DFlash forward (§6.2 tier 2).**
+   Wires `dflash_mlx.model.DFlashDraftModel` and
+   `dflash_mlx.model.ContextOnlyDraftKVCache` from the upstream
+   package (per OQ-2 closure: `dflash_mlx.runtime.load_draft_bundle`
+   provides the loader; the wrapper holds the loaded `DFlashDraftModel`
+   instance per `req_id`). Returns
    `DraftTokens(token_ids=tuple, draft_logprobs=...)`. Drives the
    **tier-2 correctness invariant** (§6.2): under the drafter
    HF-cache gate, every emitted token of the spec-on bench row must
@@ -311,23 +400,22 @@ pauses for user review per the project's incremental-execution rule.
    gate is unsuitable per `plans/P6_SPEC_FOUNDATION_OPENING.md` §6.1
    (f) closure. The tier-2 invariant is the verifier guarantee the
    schema's `quality_parity_status` field records.
-5. **(ε) `commit` no-op + stateless-drafter invariant test.**
-   `DFlashDrafter.commit(ctx, accepted_len)` is a no-op; the spike
-   relies on `propose` always re-forwarding from the committed prefix.
-   A synthetic test asserts that for any partial-accept length
-   `accepted_len ∈ [0, K)`, the next `propose` returns tokens
-   conditioned only on the committed prefix (no leakage from the
-   rejected K-tail). Silica's existing target-side rollback paths
-   (step 5 sub-units (d) and (e)) handle the corresponding KV /
-   recurrent rejection on the target side unchanged. This sub-unit
-   does **not** touch tape-replay — that path is a deferred follow-up
-   per §2.2.
-6. **(ζ) Bench wiring.** `--speculative dflash` CLI arg, two new
+6. **(ε) Engine integration — capture path + drafter wiring.**
+   Extend `silica.engine.Engine`'s spec-on path to call the
+   capture-enabled `decode_step_multi(k)` variant from (αβ) when
+   the active drafter is `DFlashDrafter`, route the captured
+   hidden states into `commit`, and assert under test that the
+   per-`req_id` `target_hidden` is correctly sliced to
+   `1 + yielded_count` after every commit. The `c_capture_hidden(k=16)`
+   microbench from (αβ) re-runs end-to-end here as a sanity check
+   that capture-on engine throughput tracks the microbench cost
+   prediction within ±10%.
+7. **(ζ) Bench wiring.** `--speculative dflash` CLI arg, two new
    scenario rows `qwen3.5-27b-warm-decode-c4-dflash` and
    `qwen3.5-moe-35b-a3b-warm-decode-c4-dflash`, quad-gating per
    step 5 (h) pattern. `python -m scripts.bench --list` count rises
    from 65 → 67.
-7. **(η) Real-model attestation + closure.** Run the two new rows on
+8. **(η) Real-model attestation + closure.** Run the two new rows on
    a host with both checkpoints cached, record the seven
    `SPECULATIVE_METRIC_FIELDS` schema fields plus REPORT-derived
    silica-integrated speedup, peak memory, and draft-overhead-per-step
@@ -336,14 +424,14 @@ pauses for user review per the project's incremental-execution rule.
    closure to this document with the gate-decision callout.
 
 This breakdown is preview-only — sub-unit boundaries may change once
-(α) lands. The user pauses after each sub-unit per the standing
+(αβ) lands. The user pauses after each sub-unit per the standing
 incremental-execution rule.
 
 ---
 
 ## 4. Architecture / interface contracts
 
-### 4.1 `DraftEngine` Protocol unchanged; drafter is stateless across calls
+### 4.1 `DraftEngine` Protocol surface unchanged; drafter is target-conditioned and stateful per `req_id`
 
 The I-5 Protocol surface stays as-is:
 
@@ -353,29 +441,74 @@ class DraftEngine(Protocol):
     def commit(self, ctx: RequestState, accepted_len: int) -> None: ...
 ```
 
-`DFlashDrafter` implements this Protocol. Two facts shape the wrapper:
+`DFlashDrafter` implements this Protocol. The wrapper holds, per
+`req_id`:
 
-- **Cost model difference (internal to `propose`):** `propose` runs
-  **one** drafter forward (block diffusion over K positions) instead
-  of γ = K - 1 autoregressive forwards. The returned
-  `DraftTokens.token_ids` is a `tuple[int, ...]` of length **up to** k
-  (typically equal to min(K, k); see OQ-3 on the K vs k relationship).
-- **Stateless-drafter invariant:** `commit(ctx, accepted_len)` is a
-  no-op. The drafter has no internal state that survives between
-  `propose` calls in the spike — each `propose` re-runs the
-  block-diffusion forward conditioned on whatever prefix
-  `RequestState` carries at call time, which silica's engine has
-  already truncated to the committed length via the existing
-  target-side rollback paths. The truncation site is
+- **`target_hidden`** — an `mx.array` of shape
+  `(1, ctx_len, hidden_dim)` at the layer ids the drafter was trained
+  against (`DFlashDraftModelArgs.target_layer_ids`). Updated by
+  `commit` from the verify forward's captured hidden states; consumed
+  by the next `propose` as the drafter's conditioning input.
+- **`draft_caches`** — a list of `ContextOnlyDraftKVCache`s, one per
+  drafter layer, with sink + sliding window. Mutated *inside*
+  `DFlashDraftModel.__call__` via `append_context`, which writes
+  only the target-hidden-derived context keys/values (length
+  `ctx_len`) to the cache. The K mask tokens' noise keys/values are
+  used for attention but never written to cache.
+
+The state-machine for one `propose` / `commit` cycle is:
+
+```text
+state at entry: target_hidden_n (length ctx_n), draft_caches_n
+
+propose(ctx, k):
+    block_token_buffer[:k] = mask_token_id
+    block_token_buffer[:1] = staged_first  # from prior commit
+    noise_embedding = target_embed_tokens(block_token_buffer)
+    draft_hidden = DFlashDraftModel(
+        noise_embedding=noise_embedding,
+        target_hidden=target_hidden_n,
+        cache=draft_caches_n,            # mutated: append_context(ctx_n)
+    )
+    drafted_logits = lm_head(draft_hidden[:, 1:, :])
+    drafted_tokens = greedy_argmax(drafted_logits)
+    return DraftTokens(token_ids=(staged_first, *drafted_tokens))
+
+silica engine: target verify forward over k positions, capture hidden
+               states at target_layer_ids → captured_hidden of shape
+               (1, k, hidden_dim). Verify also yields verify_logits.
+               greedy_verify(drafts, verify_logits) → accepted_len.
+               yielded_count = min(accepted_len, max_tokens_remaining,
+                                   first_stop_token_position).
+
+commit(ctx, yielded_count):
+    self._target_hidden[req_id] = captured_hidden[:, :1 + yielded_count, :]
+    # No work on draft_caches: rejected drafts' noise keys/values
+    # were never written; only the next propose's append_context
+    # advances the cache.
+
+state at exit: target_hidden_{n+1} (length 1 + yielded_count),
+               draft_caches_{n+1} (= draft_caches_n with ctx_n appended)
+```
+
+Two consequences of this state-machine:
+
+- **Draft-side "rollback" is implicit.** Rejected drafts were never
+  persisted in `draft_caches` — only the *target-hidden-derived
+  context* is appended, and the next cycle's `target_hidden` is
+  pre-trimmed to the committed length before the next `propose`.
+  There is no `cache.rollback(...)` call to make.
+- **Silica's engine must hand the captured hidden states to
+  `commit`.** The current spec-on path at
   `silica/engine/__init__.py:362+` (`un_committed = draft_count -
-  yielded_count`; per-cycle `RequestState.history` and KV / recurrent
-  state are rolled back to the committed prefix before the next
-  `propose` runs). This invariant is what the C.1 path already relies
-  on; C.4 inherits it without modification.
+  yielded_count`) handles target-side rollback unchanged from step 5;
+  what (ε) adds is a side-channel that surfaces
+  `captured_hidden[:, :1 + yielded_count, :]` to `DFlashDrafter.commit`
+  alongside the existing `accepted_len` argument.
 
-The reason the wrapper does **not** translate `accepted_len` into a
-DFlash tape-replay state advance is that upstream's tape-replay
-mechanism is **target-side**, not drafter-side. Quoting upstream
+The reason the wrapper does **not** plug into upstream's tape-replay
+state advance is that upstream's tape-replay mechanism is
+**target-side**, not drafter-side. Quoting upstream
 `bstnxbt/dflash-mlx` README verbatim:
 
 > "Tape-replay rollback": instead of snapshotting and restoring the
@@ -393,16 +526,20 @@ upstream's tape-replay; it inherits silica's snapshot-restore. (See
 
 ### 4.2 Rollback path table (vs step 5 foundation)
 
-| Path             | C.1 (autoregressive draft)                                  | C.4 (DFlash block drafter; drafter-only spike)                                                                          |
-| ---------------- | ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| Target-side KV   | `PagedKVCache.rollback(req_id, n_reject)`                   | unchanged from step 5                                                                                                   |
-| Target recurrent | `Qwen3_5Adapter.rollback_state(req_id)`                     | unchanged from step 5 (does **not** use upstream tape-replay; that is the deferred verify-side port — see §2.2)         |
-| Draft-side state | `DraftTargetEngine.commit(ctx, n_acc)` advances draft cache | `DFlashDrafter.commit` is a no-op; next `propose` re-forwards from the committed prefix (stateless-drafter invariant)   |
+| Path             | C.1 (autoregressive draft)                                  | C.4 (DFlash block drafter; drafter-only-with-hidden-capture spike)                                                                                                                               |
+| ---------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Target-side KV   | `PagedKVCache.rollback(req_id, n_reject)`                   | unchanged from step 5                                                                                                                                                                            |
+| Target recurrent | `Qwen3_5Adapter.rollback_state(req_id)`                     | unchanged from step 5 (does **not** use upstream tape-replay; that is the deferred verify-side port — see §2.2)                                                                                  |
+| Draft-side state | `DraftTargetEngine.commit(ctx, n_acc)` advances draft cache | `DFlashDrafter.commit(ctx, yielded_count)` updates per-`req_id` `target_hidden = captured_hidden[:, :1 + yielded_count, :]`; the `ContextOnlyDraftKVCache` requires no trim (rejected drafts were never written, see §4.1) |
 
-All three paths are within silica's existing surfaces. This is what
-makes C.4 a *drafter-only* spike: the engine integration is one new
-`DraftEngine` implementation that re-forwards on every `propose`, not
-a re-engineering of the rollback foundation.
+The first two paths are inherited verbatim from step 5. The
+draft-side path is new shape but stays within `DFlashDrafter` and
+silica's existing per-`req_id` request bookkeeping; no I-5 Protocol
+change. The new architectural surface introduced by the spike is the
+hidden-state capture path on the target adapters (sub-unit (αβ));
+that surface is reusable by any future target-conditioned drafter
+(C.3 MTP head, C.6 self-spec, etc.) and is treated as an
+infrastructure addition rather than a C.4-specific hook.
 
 ### 4.3 Drafter / target tokenizer compatibility
 
@@ -550,24 +687,33 @@ for it because the verify-side optimisations (tape-replay verify +
 separate full-DFlash-port proposal beyond step 6. The spike is the
 experiment that turns this prediction band into a number.
 
-### 5.5 OQ-5 — Stateful re-drafting hook (optional optimisation)
+### 5.5 OQ-5 — `c_capture_hidden(k)` cost on silica's stock-MLX verify
 
-**Question.** Does upstream `dflash-mlx` expose a Python-level hook
-that lets the drafter resume from `accepted_len` after partial accept,
-instead of re-running the block-diffusion forward from scratch on the
-next `propose`?
+**Question.** What is the additive cost of capturing target hidden
+states at the drafter-consumed layer ids during the verify forward,
+relative to silica's existing `c_verify(k=16)` baseline (1.494× a
+single target forward at k=4 per P-6.0.5 Unit 7)?
 
-**Resolution method.** Sub-unit (α): inspect the package's drafter
-class for any `partial_accept` / `resume_from` API. If absent, the
-spike runs with stateless `commit`-as-no-op and the next-`propose`
-re-forward — that is the documented spike scope.
+**Resolution method.** Sub-unit (αβ): a microbench row that runs
+`decode_step_multi(k=16)` with capture **disabled** vs **enabled**
+and records the wall-clock delta. If MLX's compute graph fuses the
+intermediate-layer outputs into the same forward pass without a
+second eval, the additive cost is small (<5% of baseline verify);
+if MLX requires materialising the intermediate states with
+`mx.eval(...)` separately, the additive cost is larger and shifts
+the §1 prediction band.
 
-**Why it matters.** Stateless re-forward costs roughly an extra
-`c_draft_block` per partial-accept event; if α is high (most blocks
-fully accepted) the cost is negligible, if α is low it accumulates.
-A stateful hook turns this into a step-6 follow-up optimisation; the
-spike's gate decision is unaffected because the integrated speedup
-the gate measures already includes whichever path the spike takes.
+**Why it matters.** The C.4 speedup denominator includes
+`c_capture_hidden(k)` — see §1. The §1 prediction band shifted from
+"1.5-2.2× at α ∈ [0.5, 0.7]" (pre-α framing without this term) to
+"1.4-2.0×" pending (αβ)'s actual measurement. If
+`c_capture_hidden(k=16) ≈ 0`, the band shifts back toward 1.5-2.2×;
+if `c_capture_hidden(k=16)` is comparable to a fraction of the
+verify forward (≥10%), the spike's gate-clear probability shrinks.
+
+This OQ replaces the pre-α "stateful re-drafting hook" question:
+upstream's drafter is **stateful by design** (per F-1 finding), so
+that question was never coherent.
 
 ### 5.6 OQ-6 — Drafter HF-cache gating
 
@@ -583,40 +729,211 @@ convention. Proposed: `SILICA_BENCH_DFLASH_27B` and
 envs. Two checkpoints, two envs — no redundancy with the C.1
 `Qwen3.5-0.8B` env.
 
-### 5.7 OQ-7 — Drafter / target precision pairing
+### 5.7 OQ-7 — Drafter / target precision pairing (closed at α)
 
-**Question.** Upstream HF model cards pair `z-lab/Qwen3.5-27B-DFlash`
-with the **full-precision** `Qwen/Qwen3.5-27B` target ("must be used
-in conjunction with the target model `Qwen/Qwen3.5-27B`"), and
-`z-lab/Qwen3.5-35B-A3B-DFlash` with `Qwen/Qwen3.5-35B-A3B`. Step 5's
-spec-on bench scenarios pair against the **4-bit** targets
-(`mlx-community/Qwen3.5-27B-4bit`, MoE 4-bit). Does the drafter's
-accept-rate hold up against the 4-bit target, or does step 6 need a
-different target shape?
+**Closed favourably at sub-unit (α), 2026-05-01.** See §5.8 for
+evidence: `dflash_mlx.generate.DRAFT_REGISTRY` explicitly maps
+`mlx-community/Qwen3.5-27B-4bit → z-lab/Qwen3.5-27B-DFlash` and
+`mlx-community/Qwen3.5-35B-A3B-4bit → z-lab/Qwen3.5-35B-A3B-DFlash`.
+Upstream supports the 4-bit MLX targets directly; the HF model
+card's "must be used with `Qwen/Qwen3.5-27B`" wording is a
+quality-pairing recommendation, not a precision-coupling constraint.
+The spike runs against the 4-bit targets as planned, with the
+upstream-blessed drafter pairing.
 
-**Resolution method.** Sub-unit (η): the bench attestation directly
-measures `accept_rate`. If acceptance against the 4-bit target lands
-in the predicted band (α ≥ 0.5), the pairing is fine and the spike
-proceeds. If acceptance collapses well below 0.4 — suggesting
-target-quantisation drift broke the drafter's assumed argmax
-distribution — the spike has two fallbacks:
+The pre-α fallback options below are retained as historical context
+for the gate-decision audit trail, in case (η)'s `accept_rate`
+measurement collapses below 0.4 anyway (e.g. due to chat-style prompts
+that diverge from the upstream training distribution; this is a
+*workload* concern, not a precision-coupling concern):
 
 1. Switch the dense bench row to a smaller dense Qwen3.5 (4B / 9B)
    where the matching `z-lab/Qwen3.5-{4,9}B-DFlash` drafter exists
-   and a non-4-bit target fits 48 GB. This loses comparability with
-   the v1.7.13 P-6.0 27B-4bit anchor but recovers a clean drafter /
-   target precision pairing.
+   per the upstream `DRAFT_REGISTRY`. This loses comparability with
+   the v1.7.13 P-6.0 27B-4bit anchor but tests the drafter family
+   against a different target.
 2. Document the drift, retire the dense (1a) C.4 path, and recommend
-   a follow-up that retrains the drafter against the 4-bit target —
-   which is C.2 ReDrafter scope, not C.4 spike scope.
+   a follow-up that retrains the drafter against silica's chat-style
+   workload — which is C.2 ReDrafter scope, not C.4 spike scope.
 
-**Why it matters.** The 27B target at full precision is ~52 GB BF16
-on disk and exceeds 48 GB unified memory at residency. There is no
-"just use the matching-precision target" option for the 27B row;
-either the 4-bit target retains acceptance, or the row retargets
-smaller. The spike's first sub-unit (α) verifies tokenizer equality
-(see §4.3) but acceptance-rate is a runtime measurement, not an
-orientation-time check.
+---
+
+### 5.8 (α) closure findings — recorded on 2026-05-01
+
+Sub-unit (α) installed `dflash-mlx==0.1.0` from PyPI into a throwaway
+venv at `/tmp/dflash-probe` and inspected the package source. Findings
+below close OQ-1, OQ-2, OQ-3, and OQ-7 favorably; OQ-4, OQ-5, OQ-6
+remain open. **A new finding F-1 surfaces an architecture mismatch
+with the opening's drafter-only-spike framing in §0 / §1 / §2.1 /
+§4.1; (β) pauses pending opening revision.**
+
+#### OQ-1 closure — runtime composition
+
+- **Version:** `dflash-mlx 0.1.0` (PyPI metadata; package homepage
+  `https://github.com/bstnxbt/dflash-mlx`).
+- **License:** MIT, "Copyright (c) 2026 bstnxbt"
+  (`dflash_mlx-0.1.0.dist-info/licenses/LICENSE`). Compatible with
+  silica's Apache-2.0.
+- **Top-level deps (`Requires:`):** `mlx`, `mlx-lm` — exactly two,
+  both already in silica's runtime.
+- **Transitively-installed runtime deps:** `mlx-0.31.2`,
+  `mlx-lm-0.31.3`, `mlx-metal-0.31.2`, `transformers-5.7.0`,
+  `tokenizers-0.22.2`, `safetensors-0.7.0`, `huggingface-hub-1.13.0`,
+  `numpy-2.4.4` and standard text/HTTP packages. **No `torch`** in
+  the dependency tree.
+- **Source-grep confirmation:**
+  `grep -rn '^import torch\|^from torch\| import torch\|, torch'
+  /tmp/dflash-probe/lib/python3.13/site-packages/dflash_mlx`
+  returns no matches across the six source files (`__init__.py`,
+  `generate.py`, `kernels.py`, `model.py`,
+  `recurrent_rollback_cache.py`, `runtime.py`, `serve.py`).
+
+D-009 native-runtime constraint passes. Sub-unit (β)'s
+`silica[dflash]` extras-marker can list `dflash-mlx>=0.1.0,<0.2`
+without adding a torch dependency.
+
+#### OQ-2 closure — Python API surface
+
+`dflash_mlx.runtime` exports a public Python API:
+
+- `load_target_bundle(model_ref, *, lazy, pack_target_weights, ...) -> (model, tokenizer, meta)`
+- `load_draft_bundle(model_ref, *, lazy, quantize_draft) -> (drafter, ...)`
+- `generate_baseline_once(...)` / `generate_dflash_once(...)`
+  — high-level whole-generation entry points; return result dicts
+  including `acceptance_ratio`, `phase_timings_us` (prefill / draft
+  / verify / replay / commit / commit_wall), `cycles_completed`,
+  `tokens_per_cycle`.
+- `stream_baseline_generate(...)` / `stream_dflash_generate(...)`
+  — streaming variants.
+
+Lower-level building blocks usable from a thin wrapper:
+
+- `dflash_mlx.model.DFlashDraftModel` — the block-diffusion drafter
+  `nn.Module`. Forward signature:
+  `__call__(*, noise_embedding, target_hidden, cache) -> mx.array`
+  (returns hidden states; `_lm_head_logits(target_model,
+  hidden_states[:, 1:, :])` then yields the K-1 drafted logits).
+- `dflash_mlx.model.ContextOnlyDraftKVCache` — streaming draft KV
+  cache with sink + sliding window. Per-layer; one instance per
+  drafter layer per request.
+- `dflash_mlx.model.DFlashDraftModelArgs.block_size` — drafter's
+  maximum block size (read from the checkpoint config).
+- `dflash_mlx.runtime._target_embed_tokens(target_model)` — exposes
+  the target's input embedding for noise-embedding init.
+
+The package does ship a Python API. Sub-unit (β) is not blocked on
+"reverse-engineer the CLI" — the wrapper can build directly on
+`load_draft_bundle` + `DFlashDraftModel` + `ContextOnlyDraftKVCache`.
+
+#### OQ-3 closure — Block size K
+
+- `block_tokens` is a runtime parameter on `generate_dflash_once`
+  (default 16); the upper bound is the drafter checkpoint's
+  `block_size` (from `DFlashDraftModelArgs`). The runtime computes
+  `effective_block_tokens = max(1, min(int(block_tokens or 1),
+  int(draft_model.block_size)))`.
+- The default `block_tokens=16` is what upstream's CLI uses; the
+  drafter checkpoint's `block_size` is the architectural maximum.
+  The spike defaults to `block_tokens=16` and treats it as
+  constructor-time configurable; sensitivity sweeps over k =
+  8 / 12 / 16 are a step-7 follow-up if the spike clears the gate.
+
+#### OQ-7 closure — drafter / target precision pairing (favorable)
+
+`dflash_mlx.generate.DRAFT_REGISTRY` explicitly maps the 4-bit MLX
+target IDs to the upstream drafter checkpoints:
+
+```python
+DRAFT_REGISTRY = {
+    "Qwen/Qwen3.5-4B": "z-lab/Qwen3.5-4B-DFlash",
+    "Qwen/Qwen3.5-9B": "z-lab/Qwen3.5-9B-DFlash",
+    "Qwen/Qwen3.5-27B": "z-lab/Qwen3.5-27B-DFlash",
+    "mlx-community/Qwen3.5-27B-8bit": "z-lab/Qwen3.5-27B-DFlash",
+    "mlx-community/Qwen3.5-27B-4bit": "z-lab/Qwen3.5-27B-DFlash",
+    "Qwen/Qwen3.5-35B-A3B": "z-lab/Qwen3.5-35B-A3B-DFlash",
+    "mlx-community/Qwen3.5-35B-A3B-4bit": "z-lab/Qwen3.5-35B-A3B-DFlash",
+}
+```
+
+The HF model card's "must be used in conjunction with `Qwen/Qwen3.5-27B`"
+language is the upstream-author's pairing-by-quality recommendation,
+not a precision-coupling constraint. The package itself supports the
+4-bit MLX targets directly. **OQ-7's "retarget to a smaller dense"
+fallback is not needed**; the spike runs against
+`mlx-community/Qwen3.5-27B-4bit` and `mlx-community/Qwen3.5-35B-A3B-4bit`
+as planned, with the upstream-blessed drafter pairing.
+
+#### F-1 (NEW) — drafter is target-conditioned, contradicting opening's stateless-drafter framing
+
+The opening's §0 / §1 / §2.1 / §4.1 framing — "stateless drafter +
+no-op `commit` + each `propose` re-forwards from committed prefix" —
+**does not match upstream's architecture**. Three concrete contradictions:
+
+1. **`DFlashDraftModel.__call__` requires `target_hidden: mx.array`**
+   as input (in addition to `noise_embedding` and per-layer `cache`).
+   The drafter conditions on the *target model's* hidden states at
+   specific captured layer ids (`draft_model.target_layer_ids`). It
+   is **architecturally a target-conditioned block-diffusion head**,
+   structurally similar to a C.3 MTP head, not a small-model
+   autoregressive draft.
+2. **The drafter carries per-layer streaming KV state**
+   (`ContextOnlyDraftKVCache` with sink + window). The cache stores
+   only the target-hidden-derived context keys/values; each cycle's
+   `propose` call internally invokes `append_context(context_keys,
+   context_values, ctx_len)` *during* the drafter forward, where
+   `context_keys`/`context_values` are projections of the stored
+   `target_hidden`. The K mask tokens' noise keys/values are used
+   for cross-attention but **never appended** to the cache. A
+   "stateless re-forward from committed prefix" would either
+   (a) discard this cache (accept rate collapses), or (b) rebuild
+   it from scratch each cycle (γ × layer-count cost per cycle,
+   dominates the denominator).
+3. **The next cycle's `target_hidden` is the verify forward's
+   captured hidden states sliced to `1 + yielded_count`** — so the
+   drafter depends on a target-side hidden-state output silica's
+   current `decode_step_multi(k)` adapter API does not surface.
+   `Qwen3_5Adapter.decode_step_multi(k)` returns logits only; to
+   feed `target_hidden` to `DFlashDraftModel`, silica's target
+   adapter must expose intermediate-layer hidden states at the
+   layer ids the drafter was trained against (a pattern analogous
+   to the P-5-F (3b) projection-output capture path step 5
+   inherited).
+
+#### F-1 disposition
+
+This opening (post-α) absorbs F-1 in §0 / §1 / §2.1 / §2.3 / §3 /
+§4.1 / §4.2 / §5.5. Concretely:
+
+- §0 / §4.1 carry the corrected state-machine: stored `target_hidden`
+  with a per-layer `ContextOnlyDraftKVCache` per `req_id`; `propose`
+  consumes the stored `target_hidden` and appends only the
+  target-hidden-derived context internally; `commit(ctx, yielded_count)`
+  updates the stored `target_hidden` to
+  `captured_hidden[:, :1 + yielded_count, :]`; rejected drafts'
+  noise keys/values were never written, so draft-side "rollback"
+  is implicit.
+- §3 adds sub-unit (αβ) between α and β: target-hidden capture path
+  on `Qwen3_5Adapter` and `qwen3_5_moe.py`, with a microbench for
+  `c_capture_hidden(k=16)` (now an explicit term in the §1 speedup
+  denominator) before the drafter wrapper lands.
+- §5.5 OQ-5 retires the pre-α "stateful re-drafting hook" question
+  (the drafter is stateful by design) and replaces it with the
+  `c_capture_hidden(k)` measurement question that the §1 prediction
+  band now hinges on.
+- §1 shifts the predicted band from "1.5-2.2× at α ∈ [0.5, 0.7]"
+  to "1.4-2.0×" pending (αβ)'s `c_capture_hidden(k)` measurement.
+- The verify-side deferrals (`verify_qmm`, tape-replay verify,
+  `_install_target_speculative_hooks`) remain unchanged; F-1 only
+  reshapes the *drafter* integration, not the verify-side scope.
+
+#### Resume point
+
+Sub-unit (αβ) opens after this opening revision commits. The user
+pauses per the standing incremental-execution rule between (αβ),
+(β), and each subsequent sub-unit. The throwaway venv at
+`/tmp/dflash-probe` is preserved for (αβ) reuse and for (β) when
+the wrapper imports `dflash_mlx.model.DFlashDraftModel` /
+`ContextOnlyDraftKVCache`.
 
 ---
 
@@ -711,9 +1028,11 @@ number.
 - ruff clean (silica + tests + scripts; same baseline as v1.7.19);
 - mypy clean (no new errors over the v1.7.19 baseline);
 - full non-real-model test suite passes (target: ≥2616 — the v1.7.19
-  baseline; spike adds at minimum two new test files
-  `test_dflash_drafter_protocol.py` and `test_dflash_rollback.py` plus
-  bench scenario registration tests);
+  baseline; spike adds at minimum three new test files
+  `test_qwen3_5_capture_hidden.py` (sub-unit (αβ)),
+  `test_dflash_drafter_protocol.py` (sub-unit (β)), and
+  `test_dflash_state_machine.py` (sub-unit (γ) / (ε)), plus bench
+  scenario registration tests);
 - `python -m scripts.bench --list` enumerates **at least the v1.7.19
   catalog (65 scenarios) plus the two new `-c4-dflash` rows from
   sub-unit (ζ)** — i.e. ≥67 scenarios expected at spike close.
@@ -819,25 +1138,38 @@ opening doc is the live source of truth until then.
   Drafter retraining is C.2 ReDrafter scope.
 - C.4 is **not** a multi-request / batched-spec slice. Step 5 (c)
   slice 3 deferral is preserved.
-- C.4 is **not** a `DraftEngine` Protocol change. The Protocol surface
-  stays as defined in `silica/speculative/engine.py`.
+- C.4 is **not** a `DraftEngine` Protocol-signature change. The
+  Protocol surface stays as defined in
+  `silica/speculative/engine.py`. (The `DFlashDrafter` constructor
+  takes new arguments — a target-adapter handle for the capture
+  callback, a drafter checkpoint id — but `propose(ctx, k)` and
+  `commit(ctx, accepted_len)` keep their signatures.)
+- C.4 is **not** a stateless-drafter spike. Per F-1, the drafter is
+  target-conditioned and stateful per `req_id`: it holds a stored
+  `target_hidden` and per-layer `ContextOnlyDraftKVCache`s. The
+  pre-α "stateless drafter + no-op `commit`" framing was wrong;
+  see §4.1 for the corrected state-machine.
 - C.4 is **not** an optional dep removal. `dflash-mlx` becomes an
   opt-in extra (`silica[dflash]`) that the user installs only if they
   intend to run `--speculative dflash`. Default install stays slim.
 - C.4 is **not** a full-DFlash port. Upstream's tape-replay verify
   rollback (target-side GatedDeltaNet replacement via custom Metal
-  innovation-tape kernel) and the `verify_qmm` int4 simdgroup-MMA
-  Metal kernel for the M=16 quantised matmul during target verify
-  are both deferred. The spike measures only the contribution of
+  innovation-tape kernel), the `verify_qmm` int4 simdgroup-MMA
+  Metal kernel for the M=16 quantised matmul during target verify,
+  and the `_install_target_speculative_hooks` target patches
+  installed by `dflash_mlx.runtime.load_target_bundle` are all
+  deferred. The spike measures only the contribution of
   drafter-cost reduction (block-diffusion `propose` replacing γ
-  autoregressive forwards). A full-DFlash port that includes the
-  verify-side kernels is a separate proposal that lands only if (i)
-  the drafter-only spike clears the engineering gate ≥1.8× and (ii)
-  the verify-side leverage justifies the kernel-engineering surface
-  beyond what stock MLX delivers.
+  autoregressive forwards) plus the new `c_capture_hidden(k)` term
+  on silica's stock-MLX verify path. A full-DFlash port that
+  includes the verify-side kernels is a separate proposal that
+  lands only if (i) the drafter-only-with-hidden-capture spike
+  clears the engineering gate ≥1.8× and (ii) the verify-side
+  leverage justifies the kernel-engineering surface beyond what
+  stock MLX delivers.
 
 ---
 
-*Spike opens with sub-unit (α) — `pip install dflash-mlx`, native-runtime
-verification, and Python-API discovery — pending user review of this
-document.*
+*Spike resumes with sub-unit (αβ) — target-hidden capture path on
+`Qwen3_5Adapter` and `qwen3_5_moe.py` plus `c_capture_hidden(k=16)`
+microbench — pending user review of this opening revision.*
