@@ -152,6 +152,18 @@ read in-editor while iterating.
   decisions log including [F-3a] full-trim-before-replay rationale
   (a partial-trim variant pollutes attention context during replay).
 
+### D-021 step 6 — C.4 DFlash spike (orientation)
+
+- [`P6_C4_DFLASH_OPENING.md`](../plans/P6_C4_DFLASH_OPENING.md) —
+  opening for the **drafter-only** C.4 block-diffusion spike. PLAN.md
+  §13 step 6 gate quoted verbatim (≥1.8× engineering / ≥2.5× one
+  component of (1b) survival rule); spike shape B=1 mirroring
+  step 5 (h); `DraftEngine` Protocol unchanged (cost-model spike with
+  `commit` no-op + stateless re-forward); upstream tape-replay verify
+  + `verify_qmm` int4 Metal kernel are explicit non-goals (deferred
+  full-DFlash port). Seven sub-units (α..η) starting with
+  native-runtime + Python-API verification of `bstnxbt/dflash-mlx`.
+
 ## Side track: chat CLI redesign
 
 - [`CHAT_CLI_OPENING.md`](../plans/CHAT_CLI_OPENING.md) — the design
