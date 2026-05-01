@@ -38,6 +38,12 @@ const Highlights = () => {
       body: "15+ scenarios across five oracle types — smoke, B=1 parity, B>1 reference, teacher-forced argmax, WikiText-2 perplexity. Optional vqbench cross-check column.",
       detail: ["JSONL + Markdown", "--all-kv-codecs sweep"],
     },
+    {
+      tag: "P-6 step 5 · v1.7.19",
+      title: "Speculative-decoding foundation.",
+      body: "DraftTargetEngine + multi-token verify forward + three rollback paths (target-side KV, recurrent state on Qwen3.5 hybrid via snapshot/restore + replay, draft-side via commit) + cycle-1 byte-equal greedy parity + seven-field spec-metrics schema + --speculative bench switch with two real-model warm-decode rows.",
+      detail: ["DraftTargetEngine", "--speculative draft_target", "spec-metrics emission"],
+    },
   ];
 
   return (
@@ -45,7 +51,7 @@ const Highlights = () => {
       <div className="container">
         <div className="section-head">
           <div className="section-eyebrow">What's shipped</div>
-          <h2>Six load-bearing pieces, behind frozen interfaces.</h2>
+          <h2>Seven load-bearing pieces, behind frozen interfaces.</h2>
           <p>Every architectural decision and acceptance gate lives in <span className="mono">plans/PLAN.md</span>. The interfaces don't move; capabilities slot in below them.</p>
         </div>
 

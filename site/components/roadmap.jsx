@@ -9,26 +9,35 @@ const Roadmap = () => {
     { id: "P-4", name: "Unified bench harness — runner · oracles · 15 scenarios · vqbench xcheck", state: "done" },
     { id: "P-4.5", name: "Chunked-prefill minimal + VectorCodec runtime spike", state: "done" },
     { id: "P-5", name: "VQ KV compression — BlockTQ · RaBitQ · ExtRaBitQ · per-head Haar", state: "done" },
-    { id: "P-6", name: "Weight streaming — dense layer prefetch + per-expert MoE residency", state: "stub" },
-    { id: "P-7", name: "Speculative decoding — DraftEngine · DraftTarget / EAGLE / Medusa", state: "stub" },
+    { id: "P-6", name: "Performance phase — measurement gate · Decision Gate 1 · spec foundation closed v1.7.19 · Tracks A / B / C.4-C.5 / D queued", state: "active" },
+    { id: "P-7", name: "Speculative decoding — DraftTarget foundation closed v1.7.19; ≥1.2× rolls into P-6 Track C.4 / C.5", state: "active" },
     { id: "P-8", name: "OpenAI-compatible HTTP server + session layer", state: "plan" },
   ];
 
-  const pct = phases.filter(p => p.state === "done").length / phases.length * 100;
+  const completedRatio = (
+    phases.filter(p => p.state === "done").length
+    + 0.5 * phases.filter(p => p.state === "active").length
+  ) / phases.length;
+  const pct = completedRatio * 100;
 
   return (
     <section className="block" id="roadmap" style={{ background: "var(--bg-sunken)" }}>
       <div className="container">
         <div className="section-head">
           <div className="section-eyebrow">Roadmap</div>
-          <h2>Seven phases shipped. Three on deck.</h2>
-          <p>The engine main loop already carries stub implementations behind frozen interfaces. The planned phases progressively replace those stubs without changing call sites.</p>
+          <h2>Seven phases shipped. Two in progress. One on deck.</h2>
+          <p>The engine main loop already carries stub implementations behind frozen interfaces. P-6 (performance phase) and P-7 (speculative decoding) are actively landing — the v1.7.19 spec foundation closure ships <span className="mono">DraftTargetEngine</span> + three rollback paths + spec-metrics into the bench harness; the ≥1.2× decode acceptance bullet rolls into Track C.4 / C.5. Planned phases progressively replace remaining stubs without changing call sites.</p>
         </div>
 
         <div className="rm-progress">
           <div className="rm-progress-bar"><div className="rm-progress-fill" style={{ width: pct + "%" }}></div></div>
           <div className="rm-progress-meta mono">
-            <span>{phases.filter(p => p.state === "done").length} / {phases.length} phases shipped</span>
+            <span>
+              {phases.filter(p => p.state === "done").length} shipped ·
+              {" "}{phases.filter(p => p.state === "active").length} in progress ·
+              {" "}{phases.filter(p => p.state === "plan").length + phases.filter(p => p.state === "stub").length} planned
+              {" "}({phases.length} total)
+            </span>
             <span>{Math.round(pct)}%</span>
           </div>
         </div>
@@ -44,6 +53,7 @@ const Roadmap = () => {
               <div className="rm-name">{p.name}</div>
               <div className="rm-state">
                 {p.state === "done" && <><Icon name="check" size={12} /><span>shipped</span></>}
+                {p.state === "active" && <><span className="rm-active-dot"></span><span>in progress</span></>}
                 {p.state === "stub" && <><span className="rm-stub-dot"></span><span>stub · swappable</span></>}
                 {p.state === "plan" && <><Icon name="dot" size={10} /><span>planned</span></>}
               </div>
@@ -91,6 +101,11 @@ const Roadmap = () => {
           flex-shrink: 0;
         }
         .rm-done .rm-dot { background: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); }
+        .rm-active .rm-dot {
+          background: var(--bg-elev);
+          border: 2px solid var(--accent);
+          box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
+        }
         .rm-stub .rm-dot { background: var(--bg-elev); border: 2px solid var(--ink-4); }
         .rm-plan .rm-dot { background: var(--bg-elev); border: 2px dashed var(--ink-4); }
         .rm-line {
@@ -101,6 +116,7 @@ const Roadmap = () => {
           margin-bottom: -22px;
         }
         .rm-done .rm-line { background: color-mix(in srgb, var(--accent) 35%, var(--rule)); }
+        .rm-active .rm-line { background: color-mix(in srgb, var(--accent) 18%, var(--rule)); }
         .rm-id {
           font-size: 12px;
           font-weight: 600;
@@ -108,6 +124,7 @@ const Roadmap = () => {
           letter-spacing: 0.02em;
         }
         .rm-done .rm-id { color: var(--accent); }
+        .rm-active .rm-id { color: var(--accent); }
         .rm-name {
           font-size: 14px;
           color: var(--ink);
@@ -123,6 +140,16 @@ const Roadmap = () => {
           font-feature-settings: normal;
         }
         .rm-done .rm-state { color: var(--ok); }
+        .rm-active .rm-state { color: var(--accent); }
+        .rm-active-dot {
+          width: 6px; height: 6px; border-radius: 50%;
+          background: var(--accent);
+          animation: rm-pulse 1.8s ease-in-out infinite;
+        }
+        @keyframes rm-pulse {
+          0%, 100% { opacity: 1; }
+          50%      { opacity: 0.45; }
+        }
         .rm-stub-dot {
           width: 6px; height: 6px; border-radius: 50%;
           background: var(--warn);

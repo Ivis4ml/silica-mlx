@@ -33,7 +33,7 @@ const Hero = ({ tweaks }) => {
     return (
       <section className="hero">
         <div className="container">
-          <div className="hero-eyebrow"><span className="dot"></span>Status: scheduler core, family adapters, KV codec — shipped</div>
+          <div className="hero-eyebrow"><span className="dot"></span>Status v1.7.19: scheduler core · family adapters · KV codec · spec foundation — shipped</div>
           <h1>
             Continuous-batching<br/>
             LLM serving,<br/>
@@ -42,7 +42,8 @@ const Hero = ({ tweaks }) => {
           <p className="hero-sub">
             silica-mlx ports the vLLM scheduler core — continuous batching, memory-budget admission,
             preempt+replay, radix prefix cache — onto MLX's unified-memory model. Five model families
-            with batched-output parity. Native KV codec compression shipped.
+            with batched-output parity. Native KV codec compression and the speculative-decoding
+            foundation (DraftTarget + three rollback paths) shipped at v1.7.19.
           </p>
           <div className="hero-ctas">
             <a className="btn btn-primary" href="#quickstart">Quickstart<Icon name="arrow" size={14} className="arrow" /></a>
@@ -59,7 +60,7 @@ const Hero = ({ tweaks }) => {
         <div className="hero-eyebrow"><span className="dot"></span>Status: scheduler core, family adapters, KV codec — shipped</div>
         <h1>Continuous-batching LLM serving, <em>native to Apple Silicon.</em></h1>
         <p className="hero-sub">
-          The vLLM scheduler core, the radix prefix cache, and the memory-budget admission ladder that production-grade serving frameworks rely on — ported to MLX's unified-memory model on M5 Pro 48 GB. Five model families validated against batched mlx-lm references.
+          The vLLM scheduler core, the radix prefix cache, and the memory-budget admission ladder that production-grade serving frameworks rely on — ported to MLX's unified-memory model on M5 Pro 48 GB. Five model families validated against batched mlx-lm references. Speculative-decoding foundation closed at v1.7.19 (DraftTarget + three rollback paths + spec-metrics into the bench harness).
         </p>
         <div className="hero-ctas">
           <a className="btn btn-primary" href="#quickstart">Quickstart<Icon name="arrow" size={14} className="arrow" /></a>
@@ -100,7 +101,7 @@ const Footer = () => (
       <div className="foot-grid">
         <div className="foot-col">
           <div className="brand">
-            <div className="brand-mark">si</div>
+            <div className="brand-mark">sm</div>
             <span>silica-mlx</span>
           </div>
           <p className="foot-tagline">Continuous-batching LLM serving on Apple Silicon. vLLM-core architecture, MLX-native.</p>
@@ -130,7 +131,7 @@ const Footer = () => (
       </div>
       <div className="foot-bottom">
         <div>Apache-2.0 · Target hardware: M5 Pro 48 GB</div>
-        <div className="mono">v1.7.11 · scheduler core + KV codec shipped</div>
+        <div className="mono">v1.7.19 · scheduler core + KV codec + spec foundation shipped</div>
       </div>
     </div>
   </footer>
@@ -140,7 +141,7 @@ const Nav = () => (
   <nav className="nav">
     <div className="container nav-inner">
       <a className="brand" href="#" style={{ textDecoration: "none", color: "inherit" }}>
-        <div className="brand-mark">si</div>
+        <div className="brand-mark">sm</div>
         <span>silica-mlx</span>
       </a>
       <div className="nav-links">

@@ -1,9 +1,15 @@
-# silica-mlx
+<p align="center">
+  <img src="site/uploads/silica-mark.svg" alt="silica-mlx" width="88" height="88"/>
+</p>
 
-[![Docs](https://readthedocs.org/projects/silica-mlx/badge/?version=latest&style=flat-square)](https://silica-mlx.readthedocs.io/en/latest/?badge=latest)
-[![Python](https://img.shields.io/badge/python-3.12%2B-blue?style=flat-square)](https://www.python.org/downloads/)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square)](https://opensource.org/licenses/Apache-2.0)
-[![Platform](https://img.shields.io/badge/platform-Apple%20Silicon-lightgrey?style=flat-square)](https://www.apple.com/mac/)
+<h1 align="center">silica-mlx</h1>
+
+<p align="center">
+  <a href="https://silica-mlx.readthedocs.io/en/latest/?badge=latest"><img alt="Docs" src="https://readthedocs.org/projects/silica-mlx/badge/?version=latest&style=flat-square"/></a>
+  <a href="https://www.python.org/downloads/"><img alt="Python" src="https://img.shields.io/badge/python-3.12%2B-blue?style=flat-square"/></a>
+  <a href="https://opensource.org/licenses/Apache-2.0"><img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square"/></a>
+  <a href="https://www.apple.com/mac/"><img alt="Platform" src="https://img.shields.io/badge/platform-Apple%20Silicon-lightgrey?style=flat-square"/></a>
+</p>
 
 **Continuous-batching LLM serving on Apple Silicon — vLLM-core
 architecture, MLX-native.**
@@ -486,6 +492,30 @@ in [`.readthedocs.yaml`](.readthedocs.yaml) (Ubuntu 22.04, Python
 3.12, the `[docs]` extras pulled from `pyproject.toml`). Use this
 when you want rendered cross-references and full-text search
 without any local toolchain.
+
+### Project homepage (`site/`)
+
+The marketing-style homepage at
+[ivis4ml.github.io/silica-mlx](https://ivis4ml.github.io/silica-mlx/)
+lives under [`site/`](site/) as a static React + Babel-standalone
+single-page app — no build step. To preview locally before
+pushing:
+
+```bash
+cd site
+python3 -m http.server 8765
+# then open http://localhost:8765/ in a browser
+```
+
+The browser fetches React / ReactDOM / Babel-standalone via
+unpkg.com CDN at load time and compiles the component JSX in-page,
+so the only requirements are Python 3 and a network connection on
+first load (browser caches afterwards). Edit any
+[`components/*.jsx`](site/components/) or
+[`app.jsx`](site/app.jsx) and refresh — no rebuild.
+
+GitHub Pages publishes `site/` on every push that touches the
+directory via [`.github/workflows/deploy-site.yml`](.github/workflows/deploy-site.yml).
 
 ---
 

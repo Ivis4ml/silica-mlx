@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 88 88" width="88" height="88" role="img" aria-label="silica-mlx">
+  <defs>
+    <linearGradient id="silicaInk" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1c1c1e"/>
+      <stop offset="100%" stop-color="#3a3a3c"/>
+    </linearGradient>
+  </defs>
+  <rect x="2" y="2" width="84" height="84" rx="22" ry="22" fill="url(#silicaInk)"/>
+  <text x="44" y="60"
+        text-anchor="middle"
+        font-family="ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Monaco, Consolas, monospace"
+        font-size="44"
+        font-weight="700"
+        letter-spacing="-2.2"
+        fill="#fbfbfa">sm</text>
+</svg>
