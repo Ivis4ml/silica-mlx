@@ -57,6 +57,7 @@ def _build(
     drafter._target_layer_ids = target_layer_ids
     drafter._target_hidden = {}
     drafter._draft_caches = {}
+    drafter._synthetic_emit = None
     return drafter, hidden_size
 
 
@@ -289,13 +290,15 @@ def _make_ctx(req_id: str = "req-0") -> Any:
     return RequestState(request=req)
 
 
-def test_propose_raises_until_gamma_delta() -> None:
-    """The (β) skeleton's ``propose`` raises ``NotImplementedError``;
-    sub-unit (γ) installs the synthetic emitter for the cycle-1
-    correctness gate, sub-unit (δ) wires the real DFlash forward."""
+def test_real_mode_propose_raises_until_delta() -> None:
+    """Real-mode ``propose`` (no synthetic emitter installed) raises
+    ``NotImplementedError`` pending sub-unit (δ)'s real DFlash
+    forward. The (γ) synthetic seam routes around this raise via
+    ``DFlashDrafter.for_synthetic(...)``."""
     drafter, _ = _build()
+    assert drafter._synthetic_emit is None
     ctx = _make_ctx()
-    with pytest.raises(NotImplementedError, match="sub-unit"):
+    with pytest.raises(NotImplementedError, match="sub-unit \\(δ\\)"):
         drafter.propose(ctx, k=4)
 
 

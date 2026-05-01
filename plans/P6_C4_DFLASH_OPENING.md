@@ -560,12 +560,16 @@ Two consequences of this state-machine:
   pre-trimmed to the committed length before the next `propose`.
   There is no `cache.rollback(...)` call to make.
 - **Silica's engine must hand the captured hidden states to
-  `commit`.** The current spec-on path at
-  `silica/engine/__init__.py:362+` (`un_committed = draft_count -
-  yielded_count`) handles target-side rollback unchanged from step 5;
-  what (ε) adds is a side-channel that surfaces
-  `captured_hidden[:, :1 + yielded_count, :]` to `DFlashDrafter.commit`
-  alongside the existing `accepted_len` argument.
+  `update_target_hidden`** (the side-channel method on the
+  `TargetHiddenConsumer` Protocol; see §4.5 / sub-unit (β)). The
+  current spec-on path at `silica/engine/__init__.py:362+`
+  (`un_committed = draft_count - yielded_count`) handles target-side
+  rollback unchanged from step 5; what (ε) adds is a side-channel
+  that surfaces the verify-forward's captured dict +
+  `yielded_count` to `DFlashDrafter.update_target_hidden(...)`
+  alongside the existing `DraftEngine.commit(ctx, accepted_len)`
+  call. `DraftEngine.commit` is unchanged in surface and stays a
+  no-op for DFlash per the F-1 state machine.
 
 The reason the wrapper does **not** plug into upstream's tape-replay
 state advance is that upstream's tape-replay mechanism is

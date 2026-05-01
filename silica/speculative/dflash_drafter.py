@@ -62,6 +62,7 @@ Sub-unit ordering this skeleton enables:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import mlx.core as mx
@@ -69,6 +70,14 @@ import mlx.core as mx
 from silica.core.request import RequestState
 from silica.models.hidden_capture import HiddenCaptureAdapter
 from silica.speculative.engine import DraftTokens
+
+# Sub-unit (γ): the synthetic emitter consumed by ``propose`` in
+# spec-off oracle replay tests. ``(target_hidden, k)`` -> token ids;
+# returned tuple length must be ≤ ``k``. The (γ) tests pre-record
+# spec-off cycle-1 tokens via ``Engine.generate(--speculative none)``
+# and supply a closure that returns those tokens for the same prefix
+# the verifier sees, so ``greedy_verify`` accepts the full block.
+SyntheticEmit = Callable[[mx.array, int], tuple[int, ...]]
 
 
 class DFlashDrafter:
@@ -100,9 +109,13 @@ class DFlashDrafter:
         Args:
             drafter_repo: HF model id (e.g. ``z-lab/Qwen3.5-27B-DFlash``).
                 The constructor calls ``dflash_mlx.runtime.load_draft_bundle``
-                to load the drafter weights and reads
-                ``DFlashDraftModelArgs.target_layer_ids`` from the
-                checkpoint config to fix the capture-set on construction.
+                to load the drafter weights, then reads the
+                ``target_layer_ids`` field from the loaded
+                ``DFlashDraftModel`` instance (set by
+                ``DFlashDraftModel.__init__`` from
+                ``args.dflash_config["target_layer_ids"]`` or
+                ``build_target_layer_ids(...)``) to fix the capture set
+                at construction.
             target_adapter: an adapter implementing
                 :class:`silica.models.hidden_capture.HiddenCaptureAdapter`
                 (Qwen3.5 dense or MoE in (αβ.1) / (αβ.2)). The wrapper
@@ -153,20 +166,119 @@ class DFlashDrafter:
         self._target_hidden: dict[str, mx.array] = {}
         self._draft_caches: dict[str, list[Any]] = {}
 
+        # Sub-unit (γ) synthetic seam — None on the real path; populated
+        # by ``DFlashDrafter.for_synthetic`` for the cycle-1 oracle-replay
+        # parity test.
+        self._synthetic_emit: SyntheticEmit | None = None
+
+    @classmethod
+    def for_synthetic(
+        cls,
+        *,
+        target_layer_ids: tuple[int, ...],
+        synthetic_emit: SyntheticEmit,
+    ) -> DFlashDrafter:
+        """Construct a synthetic-mode drafter for sub-unit (γ) tests.
+
+        Bypasses the real ``__init__`` (and therefore the
+        ``dflash-mlx`` import + ``load_draft_bundle`` HF download) so
+        the synthetic correctness gate runs against silica's own
+        ``DFlashDrafter`` surface — the same wrapper the (δ) real
+        forward will use — without depending on a checkpoint or the
+        opt-in extras dep. The returned drafter:
+
+        - Implements both ``DraftEngine`` and ``TargetHiddenConsumer``
+          (same ``isinstance`` profile as a real-mode instance).
+        - Has the same ``capture_layer_ids`` / ``prime`` /
+          ``update_target_hidden`` / ``free_target_hidden`` shape
+          contract as the real path.
+        - Routes ``propose(ctx, k)`` to the supplied
+          ``synthetic_emit(target_hidden, k)`` callable.
+
+        Args:
+            target_layer_ids: the (would-be-checkpoint-fixed) list of
+                layer indices the drafter consumes. Drives both
+                ``capture_layer_ids = {i + 1 for i in target_layer_ids}``
+                and the per-layer concat in ``prime`` /
+                ``update_target_hidden``.
+            synthetic_emit: callable invoked by ``propose`` in synthetic
+                mode. Signature ``(target_hidden, k) -> tuple[int, ...]``
+                with returned length **≤ k** (overflow loud-fails).
+
+        Not for production use. (ε) engine integration explicitly
+        rejects synthetic-mode drafters in non-test contexts.
+        """
+        if not target_layer_ids:
+            raise ValueError(
+                "for_synthetic: target_layer_ids must be non-empty "
+                "(matches the real-path loud-fail in _read_target_layer_ids)."
+            )
+        drafter = object.__new__(cls)
+        drafter._drafter_repo = "<synthetic>"
+        drafter._target_adapter = None  # type: ignore[assignment]
+        drafter._drafter_model = None
+        drafter._drafter_meta = None
+        drafter._target_layer_ids = tuple(int(i) for i in target_layer_ids)
+        drafter._target_hidden = {}
+        drafter._draft_caches = {}
+        drafter._synthetic_emit = synthetic_emit
+        return drafter
+
     # --- DraftEngine Protocol ----------------------------------------------
 
     def propose(self, ctx: RequestState, k: int) -> DraftTokens:
         """Block-diffusion draft of up to ``k`` tokens.
 
-        Skeleton: raises ``NotImplementedError``. Sub-unit (γ) installs
-        a synthetic emitter for the cycle-1 byte-exact parity test;
-        sub-unit (δ) wires ``DFlashDraftModel.__call__``.
+        Two modes:
+
+        - **Synthetic** (sub-unit (γ)): if the drafter was constructed
+          via :meth:`for_synthetic`, ``propose`` reads the per-``req_id``
+          stored ``target_hidden`` and forwards
+          ``synthetic_emit(target_hidden, k)`` — the (γ) tests use this
+          to replay a spec-off-recorded oracle so ``greedy_verify``
+          accepts the full block at the verifier level.
+        - **Real** (sub-unit (δ), pending): the synthetic emitter is
+          ``None`` and ``propose`` raises ``NotImplementedError``.
+
+        Synthetic-mode invariants:
+
+        - ``ctx.request_id`` must already be primed via
+          :meth:`prime` (the engine ε wiring will guarantee this; in
+          unit tests the caller primes before the first ``propose``).
+        - ``synthetic_emit`` must return ``len(token_ids) <= k``.
+          Overflow is loud-fail rather than truncating, since silently
+          accepting an over-length block would mask wiring bugs that
+          (δ)'s real forward will not tolerate.
         """
-        raise NotImplementedError(
-            "DFlashDrafter.propose lands at sub-unit (γ) (synthetic) / "
-            "(δ) (real DFlash forward). The (β) skeleton only ships "
-            "construction + the TargetHiddenConsumer side channel."
-        )
+        emit = self._synthetic_emit
+        if emit is None:
+            raise NotImplementedError(
+                "DFlashDrafter.propose: real-mode propose lands at "
+                "sub-unit (δ) (real DFlash forward via "
+                "DFlashDraftModel.__call__). The (β) skeleton + (γ) "
+                "synthetic seam only ship the synthetic-mode path; "
+                "construct via DFlashDrafter.for_synthetic(...) for "
+                "tests, or wait for (δ)."
+            )
+        req_id = ctx.request_id
+        if req_id not in self._target_hidden:
+            raise KeyError(
+                f"DFlashDrafter.propose: req_id {req_id!r} not primed. "
+                "Engine ε must call prime() after prefill_with_capture "
+                "before the first propose; unit tests must prime "
+                "explicitly."
+            )
+        target_hidden = self._target_hidden[req_id]
+        token_ids = emit(target_hidden, int(k))
+        token_tuple = tuple(int(t) for t in token_ids)
+        if len(token_tuple) > k:
+            raise ValueError(
+                f"DFlashDrafter.propose: synthetic_emit returned "
+                f"{len(token_tuple)} tokens for k={k}; expected at most "
+                f"k. Loud-fail rather than silently truncate so "
+                "synthetic-emitter wiring bugs surface immediately."
+            )
+        return DraftTokens(token_ids=token_tuple)
 
     def commit(self, ctx: RequestState, accepted_len: int) -> None:
         """No-op per the F-1 state machine (§4.1 of the OPENING).
