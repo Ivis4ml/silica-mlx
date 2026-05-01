@@ -70,7 +70,9 @@ The ten sub-units (a..i, with a2 between a and b) decompose as:
    Uses the **existing** I-2 frozen interface
    `KVManager.rollback(req_id, n_reject)` (silica/kvcache/manager.py:94);
    no Protocol surface change. The spec engine / batcher computes
-   `n_reject = γ - accepted_len` and calls into the existing API.
+   `n_reject` per branch — `γ - yielded_count` on the non-recurrent
+   path, `γ + 1` (full verify-forward trim) on the recurrent path
+   per (e) [F-3a] — and calls into the existing API.
 6. **(e) Recurrent state rollback (Qwen3.5)** — adapter restores the
    pre-draft `RecurrentSnapshot` (already captured in
    `_pre_draft_snapshots` per P5.9 step 2(c)) when verification
@@ -91,12 +93,18 @@ The ten sub-units (a..i, with a2 between a and b) decompose as:
    `qwen3.5-moe-35b-a3b-warm-decode-spec-on`.
 10. **(i) Recurrent + KV rollback test** — `tests/test_spec_rollback.py`
     binds the three rollback paths against synthetic accept patterns
-    (full accept, partial accept, full reject); covers Qwen3.5-0.8B
-    recurrent state and the paged KV block-list shrink. Cached
-    `Qwen/Qwen3-0.6B` real-model row exercises target-side KV
-    rollback only (plain KV; no recurrent path); the recurrent
-    rollback path's only real-model exercise is the 0.8B parity row
-    (sub-unit f) plus the 27B / MoE real-model acceptance rows.
+    (full accept, partial accept, full reject) parametrized over
+    recurrent vs non-recurrent target adapters. The OPENING-sketched
+    cached-`Qwen/Qwen3-0.6B` real-model rollback row was dropped
+    after empirical investigation: a synthetic always-reject drafter
+    still diverges from spec-off after ~4 cycles because the
+    surviving anchor's K / V was written via batched
+    ``decode_step_multi`` rather than single-token ``decode_step``,
+    and mlx-lm's batched matmul reduction order differs from the
+    single-token path in fp16. Long real-model spec correctness is
+    validated through the (h) bench scenarios (acceptance rate,
+    throughput, generated-text spot checks) rather than against a
+    sequential reference.
 
 PLAN §7 changes recorded in §7 of this opening.
 
@@ -171,7 +179,7 @@ Step 5 closes (1)–(3) by construction (the bench rows produce them);
 | f  | Greedy parity test                                | `tests/test_spec_parity.py` (new); `--speculative` on cached `Qwen/Qwen3-0.6B` smoke      |
 | g  | Spec-metrics emission                             | `silica/bench/runner.py` + `silica/bench/oracles.py` (populate seven canonical fields)    |
 | h  | Bench switch + two new scenarios                  | `scripts/bench.py`; `silica/bench/scenarios.py` (`-spec-on` rows, dense + MoE)            |
-| i  | Three-rollback test                               | `tests/test_spec_rollback.py` (new); cached 0.6B smoke + 0.8B-as-draft synthetic harness  |
+| i  | Three-rollback test                               | `tests/test_spec_rollback.py` (new); synthetic A/B/C patterns × recurrent/non-recurrent   |
 
 ### 2.2 Out of scope (deferred to step 6+ or v0.2)
 
@@ -450,9 +458,13 @@ the new tail falls on a block boundary or earlier, trailing blocks
 are released back to the free pool via existing `release_blocks` /
 `decrement_logical_count` primitives.
 
-The spec-engine / batcher layer is responsible for translating
-`accepted_len` into `n_reject = γ - accepted_len`; the I-2 surface
-sees only `n_reject`. No new method on `KVManager`.
+The spec-engine / batcher layer is responsible for choosing
+`n_reject`; the I-2 surface sees only the count. The non-recurrent
+path passes `γ - yielded_count` (drop only the rejected drafts);
+the recurrent path passes `γ + 1` to drop the entire verify
+forward, then restores the recurrent snapshot and replays the
+committed prefix through `decode_step_multi` (see (e) [F-3a]). No
+new method on `KVManager`.
 
 Critical: target KV blocks holding **already-rolled-back tokens are
 not visible to the prefix cache**. The radix tree only sees committed
@@ -538,30 +550,60 @@ Two new bench scenarios:
 ### (i) Three-rollback test
 
 `tests/test_spec_rollback.py`. Bound the three rollback paths
-**without** real-model gates, using a synthetic
-`AcceptPatternDraftEngine` that emits scripted token sequences and a
-mock target adapter that returns scripted accept patterns:
+**synthetic-only** — no real-model gates — using a scripted
+`_PatternDraftEngine` that emits fixed token sequences and a
+`_PatternAdapter` / `_RecurrentPatternAdapter` pair that returns
+scripted accept patterns. Each pattern is parametrized over
+`recurrent ∈ {False, True}` so the non-recurrent and recurrent
+rollback maths are pinned side by side:
 
-- **Pattern A — full accept (accepted_len == γ).** No rollback
-  fires; the verify forward fills KV for all k = γ+1 input positions
-  (the anchor and the γ drafts). All γ drafts are committed; the
-  bonus is yielded but its KV slot is filled by the next cycle's
-  verify forward (where it becomes the anchor). Yielded this cycle =
-  γ + 1 = k tokens.
-- **Pattern B — partial accept (0 < accepted_len < γ).** KV and
-  recurrent rollback fire with `n_reject = γ - accepted_len`. After
-  rollback, KV growth this cycle = 1 anchor + accepted_len drafts;
-  the rejected drafts past `accepted_len` are removed. Yielded =
-  accepted_len + 1 (drafts + bonus from the rejected position).
-- **Pattern C — full reject (accepted_len == 0).** KV / recurrent
-  rollback with `n_reject = γ`. Net KV growth this cycle = 1
-  position (the anchor only); all γ drafts removed. Yielded = 1
-  (the bonus, sampled from `verify_logits[0]` — the prediction at
-  the anchor's position).
+- **Pattern A — full accept (`yielded_count == γ`, `un_committed == 0`).**
+  No KV rollback on either path. Drafter sees `commit(γ)`. On the
+  recurrent path, `commit_state(req_id, γ)` evicts the pre-draft
+  snapshot; verify forward already advanced both attention KV and
+  recurrent state to the committed boundary. Yielded this cycle =
+  γ + 1 tokens (anchor's bonus + γ drafts, in spec-cycle ordering).
 
-Plus one **real-model rollback row** on cached `Qwen/Qwen3-0.6B`
-gated on `--cache-only`: drives ~50 decode steps with synthetic
-drafts, asserts spec-on yields the same tokens as spec-off.
+- **Pattern B — partial accept (`0 < yielded_count < γ`,
+  `un_committed = γ - yielded_count > 0`).**
+  - **Non-recurrent path:** `kv.rollback(req_id, un_committed)`
+    trims only the rejected drafts. Net KV growth this cycle =
+    1 anchor + `yielded_count` drafts.
+  - **Recurrent path:** `kv.rollback(req_id, draft_count + 1)`
+    drops the **entire** verify forward (anchor + all drafts), then
+    `rollback_state(req_id, un_committed)` restores the pre-draft
+    snapshot, then `decode_step_multi(verify_input[:1 +
+    yielded_count])` replays the committed prefix to drive both
+    attention KV and recurrent state forward in lockstep. Net KV
+    growth this cycle is the same `1 + yielded_count`. The
+    full-trim-before-replay sequence is required because the replay
+    is a full-model forward, and a surviving committed-prefix KV
+    would corrupt the global-attention context window the replay
+    sees (see §3 sub-unit (e) [F-3a] in
+    `plans/P6_SPEC_FOUNDATION_E_ORIENTATION.md`).
+  - Drafter sees `commit(yielded_count)`. Yielded this cycle =
+    `yielded_count + 1` tokens (drafts + bonus from the rejected
+    position).
+
+- **Pattern C — full reject (`yielded_count == 0`, `un_committed = γ`).**
+  Same shape as Pattern B with `yielded_count = 0`:
+  - **Non-recurrent:** `kv.rollback(req_id, γ)`.
+  - **Recurrent:** `kv.rollback(req_id, draft_count + 1)`,
+    `rollback_state(req_id, γ)`, replay `decode_step_multi(
+    verify_input[:1])` (anchor only).
+  - Drafter sees `commit(0)`. Yielded = 1 (the bonus, sampled from
+    `verify_logits[0]`).
+
+A cached-`Qwen/Qwen3-0.6B` real-model rollback row was originally
+sketched here but is **omitted**: empirically a synthetic
+always-reject drafter still diverges from spec-off after ~4 cycles
+because the surviving anchor's K / V was written via batched
+`decode_step_multi` rather than single-token `decode_step`, and
+mlx-lm's batched matmul reduction order differs from the
+single-token path in fp16. Long real-model spec correctness is
+validated through the (h) bench scenarios (acceptance rate,
+throughput, generated-text spot checks) rather than against a
+sequential byte-equal reference.
 
 ---
 
@@ -575,9 +617,14 @@ drafts, asserts spec-on yields the same tokens as spec-off.
 | Target-side KV             | `KVManager` (concrete: `PagedKVCache`, `SimpleKVCache`) | `accepted_len < γ`         | `rollback(req_id, n_reject)` — already in I-2 frozen interface; sub-unit (d) lands concrete behaviour, no Protocol change |
 | Target-side recurrent      | `ModelAdapter` (Qwen3.5 family — 0.8B / 27B / MoE) | `accepted_len < γ`         | `rollback_recurrent_state(req_id, n_reject)` — new method on adapters with recurrent state; plain-KV adapters do not implement it |
 
-`n_reject = γ - accepted_len`; the spec-engine / batcher layer
-performs the conversion before calling into I-2 / I-1. Plain-KV
-adapters (Qwen3 0.6B, dense Gemma4 non-MoE) do not implement
+`n_reject` shape is per-path: the **target-side recurrent** path
+uses `n_reject = γ - yielded_count` (drafts the recurrent snapshot
+must undo), but the **target-side KV** path passes `γ + 1` on
+recurrent adapters (drop the full verify forward; the engine then
+re-fills attention KV via the replay forward) and `γ - yielded_count`
+on non-recurrent adapters. See (e) [F-3a] for why the recurrent
+path cannot use a partial KV trim. Plain-KV adapters (Qwen3 0.6B,
+dense Gemma4 non-MoE) do not implement
 `rollback_recurrent_state` at all; the spec-engine guards the call
 with an explicit `has_recurrent_state(adapter)` check (matching the
 existing `ModelCapabilities.has_recurrent_state` flag in
@@ -803,11 +850,12 @@ Alternative conventions ruled out:
   produce identical tokens to a fully-spec-off batch.
 - **(d)** `KVManager.rollback(req_id, n_reject)` (existing I-2
   surface, `silica/kvcache/manager.py:94`) gets the concrete spec
-  rollback behaviour on `PagedKVCache`; cached 0.6B real-model
-  rollback row in sub-unit (i) exercises target-side KV rollback
-  under partial accept (Qwen3-0.6B is plain KV per
-  `silica/bench/scenarios.py:146`, so this row covers the KV path
-  only — no recurrent state).
+  rollback behaviour on `PagedKVCache`. Coverage: dedicated unit
+  tests in `tests/test_paged_kvcache.py` and `tests/test_simple_kvcache.py`
+  (per-layer trim under hybrid lists landed in (e) slice 1); the
+  engine-level call-pattern correctness is pinned by the synthetic
+  Pattern B / C tests in sub-unit (i). The originally-sketched
+  cached-0.6B real-model rollback row was dropped — see (i) below.
 - **(e)** `adapter.rollback_recurrent_state` lands; the recurrent
   rollback path's only real-model exercise is the 0.8B parity row
   (sub-unit f) plus the 27B / MoE real-model acceptance rows. The
@@ -830,8 +878,11 @@ Alternative conventions ruled out:
 - **(h)** `--speculative {none,draft_target}` flag works on
   `scripts/bench.py`; the two new scenarios (`spec-on` dense + MoE)
   are registered and runnable.
-- **(i)** `tests/test_spec_rollback.py` passes (synthetic patterns
-  A/B/C plus the cached 0.6B real-model rollback row).
+- **(i)** `tests/test_spec_rollback.py` passes — synthetic patterns
+  A / B / C parametrized over recurrent ∈ {False, True}. No real-
+  model rollback row: long real-model spec correctness is validated
+  through the (h) bench scenarios rather than against a sequential
+  byte-equal reference (rationale in §3 (i)).
 
 ### 6.2 Performance gate — tracked, **not** blocking
 
