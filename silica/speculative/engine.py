@@ -129,6 +129,27 @@ class TargetHiddenConsumer(Protocol):
     they do not implement this Protocol.
     """
 
+    @property
+    def capture_layer_ids(self) -> frozenset[int]:
+        """Adapter-side capture-set the engine ε wiring should request.
+
+        Returns the dict-key set the engine forwards to
+        ``adapter.prefill_with_capture(...)`` and
+        ``adapter.decode_step_multi_with_capture(...)``. The convention
+        is the +1 offset between the upstream drafter's
+        ``target_layer_ids`` (``i`` = layer ``i-1`` output, with 0 =
+        embedding) and silica's adapter-side capture-dict keys
+        (``key 0`` = embedding output, ``key i + 1`` = output of
+        ``model.layers[i]``). Concretely:
+        ``frozenset(i + 1 for i in self._target_layer_ids)`` for
+        DFlash; future C.3 / C.6 wrappers compute their own offset
+        from their architecture.
+
+        Read-only after construction — the drafter's required layer
+        set is fixed by its checkpoint.
+        """
+        ...
+
     def prime(
         self, req_id: str, captured_dict: dict[int, mx.array]
     ) -> None:

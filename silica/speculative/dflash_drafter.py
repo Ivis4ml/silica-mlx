@@ -128,12 +128,23 @@ class DFlashDrafter:
 
         self._drafter_repo = drafter_repo
         self._target_adapter = target_adapter
-        # ``load_draft_bundle`` returns (drafter_model, ...) — see
-        # `/tmp/dflash-probe/.../dflash_mlx/runtime.py` for the shape;
-        # exact unpack lands in (δ) when the wrapper actually consumes it.
-        self._drafter_bundle: Any = load_draft_bundle(drafter_repo)
-        # Pull the checkpoint-fixed layer-id list. Upstream stores it as
-        # a list-like under ``DFlashDraftModelArgs.target_layer_ids``.
+        # Per upstream verify (commit `cee5f68` reading of
+        # `dflash_mlx.runtime.load_draft_bundle`) the bundle is
+        # ``(model, meta_dict)`` where ``meta_dict`` carries
+        # ``resolved_model_ref`` / ``config`` / ``quantize_draft``.
+        bundle = load_draft_bundle(drafter_repo)
+        if not (isinstance(bundle, tuple) and len(bundle) == 2):
+            raise RuntimeError(
+                "DFlashDrafter expected dflash_mlx.runtime.load_draft_bundle "
+                f"to return (model, meta) tuple; got {type(bundle).__name__}. "
+                "Upstream API may have changed — pin dflash-mlx at the "
+                "version recorded in pyproject.toml's [dflash] extras."
+            )
+        self._drafter_model: Any = bundle[0]
+        self._drafter_meta: Any = bundle[1]
+        # ``target_layer_ids`` lives on the model instance, not on args
+        # — upstream sets it in ``DFlashDraftModel.__init__`` from
+        # ``args.dflash_config["target_layer_ids"]`` with a fallback.
         # Materialise to a tuple so it cannot be mutated post-init.
         self._target_layer_ids: tuple[int, ...] = self._read_target_layer_ids()
 
@@ -170,6 +181,24 @@ class DFlashDrafter:
         return None
 
     # --- TargetHiddenConsumer side channel ---------------------------------
+
+    @property
+    def capture_layer_ids(self) -> frozenset[int]:
+        """Adapter-side capture set the engine should request.
+
+        Returns ``frozenset(i + 1 for i in target_layer_ids)`` —
+        the ``+1`` offset matches upstream
+        ``dflash_mlx.runtime.target_forward_with_hidden_states``
+        (``capture_layer_ids = {int(layer_id) + 1 for layer_id in
+        draft_model.target_layer_ids}``) and silica's adapter-side
+        convention (key 0 = embedding output, key ``i + 1`` = output
+        of ``model.layers[i]``). The (ε) engine wiring forwards this
+        directly to ``decode_step_multi_with_capture(...,
+        capture_layer_ids)`` and ``prefill_with_capture(...,
+        capture_layer_ids)`` so the layer set is sourced from the
+        drafter checkpoint, not configured by the caller.
+        """
+        return frozenset(i + 1 for i in self._target_layer_ids)
 
     def prime(
         self, req_id: str, captured_dict: dict[int, mx.array]
@@ -259,33 +288,50 @@ class DFlashDrafter:
         return mx.concatenate(slices, axis=-1)
 
     def _read_target_layer_ids(self) -> tuple[int, ...]:
-        """Pull ``target_layer_ids`` from the loaded drafter bundle.
+        """Pull ``target_layer_ids`` from the loaded drafter model.
 
-        ``dflash_mlx.runtime.load_draft_bundle`` returns a tuple whose
-        first element is the ``DFlashDraftModel`` instance; its
-        ``args.target_layer_ids`` is the list this method returns. The
-        exact unpacking — bundle layout, attribute path — is verified
-        against an installed ``dflash-mlx`` at sub-unit (δ) when
-        ``propose`` actually consumes the bundle. The (β) skeleton
-        keeps this method conservative: it tries the documented path
-        and falls back to an empty tuple if the layout differs (the
-        wrapper's prime / update calls then raise on the empty
-        ``target_layer_ids`` rather than silently producing wrong
-        shapes).
+        Upstream stores the field on the **model instance** in
+        ``DFlashDraftModel.__init__``:
+
+            target_layer_ids = list(
+                (args.dflash_config or {}).get("target_layer_ids") or ()
+            )
+            self.target_layer_ids = target_layer_ids or build_target_layer_ids(
+                args.num_target_layers, args.num_hidden_layers
+            )
+
+        — i.e. the field lives on the model, not on ``args``, and is
+        always non-empty by upstream construction (``build_target_layer_ids``
+        synthesises a list when no override is configured). Loud-fail
+        if either invariant is violated, since silently returning an
+        empty tuple here would surface as a confusing
+        ``mx.concatenate([], axis=-1)`` failure deep inside ``prime``.
         """
-        bundle = self._drafter_bundle
-        # Best-effort path that matches the upstream
-        # ``load_draft_bundle`` shape we read at sub-unit (α). Concrete
-        # unpacking + invariant checks land at (δ).
+        ids = getattr(self._drafter_model, "target_layer_ids", None)
+        if ids is None:
+            raise RuntimeError(
+                "DFlashDrafter could not read 'target_layer_ids' from the "
+                f"loaded drafter model {type(self._drafter_model).__name__}. "
+                "Upstream DFlashDraftModel sets this attribute in __init__; "
+                "check that load_draft_bundle returned a DFlashDraftModel "
+                "instance and that the dflash-mlx version pinned in "
+                "pyproject.toml's [dflash] extras matches the runtime."
+            )
         try:
-            drafter_model = bundle[0] if isinstance(bundle, tuple) else bundle
-            args = getattr(drafter_model, "args", None)
-            ids = getattr(args, "target_layer_ids", None)
-            if ids is None:
-                return ()
-            return tuple(int(i) for i in ids)
-        except (AttributeError, TypeError, ValueError):
-            return ()
+            tup = tuple(int(i) for i in ids)
+        except TypeError as e:
+            raise RuntimeError(
+                "DFlashDrafter: 'target_layer_ids' on the drafter model "
+                f"is not iterable (got {ids!r})."
+            ) from e
+        if not tup:
+            raise RuntimeError(
+                "DFlashDrafter: drafter model's 'target_layer_ids' is "
+                "empty. Upstream's build_target_layer_ids should always "
+                "produce a non-empty list; an empty list here means "
+                "the checkpoint config or fallback path is broken."
+            )
+        return tup
 
     def _build_draft_caches(self) -> list[Any]:
         """Construct per-layer ``ContextOnlyDraftKVCache`` instances.

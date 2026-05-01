@@ -52,7 +52,8 @@ def _build(
     drafter = object.__new__(DFlashDrafter)
     drafter._drafter_repo = "test/synthetic"
     drafter._target_adapter = None  # type: ignore[assignment]
-    drafter._drafter_bundle = None
+    drafter._drafter_model = None
+    drafter._drafter_meta = None
     drafter._target_layer_ids = target_layer_ids
     drafter._target_hidden = {}
     drafter._draft_caches = {}
@@ -94,6 +95,43 @@ def test_dflash_drafter_implements_protocols() -> None:
     noop = NoopDraftEngine()
     assert isinstance(noop, DraftEngine)
     assert not isinstance(noop, TargetHiddenConsumer)
+
+
+def test_capture_layer_ids_property_pins_plus_one_offset() -> None:
+    """``capture_layer_ids`` must apply the upstream ``+1`` offset
+    between drafter ``target_layer_ids`` and silica's adapter-side
+    capture-dict keys. Mismatch surfaces as a ``KeyError`` inside
+    ``prime``; pinning the property eliminates the ambiguity at the
+    Protocol surface so engine ε can route the set without computing
+    the offset itself."""
+    target_layer_ids = (0, 7, 14)
+    drafter, _ = _build(target_layer_ids=target_layer_ids)
+    expected = frozenset({1, 8, 15})
+    assert drafter.capture_layer_ids == expected
+    # Read-only contract: the property does not allocate storage that
+    # could drift from the construction-time list.
+    assert drafter.capture_layer_ids == drafter.capture_layer_ids
+
+
+def test_capture_layer_ids_matches_what_prime_consumes() -> None:
+    """Round-trip pin: a captured dict whose keys are
+    ``drafter.capture_layer_ids`` is the exact set ``prime`` accepts
+    without raising."""
+    target_layer_ids = (0, 7, 14)
+    drafter, hidden_size = _build(
+        target_layer_ids=target_layer_ids, hidden_size=4
+    )
+    captured = _captured_dict(
+        layer_ids_plus_one=tuple(sorted(drafter.capture_layer_ids)),
+        ctx_len=3,
+        hidden_size=hidden_size,
+    )
+    drafter.prime("req-roundtrip", captured)
+    assert drafter._target_hidden["req-roundtrip"].shape == (
+        1,
+        3,
+        len(target_layer_ids) * hidden_size,
+    )
 
 
 def test_prime_aggregates_target_hidden_with_correct_shape() -> None:
@@ -272,6 +310,65 @@ def test_commit_is_noop() -> None:
     drafter.commit(ctx, accepted_len=2)
     assert drafter._target_hidden == {}
     assert drafter._draft_caches == {}
+
+
+def test_read_target_layer_ids_loud_fails_on_missing_attr() -> None:
+    """If the loaded drafter model lacks ``target_layer_ids``, the
+    skeleton must raise ``RuntimeError`` referencing the upstream
+    DFlashDraftModel.__init__ contract — silently returning ``()``
+    would surface as a confusing ``mx.concatenate([], axis=-1)``
+    crash inside ``prime``."""
+
+    class _FakeBareModel:  # no target_layer_ids
+        pass
+
+    drafter = object.__new__(DFlashDrafter)
+    drafter._drafter_repo = "test/synthetic"
+    drafter._target_adapter = None  # type: ignore[assignment]
+    drafter._drafter_model = _FakeBareModel()
+    drafter._drafter_meta = None
+    with pytest.raises(RuntimeError, match="target_layer_ids"):
+        drafter._read_target_layer_ids()
+
+
+def test_read_target_layer_ids_loud_fails_on_empty() -> None:
+    """Empty ``target_layer_ids`` indicates a broken upstream config;
+    upstream's ``build_target_layer_ids`` should always synthesise a
+    non-empty list. Loud-fail rather than letting the empty list flow
+    through ``mx.concatenate``."""
+
+    class _FakeEmptyIds:
+        target_layer_ids: tuple[int, ...] = ()
+
+    drafter = object.__new__(DFlashDrafter)
+    drafter._drafter_repo = "test/synthetic"
+    drafter._target_adapter = None  # type: ignore[assignment]
+    drafter._drafter_model = _FakeEmptyIds()
+    drafter._drafter_meta = None
+    with pytest.raises(RuntimeError, match="empty"):
+        drafter._read_target_layer_ids()
+
+
+def test_read_target_layer_ids_returns_tuple_from_model_instance() -> None:
+    """Happy path: the field lives on the model instance, not on
+    ``args``. The skeleton reads ``drafter_model.target_layer_ids``
+    and materialises to a tuple."""
+
+    class _FakeModel:
+        target_layer_ids = [0, 7, 14]
+        # An ``args`` attribute exists but does NOT carry
+        # target_layer_ids — confirms the skeleton no longer reads
+        # from args.target_layer_ids (the previous β bug).
+
+        class args:
+            target_layer_ids = [99, 99, 99]  # would be wrong if read
+
+    drafter = object.__new__(DFlashDrafter)
+    drafter._drafter_repo = "test/synthetic"
+    drafter._target_adapter = None  # type: ignore[assignment]
+    drafter._drafter_model = _FakeModel()
+    drafter._drafter_meta = None
+    assert drafter._read_target_layer_ids() == (0, 7, 14)
 
 
 _HAS_DFLASH = importlib.util.find_spec("dflash_mlx") is not None

@@ -391,24 +391,36 @@ per the project's incremental-execution rule.
    the §4.1 state-machine. Empty test asserting Protocol conformance
    via `runtime_checkable`. Lands the package extras marker
    (`pyproject.toml`) and the import-gating skipif marker for tests.
-4. **(γ) `propose` + `commit` against a synthetic drafter (§6.2 tier 1).**
-   A scripted block-diffusion drafter that returns a deterministic
-   `(target_hidden, K, hidden_dim)` → K-token mapping for a fixed
-   prefix. The synthetic drafter has the same call shape as
-   `DFlashDraftModel.__call__` — it consumes `target_hidden` and
-   returns `(noise hidden, drafted token ids)` — but its block-diffusion
-   forward is a programmatic look-up. Drives the **tier-1
-   correctness gate** (§6.2): on a cached small target (e.g.
-   `Qwen/Qwen3-0.6B`) with capture enabled via (αβ), spec-on cycle-1
-   token sequences must be byte-equivalent to spec-off greedy under
-   fixed seed. Cycle 1 has no batched-vs-sequential KV reduction-order
-   divergence, so byte equality is achievable. This sub-unit is
-   **not** a fallback for absent real-model checkpoints — it is the
-   structural-correctness tier of the gate in its own right and runs
-   unconditionally as part of the test suite. Also bound: a
-   `commit(ctx, yielded_count)` test that asserts the next `propose`
-   uses a `target_hidden` of length `1 + yielded_count`, regardless
-   of what the previous block proposed.
+4. **(γ) `propose` against a synthetic drafter — spec-off oracle replay (§6.2 tier 1).**
+   A scripted "drafter" whose `propose(ctx, k)` emits a deterministic
+   K-token block. To pass the tier-1 gate the emitted tokens must be
+   accepted by silica's existing `greedy_verify` against the target's
+   actual argmax — this rules out hash-of-`target_hidden` schemes that
+   produce arbitrary in-vocab ids, which the verifier would reject.
+   The chosen design is **spec-off oracle replay**:
+
+   - First, run spec-off greedy on the target for K cycle-1 tokens
+     and record the resulting token sequence as the oracle.
+   - Then, install the synthetic drafter to emit those exact recorded
+     tokens; spec-on runs through `Engine.generate` with
+     `--speculative dflash` (synthetic mode), and the verifier
+     accepts the full drafted block because every token equals the
+     target's argmax by construction.
+
+   The fixture is **`Qwen/Qwen3.5-0.8B`** — the smallest cached
+   checkpoint silica's αβ surface covers (`Qwen3Adapter` does **not**
+   ship `prefill_with_capture`; the Qwen3 family is out of scope
+   per `dflash_mlx.generate.DRAFT_REGISTRY`'s lack of a Qwen3
+   drafter). Cycle 1 has no batched-vs-sequential KV reduction-order
+   divergence, so spec-on / spec-off byte equality on the recorded
+   tokens is achievable. This sub-unit is **not** a fallback for
+   absent real-model checkpoints — it is the structural-correctness
+   tier of the gate in its own right and runs unconditionally as
+   part of the test suite. Also bound: a `commit(ctx, yielded_count)`
+   + `update_target_hidden(req_id, captured, yielded_count)` test
+   that asserts the next `propose` uses a `target_hidden` of length
+   `1 + yielded_count`, regardless of what the previous block
+   proposed.
 5. **(δ) `propose` implementation — real DFlash forward (§6.2 tier 2).**
    Wires `dflash_mlx.model.DFlashDraftModel` and
    `dflash_mlx.model.ContextOnlyDraftKVCache` from the upstream
