@@ -595,7 +595,7 @@ upstream's tape-replay; it inherits silica's snapshot-restore. (See
 | ---------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Target-side KV   | `PagedKVCache.rollback(req_id, n_reject)`                   | unchanged from step 5                                                                                                                                                                            |
 | Target recurrent | `Qwen3_5Adapter.rollback_state(req_id)`                     | unchanged from step 5 (does **not** use upstream tape-replay; that is the deferred verify-side port — see §2.2)                                                                                  |
-| Draft-side state | `DraftTargetEngine.commit(ctx, n_acc)` advances draft cache | `DFlashDrafter.commit(ctx, yielded_count)` updates per-`req_id` `target_hidden = captured_hidden[:, :1 + yielded_count, :]`; the `ContextOnlyDraftKVCache` requires no trim (rejected drafts were never written, see §4.1) |
+| Draft-side state | `DraftTargetEngine.commit(ctx, n_acc)` advances draft cache | `DFlashDrafter.update_target_hidden(req_id, captured, yielded_count)` (TargetHiddenConsumer side channel; (β)) updates per-`req_id` `target_hidden = aggregate(captured)[:, :1 + yielded_count, :]`; `commit(ctx, accepted_len)` is a no-op; the `ContextOnlyDraftKVCache` requires no trim (rejected drafts were never written, see §4.1) |
 
 The first two paths are inherited verbatim from step 5. The
 draft-side path is new shape but stays within `DFlashDrafter` and

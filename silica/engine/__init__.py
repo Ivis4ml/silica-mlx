@@ -55,9 +55,14 @@ from silica.core.sampling import SamplingParams
 from silica.kvcache.manager import KVHandle, KVManager
 from silica.kvcache.prefix import RadixPrefixCache
 from silica.models.adapter import ModelAdapter
+from silica.models.hidden_capture import HiddenCaptureAdapter
 from silica.models.recurrent import SpecRecurrentRollbackAdapter
 from silica.scheduler.batcher import ContinuousBatcher
-from silica.speculative.engine import DraftEngine, NoopDraftEngine
+from silica.speculative.engine import (
+    DraftEngine,
+    NoopDraftEngine,
+    TargetHiddenConsumer,
+)
 from silica.speculative.verify import greedy_verify, run_verify_forward
 
 if TYPE_CHECKING:
@@ -167,6 +172,15 @@ class Engine:
             reset = getattr(self._draft_engine, "reset", None)
             if reset is not None:
                 reset(handle.req_id)
+            # D-021 step 6 sub-unit (ε): drop the per-``req_id``
+            # target_hidden + draft_caches when the drafter is a
+            # ``TargetHiddenConsumer`` (DFlash class). Mirrors the
+            # ``reset`` guard above — the method is on the optional
+            # Protocol mixin, so non-target-hidden drafters
+            # (``NoopDraftEngine`` / ``DraftTargetEngine``) skip this
+            # cleanup branch without any guard cost.
+            if isinstance(self._draft_engine, TargetHiddenConsumer):
+                self._draft_engine.free_target_hidden(handle.req_id)
             # Drop any pending pre-draft recurrent snapshot. Idempotent
             # under ``free_state`` semantics — safe to call when no draft
             # window is open or when this request never entered the spec
@@ -193,11 +207,49 @@ class Engine:
                 "(see plans/P6_SPEC_FOUNDATION_OPENING.md §4.3)."
             )
 
+        # D-021 step 6 sub-unit (ε): TargetHiddenConsumer side channel
+        # detection. Cached once at the top of ``_drive`` so the per-
+        # cycle hot path can branch on a local rather than re-run
+        # ``isinstance`` per iteration. C.1 ``DraftTargetEngine`` and
+        # ``NoopDraftEngine`` do not implement this Protocol; the
+        # branch below is a no-op for them and the existing engine
+        # path stays byte-identical.
+        target_hidden_drafter = (
+            self._draft_engine
+            if isinstance(self._draft_engine, TargetHiddenConsumer)
+            else None
+        )
+        if target_hidden_drafter is not None and not isinstance(
+            self._adapter, HiddenCaptureAdapter
+        ):
+            raise NotImplementedError(
+                f"TargetHiddenConsumer drafter "
+                f"({type(self._draft_engine).__name__}) requires a "
+                "HiddenCaptureAdapter target. Qwen3.5 dense + MoE are "
+                "supported per (αβ.1) / (αβ.2); other families are out "
+                "of scope (no upstream DFlash drafter targets them per "
+                "dflash_mlx.generate.DRAFT_REGISTRY)."
+            )
+
         prompt_arr = mx.array(prompt_ids, dtype=mx.int32)
 
         # Prefill + first sample — measured as a single TTFT block.
+        # When a TargetHiddenConsumer drafter is wired, the prefill
+        # forward is routed through ``prefill_with_capture`` so the
+        # captured hidden states seed cycle-1 ``target_hidden`` via
+        # ``drafter.prime``. Last-position logits match the existing
+        # ``prefill`` contract — the engine sampler is unchanged.
         t0 = time.perf_counter()
-        logits, _ = self._adapter.prefill(prompt_arr, handle)
+        if target_hidden_drafter is not None:
+            assert isinstance(self._adapter, HiddenCaptureAdapter)
+            logits, captured_prefill, _ = self._adapter.prefill_with_capture(
+                prompt_arr,
+                handle,
+                target_hidden_drafter.capture_layer_ids,
+            )
+            target_hidden_drafter.prime(handle.req_id, captured_prefill)
+        else:
+            logits, _ = self._adapter.prefill(prompt_arr, handle)
         history: list[int] = list(prompt_ids)
         token_scalar = self._sampler.sample(
             logits, mx.array(history, dtype=mx.int32), params
@@ -243,10 +295,20 @@ class Engine:
                 else 0.0
             )
             drafts = self._draft_engine.propose(ctx, gamma)
-            if not drafts.token_ids:
-                # Spec-off (NoopDraftEngine) or draft engine declined
-                # to propose this cycle. Single-token decode — byte-
-                # identical to the pre-spec loop.
+            if not drafts.token_ids and target_hidden_drafter is None:
+                # Spec-off (NoopDraftEngine) or non-target-hidden
+                # drafter that declined this cycle. Single-token
+                # decode — byte-identical to the pre-spec loop.
+                #
+                # ``TargetHiddenConsumer`` drafters explicitly skip
+                # this branch even on empty drafts: they must route
+                # through the spec verify path below so the captured
+                # hidden states feed ``update_target_hidden`` and
+                # ``target_hidden`` does not go stale across the
+                # empty cycle. With ``draft_count = 0`` the verify
+                # input is just ``[anchor]`` and the bonus emit at
+                # the bottom of the cycle yields exactly one token,
+                # functionally equivalent to ``decode_step`` here.
                 step_in = mx.array([tok_int], dtype=mx.int32)
                 logits, _ = self._adapter.decode_step(step_in, handle)
                 token_scalar = self._sampler.sample(
@@ -306,9 +368,26 @@ class Engine:
                 if self._spec_collector is not None
                 else 0.0
             )
-            verify_logits, _ = run_verify_forward(
-                self._adapter, verify_input, handle
-            )
+            # D-021 step 6 sub-unit (ε): route the verify forward
+            # through the capture variant when a TargetHiddenConsumer
+            # drafter is active. The capture is purely additive —
+            # logits returned are bit-equivalent to the plain
+            # ``run_verify_forward`` path (pinned in (αβ.3)), so the
+            # verifier and bonus-emit math below are unchanged.
+            captured_verify: dict[int, mx.array] | None = None
+            if target_hidden_drafter is not None:
+                assert isinstance(self._adapter, HiddenCaptureAdapter)
+                verify_logits, captured_verify, _ = (
+                    self._adapter.decode_step_multi_with_capture(
+                        verify_input,
+                        handle,
+                        target_hidden_drafter.capture_layer_ids,
+                    )
+                )
+            else:
+                verify_logits, _ = run_verify_forward(
+                    self._adapter, verify_input, handle
+                )
             verify_elapsed_ms = (
                 (time.perf_counter() - verify_start) * 1000.0
                 if self._spec_collector is not None
@@ -374,6 +453,21 @@ class Engine:
                 )
                 if un_committed > 0:
                     self._spec_collector.record_rollback()
+            # D-021 step 6 sub-unit (ε): update the target-hidden
+            # drafter's per-``req_id`` ``target_hidden`` BEFORE the
+            # target-side KV / recurrent rollback runs. The captured
+            # hidden states reference distinct mx.arrays from the KV
+            # cache (intermediate layer outputs, not cache writes),
+            # so ordering is correctness-neutral — it is fixed at
+            # "update first, rollback after" for clarity, matching
+            # the F-1 state machine in §4.1 of the OPENING.
+            if target_hidden_drafter is not None:
+                assert captured_verify is not None
+                target_hidden_drafter.update_target_hidden(
+                    handle.req_id,
+                    captured_verify,
+                    yielded_count,
+                )
             recurrent_adapter = (
                 self._adapter
                 if isinstance(self._adapter, SpecRecurrentRollbackAdapter)
