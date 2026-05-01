@@ -289,6 +289,17 @@ class Engine:
                 if accepted_tok in params.stop_token_ids:
                     stop_hit = True
                     break
+            # Post-loop ``max_tokens`` check. The in-loop guard fires at
+            # the **start** of an iteration, so an accept_len-token cycle
+            # that exits the for loop naturally with ``n == max_tokens``
+            # never trips it; the bonus emit below would otherwise
+            # overshoot ``max_tokens`` by one. Reproduces under
+            # spec-on at ``max_tokens == prefill_yield + γ * cycles``
+            # (e.g. verify_k=4 / max_tokens=4 yields 5 tokens without
+            # this guard). Spec-off has the same hard cap via the top-of-
+            # loop ``while n < params.max_tokens``; spec-on must mirror it.
+            if n >= params.max_tokens:
+                stop_hit = True
 
             # KV rollback: undo every draft slot past ``yielded_count``
             # in the verify forward — the (draft_count - accepted_len)

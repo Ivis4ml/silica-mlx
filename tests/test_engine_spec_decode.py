@@ -397,6 +397,38 @@ def test_spec_on_max_tokens_cap_mid_accept_skips_bonus() -> None:
     assert drafter.commit_calls == [2]
 
 
+def test_spec_on_max_tokens_at_yield_loop_boundary_skips_bonus() -> None:
+    """Regression: when the accepted-draft yield loop exits naturally
+    with ``n == max_tokens``, the bonus emit must be suppressed. The
+    in-loop ``n >= max_tokens`` guard fires only at the start of an
+    iteration, so a cycle whose accept count lands ``n`` exactly on
+    ``max_tokens`` never trips it; without the post-loop guard the
+    engine would yield ``max_tokens + 1`` tokens.
+
+    Setup: γ = 3 (verify_k = 4), max_tokens = 4. Prefill yields 1 token
+    (n = 1). Cycle 1: 3 drafts all accepted, yielded one at a time
+    bringing ``n`` from 1 → 4 with the in-loop guard never firing
+    (each ``n < 4`` check passes before the yield). The for loop exits
+    on ``range(3)`` exhaustion. Bonus must NOT yield.
+    """
+    adapter = _ScriptedSpecAdapter(
+        prefill_argmax=100,
+        verify_logits=[[200, 201, 202, 250]],
+    )
+    kv = _TrackedKVManager()
+    drafter = _ScriptedDraftEngine(proposals=[[200, 201, 202]])
+    engine = Engine(adapter, kv, draft_engine=drafter, verify_k=4)
+    out = _collect(engine.generate("hi", _greedy(max_tokens=4)))
+    # Exactly 4 tokens — bonus suppressed by the post-loop guard.
+    assert out == [100, 200, 201, 202]
+    # Full accept: no KV rollback.
+    assert kv.rollback_calls == []
+    # commit(yielded_count = 3) — same as full accept.
+    assert drafter.commit_calls == [3]
+    # Single decode_step_multi (verify only — no replay since no reject).
+    assert adapter.decode_multi_calls == 1
+
+
 def test_spec_on_stop_token_mid_accept_skips_bonus() -> None:
     # γ = 3. Drafts all match target argmax, but draft[1] = 13 is in
     # stop_token_ids. Engine yields [anchor=100, draft0=12, draft1=13]
