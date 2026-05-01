@@ -100,11 +100,15 @@ takes any quantization tier mlx-lm understands. The risk is
 
 ### 2.1 In scope
 
-- **Find or convert a Qwen3.5-27B-3bit checkpoint.** First-pass
-  HF lookup; if no native 3-bit Qwen3.5-27B exists, run
-  `mlx_lm.convert -q --bits 3` against `Qwen/Qwen3.5-27B`. The
-  conversion is offline, ~5-10 minutes, output ≈12 GB on disk.
-  Cache locally; not committed to silica's repo.
+- **Use the matched-family native 3-bit Qwen3.5-27B fixture
+  identified at B.1 read-only HF lookup (OQ-1 closure).**
+  Primary: `NexVeridian/Qwen3.5-27B-3bit` (≈11 GB on disk; MLX
+  safetensors; created 2026-02-25 from `Qwen/Qwen3.5-27B` via
+  `mlx_lm.convert -q --bits 3`). Backup:
+  `RepublicOfKorokke/Qwen3.5-27B-mlx-lm-3bit` (≈11 GB; same
+  base; only used if NexVeridian's checkpoint exhibits a loader
+  / layout issue). The 52 GB full-precision pull + offline
+  convert path is **retired** — no in-house conversion needed.
 - **B.1 loader smoke.** Load the 3-bit checkpoint via
   `silica.models.factory.adapter_for_repo`; run
   `Engine.generate("Hello", max_tokens=4)`; assert no exceptions,
@@ -182,9 +186,10 @@ Three sub-units, each landing as one commit, with a user pause
 between each per the standing incremental-execution rule.
 
 1. **(B.1) 3-bit loader smoke + bench scenario registration.**
-   - Acquire a 3-bit Qwen3.5-27B checkpoint (HF lookup → convert
-     fallback). Document the choice + gate env var
-     (`SILICA_REAL_QWEN3_5_27B_3BIT`).
+   - Acquire `NexVeridian/Qwen3.5-27B-3bit` (≈11 GB MLX
+     safetensors; OQ-1 closed at the read-only HF lookup that
+     preceded this sub-unit). Gate env var:
+     `SILICA_REAL_QWEN3_5_27B_3BIT`.
    - Verify `silica.models.factory.adapter_for_repo` loads it
      cleanly; spot-check `Engine.generate("Hello", max_tokens=4)`.
      No silica code change expected unless the loader chokes on
@@ -290,31 +295,37 @@ without normalisation.
 
 ## 5. Open questions
 
-### 5.1 OQ-1 — 3-bit Qwen3.5-27B checkpoint availability
+### 5.1 OQ-1 — 3-bit Qwen3.5-27B checkpoint availability (closed favourably at B.1 read-only HF lookup, 2026-05-01)
 
-**Question.** Does a published Qwen3.5-27B 3-bit checkpoint exist
-on HF, and if so, what repo id? `unsloth/Qwen3.6-27B-UD-MLX-3bit`
-is the closest published precedent but is **Qwen 3.6**, not
-Qwen 3.5; using the wrong family confounds the 3-bit-vs-4-bit
-quality comparison.
+**Closed favourably.** The B.1 read-only HF lookup found two
+matched-family native MLX 3-bit Qwen3.5-27B checkpoints, both
+created by running `mlx_lm.convert -q --bits 3` against
+`Qwen/Qwen3.5-27B`:
 
-**Resolution method.** Sub-unit (B.1)'s first deliverable: HF
-search for `Qwen3.5-27B` quantizations. Likely candidates:
-`mlx-community/Qwen3.5-27B-3bit`, `mlx-community/Qwen3.5-27B-MLX-3bit`,
-or similar. If no match, run `mlx_lm.convert -q --bits 3
---mlx-path qwen3_5_27b_3bit Qwen/Qwen3.5-27B` to convert offline.
-The convert path requires the **full-precision** checkpoint
-(~52 GB BF16), which silica does **not** currently cache and
-which exceeds 48 GB unified memory at residency. Pulling
-`Qwen/Qwen3.5-27B` for conversion alone is ~52 GB on disk; not
-trivial.
+| Repo | Created | Downloads | mlx-lm version | Storage |
+| ---- | ------- | --------- | -------------- | ------- |
+| **`NexVeridian/Qwen3.5-27B-3bit`** (primary) | 2026-02-25 (1 day after Qwen3.5-27B release) | 309 | 0.30.8 | ≈11.0 GB |
+| `RepublicOfKorokke/Qwen3.5-27B-mlx-lm-3bit` (backup) | 2026-03-08 | 230 | 0.30.7 | ≈11.0 GB |
 
-**Fallback.** If the full-precision pull is too costly, B.1
-documents the convert-required state and the spike retargets to
-`unsloth/Qwen3.6-27B-UD-MLX-3bit` for the runtime smoke test
-only — quality cross-check then compares Qwen3.6-27B-3bit
-against `mlx-community/Qwen3.6-27B-4bit` (if available), or B.2
-is documented as "deferred pending matched-family checkpoints".
+Both have identical layout: 3 safetensor shards + `config.json`
++ `model.safetensors.index.json` + tokenizer files;
+`quantization_config.bits = 3`; `model_type = "qwen3_5"`. Total
+storage parameters 26.9B (= 843 M BF16 + 2.52 B U32-packed
+quantized + a handful of F32 RMSNorm scales). The two
+checkpoints differ by ≈12 KB in `used_storage` and a few
+thousand F32 params (likely RMSNorm vs LayerNorm metadata) —
+not load-bearing.
+
+**Decision.** B.1 uses **`NexVeridian/Qwen3.5-27B-3bit`** as the
+primary fixture (earliest, most-downloaded, mlx-lm 0.30.8).
+`RepublicOfKorokke/Qwen3.5-27B-mlx-lm-3bit` is reserved as a
+backup for layout / loader issues only; not pulled at B.1 time.
+
+**52 GB convert fallback retired.** The orientation's earlier
+"if no native 3-bit, run `mlx_lm.convert` against the 52 GB
+full-precision Qwen3.5-27B" plan is no longer needed. OQ-5
+(absolute fp16 PPL anchor) remains documented as a known caveat
+for the relative-only B.2 gate, but does not block step 7.
 
 ### 5.2 OQ-2 — PPL gate threshold
 
@@ -375,11 +386,12 @@ possible), the relative gate fails to detect a 3-bit-only
 quality drop.
 
 **Resolution method.** Out of scope for B.2's relative-only
-gate. Documented in the (B.2) REPORT as a known caveat. If
-silica eventually wants an fp16 anchor, that is a separate
-quality cross-check requiring a 52 GB checkpoint pull (the same
-constraint that may push B.1 to convert the 3-bit checkpoint
-locally).
+gate. Documented in the (B.2) REPORT as a known caveat. An fp16
+anchor cross-check would require pulling the 52 GB
+`Qwen/Qwen3.5-27B` full-precision checkpoint, which exceeds 48
+GB unified memory at residency on M5 Pro and is out of scope
+for step 7 — relative drift between the two cached MLX
+quantizations is the load-bearing comparison.
 
 ---
 
