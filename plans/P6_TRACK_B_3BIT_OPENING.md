@@ -40,8 +40,13 @@ to lift its bandwidth ceiling. PLAN.md §13 step 7 verbatim:
 Three sub-units (B.1 / B.2 / B.3) measured independently. Two
 acceptance gates:
 
-- **Quality (B.2)**: `ΔPPL ≤ 0.5 absolute OR ≤ 5% relative` on
-  WikiText-2 chunked-NLL, whichever is tighter.
+- **Quality (B.2)**: `ΔPPL ≤ 0.5 absolute AND ≤ 5% relative` on
+  WikiText-2 chunked-NLL — **both must pass**. Failing either
+  drops 3-bit to "available with caveats / opt-in"; quality gate
+  is not declared passed. The two thresholds are not redundant:
+  the absolute bound catches drift on smaller PPL values where
+  5% relative is laxer; the relative bound catches drift on
+  larger PPL values where 0.5 absolute is laxer.
 - **Performance (B.3)**: `≥21 tok/s` on `qwen3.5-27b-warm-decode-b1-3bit`
   = ≥1.31× over the v1.7.13 b1 anchor (16.05 tok/s). PLAN's 21-24
   band is a prediction; the gate is the lower bound.
@@ -108,12 +113,20 @@ takes any quantization tier mlx-lm understands. The risk is
   — the relative-reduction form avoids brittle absolute thresholds
   if scale/zero metadata or activation scratch don't shrink
   linearly with weight bits).
-- **B.2 quality cross-check.** Add bench oracle row
-  `qwen3.5-27b-3bit-vs-4bit-ppl` running the existing PPL
-  chunked-NLL oracle on WikiText-2 against both the 4-bit and
-  3-bit Qwen3.5-27B variants. Acceptance: `ΔPPL ≤ 0.5 absolute OR
-  ≤ 5% relative`, whichever is tighter. Same fixture (WikiText-2)
-  the existing 0.6B PPL rows use, scaled to 27B's chunk size.
+- **B.2 quality cross-check.** Register **two** `OracleKind.PPL`
+  scenarios — `qwen3.5-27b-wikitext-ppl-4bit` and
+  `qwen3.5-27b-wikitext-ppl-3bit` — each carrying its own
+  `Scenario.repo` (the 4-bit and 3-bit checkpoints respectively)
+  and matching the existing 0.6B PPL fixture's chunked-NLL config
+  scaled to 27B's chunk size. Each row is gated independently
+  (4-bit row on `SILICA_REAL_QWEN3_5_27B`; 3-bit row on
+  `SILICA_REAL_QWEN3_5_27B_3BIT`). The runner is **not**
+  extended to consume two `repo`s in one row — that would
+  reshape `Scenario.repo` semantics for one consumer. Instead
+  the (B.2) REPORT.md section reads both rows' `ScenarioResult`
+  outputs from the JSONL and computes ΔPPL against the gate
+  thresholds. This keeps the harness change small and the
+  `Scenario.repo` invariant ("one repo per scenario row") intact.
 - **B.3 27B 3-bit warm-decode.** Add bench scenario
   `qwen3.5-27b-warm-decode-b1-3bit` mirroring `qwen3.5-27b-warm-decode-b1`
   shape exactly (B=1, 128-token prompt, 384-token generation,
@@ -178,24 +191,40 @@ between each per the standing incremental-execution rule.
      a 3-bit checkpoint detail (group size, scale dtype).
    - Register `qwen3.5-27b-warm-decode-b1-3bit` scenario in
      `silica/bench/scenarios.py`, mirroring `b1` shape.
-   - Tests: `--list` enumerates the new scenario; catalog count
-     rises from 67 → 68; gate env var resolution test;
-     scenario-shape parity test against b1 cousin (workload
-     match, target gate match).
+   - Tests pin three invariants on the new scenario:
+     - **Workload shape parity** with `qwen3.5-27b-warm-decode-b1`:
+       same `prompts`, `max_tokens`, `max_batch_size`, `oracle`.
+     - **Repo differs**: 3-bit row's `repo` is the 3-bit
+       checkpoint id, **not** the 4-bit cousin's repo.
+     - **Gate differs**: 3-bit row's `gate_env_var` is
+       `SILICA_REAL_QWEN3_5_27B_3BIT`, **not** the 4-bit cousin's
+       `SILICA_REAL_QWEN3_5_27B`. The two checkpoints are gated
+       independently so a user with only the 4-bit cached cannot
+       trigger an unintended 12 GB load.
+     Plus: `--list` enumerates the new scenario; catalog count
+     rises from 67 → 68.
 2. **(B.2) WikiText-2 PPL cross-check.**
-   - Add bench oracle scenario `qwen3.5-27b-3bit-vs-4bit-ppl`
-     using `OracleKind.PPL` against the existing WikiText-2
-     fixture. Two sub-rows: 4-bit baseline + 3-bit candidate,
-     same chunked-NLL config the 0.6B rows use scaled to 27B's
-     chunk size.
-   - Run gated under `SILICA_REAL_QWEN3_5_27B`. Record
-     ΔPPL = ppl_3bit − ppl_4bit (absolute) and relative.
-   - Append (B.2) section to a new
-     `plans/P6_TRACK_B/REPORT.md` with the measured ppls + Δ +
-     gate-pass / -fail call.
-   - Tests: scenario shape, oracle config, gate env resolution.
-     The actual PPL run is environment-affecting (loads two 27B
-     checkpoints back-to-back) and is the sub-unit's deliverable.
+   - Register two `OracleKind.PPL` scenarios — one per repo:
+     - `qwen3.5-27b-wikitext-ppl-4bit` (repo
+       `mlx-community/Qwen3.5-27B-4bit`, gate
+       `SILICA_REAL_QWEN3_5_27B`).
+     - `qwen3.5-27b-wikitext-ppl-3bit` (repo from B.1, gate
+       `SILICA_REAL_QWEN3_5_27B_3BIT`).
+     Both reuse the existing 0.6B PPL fixture's chunked-NLL
+     oracle config scaled to 27B's chunk size; **no runner
+     change**, no new oracle code.
+   - Run each under its own gate env. Each emits a standard
+     `ScenarioResult` row with `ppl` in metadata.
+   - Append (B.2) section to `plans/P6_TRACK_B/REPORT.md`,
+     reading both rows from the bench JSONL and computing
+     `ΔPPL_abs = ppl_3bit − ppl_4bit` + `ΔPPL_rel = ΔPPL_abs /
+     ppl_4bit`. Gate evaluation is REPORT-side, not runner-side.
+   - Tests: scenario shape (each row has its own correct repo +
+     gate); oracle config matches existing 0.6B PPL rows;
+     `--list` enumerates both rows. The actual PPL run is
+     environment-affecting (loads two 27B checkpoints back-to-back
+     across the two scenarios) and is the sub-unit's
+     load-bearing deliverable.
 3. **(B.3) 27B 3-bit warm-decode attestation.**
    - Run `qwen3.5-27b-warm-decode-b1-3bit` under the four-gate-
      active conditions: target HF cache + 3-bit env + WikiText-2
@@ -290,8 +319,9 @@ is documented as "deferred pending matched-family checkpoints".
 ### 5.2 OQ-2 — PPL gate threshold
 
 **Question.** PLAN.md §13 step 7 says "pass quality gate" without
-naming a number. `plans/P6_OPENING.md` §3 Track B B.2 proposes
-`ΔPPL ≤ 0.5 absolute OR ≤ 5% relative`. Is that the right floor?
+naming a number. The §6.2 acceptance gate above pins
+`ΔPPL ≤ 0.5 absolute AND ≤ 5% relative` — both must pass. Is
+that the right pair?
 
 **Resolution method.** B.2 records both the absolute ppl values
 and the deltas; the gate evaluation reads the OPENING's threshold
@@ -366,13 +396,17 @@ locally).
 
 ### 6.2 B.2 — PPL quality cross-check
 
-- `qwen3.5-27b-3bit-vs-4bit-ppl` runs to completion under the
-  WikiText-2 fixture.
-- `ΔPPL = ppl_3bit − ppl_4bit ≤ 0.5 absolute` **AND**
-  `ΔPPL_relative ≤ 5%` of `ppl_4bit`. Pass requires both.
-- If only one passes, B.2 ships as "available with caveats" and
-  the runtime promotion to default 3-bit is **blocked** —
-  consumers can opt in via the explicit scenario id.
+- Both `qwen3.5-27b-wikitext-ppl-4bit` and
+  `qwen3.5-27b-wikitext-ppl-3bit` run to completion under the
+  WikiText-2 fixture, each under its own gate env. The (B.2)
+  REPORT.md section reads both `ScenarioResult.metadata.ppl`
+  values from the bench JSONL.
+- Quality gate: `ΔPPL_abs = ppl_3bit − ppl_4bit ≤ 0.5`
+  **AND** `ΔPPL_rel = ΔPPL_abs / ppl_4bit ≤ 0.05` (5%).
+  **Pass requires both.** Failing either drops 3-bit to
+  "available with caveats / opt-in" — consumers can use the
+  explicit scenario id but the gate is **not** declared
+  passed and runtime promotion to default 3-bit is **blocked**.
 
 ### 6.3 B.3 — 27B 3-bit warm-decode performance
 
