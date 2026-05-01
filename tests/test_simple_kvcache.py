@@ -6,7 +6,7 @@ Covers:
   - Single-request ownership discipline (second req_id raises, free releases).
   - Heterogeneous per-layer list is preserved (ArraysCache + KVCache mix).
   - budget.resident_bytes aggregates nbytes (D-012 alignment).
-  - rollback delegates to mlx-lm's trim_prompt_cache when trimmable.
+  - rollback walks per-layer; trimmable entries trim, non-trimmable pass through.
   - cache_list extension method requires owner match.
 """
 
@@ -178,7 +178,7 @@ def test_budget_aggregates_nbytes_after_fill() -> None:
     assert b.logical_bytes == expected
 
 
-# --- rollback delegates to mlx-lm trim ---
+# --- rollback trims per layer ---
 
 
 def test_rollback_trims_trimmable_entries() -> None:
@@ -202,12 +202,43 @@ def test_rollback_with_zero_is_noop() -> None:
     assert entries[0].offset == 4
 
 
-def test_rollback_when_not_trimmable_is_noop() -> None:
-    # Default ArraysCache is not trimmable — can_trim_prompt_cache returns
-    # False when any entry is non-trimmable, so the whole call no-ops.
-    entries: list[Any] = [KVCache(), ArraysCache(size=2)]
+def test_rollback_trims_only_trimmable_in_hybrid_list() -> None:
+    """D-021 step 5 sub-unit (e) slice 1: per-layer trim.
+
+    Hybrid lists mix trimmable (``KVCache``) and non-trimmable
+    (``ArraysCache``) entries. The earlier all-or-nothing
+    ``can_trim_prompt_cache`` guard skipped every trim once any
+    entry was non-trimmable, blocking attention KV rollback for the
+    speculative engine path on Qwen3.5. Per-layer trim now trims the
+    trimmable entries individually and passes the recurrent slots
+    through; recurrent rollback is the adapter's job (D-021 step 5
+    sub-unit (e) slice 2).
+    """
+    entries: list[Any] = [KVCache(), KVCache(), ArraysCache(size=2)]
     _feed_kvcache(entries[0], n_tokens=4)
+    _feed_kvcache(entries[1], n_tokens=4)
     kv = SimpleKVCache(entries)
     kv.reserve_for_prefill("req-a", [1])
+
     kv.rollback("req-a", 2)
-    assert entries[0].offset == 4  # unchanged
+
+    assert entries[0].offset == 2  # KVCache trimmed
+    assert entries[1].offset == 2  # KVCache trimmed
+    # ArraysCache untouched — recurrent rollback is the adapter's job.
+    assert isinstance(entries[2], ArraysCache)
+    assert entries[2].cache == [None, None]
+
+
+def test_rollback_on_all_recurrent_list_is_noop() -> None:
+    """No KVCache in the list (degenerate model with only recurrent
+    layers): per-layer trim finds nothing trimmable and passes through
+    cleanly. Mirrors the previous no-op semantic on a list where every
+    entry happens to be non-trimmable."""
+    entries: list[Any] = [ArraysCache(size=2), ArraysCache(size=2)]
+    kv = SimpleKVCache(entries)
+    kv.reserve_for_prefill("req-a", [1])
+    # Should not raise; ArraysCache has no `trim` method but
+    # `is_trimmable()` returns False so the loop skips it.
+    kv.rollback("req-a", 3)
+    assert entries[0].cache == [None, None]
+    assert entries[1].cache == [None, None]

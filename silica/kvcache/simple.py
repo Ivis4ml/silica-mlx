@@ -17,10 +17,15 @@ Design constraints:
     the ``HYBRID_DELTANET`` attention pattern (D-015); SimpleKVCache stores the
     list as produced by the model's ``make_cache()`` and hands it through
     untouched.
-  - **Rollback delegates to mlx-lm.** ``rollback(n)`` calls
-    ``mlx_lm.models.cache.trim_prompt_cache``; it is best-effort — entries that
-    are not ``is_trimmable()`` (e.g. some recurrent caches) silently no-op,
-    which is the correct behaviour for P-1 (speculative decode is a P-7 item).
+  - **Per-layer rollback.** ``rollback(n)`` walks the cache list and calls
+    ``c.trim(n)`` on every entry whose ``is_trimmable()`` returns True;
+    non-trimmable entries (typically ``ArraysCache`` for DeltaNet recurrent
+    state) pass through untouched. Recurrent state is rolled back through
+    ``Qwen3_5Adapter.rollback_state``'s snapshot / restore pair (D-021
+    step 5 sub-unit (e)); the I-2 ``rollback`` surface owns only attention
+    KV. An earlier revision deferred to ``trim_prompt_cache`` and skipped
+    every trim once any entry was non-trimmable — defensive but blocked
+    hybrid attention rollback for the speculative engine path.
   - **Resident bytes aggregate nbytes.** Per the Gate A finding (D-012), mlx-lm
     already exposes ``nbytes`` as the canonical measurement; no reconciliation.
 
@@ -91,11 +96,28 @@ class SimpleKVCache:
         self._require_owner(req_id)
 
     def rollback(self, req_id: str, n_reject: int) -> None:
+        """Trim every trimmable per-layer cache by ``n_reject`` positions.
+
+        Per-layer dispatch (D-021 step 5 sub-unit (e)): trimmable caches
+        (mlx-lm's ``KVCache``) drop their last ``n_reject`` positions
+        individually; non-trimmable caches (``ArraysCache`` for DeltaNet
+        recurrent slots) pass through untouched. The recurrent state is
+        rolled back through ``Qwen3_5Adapter.rollback_state``'s
+        snapshot/restore pair, not through this method — see
+        ``plans/P6_SPEC_FOUNDATION_E_ORIENTATION.md`` §2 for the
+        decoupling rationale.
+
+        The earlier all-or-nothing semantic (skip every trim if any cache
+        was non-trimmable) was a defensive pin from before recurrent
+        snapshot/restore landed; flipping to per-layer trim is required
+        for the engine spec path's hybrid attention KV rollback.
+        """
         self._require_owner(req_id)
         if n_reject <= 0:
             return
-        if mlx_cache.can_trim_prompt_cache(self._cache_list):
-            mlx_cache.trim_prompt_cache(self._cache_list, n_reject)
+        for cache in self._cache_list:
+            if cache.is_trimmable():
+                cache.trim(n_reject)
 
     def free(self, req_id: str) -> None:
         self._require_owner(req_id)
