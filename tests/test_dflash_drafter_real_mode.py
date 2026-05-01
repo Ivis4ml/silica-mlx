@@ -125,16 +125,22 @@ class _FakeEmbedding:
     """Tied-embedding stand-in. Returns a deterministic
     ``(B, T, hidden_size)`` lookup; ``as_linear`` projects back to
     ``(B, T, vocab_size)`` so the argmax over the lm-head is
-    predictable from the input row index."""
+    predictable from the input row index. Records every input
+    ``tokens_2d`` so tests can pin the exact token contents the
+    drafter forward sees (staged-first at slot 0, mask token at
+    slots 1..block_len-1)."""
 
     def __init__(self, vocab_size: int, hidden_size: int) -> None:
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
+        self.last_tokens_2d: list[list[int]] | None = None
 
     def __call__(self, tokens_2d: mx.array) -> mx.array:
-        # Deterministic embedding: each token id maps to a
-        # ``hidden_size``-vector of zeros — the contents are not
-        # consumed by the test, only the shape.
+        # Capture the input tokens so the staged-first / mask layout
+        # can be asserted exactly in the test, not just inferred from
+        # the (B, T) shape.
+        py: Any = tokens_2d.tolist()
+        self.last_tokens_2d = [list(row) for row in py]
         b, t = int(tokens_2d.shape[0]), int(tokens_2d.shape[1])
         return mx.zeros(shape=(b, t, self.hidden_size), dtype=mx.float32)
 
@@ -302,10 +308,9 @@ def test_real_propose_passes_staged_first_at_position_zero() -> None:
     """The forward must see ``noise_embedding`` of shape
     ``(1, block_len, hidden_size)`` where position 0 corresponds to
     ``ctx.output_token_ids[-1]`` and positions 1..block_len-1 to
-    ``mask_token_id``. The ``_FakeDFlashModel`` records the call
-    shape so we can pin block_len; the inner embedding pass is
-    deterministic but doesn't preserve token ids, so we verify
-    block_len directly."""
+    ``mask_token_id``. The fake embedding records the input
+    ``tokens_2d`` so the assertion checks the exact token layout,
+    not just the input shape."""
     drafter = _build(block_size=16, mask_token_id=99)
     drafter.prime(
         "req-staged",
@@ -321,6 +326,14 @@ def test_real_propose_passes_staged_first_at_position_zero() -> None:
     assert call["noise_embedding_shape"] == (1, 5, 4)
     # target_hidden shape (1, ctx_len, |L| * hidden_size) = (1, 2, 4).
     assert call["target_hidden_shape"] == (1, 2, 4)
+
+    # Token-content invariant: slot 0 = staged_first (= 42), slots
+    # 1..block_len-1 = mask_token_id (= 99). Recovered from the fake
+    # embedding's recorded tokens_2d input.
+    target_adapter: Any = drafter._target_adapter
+    embed = target_adapter._model.language_model.model.embed_tokens
+    assert isinstance(embed, _FakeEmbedding)
+    assert embed.last_tokens_2d == [[42, 99, 99, 99, 99]]
 
 
 def test_real_propose_passes_same_cache_list_across_cycles() -> None:

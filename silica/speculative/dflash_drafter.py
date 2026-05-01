@@ -181,6 +181,9 @@ class DFlashDrafter:
         # ``dflash_mlx.model`` (already loaded above via the deferred
         # import) and binds the upstream sink/window defaults that
         # ``runtime._resolve_draft_window`` resolves from env vars.
+        # Env names + defaults match upstream verbatim (see
+        # ``dflash_mlx/runtime.py:_resolve_draft_window``); override
+        # parity matters for (η)'s real-checkpoint attestation.
         # Tests with a fake drafter set ``self._cache_factory = None``
         # before ``prime`` runs — see ``_build_draft_caches`` for the
         # placeholder fallback.
@@ -188,8 +191,8 @@ class DFlashDrafter:
             ContextOnlyDraftKVCache,
         )
 
-        sink = int(os.environ.get("DFLASH_DRAFT_SINK_SIZE", "64"))
-        window = int(os.environ.get("DFLASH_DRAFT_WINDOW_SIZE", "1024"))
+        sink = int(os.environ.get("DFLASH_DRAFT_SINK", "64"))
+        window = int(os.environ.get("DFLASH_DRAFT_WINDOW", "1024"))
 
         def _make_real_cache() -> Any:
             return ContextOnlyDraftKVCache(
@@ -629,4 +632,4 @@ class DFlashDrafter:
         return [factory() for _ in drafter.layers]
 
 
-__all__ = ["DFlashDrafter"]
+__all__ = ["DFlashDrafter", "SyntheticEmit"]
