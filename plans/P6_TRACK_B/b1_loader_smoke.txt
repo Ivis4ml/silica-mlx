@@ -1,0 +1,15 @@
+# B.1 loader smoke probe — repo=NexVeridian/Qwen3.5-27B-3bit
+# gate env: SILICA_REAL_QWEN3_5_27B_3BIT=1
+Fetching 9 files:   0%|          | 0/9 [00:00<?, ?it/s]Fetching 9 files: 100%|██████████| 9/9 [00:00<00:00, 112347.43it/s]
+adapter loaded in 1.60 s
+peak after load: 11.77 GB (10.96 GiB)
+adapter config: model_name='qwen3_5', num_layers=64, hidden_size=5120, vocab_size=248044
+generated 4 tokens in 0.29 s: [11, 353, 599, 264]
+peak after generate: 11.98 GB (11.16 GiB)
+
+B.1 §6.1 acceptance gate:
+  measured peak = 11.16 GiB; anchor 4-bit = 15.34 GiB
+  reduction vs anchor = 27.2% (target ≥ 20% under relative form)
+  abs form (≤ 13.0 GiB): PASS
+  rel form (≥ 20% reduction): PASS
+  gate (either passes): PASS

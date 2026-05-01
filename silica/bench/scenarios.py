@@ -1971,6 +1971,48 @@ _QWEN3_5_27B_WARM_DECODE_B1 = Scenario(
 )
 
 
+# D-021 step 7 sub-unit (B.1) — 3-bit Qwen3.5-27B warm-decode row.
+# Mirrors ``qwen3.5-27b-warm-decode-b1``'s shape exactly (same
+# workload, oracle, max_batch_size, max_tokens) so silica-integrated
+# speedup vs the v1.7.13 4-bit anchor is read directly from the ratio
+# without normalisation. Only ``repo`` and ``gate_env_var`` differ —
+# the gate env is independent so a user with only the 4-bit cached
+# cannot trigger an unintended ~11 GB 3-bit checkpoint load.
+#
+# Drafter selection: ``NexVeridian/Qwen3.5-27B-3bit`` is the matched-
+# family native MLX 3-bit checkpoint identified at B.1's read-only
+# HF lookup (created 2026-02-25 via ``mlx_lm.convert -q --bits 3``
+# against ``Qwen/Qwen3.5-27B``; ≈11 GB on disk; mlx-lm 0.30.8). The
+# ``RepublicOfKorokke/Qwen3.5-27B-mlx-lm-3bit`` backup is reserved
+# for layout / loader issues and is NOT registered here; if surfaced,
+# the row's ``repo`` field is the load-bearing knob to swap.
+_QWEN3_5_27B_WARM_DECODE_B1_3BIT = Scenario(
+    id="qwen3.5-27b-warm-decode-b1-3bit",
+    repo="NexVeridian/Qwen3.5-27B-3bit",
+    workload=_warm_decode_workload(max_batch_size=1, max_tokens=384),
+    oracle=OracleKind.WARM_DECODE,
+    gate_env_var="SILICA_REAL_QWEN3_5_27B_3BIT",
+    description=(
+        "**D-021 step 7 sub-unit (B.1) — 3-bit dense warm-decode "
+        "row.** Mirrors ``qwen3.5-27b-warm-decode-b1`` shape exactly "
+        "(B=1, 128-token prompt, 384-token generation, "
+        "max_tokens=384) but loads ``NexVeridian/Qwen3.5-27B-3bit`` "
+        "instead of the 4-bit cousin. Bandwidth math (PLAN.md §13 "
+        "step 7): 4-bit at ~13.5 GB/step vs 3-bit at ~10.1 GB/step "
+        "lifts the 22.7 tok/s ceiling to ~30.3 tok/s; the b1 4-bit "
+        "anchor measured 16.05 tok/s (v1.7.13 P-6.0), so 3-bit "
+        "predicts 21-24 tok/s = 1.31×. Dual-gated on "
+        "SILICA_REAL_QWEN3_5_27B_3BIT because the 3-bit checkpoint "
+        "is ~11 GB on disk and the predicted peak device memory "
+        "during sustained decode is ~12-13 GB. Quality cross-check "
+        "lives in (B.2) ``qwen3.5-27b-wikitext-ppl-3bit`` paired "
+        "with the 4-bit baseline ``qwen3.5-27b-wikitext-ppl-4bit``; "
+        "performance gate per PLAN §13 step 7: ≥21 tok/s passes, "
+        "16 < tok/s < 21 ships opt-in, ≤16 escalates to mlx-lm."
+    ),
+)
+
+
 _QWEN3_5_27B_WARM_DECODE_B2 = Scenario(
     id="qwen3.5-27b-warm-decode-b2",
     repo="mlx-community/Qwen3.5-27B-4bit",
@@ -2743,6 +2785,11 @@ BUILTIN_SCENARIOS: dict[str, Scenario] = {
     # run as plain warm-decode same as the b1 baseline).
     _QWEN3_5_27B_WARM_DECODE_C4_DFLASH.id: _QWEN3_5_27B_WARM_DECODE_C4_DFLASH,
     _QWEN3_5_MOE_WARM_DECODE_C4_DFLASH.id: _QWEN3_5_MOE_WARM_DECODE_C4_DFLASH,
+    # D-021 step 7 sub-unit (B.1) — 3-bit dense warm-decode row;
+    # mirrors qwen3.5-27b-warm-decode-b1 shape against the
+    # NexVeridian/Qwen3.5-27B-3bit checkpoint, gated independently
+    # under SILICA_REAL_QWEN3_5_27B_3BIT.
+    _QWEN3_5_27B_WARM_DECODE_B1_3BIT.id: _QWEN3_5_27B_WARM_DECODE_B1_3BIT,
 }
 
 
