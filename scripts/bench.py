@@ -184,20 +184,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--speculative",
-        choices=["none", "draft_target"],
+        choices=["none", "draft_target", "dflash"],
         default="none",
         help=(
-            "speculative-decoding mode (D-021 step 5 sub-unit (h)). "
-            "Default ``none`` runs every scenario spec-off and is "
-            "byte-identical to pre-(h) bench rows. ``draft_target`` "
-            "activates spec for any scenario whose ``spec_config`` is "
-            "set (e.g. ``qwen3.5-27b-warm-decode-spec-on``); the "
-            "runner wires a ``DraftTargetEngine`` loaded from the "
-            "scenario's ``draft_repo`` plus a ``SpecMetricCollector`` "
-            "into the engine, and after generation merges the seven "
-            "speculative-metric fields into ``ScenarioResult.metadata``. "
-            "Scenarios without ``spec_config`` always run spec-off "
-            "regardless of this flag"
+            "speculative-decoding mode (D-021 step 5 sub-unit (h) "
+            "+ step 6 sub-unit (ζ)). Default ``none`` runs every "
+            "scenario spec-off, byte-identical to pre-(h) rows. "
+            "``draft_target`` activates spec for scenarios whose "
+            "``spec_config.kind == 'draft_target'`` (the C.1 rows "
+            "``*-warm-decode-spec-on``); the runner wires a "
+            "``DraftTargetEngine`` plus a ``SpecMetricCollector``. "
+            "``dflash`` activates spec for scenarios whose "
+            "``spec_config.kind == 'dflash'`` (the C.4 block-"
+            "diffusion drafter rows ``*-warm-decode-c4-dflash``); "
+            "the runner wires a ``DFlashDrafter`` and engine ε's "
+            "``TargetHiddenConsumer`` side channel routes "
+            "αβ-captured hidden states automatically. Scenarios "
+            "whose ``spec_config.kind`` does not match the active "
+            "mode (or that lack ``spec_config``) run spec-off."
         ),
     )
     return p

@@ -2553,6 +2553,101 @@ _QWEN3_5_MOE_WARM_DECODE_SPEC_ON = Scenario(
 )
 
 
+# --- D-021 step 6 sub-unit (ζ): C.4 DFlash spec-on warm-decode rows -----
+#
+# Mirror the (h) ``-spec-on`` rows shape exactly so the spec-on /
+# spec-off ratio is comparable against the v1.7.13 P-6.0 b1 anchor.
+# What changes: the drafter is the upstream DFlash block-diffusion
+# checkpoint per ``dflash_mlx.generate.DRAFT_REGISTRY``, and the
+# ``SpecConfig.kind`` discriminator is ``"dflash"`` so the runner's
+# ``--speculative dflash`` mode dispatches a ``DFlashDrafter`` rather
+# than the C.1 autoregressive ``DraftTargetEngine``.
+#
+# ``verify_k=16`` matches the upstream ``block_size`` default —
+# running below that would not exercise the headline block-diffusion
+# regime and would inflate the silica-integrated speedup with cycle-
+# accumulation costs that disappear at the natural K. The αβ.1 +
+# αβ.2 microbench measured ``c_capture_hidden(k=16)`` at noise-level
+# on M5 Pro, so the verify forward at this length is comparable to
+# ``c_verify(k=4)`` modulo the bandwidth-utilisation-per-input curve
+# (P-6.0.5 Unit 7).
+#
+# Drafter envs: ``SILICA_BENCH_DFLASH_27B`` /
+# ``SILICA_BENCH_DFLASH_35B_A3B`` (per OPENING §5.6 OQ-6 closure).
+# Quad-gated: target HF cache, ``SILICA_REAL_QWEN3_5_27B`` (or
+# ``_MOE``), drafter HF cache, drafter env. Under default
+# ``--speculative none`` the rows behave like the b1 baseline; under
+# ``--speculative draft_target`` they fall to spec-off too because
+# their ``kind`` does not match.
+
+_QWEN3_5_27B_WARM_DECODE_C4_DFLASH = Scenario(
+    id="qwen3.5-27b-warm-decode-c4-dflash",
+    repo="mlx-community/Qwen3.5-27B-4bit",
+    workload=_warm_decode_workload(max_batch_size=1, max_tokens=384),
+    oracle=OracleKind.WARM_DECODE,
+    gate_env_var="SILICA_REAL_QWEN3_5_27B",
+    spec_config=SpecConfig(
+        draft_repo="z-lab/Qwen3.5-27B-DFlash",
+        verify_k=16,
+        draft_gate_env_var="SILICA_BENCH_DFLASH_27B",
+        kind="dflash",
+    ),
+    description=(
+        "**D-021 step 6 sub-unit (ζ) — dense 27B C.4 DFlash spec-on "
+        "warm-decode.** Mirrors ``qwen3.5-27b-warm-decode-b1`` shape "
+        "(B=1, 128-token prompt, 384-token generation, max_tokens=384) "
+        "but routes through ``--speculative dflash``: a "
+        "``DFlashDrafter`` against ``z-lab/Qwen3.5-27B-DFlash`` (2B "
+        "BF16 ≈ 4 GB) drives the block-diffusion drafter at "
+        "``verify_k=16`` (the upstream block_size default) and engine "
+        "ε's ``TargetHiddenConsumer`` side channel routes αβ-captured "
+        "hidden states through ``prime`` / ``update_target_hidden`` / "
+        "``free_target_hidden``. Bench metadata picks up the seven "
+        "``silica.bench.spec_metrics`` fields plus REPORT-derived "
+        "silica-integrated speedup. Quad-gated under ``--speculative "
+        "dflash``: (1) target HF cache hit, (2) ``SILICA_REAL_QWEN3_5_27B`` "
+        "for the 16 GB target weights, (3) drafter HF cache hit on "
+        "``z-lab/Qwen3.5-27B-DFlash``, (4) ``SILICA_BENCH_DFLASH_27B`` "
+        "for the drafter weights. Under default ``--speculative none`` "
+        "or ``--speculative draft_target`` the row drops to spec-off "
+        "(``spec_config.kind`` mismatch) and runs as plain warm-decode "
+        "against the target only — same numbers as the b1 baseline."
+    ),
+)
+
+
+_QWEN3_5_MOE_WARM_DECODE_C4_DFLASH = Scenario(
+    id="qwen3.5-moe-35b-a3b-warm-decode-c4-dflash",
+    repo="mlx-community/Qwen3.5-35B-A3B-4bit",
+    workload=_warm_decode_workload(max_batch_size=1, max_tokens=384),
+    oracle=OracleKind.WARM_DECODE,
+    gate_env_var="SILICA_REAL_QWEN3_5_MOE",
+    spec_config=SpecConfig(
+        draft_repo="z-lab/Qwen3.5-35B-A3B-DFlash",
+        verify_k=16,
+        draft_gate_env_var="SILICA_BENCH_DFLASH_35B_A3B",
+        kind="dflash",
+    ),
+    description=(
+        "**D-021 step 6 sub-unit (ζ) — MoE 35B-A3B C.4 DFlash spec-on "
+        "warm-decode.** MoE counterpart to "
+        "``qwen3.5-27b-warm-decode-c4-dflash``; mirrors the b1 cousin "
+        "shape (B=1, 384-token generation) with the upstream "
+        "MoE-paired drafter ``z-lab/Qwen3.5-35B-A3B-DFlash`` (0.5B "
+        "BF16 ≈ 1 GB). Same ``verify_k=16``. Quad-gated under "
+        "``--speculative dflash``: (1) target HF cache hit, (2) "
+        "``SILICA_REAL_QWEN3_5_MOE`` for the 20 GB target weights, "
+        "(3) drafter HF cache hit, (4) ``SILICA_BENCH_DFLASH_35B_A3B`` "
+        "for the drafter weights. The MoE row reports absolute "
+        "decode tok/s + ``accept_rate`` / ``draft_cost_ms`` for "
+        "cross-target sensitivity — no ``silica-integrated speedup`` "
+        "ratio is reported because no MoE B=1 warm-decode spec-off "
+        "baseline exists at this commit (see OPENING §6.1 MoE row "
+        "reporting)."
+    ),
+)
+
+
 BUILTIN_SCENARIOS: dict[str, Scenario] = {
     _QWEN3_0_6B_SMOKE.id: _QWEN3_0_6B_SMOKE,
     _QWEN3_0_6B_B1_PARITY.id: _QWEN3_0_6B_B1_PARITY,
@@ -2642,6 +2737,12 @@ BUILTIN_SCENARIOS: dict[str, Scenario] = {
     # path, otherwise these run as plain warm-decode).
     _QWEN3_5_27B_WARM_DECODE_SPEC_ON.id: _QWEN3_5_27B_WARM_DECODE_SPEC_ON,
     _QWEN3_5_MOE_WARM_DECODE_SPEC_ON.id: _QWEN3_5_MOE_WARM_DECODE_SPEC_ON,
+    # D-021 step 6 sub-unit (ζ) — C.4 DFlash spec-on warm-decode
+    # (real models + upstream DFlash drafters, quad-gated;
+    # --speculative dflash activates the spec path, otherwise these
+    # run as plain warm-decode same as the b1 baseline).
+    _QWEN3_5_27B_WARM_DECODE_C4_DFLASH.id: _QWEN3_5_27B_WARM_DECODE_C4_DFLASH,
+    _QWEN3_5_MOE_WARM_DECODE_C4_DFLASH.id: _QWEN3_5_MOE_WARM_DECODE_C4_DFLASH,
 }
 
 

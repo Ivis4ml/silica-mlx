@@ -432,9 +432,9 @@ class SpecConfig:
     bench scenario.
 
     A scenario carrying ``spec_config`` declares it WANTS to run under
-    ``--speculative draft_target``; the bench runner reads
-    ``draft_repo`` and ``verify_k`` to wire ``DraftTargetEngine`` +
-    ``SpecMetricCollector`` into the engine. Scenarios without
+    ``--speculative {draft_target,dflash}``; the bench runner reads
+    ``draft_repo``, ``verify_k``, and ``kind`` to wire the matching
+    drafter + ``SpecMetricCollector`` into the engine. Scenarios without
     ``spec_config`` (the common case) run spec-off regardless of CLI
     flag, and scenarios with ``spec_config`` still run spec-off when
     the CLI passes ``--speculative none`` (the default; backwards-
@@ -446,7 +446,7 @@ class SpecConfig:
 
     ``draft_gate_env_var`` is the second-tier gate the bench runner
     checks (in addition to ``Scenario.gate_env_var``) when
-    ``speculative_mode == "draft_target"``. Without it, a user with
+    ``speculative_mode`` matches ``kind``. Without it, a user with
     only the drafter checkpoint cached could trigger an unintended
     target-checkpoint load (the b1 cousin's existing
     ``SILICA_REAL_QWEN3_5_27B`` opt-in would be bypassed by the
@@ -454,11 +454,24 @@ class SpecConfig:
     HF cache directory existing, mirroring ``Scenario.repo`` cache
     semantics. ``None`` means "no extra env-var gate" — only the
     drafter cache weak gate applies.
+
+    D-021 step 6 sub-unit (ζ): ``kind`` discriminates between
+    ``"draft_target"`` (C.1, autoregressive small-model draft via
+    :class:`silica.speculative.DraftTargetEngine`) and ``"dflash"``
+    (C.4, block-diffusion drafter via
+    :class:`silica.speculative.dflash_drafter.DFlashDrafter`). The
+    bench runner ignores rows whose ``kind`` does not match the
+    active CLI ``--speculative`` mode — letting a user run only the
+    C.1 rows under ``--speculative draft_target`` and only the C.4
+    rows under ``--speculative dflash`` without scenario filtering.
+    Default ``"draft_target"`` keeps every pre-(ζ) row's behaviour
+    unchanged.
     """
 
     draft_repo: str
     verify_k: int = 4
     draft_gate_env_var: str | None = None
+    kind: str = "draft_target"
 
     def __post_init__(self) -> None:
         if not self.draft_repo:
@@ -469,6 +482,11 @@ class SpecConfig:
         if self.verify_k < 1:
             raise ValueError(
                 f"SpecConfig.verify_k must be >= 1, got {self.verify_k}"
+            )
+        if self.kind not in ("draft_target", "dflash"):
+            raise ValueError(
+                f"SpecConfig.kind must be 'draft_target' or 'dflash'; "
+                f"got {self.kind!r}"
             )
 
 

@@ -271,15 +271,25 @@ def _check_gates(
     large enough to warrant a gate check, not a runtime raise.
 
     D-021 step 5 sub-unit (h): when the runner is going to actually
-    activate spec for this scenario (``speculative_mode == "draft_target"``
-    AND ``scenario.spec_config is not None``), the drafter checkpoint's
+    activate spec for this scenario (``speculative_mode`` is set AND
+    matches ``scenario.spec_config.kind``), the drafter checkpoint's
     cache and ``spec_config.draft_gate_env_var`` (if set) are checked
     on top of the target's existing gates. This keeps the spec-on
     rows quad-gated (target cache, target env, drafter cache,
-    drafter env) without
-    bypassing the target's existing opt-in. Under
-    ``speculative_mode == "none"`` the drafter checks are skipped —
-    the scenario runs as plain warm-decode.
+    drafter env) without bypassing the target's existing opt-in.
+    Under ``speculative_mode == "none"``, or when
+    ``speculative_mode`` does not match the scenario's
+    ``spec_config.kind``, the drafter checks are skipped — the
+    scenario runs as plain warm-decode.
+
+    D-021 step 6 sub-unit (ζ): the gate respects ``spec_config.kind``
+    so a user running ``--speculative dflash`` only activates spec
+    on rows whose ``spec_config.kind == "dflash"``. C.1 rows
+    (``kind == "draft_target"``) drop to spec-off in that mode; C.4
+    rows similarly drop to spec-off under ``draft_target`` or
+    ``none``. Skip reasons distinguish ``draft_cache_missing`` /
+    ``draft_env_var_not_set`` / ``spec_kind_mismatch`` so CI logs
+    surface the exact branch.
     """
     cache = hf_cache_path_for_repo(scenario.repo)
     if not cache.exists():
@@ -295,8 +305,9 @@ def _check_gates(
         if not wp.is_file():
             return f"wikitext_cache_missing:{wp}"
     if (
-        speculative_mode == "draft_target"
+        speculative_mode in ("draft_target", "dflash")
         and scenario.spec_config is not None
+        and scenario.spec_config.kind == speculative_mode
     ):
         draft_cache = hf_cache_path_for_repo(scenario.spec_config.draft_repo)
         if not draft_cache.exists():
@@ -334,18 +345,21 @@ class BenchRunner:
         vqbench_epsilon: float = 0.01,
         speculative_mode: str = "none",
     ) -> None:
-        # D-021 step 5 sub-unit (h) slice 1: speculative-decoding
-        # master switch. ``"none"`` (default; backwards-compatible)
-        # ignores any scenario.spec_config and runs all scenarios
-        # spec-off. ``"draft_target"`` activates spec for scenarios
-        # whose spec_config is set; scenarios without spec_config
-        # remain spec-off (no implicit defaulting in slice 1).
+        # D-021 step 5 sub-unit (h) slice 1 + step 6 sub-unit (ζ):
+        # speculative-decoding master switch. ``"none"`` (default;
+        # backwards-compatible) ignores any scenario.spec_config and
+        # runs all scenarios spec-off. ``"draft_target"`` activates
+        # spec for scenarios whose ``spec_config.kind == "draft_target"``
+        # (the C.1 ``-spec-on`` rows); ``"dflash"`` activates spec for
+        # scenarios whose ``spec_config.kind == "dflash"`` (the C.4
+        # ``-c4-dflash`` rows). Scenarios whose kind does not match
+        # the active mode (or that lack spec_config) remain spec-off.
         # Validated loud so a typo from a programmatic caller surfaces
         # at construction rather than as a silent spec-off run.
-        if speculative_mode not in ("none", "draft_target"):
+        if speculative_mode not in ("none", "draft_target", "dflash"):
             raise ValueError(
-                f"BenchRunner speculative_mode must be 'none' or "
-                f"'draft_target'; got {speculative_mode!r}"
+                f"BenchRunner speculative_mode must be 'none', "
+                f"'draft_target', or 'dflash'; got {speculative_mode!r}"
             )
         self._speculative_mode: str = speculative_mode
         self._engine_factory: EngineFactory = (
@@ -471,36 +485,74 @@ class BenchRunner:
         Engine.
 
         D-021 step 5 sub-unit (h) slice 1: when the runner was
-        constructed with ``speculative_mode="draft_target"`` AND the
-        scenario carries a ``spec_config``, this factory wires a
-        ``DraftTargetEngine`` (loaded via ``from_repo`` so it gets a
-        ``_MultiKVCache`` for free) and a fresh ``SpecMetricCollector``
-        into the engine. Otherwise the engine is built spec-off, which
-        is byte-identical to the pre-(h) construction path.
+        constructed with ``speculative_mode == "draft_target"`` AND the
+        scenario carries a ``spec_config`` whose ``kind == "draft_target"``,
+        this factory wires a ``DraftTargetEngine`` (loaded via
+        ``from_repo`` so it gets a ``_MultiKVCache`` for free) and a
+        fresh ``SpecMetricCollector`` into the engine.
+
+        D-021 step 6 sub-unit (ζ): the analogous
+        ``speculative_mode == "dflash"`` + ``spec_config.kind == "dflash"``
+        branch wires a :class:`silica.speculative.dflash_drafter.DFlashDrafter`
+        against the loaded adapter (which (ε) requires to implement
+        :class:`silica.models.hidden_capture.HiddenCaptureAdapter`).
+        Engine ε's ``_drive`` then routes prefill / verify through
+        the αβ capture surface and the
+        :class:`silica.speculative.engine.TargetHiddenConsumer` side
+        channel automatically — no extra runner wiring needed.
+
+        Otherwise the engine is built spec-off, which is byte-
+        identical to the pre-(h) construction path.
 
         Imports :mod:`silica.models.factory` lazily so ``silica.bench``
         stays cheap to import for CLI listing (--list) without pulling
-        in the adapter dispatch table.
+        in the adapter dispatch table. The DFlash branch additionally
+        defers the ``silica.speculative.dflash_drafter`` import so a
+        bench run that does not use ``--speculative dflash`` does not
+        pull in ``dflash-mlx`` (the opt-in extras dep).
         """
         from silica.models.factory import adapter_for_repo
 
         adapter, kv = adapter_for_repo(scenario.repo)
+        spec_config = scenario.spec_config
         if (
-            self._speculative_mode == "draft_target"
-            and scenario.spec_config is not None
+            spec_config is not None
+            and self._speculative_mode == spec_config.kind
         ):
             from silica.bench.spec_collector import SpecMetricCollector
-            from silica.speculative.draft_target import DraftTargetEngine
 
-            drafter = DraftTargetEngine.from_repo(
-                scenario.spec_config.draft_repo
-            )
             collector = SpecMetricCollector()
+            if spec_config.kind == "draft_target":
+                from silica.speculative.draft_target import DraftTargetEngine
+
+                drafter: Any = DraftTargetEngine.from_repo(
+                    spec_config.draft_repo
+                )
+            elif spec_config.kind == "dflash":
+                from silica.models.hidden_capture import HiddenCaptureAdapter
+                from silica.speculative.dflash_drafter import DFlashDrafter
+
+                if not isinstance(adapter, HiddenCaptureAdapter):
+                    raise NotImplementedError(
+                        "C.4 DFlash bench scenario requires a "
+                        "HiddenCaptureAdapter target (Qwen3.5 dense + "
+                        "MoE per (αβ.1) / (αβ.2)); got "
+                        f"{type(adapter).__name__}."
+                    )
+                drafter = DFlashDrafter(
+                    drafter_repo=spec_config.draft_repo,
+                    target_adapter=adapter,
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported spec_config.kind {spec_config.kind!r} "
+                    "(expected 'draft_target' or 'dflash')"
+                )
             engine = Engine(
                 adapter,
                 kv,
                 draft_engine=drafter,
-                verify_k=scenario.spec_config.verify_k,
+                verify_k=spec_config.verify_k,
                 spec_collector=collector,
             )
             return adapter, engine

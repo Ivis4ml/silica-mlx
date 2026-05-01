@@ -65,8 +65,11 @@ def test_spec_config_is_frozen() -> None:
 
 
 def test_bench_runner_rejects_unknown_speculative_mode() -> None:
+    # D-021 step 6 sub-unit (ζ) added 'dflash'; the message lists all
+    # three accepted values now.
     with pytest.raises(
-        ValueError, match="speculative_mode must be 'none' or 'draft_target'"
+        ValueError,
+        match="speculative_mode must be 'none', 'draft_target', or 'dflash'",
     ):
         BenchRunner(speculative_mode="auto")
 
@@ -74,6 +77,7 @@ def test_bench_runner_rejects_unknown_speculative_mode() -> None:
 def test_bench_runner_accepts_known_speculative_modes() -> None:
     BenchRunner(speculative_mode="none")
     BenchRunner(speculative_mode="draft_target")
+    BenchRunner(speculative_mode="dflash")
 
 
 # --- runner spec metadata merge --------------------------------------------
