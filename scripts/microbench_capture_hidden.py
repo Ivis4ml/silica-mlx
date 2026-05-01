@@ -29,14 +29,15 @@ import argparse
 import os
 import sys
 import time
-from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import mlx.core as mx
 
 from silica.kvcache.manager import KVHandle
 from silica.kvcache.simple import SimpleKVCache
-from silica.models.qwen3_5 import Qwen3_5Adapter
+from silica.models.factory import adapter_for_repo
+from silica.models.hidden_capture import HiddenCaptureAdapter
 
 DEFAULT_REPO = "Qwen/Qwen3.5-0.8B"
 
@@ -48,7 +49,8 @@ def _hf_cache(repo: str) -> Path:
 
 def _bench_one(
     *,
-    adapter_factory: Callable[[], tuple[Qwen3_5Adapter, SimpleKVCache]],
+    adapter: Any,
+    kv: SimpleKVCache,
     k: int,
     capture_layer_ids: frozenset[int] | None,
     warmup: int,
@@ -56,28 +58,42 @@ def _bench_one(
 ) -> float:
     """Return median per-call wall-clock seconds.
 
-    Each iteration loads a fresh adapter so the verify forward starts
-    from an empty KV cache (matching the (αβ) microbench precondition:
-    cycle-1 cost, no warm cache to amortise the embed_tokens lookup
-    against). The factory closure encapsulates the load.
+    The adapter is loaded once by the caller and reused; each iteration
+    runs ``decode_step_multi`` (or the capture variant) against a
+    freshly-reserved request id so the verify forward starts from an
+    empty KV cache. This isolates ``c_capture_hidden(k)`` from
+    model-load cost — important on heavy MoE fixtures where a 20 GB
+    fresh-load dominates the wall-clock and drowns the signal we care
+    about.
     """
     samples: list[float] = []
-    handle = KVHandle(req_id="capture-bench")
     tokens = mx.array([101] * k, dtype=mx.int32)
 
-    for _ in range(warmup):
-        adapter, kv = adapter_factory()
-        kv.reserve_for_prefill(handle.req_id, [])  # type: ignore[arg-type]
+    def _release(req_id: str) -> None:
+        # Adapter-side per-request snapshot (Qwen3.5 hybrid only).
+        if hasattr(adapter, "free_state"):
+            adapter.free_state(req_id)
+        # SimpleKVCache itself is single-request; free its claim so
+        # the next req_id can ``reserve_for_prefill``.
+        if hasattr(kv, "free"):
+            kv.free(req_id)
+
+    for i in range(warmup):
+        req_id = f"capture-bench-warmup-{i}"
+        handle = KVHandle(req_id=req_id)
+        kv.reserve_for_prefill(req_id, [])  # type: ignore[arg-type]
         if capture_layer_ids is None:
             adapter.decode_step_multi(tokens, handle)
         else:
             adapter.decode_step_multi_with_capture(
                 tokens, handle, capture_layer_ids
             )
+        _release(req_id)
 
-    for _ in range(iters):
-        adapter, kv = adapter_factory()
-        kv.reserve_for_prefill(handle.req_id, [])  # type: ignore[arg-type]
+    for i in range(iters):
+        req_id = f"capture-bench-iter-{i}"
+        handle = KVHandle(req_id=req_id)
+        kv.reserve_for_prefill(req_id, [])  # type: ignore[arg-type]
         # mx.synchronize is not exposed; mx.eval forces materialisation.
         # Use a tight wall-clock window.
         t0 = time.perf_counter()
@@ -92,6 +108,7 @@ def _bench_one(
             mx.eval(logits, *captured.values())
         elapsed = time.perf_counter() - t0
         samples.append(elapsed)
+        _release(req_id)
 
     samples.sort()
     return samples[len(samples) // 2]
@@ -129,19 +146,26 @@ def main() -> int:
         )
         return 0
 
-    # Probe-load once for the layer-count + hidden-size header.
-    adapter, _ = Qwen3_5Adapter.from_hf_repo(args.repo)
-    num_layers = adapter.config.num_layers
-    hidden_size = adapter.config.hidden_size
+    # Load once for the layer-count + hidden-size header AND reuse for
+    # both bench runs. Dispatch via adapter_for_repo so dense and MoE
+    # Qwen3.5 fixtures both go through the registered adapter class.
+    probe_adapter, probe_kv = adapter_for_repo(args.repo)
+    if not isinstance(probe_adapter, HiddenCaptureAdapter):
+        print(
+            f"error: adapter for {args.repo} ({type(probe_adapter).__name__}) "
+            "does not implement HiddenCaptureAdapter. (αβ.1) covers Qwen3.5 "
+            "dense; (αβ.2) extends to Qwen3.5-MoE.",
+            file=sys.stderr,
+        )
+        return 2
+    num_layers = probe_adapter.config.num_layers  # type: ignore[attr-defined]
+    hidden_size = probe_adapter.config.hidden_size  # type: ignore[attr-defined]
     if args.capture_layer_ids is None:
         capture_set = frozenset({0, num_layers // 2, num_layers})
     else:
         capture_set = frozenset(
             int(x) for x in args.capture_layer_ids.split(",")
         )
-
-    def factory() -> tuple[Qwen3_5Adapter, SimpleKVCache]:
-        return Qwen3_5Adapter.from_hf_repo(args.repo)
 
     print(
         f"# c_capture_hidden microbench — repo={args.repo}, k={args.k}, "
@@ -152,16 +176,21 @@ def main() -> int:
         f"(|capture| = {len(capture_set)})"
     )
     print(f"# warmup={args.warmup}, iters={args.iters} (median reported)")
+    print("# adapter loaded once and reused; iters use fresh per-req KV.")
 
+    # Reuse the probe-loaded adapter for both runs so the load cost
+    # does not contribute to the per-iteration wall-clock.
     baseline_s = _bench_one(
-        adapter_factory=factory,
+        adapter=probe_adapter,
+        kv=probe_kv,
         k=args.k,
         capture_layer_ids=None,
         warmup=args.warmup,
         iters=args.iters,
     )
     capture_s = _bench_one(
-        adapter_factory=factory,
+        adapter=probe_adapter,
+        kv=probe_kv,
         k=args.k,
         capture_layer_ids=capture_set,
         warmup=args.warmup,
