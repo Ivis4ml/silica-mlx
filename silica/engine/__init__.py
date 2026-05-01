@@ -43,6 +43,7 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import Iterator, Sequence
+from typing import TYPE_CHECKING
 
 import mlx.core as mx
 
@@ -58,6 +59,13 @@ from silica.models.recurrent import SpecRecurrentRollbackAdapter
 from silica.scheduler.batcher import ContinuousBatcher
 from silica.speculative.engine import DraftEngine, NoopDraftEngine
 from silica.speculative.verify import greedy_verify, run_verify_forward
+
+if TYPE_CHECKING:
+    # Lazy import: ``silica.bench`` pulls in ``silica.bench.runner``
+    # which imports ``silica.engine.Engine`` — eager import of the
+    # collector here would cycle. The collector is duck-typed
+    # at runtime; only the type checker resolves the symbol.
+    from silica.bench.spec_collector import SpecMetricCollector
 
 
 class Engine:
@@ -76,6 +84,7 @@ class Engine:
         *,
         draft_engine: DraftEngine | None = None,
         verify_k: int = 4,
+        spec_collector: SpecMetricCollector | None = None,
     ) -> None:
         # D-021 step 5 sub-unit (b): single-request spec wiring.
         # ``draft_engine`` defaults to ``NoopDraftEngine`` so spec-off is
@@ -95,6 +104,13 @@ class Engine:
         self._req_counter = 0
         self._draft_engine: DraftEngine = draft_engine or NoopDraftEngine()
         self._verify_k = verify_k
+        # D-021 step 5 sub-unit (g): optional spec-metrics collector. The
+        # engine emits propose / verify / rollback signals to it during
+        # the spec branch; spec-off cycles (NoopDraftEngine) emit nothing.
+        # Bench runners construct one collector per scenario and call
+        # ``materialize`` after generation to populate the seven schema
+        # fields in ``ScenarioResult.metadata``.
+        self._spec_collector: SpecMetricCollector | None = spec_collector
 
     @property
     def kv_manager(self) -> KVManager:
@@ -210,6 +226,11 @@ class Engine:
         decode_count = 0
         n = 1
         while n < params.max_tokens:
+            propose_start = (
+                time.perf_counter()
+                if self._spec_collector is not None
+                else 0.0
+            )
             drafts = self._draft_engine.propose(ctx, gamma)
             if not drafts.token_ids:
                 # Spec-off (NoopDraftEngine) or draft engine declined
@@ -253,6 +274,14 @@ class Engine:
             verify_input = mx.array(
                 [tok_int] + list(drafts.token_ids), dtype=mx.int32
             )
+            # D-021 step 5 sub-unit (g): record the propose cost. Timed
+            # from before ``propose`` returned drafts (start at the top
+            # of the loop) until just before the verify forward runs.
+            if self._spec_collector is not None:
+                self._spec_collector.record_propose(
+                    draft_count=draft_count,
+                    elapsed_ms=(time.perf_counter() - propose_start) * 1000.0,
+                )
             # D-021 step 5 sub-unit (e) slice 2: capture the pre-draft
             # recurrent state on adapters that own one. Snapshot lives
             # under ``handle.req_id`` until ``commit_state`` (full
@@ -261,8 +290,18 @@ class Engine:
             # in the ``generate`` finally tail covers terminal cleanup.
             if isinstance(self._adapter, SpecRecurrentRollbackAdapter):
                 self._adapter.snapshot_pre_draft_state(handle.req_id)
+            verify_start = (
+                time.perf_counter()
+                if self._spec_collector is not None
+                else 0.0
+            )
             verify_logits, _ = run_verify_forward(
                 self._adapter, verify_input, handle
+            )
+            verify_elapsed_ms = (
+                (time.perf_counter() - verify_start) * 1000.0
+                if self._spec_collector is not None
+                else 0.0
             )
             accepted_len = greedy_verify(drafts.token_ids, verify_logits)
 
@@ -311,6 +350,19 @@ class Engine:
             # fewer than γ would otherwise have its committed prefix
             # over-trimmed.
             un_committed = draft_count - yielded_count
+            # D-021 step 5 sub-unit (g): record this verify cycle. Done
+            # before the rollback path runs so a partial-reject cycle's
+            # verify cost is attributed regardless of the rollback path
+            # taken (recurrent vs non-recurrent share the same verify
+            # forward). Rollback events are recorded separately below.
+            if self._spec_collector is not None:
+                self._spec_collector.record_verify(
+                    accepted_len=accepted_len,
+                    yielded_count=yielded_count,
+                    elapsed_ms=verify_elapsed_ms,
+                )
+                if un_committed > 0:
+                    self._spec_collector.record_rollback()
             recurrent_adapter = (
                 self._adapter
                 if isinstance(self._adapter, SpecRecurrentRollbackAdapter)
@@ -385,6 +437,13 @@ class Engine:
             decode_count += 1
             history.append(tok_int)
             ctx.output_token_ids.append(tok_int)
+            # D-021 step 5 sub-unit (g): record the bonus emission so
+            # ``tokens_per_target_forward`` counts the bonus token, not
+            # only the accepted drafts. Reached only when ``stop_hit``
+            # was False above (max_tokens / stop-token mid-yield paths
+            # break before reaching this point and emit no bonus).
+            if self._spec_collector is not None:
+                self._spec_collector.record_bonus()
             if tok_int in params.stop_token_ids:
                 break
 
