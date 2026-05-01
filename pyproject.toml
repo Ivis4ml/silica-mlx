@@ -52,6 +52,12 @@ docs = [
     "sphinx-autodoc-typehints>=2.0",
     "linkify-it-py>=2.0",
 ]
+# D-021 step 6 (β): the C.4 DFlash speculative path's drafter wrapper.
+# Default ``silica-mlx`` install stays slim; users opt in via
+# ``pip install 'silica-mlx[dflash]'`` to enable ``--speculative dflash``.
+dflash = [
+    "dflash-mlx>=0.1.0,<0.2",
+]
 
 [dependency-groups]
 dev = [

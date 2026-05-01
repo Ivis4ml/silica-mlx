@@ -12,12 +12,25 @@ integration point — the decode loop calling `propose` / `commit` —
 is fixed from P-0; spec-off remains the byte-equal default via
 `NoopDraftEngine`, and spec-on is a constructor-time choice on
 `silica.engine.Engine` (no conditional branches in the main loop).
+
+D-021 step 6 sub-unit (β) adds :class:`TargetHiddenConsumer`, an
+optional Protocol mixin for **target-conditioned** drafters (DFlash;
+future C.3 MTP head, C.6 self-spec) that need the verify forward's
+captured hidden states routed to them as a side channel. The
+`DraftEngine` Protocol surface is unchanged: `propose(ctx, k)` and
+`commit(ctx, accepted_len)` keep their signatures, so C.1's
+`DraftTargetEngine` and `NoopDraftEngine` stay Protocol-conformant
+unchanged. The engine checks `isinstance(drafter, TargetHiddenConsumer)`
+before calling the side-channel methods; C.1 / Noop opt out by
+simply not implementing them.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
+
+import mlx.core as mx
 
 from silica.core.request import RequestState
 
@@ -72,3 +85,65 @@ class NoopDraftEngine:
 
     def commit(self, ctx: RequestState, accepted_len: int) -> None:
         return None
+
+
+@runtime_checkable
+class TargetHiddenConsumer(Protocol):
+    """Optional side-channel mixin for target-conditioned drafters.
+
+    Implemented by drafters whose ``propose`` requires the *target*
+    model's hidden states at specific layer indices as a conditioning
+    input — the DFlash block-diffusion drafter is the load-bearing
+    case (D-021 step 6); future C.3 MTP head and C.6 self-spec
+    variants share the surface. The contract:
+
+    - **`prime(req_id, captured_dict)`** is called once after
+      ``adapter.prefill_with_capture(...)`` populates the captured
+      dict, before the first ``propose``. Aggregates the per-layer
+      slices the drafter needs and stores them as the cycle-1
+      ``target_hidden`` for ``req_id``.
+    - **`update_target_hidden(req_id, captured_dict, yielded_count)``**
+      is called after each verify forward (downstream of
+      ``decode_step_multi_with_capture``). The wrapper extracts the
+      same per-layer slices from the new dict, slices to
+      ``1 + yielded_count`` positions to match the engine's commit,
+      and stores the result for the next cycle's ``propose``.
+    - **`free_target_hidden(req_id)`** drops the per-request state
+      when the engine frees a request.
+
+    The captured dict the engine forwards has the convention
+    ``key 0`` = embedding output, ``key i + 1`` = output of
+    ``model.layers[i]`` (matching
+    ``dflash_mlx.runtime.target_forward_with_hidden_states``). The
+    wrapper internally maps the drafter's ``target_layer_ids`` (a
+    checkpoint-fixed list) onto the dict via the +1 offset and
+    concatenates along the last axis to produce the
+    ``(1, ctx_len, |L| * hidden_size)`` array
+    ``DFlashDraftModel.__call__`` consumes.
+
+    Adapters / drafters that do not need this side channel simply
+    skip implementing the Protocol — ``isinstance(drafter,
+    TargetHiddenConsumer)`` returns False and the engine bypasses
+    the calls entirely. C.1 ``DraftTargetEngine`` and
+    ``NoopDraftEngine`` are deliberately not target-conditioned, so
+    they do not implement this Protocol.
+    """
+
+    def prime(
+        self, req_id: str, captured_dict: dict[int, mx.array]
+    ) -> None:
+        """Seed cycle-1 ``target_hidden`` for ``req_id``."""
+        ...
+
+    def update_target_hidden(
+        self,
+        req_id: str,
+        captured_dict: dict[int, mx.array],
+        yielded_count: int,
+    ) -> None:
+        """Advance cycle-N ``target_hidden`` for ``req_id``."""
+        ...
+
+    def free_target_hidden(self, req_id: str) -> None:
+        """Drop per-request state when the engine frees the request."""
+        ...

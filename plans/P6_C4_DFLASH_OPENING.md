@@ -199,20 +199,27 @@ drafter-only-with-hidden-capture number sits just below the gate
   continue to use `silica.speculative.verify.greedy_verify`.
 - **Target-conditioned drafter with `commit`-updates-`target_hidden`
   semantics.** The wrapper holds, per `req_id`, the stored
-  `target_hidden` (an `mx.array` of shape `(1, ctx_len, hidden_dim)`
-  at the layer ids the drafter was trained against) and the per-layer
-  `ContextOnlyDraftKVCache`s. Each `propose(ctx, k)` reads the stored
-  `target_hidden` and calls `DFlashDraftModel(noise_embedding=…,
+  `target_hidden` and the per-layer `ContextOnlyDraftKVCache`s. The
+  `target_hidden` shape is **`(1, ctx_len, |L| * hidden_size)`**
+  where `L = drafter.target_layer_ids` is the (checkpoint-fixed) list
+  of layer indices the drafter consumes — upstream's
+  `dflash_mlx.runtime.extract_context_feature_from_dict` produces it
+  as `mx.concatenate([captured_dict[layer_id + 1] for layer_id in
+  target_layer_ids], axis=-1)`, where each per-layer slice has shape
+  `(1, ctx_len, hidden_size)`. Each `propose(ctx, k)` reads the
+  stored `target_hidden` and calls `DFlashDraftModel(noise_embedding=…,
   target_hidden=…, cache=draft_caches)`; the draft forward internally
   appends the target-hidden-derived context to the draft caches via
   `append_context`. Each `commit(ctx, yielded_count)` slices the
   verify forward's captured hidden states to `1 + yielded_count`
-  positions and stores them as the new `target_hidden` for the next
-  cycle. Rejected drafts were never written to the draft cache (only
-  the noise keys/values for them existed, and those are not appended)
-  — so draft-side "rollback" is implicit: simply slicing the new
-  `target_hidden` to the committed length keeps the drafter's state
-  consistent with what the engine emitted. Silica's existing
+  positions, runs the same dict→concat aggregation over
+  `target_layer_ids`, and stores the result as the new
+  `target_hidden` for the next cycle. Rejected drafts were never
+  written to the draft cache (only the noise keys/values for them
+  existed, and those are not appended) — so draft-side "rollback" is
+  implicit: simply slicing the new `target_hidden` to the committed
+  length keeps the drafter's state consistent with what the engine
+  emitted. Silica's existing
   target-side rollback paths (`PagedKVCache.rollback`,
   `Qwen3_5Adapter.rollback_state`) handle target rejection unchanged
   from step 5. See §4.1 for the full state-machine.
@@ -461,10 +468,15 @@ class DraftEngine(Protocol):
 `req_id`:
 
 - **`target_hidden`** — an `mx.array` of shape
-  `(1, ctx_len, hidden_dim)` at the layer ids the drafter was trained
-  against (`DFlashDraftModelArgs.target_layer_ids`). Updated by
-  `commit` from the verify forward's captured hidden states; consumed
-  by the next `propose` as the drafter's conditioning input.
+  **`(1, ctx_len, |L| * hidden_size)`** where
+  `L = DFlashDraftModelArgs.target_layer_ids` (a fixed list per
+  drafter checkpoint). Built by extracting per-layer slices of shape
+  `(1, ctx_len, hidden_size)` from the captured-hiddens dict at keys
+  `[layer_id + 1 for layer_id in target_layer_ids]` and concatenating
+  along `axis=-1` — see upstream
+  `dflash_mlx.runtime.extract_context_feature_from_dict`. Updated by
+  `commit` (or its side-channel — see below); consumed by the next
+  `propose` as the drafter's conditioning input.
 - **`draft_caches`** — a list of `ContextOnlyDraftKVCache`s, one per
   drafter layer, with sink + sliding window. Mutated *inside*
   `DFlashDraftModel.__call__` via `append_context`, which writes
@@ -475,7 +487,8 @@ class DraftEngine(Protocol):
 The state-machine for one `propose` / `commit` cycle is:
 
 ```text
-state at entry: target_hidden_n (length ctx_n), draft_caches_n
+state at entry: target_hidden_n (shape (1, ctx_n, |L|*hidden_size)),
+                draft_caches_n
 
 propose(ctx, k):
     block_token_buffer[:k] = mask_token_id
@@ -490,22 +503,42 @@ propose(ctx, k):
     drafted_tokens = greedy_argmax(drafted_logits)
     return DraftTokens(token_ids=(staged_first, *drafted_tokens))
 
-silica engine: target verify forward over k positions, capture hidden
-               states at target_layer_ids → captured_hidden of shape
-               (1, k, hidden_dim). Verify also yields verify_logits.
-               greedy_verify(drafts, verify_logits) → accepted_len.
-               yielded_count = min(accepted_len, max_tokens_remaining,
-                                   first_stop_token_position).
+silica engine: target verify forward over k positions via
+               decode_step_multi_with_capture, returning verify_logits
+               and a captured_dict whose entries each have shape
+               (1, k, hidden_size). greedy_verify(drafts,
+               verify_logits) → accepted_len. yielded_count =
+               min(accepted_len, max_tokens_remaining,
+                   first_stop_token_position).
 
-commit(ctx, yielded_count):
-    self._target_hidden[req_id] = captured_hidden[:, :1 + yielded_count, :]
+# Side channel separate from DraftEngine.commit (which only carries
+# accepted_len). The (β) wrapper exposes update_target_hidden;
+# the engine routes captured_dict + yielded_count to it.
+update_target_hidden(req_id, captured_dict, yielded_count):
+    selected = [captured_dict[i + 1] for i in target_layer_ids]
+    full = mx.concatenate(selected, axis=-1)  # (1, k, |L|*hidden)
+    self._target_hidden[req_id] = full[:, : 1 + yielded_count, :]
     # No work on draft_caches: rejected drafts' noise keys/values
     # were never written; only the next propose's append_context
     # advances the cache.
 
-state at exit: target_hidden_{n+1} (length 1 + yielded_count),
+commit(ctx, accepted_len):  # standard DraftEngine surface
+    return None  # no-op; state advances via update_target_hidden.
+
+state at exit: target_hidden_{n+1} of shape
+               (1, 1 + yielded_count, |L|*hidden_size),
                draft_caches_{n+1} (= draft_caches_n with ctx_n appended)
 ```
+
+**Why `update_target_hidden` is split from `commit`.** The
+`DraftEngine` Protocol's `commit(ctx, accepted_len)` carries only
+the accepted count. Routing the verify-forward's captured hiddens
+to the drafter requires a side channel; rather than widening the
+Protocol surface (which would break the C.1 baseline's existing
+`DraftTargetEngine` + `NoopDraftEngine`), the (β) wrapper exposes a
+separate `TargetHiddenConsumer` Protocol mixin that the engine
+checks via `isinstance` before calling. C.1 stays Protocol-conformant
+unchanged; only DFlash-class drafters opt into the side channel.
 
 Two consequences of this state-machine:
 
