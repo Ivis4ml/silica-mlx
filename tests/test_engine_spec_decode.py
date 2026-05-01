@@ -513,3 +513,299 @@ def test_draft_engine_reset_called_on_finally() -> None:
     list(engine2.generate("hi", _greedy(max_tokens=1)))
     assert drafter.reset_calls == 2
     assert drafter.reset_req_ids == ["req-0", "req-0"]
+
+
+# --- D-021 step 5 sub-unit (e) slice 2 — recurrent rollback wiring ---------
+
+
+class _RecurrentScriptedSpecAdapter(_ScriptedSpecAdapter):
+    """``_ScriptedSpecAdapter`` plus the four ``SpecRecurrentRollbackAdapter``
+    helpers, all bookkeeping-only.
+
+    Records every snapshot / commit_state / rollback_state / free_state
+    invocation and every ``decode_step_multi`` input so tests can pin the
+    recurrent path's call ordering and replay-slice contents.
+    """
+
+    def __init__(
+        self,
+        *,
+        prefill_argmax: int,
+        decode_argmaxes: Sequence[int] = (),
+        verify_logits: Sequence[Sequence[int]] = (),
+    ) -> None:
+        super().__init__(
+            prefill_argmax=prefill_argmax,
+            decode_argmaxes=decode_argmaxes,
+            verify_logits=verify_logits,
+        )
+        self.snapshot_calls: list[str] = []
+        self.commit_state_calls: list[tuple[str, int]] = []
+        self.rollback_state_calls: list[tuple[str, int]] = []
+        self.free_state_calls: list[str] = []
+        self.verify_inputs_seen: list[list[int]] = []
+
+    def decode_step_multi(
+        self, tokens: mx.array, kv_handle: KVHandle
+    ) -> tuple[mx.array, StateDelta]:
+        # mx.array.tolist() on a 1-D int32 array returns list[int]; the
+        # type is inferred broadly so coerce explicitly for the type
+        # checker.
+        flat = [int(tokens[i].item()) for i in range(int(tokens.size))]
+        self.verify_inputs_seen.append(flat)
+        return super().decode_step_multi(tokens, kv_handle)
+
+    # --- SpecRecurrentRollbackAdapter Protocol ---
+
+    def snapshot_pre_draft_state(self, req_id: str) -> Any:
+        # Nested-window guard mirrors Qwen3_5Adapter — defends the
+        # invariant that commit_state / rollback_state must close the
+        # window before the next snapshot.
+        if req_id in self.snapshot_calls and (
+            self._open_window(req_id)
+        ):
+            raise RuntimeError(
+                f"nested pre-draft snapshot for {req_id!r}"
+            )
+        self.snapshot_calls.append(req_id)
+        return object()
+
+    def commit_state(self, req_id: str, n_accepted: int) -> None:
+        self.commit_state_calls.append((req_id, int(n_accepted)))
+
+    def rollback_state(self, req_id: str, n_reject: int) -> None:
+        self.rollback_state_calls.append((req_id, int(n_reject)))
+
+    def free_state(self, req_id: str) -> None:
+        self.free_state_calls.append(req_id)
+
+    def _open_window(self, req_id: str) -> bool:
+        # Return True if the most recent snapshot for this req_id
+        # has not yet been closed by commit_state / rollback_state.
+        commits = sum(1 for r, _ in self.commit_state_calls if r == req_id)
+        rollbacks = sum(
+            1 for r, _ in self.rollback_state_calls if r == req_id
+        )
+        snapshots = sum(1 for r in self.snapshot_calls if r == req_id)
+        return snapshots > commits + rollbacks
+
+
+def test_recurrent_full_accept_calls_commit_state_no_replay() -> None:
+    """Full accept: verify forward already at the committed boundary;
+    snapshot is dropped via commit_state, no rollback / replay."""
+    adapter = _RecurrentScriptedSpecAdapter(
+        prefill_argmax=100,
+        verify_logits=[[200, 201, 202, 250]],
+    )
+    kv = _TrackedKVManager()
+    drafter = _ScriptedDraftEngine(proposals=[[200, 201, 202]])
+    engine = Engine(adapter, kv, draft_engine=drafter, verify_k=4)
+    out = _collect(engine.generate("hi", _greedy(max_tokens=5)))
+    assert out == [100, 200, 201, 202, 250]
+
+    assert adapter.snapshot_calls == ["req-0"]
+    assert adapter.commit_state_calls == [("req-0", 3)]
+    assert adapter.rollback_state_calls == []
+    # Single decode_step_multi call (verify only — no replay).
+    assert adapter.decode_multi_calls == 1
+    assert kv.rollback_calls == []
+    # free_state runs in the generate finally tail.
+    assert adapter.free_state_calls == ["req-0"]
+
+
+def test_recurrent_partial_accept_trims_full_verify_then_replays() -> None:
+    """Partial accept: trim attention KV by ``draft_count + 1`` (drop the
+    full verify), restore recurrent state, then replay
+    ``decode_step_multi`` over ``verify_input[:1 + yielded_count]``. No
+    second KV trim. F-3 / F-3a in the orientation."""
+    # γ = 3. Drafts = [200, 201, 202]. argmax targets =
+    # [200, 999, 0, 0] → accepted_len = 1 (draft[0] matches, draft[1]
+    # rejected). yielded_count = 1, un_committed = 2. bonus = 999.
+    adapter = _RecurrentScriptedSpecAdapter(
+        prefill_argmax=100,
+        # First call: verify forward over [100, 200, 201, 202].
+        # Second call: replay over [100, 200] — values discarded but
+        # the synthetic adapter still consumes a row from the queue.
+        verify_logits=[[200, 999, 0, 0], [0, 0]],
+    )
+    kv = _TrackedKVManager()
+    drafter = _ScriptedDraftEngine(proposals=[[200, 201, 202]])
+    engine = Engine(adapter, kv, draft_engine=drafter, verify_k=4)
+    out = _collect(engine.generate("hi", _greedy(max_tokens=3)))
+    assert out == [100, 200, 999]
+
+    # Recurrent path call sequence.
+    assert adapter.snapshot_calls == ["req-0"]
+    assert adapter.rollback_state_calls == [("req-0", 2)]  # un_committed
+    assert adapter.commit_state_calls == []
+    # Single KV rollback by ``draft_count + 1 = 4`` (no second trim).
+    assert kv.rollback_calls == [("req-0", 4)]
+    # Two decode_step_multi calls: verify + replay.
+    assert adapter.decode_multi_calls == 2
+    # Replay slice = [anchor, accepted_draft] = [100, 200].
+    assert adapter.verify_inputs_seen == [
+        [100, 200, 201, 202],
+        [100, 200],
+    ]
+    assert adapter.free_state_calls == ["req-0"]
+
+
+def test_recurrent_full_reject_replays_anchor_only() -> None:
+    """Full reject (yielded_count == 0): replay slice is just the
+    anchor token (length 1)."""
+    adapter = _RecurrentScriptedSpecAdapter(
+        prefill_argmax=100,
+        verify_logits=[[777, 0, 0, 0], [0]],
+    )
+    kv = _TrackedKVManager()
+    drafter = _ScriptedDraftEngine(proposals=[[200, 201, 202]])
+    engine = Engine(adapter, kv, draft_engine=drafter, verify_k=4)
+    out = _collect(engine.generate("hi", _greedy(max_tokens=2)))
+    assert out == [100, 777]
+
+    assert adapter.snapshot_calls == ["req-0"]
+    assert adapter.rollback_state_calls == [("req-0", 3)]
+    # KV trim by draft_count + 1 = 4; replay over [anchor] only.
+    assert kv.rollback_calls == [("req-0", 4)]
+    assert adapter.verify_inputs_seen == [
+        [100, 200, 201, 202],
+        [100],
+    ]
+
+
+def test_recurrent_max_tokens_cut_replays_over_yielded_count() -> None:
+    """When ``max_tokens`` cuts the yield short of the verifier's
+    accept, replay slice keys on ``yielded_count``, not
+    ``accepted_len``. Mirrors the existing KV rollback contract."""
+    # γ = 3, all drafts would accept. max_tokens = 3 caps at
+    # [anchor=100, draft0=200, draft1=201] → yielded_count = 2.
+    # accepted_len = 3 (verifier accepted all), un_committed = 1.
+    adapter = _RecurrentScriptedSpecAdapter(
+        prefill_argmax=100,
+        verify_logits=[[200, 201, 202, 250], [0, 0, 0]],
+    )
+    kv = _TrackedKVManager()
+    drafter = _ScriptedDraftEngine(proposals=[[200, 201, 202]])
+    engine = Engine(adapter, kv, draft_engine=drafter, verify_k=4)
+    out = _collect(engine.generate("hi", _greedy(max_tokens=3)))
+    assert out == [100, 200, 201]
+
+    # un_committed = draft_count - yielded_count = 3 - 2 = 1.
+    assert adapter.rollback_state_calls == [("req-0", 1)]
+    # KV trim by draft_count + 1 = 4 (whole verify), no second trim.
+    assert kv.rollback_calls == [("req-0", 4)]
+    # Replay slice is verify_input[:1 + yielded_count] = [100, 200, 201].
+    assert adapter.verify_inputs_seen == [
+        [100, 200, 201, 202],
+        [100, 200, 201],
+    ]
+
+
+def test_recurrent_stop_hit_mid_yield_still_runs_recurrent_rollback() -> None:
+    """F-6: terminal cycles (stop_hit on a yielded draft) take the same
+    recurrent rollback path so the end-of-cycle invariant
+    ``recurrent state at L + 1 + yielded_count`` holds uniformly."""
+    # γ = 3. Drafts = [200, 99, 202]. argmax targets =
+    # [200, 99, 202, 250] → all 3 would accept, but draft[1] = 99 is
+    # in stop_token_ids → engine yields anchor + draft0 + draft1 then
+    # stops. yielded_count = 2, un_committed = 1. No bonus sampled.
+    adapter = _RecurrentScriptedSpecAdapter(
+        prefill_argmax=100,
+        verify_logits=[[200, 99, 202, 250], [0, 0, 0]],
+    )
+    kv = _TrackedKVManager()
+    drafter = _ScriptedDraftEngine(proposals=[[200, 99, 202]])
+    engine = Engine(adapter, kv, draft_engine=drafter, verify_k=4)
+    params = SamplingParams(
+        temperature=0.0, max_tokens=8, stop_token_ids=(99,)
+    )
+    out = _collect(engine.generate("hi", params))
+    assert out == [100, 200, 99]
+
+    # Recurrent rollback runs even though we are about to terminate.
+    assert adapter.rollback_state_calls == [("req-0", 1)]
+    assert kv.rollback_calls == [("req-0", 4)]
+    assert adapter.commit_state_calls == []
+    assert adapter.verify_inputs_seen == [
+        [100, 200, 99, 202],
+        [100, 200, 99],
+    ]
+    # free_state still runs in the finally tail.
+    assert adapter.free_state_calls == ["req-0"]
+
+
+def test_recurrent_free_state_called_when_spec_branch_never_enters() -> None:
+    """The cleanup tail calls ``free_state`` regardless of whether the
+    spec branch entered the cycle. Idempotent under
+    ``_pre_draft_snapshots.pop(..., None)``."""
+    adapter = _RecurrentScriptedSpecAdapter(
+        prefill_argmax=42,
+        decode_argmaxes=[7],
+    )
+    kv = _TrackedKVManager()
+    # Drafter returns no proposals — engine takes the single-token
+    # decode_step path, never calls snapshot / rollback_state.
+    drafter = _ScriptedDraftEngine()
+    engine = Engine(adapter, kv, draft_engine=drafter, verify_k=4)
+    out = _collect(engine.generate("hi", _greedy(max_tokens=2)))
+    assert out == [42, 7]
+
+    assert adapter.snapshot_calls == []
+    assert adapter.commit_state_calls == []
+    assert adapter.rollback_state_calls == []
+    # Cleanup still fires.
+    assert adapter.free_state_calls == ["req-0"]
+
+
+def test_recurrent_two_cycles_full_accept_then_partial_does_not_nest() -> None:
+    """Multi-cycle sanity: full-accept cycle drops snapshot via
+    commit_state, so the next cycle's snapshot does not raise the
+    nested-window guard."""
+    # Cycle 1: full accept (γ=2 drafts). Bonus sampled.
+    # Cycle 2: partial accept (1 of 2 accepted). Stop-hit on bonus.
+    adapter = _RecurrentScriptedSpecAdapter(
+        prefill_argmax=100,
+        verify_logits=[
+            [200, 201, 250],         # cycle 1 verify (full accept)
+            [300, 999, 0],           # cycle 2 verify (1 accepted, reject draft[1]=301; bonus=999)
+            [0, 0],                  # cycle 2 replay [250, 300]
+        ],
+    )
+    kv = _TrackedKVManager()
+    drafter = _ScriptedDraftEngine(proposals=[[200, 201], [300, 301]])
+    engine = Engine(adapter, kv, draft_engine=drafter, verify_k=3)
+    params = SamplingParams(
+        temperature=0.0, max_tokens=10, stop_token_ids=(999,)
+    )
+    out = _collect(engine.generate("hi", params))
+    # Cycle 1: anchor 100, drafts 200, 201, bonus 250 (next cycle anchor).
+    # Cycle 2: drafts 300 (accepted), bonus 999 (stop).
+    assert out == [100, 200, 201, 250, 300, 999]
+
+    assert adapter.snapshot_calls == ["req-0", "req-0"]
+    assert adapter.commit_state_calls == [("req-0", 2)]    # cycle 1
+    assert adapter.rollback_state_calls == [("req-0", 1)]  # cycle 2
+    # Cycle 1 KV: no rollback. Cycle 2 KV: rollback by draft_count + 1 = 3.
+    assert kv.rollback_calls == [("req-0", 3)]
+    assert adapter.free_state_calls == ["req-0"]
+
+
+def test_non_recurrent_adapter_path_unchanged() -> None:
+    """Regression: non-recurrent adapters take the existing path.
+    Single KV rollback by ``un_committed``; no recurrent helper calls
+    invoked (and the engine does not raise even though those helpers
+    don't exist on the adapter)."""
+    # Same scenario as test_spec_on_partial_accept_rolls_back_and_yields_bonus.
+    adapter = _ScriptedSpecAdapter(
+        prefill_argmax=100,
+        verify_logits=[[200, 201, 999, 0]],
+    )
+    kv = _TrackedKVManager()
+    drafter = _ScriptedDraftEngine(proposals=[[200, 201, 202]])
+    engine = Engine(adapter, kv, draft_engine=drafter, verify_k=4)
+    out = _collect(engine.generate("hi", _greedy(max_tokens=4)))
+    assert out == [100, 200, 201, 999]
+    # Existing single rollback by un_committed = 1 (NOT draft_count + 1 = 4).
+    assert kv.rollback_calls == [("req-0", 1)]
+    # Single decode_step_multi (no replay).
+    assert adapter.decode_multi_calls == 1

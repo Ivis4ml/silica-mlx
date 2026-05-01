@@ -140,8 +140,54 @@ class RecurrentStateAdapter(Protocol):
         ...
 
 
+@runtime_checkable
+class SpecRecurrentRollbackAdapter(Protocol):
+    """Mixin implemented by adapters whose recurrent state needs
+    explicit rollback when the speculative engine rejects drafts.
+
+    Mirrors ``RecurrentStateAdapter``'s shape: ``runtime_checkable``
+    so the engine can dispatch via ``isinstance(adapter,
+    SpecRecurrentRollbackAdapter)`` without naming any concrete
+    adapter class. ``Qwen3_5Adapter`` and (via inheritance)
+    ``Qwen3_5MoeAdapter`` implement the four helpers; non-recurrent
+    adapters do not, and the engine's spec path skips this branch
+    entirely.
+
+    The four helpers were installed in P5.9 step 2(c) as a primitive
+    surface; D-021 step 5 sub-unit (e) lands the engine consumer.
+    See ``plans/P6_SPEC_FOUNDATION_E_ORIENTATION.md`` for the
+    snapshot / restore / replay protocol the engine drives.
+    """
+
+    def snapshot_pre_draft_state(self, req_id: str) -> RecurrentSnapshot:
+        """Capture the recurrent state just before the verify forward
+        consumes draft tokens. Stored under ``req_id`` until
+        ``commit_state`` or ``rollback_state`` closes the draft
+        window. Nested windows for the same request must raise."""
+        ...
+
+    def commit_state(self, req_id: str, n_accepted: int) -> None:
+        """Mark ``n_accepted`` recurrent-state advances as committed.
+        The live cache is the source of truth; this drops the
+        pending pre-draft snapshot for ``req_id``."""
+        ...
+
+    def rollback_state(self, req_id: str, n_reject: int) -> None:
+        """Restore the pre-draft recurrent snapshot for ``req_id``.
+        Caller is responsible for replaying any committed prefix
+        through the model forward to bring the recurrent state to
+        the committed boundary."""
+        ...
+
+    def free_state(self, req_id: str) -> None:
+        """Drop any adapter-local state held for ``req_id`` —
+        idempotent and safe to call when no draft window is open."""
+        ...
+
+
 __all__ = [
     "RecurrentSnapshot",
     "RecurrentStateAdapter",
+    "SpecRecurrentRollbackAdapter",
     "_RecurrentLayerEntry",
 ]

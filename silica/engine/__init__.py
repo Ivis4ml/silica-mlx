@@ -54,6 +54,7 @@ from silica.core.sampling import SamplingParams
 from silica.kvcache.manager import KVHandle, KVManager
 from silica.kvcache.prefix import RadixPrefixCache
 from silica.models.adapter import ModelAdapter
+from silica.models.recurrent import SpecRecurrentRollbackAdapter
 from silica.scheduler.batcher import ContinuousBatcher
 from silica.speculative.engine import DraftEngine, NoopDraftEngine
 from silica.speculative.verify import greedy_verify, run_verify_forward
@@ -139,6 +140,12 @@ class Engine:
             reset = getattr(self._draft_engine, "reset", None)
             if reset is not None:
                 reset(handle.req_id)
+            # Drop any pending pre-draft recurrent snapshot. Idempotent
+            # under ``free_state`` semantics — safe to call when no draft
+            # window is open or when this request never entered the spec
+            # path. D-021 step 5 sub-unit (e) slice 2.
+            if isinstance(self._adapter, SpecRecurrentRollbackAdapter):
+                self._adapter.free_state(handle.req_id)
 
     # --- private ---
 
@@ -246,6 +253,14 @@ class Engine:
             verify_input = mx.array(
                 [tok_int] + list(drafts.token_ids), dtype=mx.int32
             )
+            # D-021 step 5 sub-unit (e) slice 2: capture the pre-draft
+            # recurrent state on adapters that own one. Snapshot lives
+            # under ``handle.req_id`` until ``commit_state`` (full
+            # accept) or ``rollback_state`` (partial reject) closes the
+            # window. Skipped on non-recurrent adapters; ``free_state``
+            # in the ``generate`` finally tail covers terminal cleanup.
+            if isinstance(self._adapter, SpecRecurrentRollbackAdapter):
+                self._adapter.snapshot_pre_draft_state(handle.req_id)
             verify_logits, _ = run_verify_forward(
                 self._adapter, verify_input, handle
             )
@@ -285,8 +300,50 @@ class Engine:
             # fewer than γ would otherwise have its committed prefix
             # over-trimmed.
             un_committed = draft_count - yielded_count
+            recurrent_adapter = (
+                self._adapter
+                if isinstance(self._adapter, SpecRecurrentRollbackAdapter)
+                else None
+            )
             if un_committed > 0:
-                self._kv_manager.rollback(handle.req_id, un_committed)
+                # D-021 step 5 sub-unit (e) slice 2 — recurrent path:
+                # the verify forward advanced both attention KV and
+                # recurrent state through ``draft_count + 1`` positions.
+                # Reset attention KV to the pre-cycle offset by
+                # trimming all verify writes, restore recurrent state
+                # from the snapshot, then replay ``decode_step_multi``
+                # over the committed prefix to drive both layer types
+                # forward in lockstep through ``1 + yielded_count``
+                # tokens. See orientation §3 [F-3] / [F-3a] for why
+                # the simpler "trim by un_committed only and replay"
+                # sequence corrupts global-attention context during
+                # replay.
+                if recurrent_adapter is not None:
+                    self._kv_manager.rollback(
+                        handle.req_id, draft_count + 1
+                    )
+                    recurrent_adapter.rollback_state(
+                        handle.req_id, un_committed
+                    )
+                    replay_input = verify_input[: 1 + yielded_count]
+                    # Symmetric with the verify forward above: route
+                    # through ``run_verify_forward`` so adapters that
+                    # have not shipped a real ``decode_step_multi``
+                    # take the per-step ``decode_step`` fallback for
+                    # replay too. Logits are discarded here — replay
+                    # exists only for the side effects on KV +
+                    # recurrent state.
+                    run_verify_forward(self._adapter, replay_input, handle)
+                else:
+                    self._kv_manager.rollback(handle.req_id, un_committed)
+            elif recurrent_adapter is not None:
+                # Full accept (``yielded_count == draft_count``): no
+                # rollback, the verify forward already landed both
+                # attention KV and recurrent state on the committed
+                # boundary. Drop the pending snapshot so the next
+                # cycle's ``snapshot_pre_draft_state`` does not raise
+                # the nested-window guard.
+                recurrent_adapter.commit_state(handle.req_id, yielded_count)
 
             # Inform the draft engine. ``yielded_count`` (not
             # ``accepted_len``) is the count the draft's own KV must
