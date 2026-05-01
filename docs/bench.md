@@ -88,6 +88,81 @@ Cache + `SILICA_REAL_<family>=1`.
 | `gemma4-moe-smoke` | `SILICA_REAL_GEMMA4_MOE` | MoE SMOKE, ~16 GB checkpoint |
 | `gemma4-moe-26b-a4b-warm-decode-b1` | `SILICA_REAL_GEMMA4_MOE` | second-MoE-family warm-decode baseline |
 
+### Speculative-decoding rows (D-021 step 5 sub-unit (h))
+
+Foundation closed at v1.7.19. These rows mirror their non-spec
+warm-decode cousins and route through the spec engine when invoked
+under `--speculative draft_target`; under the default
+`--speculative none` they degrade to plain warm-decode against the
+target alone (drafter checks skipped, byte-identical to the b1
+baseline).
+
+| id | gates (all four required for spec on) | shape |
+| --- | --- | --- |
+| `qwen3.5-27b-warm-decode-spec-on` | `SILICA_REAL_QWEN3_5_27B` (target) + `SILICA_REAL_QWEN3_5_0_8B_DRAFT` (drafter) + HF cache hits on both | dense 27B B=1, 384-token gen; drafter `Qwen/Qwen3.5-0.8B`, `verify_k=4` |
+| `qwen3.5-moe-35b-a3b-warm-decode-spec-on` | `SILICA_REAL_QWEN3_5_MOE` (target) + `SILICA_REAL_QWEN3_5_0_8B_DRAFT` (drafter) + HF cache hits on both | MoE 35B-A3B B=1, 384-token gen; same drafter / `verify_k` as the dense row |
+
+The two new rows are quad-gated. `_check_gates` skips loud with
+`env_var_not_set:` / `draft_env_var_not_set:` / `draft_cache_missing:`
+on any missing gate. Sharing the target row's existing strong gate
+(`SILICA_REAL_QWEN3_5_27B` / `SILICA_REAL_QWEN3_5_MOE`) preserves
+the existing target opt-in; the drafter gate
+`SILICA_REAL_QWEN3_5_0_8B_DRAFT` is a separate per-checkpoint
+toggle so users who only have the target weights cached do not
+trip a drafter download.
+
+`ScenarioResult.metadata` carries the seven
+`silica.bench.spec_metrics` fields when the row runs under
+`--speculative draft_target`:
+
+| field | meaning |
+| --- | --- |
+| `accept_rate` | fraction of proposed drafts the target argmax accepted |
+| `verify_cost_ms` | mean ms per target-side `decode_step_multi` verify forward |
+| `draft_cost_ms` | mean ms per drafter `propose` call (`0.0` for same-model self-spec) |
+| `tokens_per_target_forward` | `(yielded_drafts + bonus_tokens) / target_forward_count` — headline speedup observable |
+| `rollback_count` | cycles that fired a target-side KV rollback (`un_committed > 0`) |
+| `tree_node_visits` | always `0` for trajectory drafters; non-zero only on tree variants (C.5) |
+| `quality_parity_status` | `parity` / `diverged` / `not_tested` (set by the harness, default `not_tested`) |
+
+`validate_speculative_metrics` runs at row exit; missing or
+invalid fields flip the row to `status="failed"` with the
+violation tags appended to `reason`.
+
+#### How to read first spec results
+
+1. Run the baseline first (no spec):
+
+   ```bash
+   SILICA_REAL_QWEN3_5_27B=1 python -m scripts.bench \
+       --scenario qwen3.5-27b-warm-decode-b1 \
+       --out spec-off.jsonl
+   ```
+
+2. Run the spec-on row with both gates set:
+
+   ```bash
+   SILICA_REAL_QWEN3_5_27B=1 SILICA_REAL_QWEN3_5_0_8B_DRAFT=1 \
+       python -m scripts.bench \
+       --speculative draft_target \
+       --scenario qwen3.5-27b-warm-decode-spec-on \
+       --out spec-on.jsonl
+   ```
+
+3. Compare `decode_tok_s` between the two JSONL rows; read
+   `metadata.accept_rate` and `metadata.tokens_per_target_forward`
+   on the spec-on row to attribute any speedup to drafter
+   acceptance vs verify-amortisation.
+
+The OPENING-time goal of ≥1.2× decode-throughput vs spec-off is
+**tracked, not blocking** at foundation closure (per
+`plans/P6_SPEC_FOUNDATION_OPENING.md` §6.2 and Decision Gate 1
+v1.7.18); v0.1 spec foundation passes when correctness + metric
+schema land, and Track C.4 / C.5 in P-6 carry the throughput
+bullet. The (c) slice 3 multi-request hybrid batched-spec path is
+deferred — both spec-on rows are B=1 and route through
+`Engine.generate`, not `ContinuousBatcher`.
+
 ### Warm-decode oracle (P-6.0 measurement gate)
 
 The `WARM_DECODE` oracle measures sustained warm-start

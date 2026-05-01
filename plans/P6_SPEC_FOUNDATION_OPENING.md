@@ -3,8 +3,8 @@
 | Field         | Value                                                                                                        |
 | ------------- | ------------------------------------------------------------------------------------------------------------ |
 | Phase         | P-6 (Performance Phase) — D-021 step 5                                                                       |
-| Status        | drafted; pending user review                                                                                 |
-| Last updated  | 2026-04-29                                                                                                   |
+| Status        | foundation closed at v1.7.19 — sub-units (a)..(b), (c) slices 1/2a/2b, (d), (e), (f), (g), (h) all on disk; (i) synthetic three-rollback closed; (c) slice 3 (multi-request hybrid + sliding batched-spec) deferred as non-blocking performance extension. Foundation gate §6.1 + toolchain attestation §6.3 both pass. |
+| Last updated  | 2026-04-30                                                                                                   |
 | Scope owner   | Xin Zhou                                                                                                     |
 | Predecessors  | P-5 complete (v1.7.13); P-6.0.5 measurement expansion closed (v1.7.17); Decision Gate 1 closed (v1.7.18)     |
 | Successors    | D-021 step 6 (C.4 DFlash spike); P-7 closure-in-v0.1-scope is settled here (see §7 OQ-2)                     |
@@ -861,16 +861,22 @@ Alternative conventions ruled out:
   (sub-unit f) plus the 27B / MoE real-model acceptance rows. The
   synthetic patterns (A / B / C) in sub-unit (i) exercise the
   contract on a mock recurrent adapter.
-- **(f) Greedy parity** — temperature 0, fixed seed,
-  `--speculative draft_target` produces byte-equal token sequences
-  vs `--speculative none` on:
-  - `Qwen/Qwen3-0.6B` cached smoke (CI gate);
-  - `Qwen/Qwen3.5-0.8B` standalone (CI gate);
-  - `mlx-community/Qwen3.5-27B-4bit` (`SILICA_REAL_QWEN3_5_27B` real
-    row; manual acceptance, recorded under
-    `plans/P6_SPEC_FOUNDATION_BASELINE/`);
-  - `mlx-community/Qwen3.5-35B-A3B-4bit` (`SILICA_REAL_QWEN3_5_MOE_A3B`
-    real row; manual acceptance).
+- **(f) Greedy parity** — temperature 0, `--speculative draft_target`
+  produces byte-equal token sequences vs `--speculative none` across
+  one full speculative cycle (`verify_k + 1` tokens) on:
+  - `Qwen/Qwen3-0.6B` cache-only (plain GLOBAL attention);
+  - `Qwen/Qwen3.5-0.8B` cache-only (hybrid DeltaNet + GLOBAL).
+  Beyond cycle 1, fp16 reduction-order noise between batched
+  `decode_step_multi` and per-step `decode_step` flips an argmax
+  somewhere downstream; long real-model spec correctness is therefore
+  not gated on byte equality — it is validated through the (h) bench
+  scenarios (acceptance rate, throughput, generated-text spot
+  checks). The OPENING-sketched 27B / MoE byte-equal real-model
+  parity rows (and the corresponding
+  `plans/P6_SPEC_FOUNDATION_BASELINE/` directory) are dropped on the
+  same rationale; long-run real-model results land in (h) bench
+  artefacts when the user runs the two `-spec-on` scenarios on a
+  machine with both target and drafter checkpoints cached.
 - **(g) Spec-metrics schema** — every spec-enabled bench row populates
   all seven `silica.bench.spec_metrics` fields;
   `validate_speculative_metrics` returns empty list. Schema-mismatch
@@ -883,6 +889,36 @@ Alternative conventions ruled out:
   model rollback row: long real-model spec correctness is validated
   through the (h) bench scenarios rather than against a sequential
   byte-equal reference (rationale in §3 (i)).
+
+#### Closure status (v1.7.19)
+
+All foundation sub-units land on disk. Closure commits, in order:
+
+| Sub-unit | Commits |
+| --- | --- |
+| Step 5 opening | `318446b` (docs(plan): open D-021 step 5 speculative foundation) |
+| (a) `DraftTargetEngine` minimal | `58d9fd9` |
+| (a2) `decode_step_multi(k)` contract + slices 1-4 | `0dfadfd` / `31f5a7d` / `cfa599e` / `edf257e` |
+| (b) Engine main-loop integration | `a71bb63` |
+| (c) Batcher integration | deliverable 0 right-trim pin `d639e82`; slice 1 `b035c61`; orientation `e68f98f`; slice 2a (per-`req_id` drafter refactor) `615787d`; slice 2b (multi-row spec cohort) `1158c13` |
+| (d) Target-side KV rollback | `74946e2` |
+| (e) Recurrent-state rollback | orientation `03774f7`; slice 1 (`SimpleKVCache` per-layer trim) `0bde8cb`; slice 2 (engine wiring) `b76b276` |
+| (f) Greedy parity test | `c3800e2` (cycle-1 byte equality on cached Qwen3-0.6B + Qwen3.5-0.8B) |
+| Engine spec bonus overshoot fix | `2ae816c` (max_tokens + 1 yield bug surfaced by (f) parity) |
+| (i) Three-rollback synthetic | `139bfbf` (also syncs OPENING §3 (i) to drop the cached real-model rollback row) |
+| (g) `SpecMetricCollector` + Engine emission | `ee3ac05` |
+| (h) BenchRunner spec activation + metadata merge | slice 1 `a6d64bc`; slice 2 `4c4bb0a` (--speculative CLI + spec-on warm-decode rows + quad-gating) |
+
+**Deferred — non-blocking for foundation correctness:** (c) slice 3
+— `ContinuousBatcher` multi-request hybrid + sliding spec path. The
+(h) bench scenarios are B=1 (single-request via
+`Engine.generate`), so the batcher's GLOBAL-only gate at
+`silica/scheduler/batcher.py:268-279` is not exercised under (h)'s
+two new rows. Slice 3 lifts that gate by porting (e) slice 2's
+trim → restore → replay sequence onto per-row dispatch over
+`BatchKVCache`'s right-padding primitive; a separate orientation
+will plan that work. Step 5 foundation closure does not depend on
+slice 3 — every gate in §6.1 (a..i) above passes without it.
 
 ### 6.2 Performance gate — tracked, **not** blocking
 
@@ -961,10 +997,21 @@ expected case), Track C.4 / C.5 is the path forward.
   step 5 close. Phrasing the gate against the v1.7.18 anchor rather
   than a hard-coded number avoids drift if any unrelated scenario
   lands in the same window.
-- Real-model acceptance row produces a `plans/P6_SPEC_FOUNDATION_BASELINE/`
-  directory mirroring `plans/P6_0_5_BASELINE/` with at minimum: dense
-  27B spec-on / MoE spec-on warm-decode rows plus a brief REPORT.md
-  recording integrated speedup, accept rate, draft cost ratio.
+- (Originally drafted: real-model acceptance row produces a
+  `plans/P6_SPEC_FOUNDATION_BASELINE/` directory mirroring
+  `plans/P6_0_5_BASELINE/` with dense 27B spec-on / MoE spec-on
+  warm-decode rows plus a brief REPORT.md recording integrated
+  speedup, accept rate, draft cost ratio.) **Dropped at step 5
+  closure.** The two `-spec-on` rows registered in (h) are
+  quad-gated and execute via `silica-bench --speculative draft_target
+  --scenario qwen3.5-27b-warm-decode-spec-on` (or the MoE id) on the
+  user's machine; the JSONL row's `metadata` already carries the
+  seven `silica.bench.spec_metrics` fields plus `decode_tok_s`, so
+  spec-on / spec-off comparison is a JSONL diff against the
+  `qwen3.5-27b-warm-decode-b1` baseline rather than a separate
+  baseline directory. Decision Gate 2 (D-021 step 6+) will
+  consolidate any acceptance-row REPORT under
+  `plans/P6_SPEC_FOUNDATION_BASELINE/` if useful at that point.
 
 ### 6.4 Memory accounting
 

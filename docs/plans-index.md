@@ -116,6 +116,42 @@ read in-editor while iterating.
   reading-order navigation, and the verification map for
   re-deriving any cited number independently.
 
+### P-6.0.5 measurement expansion (D-021 step 3)
+
+- [`P6_0_5_OPENING.md`](../plans/P6_0_5_OPENING.md) — opening for
+  the eight-row measurement expansion (5 mandatory warm-decode +
+  2 warm-TTFT-pair + 1 target-verify microbench).
+- [`P6_0_5_BASELINE/`](../plans/P6_0_5_BASELINE/) — closed
+  artefacts; `REPORT.md` aggregates the cross-row reading and
+  feeds Decision Gate 1.
+
+### Decision Gate 1 (D-021 step 4)
+
+- [`P6_0_DECISION_GATE_1_OPENING.md`](../plans/P6_0_DECISION_GATE_1_OPENING.md)
+  — closed at v1.7.18. (1a) ≥40 tok/s primary unchanged, (1b)
+  ≥60 tok/s reframed as stretch with two-condition survival rule
+  (full-stack measurement OR Track C.5 tree-shape spike), (2a)
+  ≥100 tok/s aggregate cleared, (2b) reduced to ≥175 tok/s
+  aggregate at B≥3.
+
+### D-021 step 5 — speculative-decoding foundation (closed at v1.7.19)
+
+- [`P6_SPEC_FOUNDATION_OPENING.md`](../plans/P6_SPEC_FOUNDATION_OPENING.md)
+  — opening for step 5: ten sub-units (a, a2, b..i) with §6.1
+  acceptance gates, §6.2 ≥1.2× tracked-not-blocking note, §6.3
+  toolchain attestation. **Closure status (v1.7.19)** in the §6.1
+  block lists every sub-unit's commit, the (e) recurrent rollback
+  trim → restore → replay arithmetic, and the (c) slice 3 deferral
+  (multi-request hybrid batched-spec, non-blocking for foundation
+  correctness).
+- [`P6_SPEC_FOUNDATION_C_ORIENTATION.md`](../plans/P6_SPEC_FOUNDATION_C_ORIENTATION.md)
+  — orientation for sub-unit (c) (multi-request batcher integration);
+  decisions log + slice plan with [F-1]..[F-7] findings.
+- [`P6_SPEC_FOUNDATION_E_ORIENTATION.md`](../plans/P6_SPEC_FOUNDATION_E_ORIENTATION.md)
+  — orientation for sub-unit (e) (recurrent-state rollback);
+  decisions log including [F-3a] full-trim-before-replay rationale
+  (a partial-trim variant pollutes attention context during replay).
+
 ## Side track: chat CLI redesign
 
 - [`CHAT_CLI_OPENING.md`](../plans/CHAT_CLI_OPENING.md) — the design

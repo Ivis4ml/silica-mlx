@@ -2,9 +2,9 @@
 
 | Field        | Value                                                                      |
 | ------------ | -------------------------------------------------------------------------- |
-| Version      | v1.7.18                                                                    |
-| Last updated | 2026-04-29                                                                 |
-| Status       | P-5 complete; P-5 Acceptance (1)–(4) closed at v1.7.4; (a-real) real-activation xcheck closed at v1.7.5; P-3-C5 closed in slice-prefill regime (C5.5 α-MVP); P-3-E4 batched MoE smoke + scheduler-glue parity closed at v1.7.9; P-5-F pre-RoPE production routing closed at v1.7.6 via the (3b) projection-output capture path (F.1-F.4); (b-static) Qwen3.5-4B PPL vs vqbench REPORT.md baseline closed at v1.7.7; slice-regime + pre_norm hybrid Qwen3.5-0.8B E2E discriminator closed at v1.7.8; per-head Haar rotation landed as opt-in (default OFF) at v1.7.8; per-head D.2a 3-seed re-measurement at v1.7.10 — \|mean_gap\| 0.150 → 0.066 PPL (56% reduction); per-head (b-static) Qwen3.5-4B production-path re-measurement at v1.7.11 — std 5.3× tighter, mean unchanged in SEM, default flip is now an administrative landing, not an empirical question; **P-6 re-scoped from "Weight Streaming" to "Performance Phase" at v1.7.13 per D-017 / D-018 / D-019 — dense Qwen3.5-27B-4bit ≥60 tok/s primary target + MoE Qwen3.5-35B-A3B-4bit ≥100 tok/s stretch validator on 48 GB M5 Pro; P-7 Speculative promoted from T2 to T1; dense layer-streaming deferred to v0.2; Track C speculative grows to five sub-units per D-020 (C.1 draft-target, C.2 ReDrafter, C.3 MTP, C.4 DFlash, C.5 DDTree) and to six sub-units at v1.7.14 round-2 review (C.6 QuantSpec-like self-spec exploratory); P-6.0 measurement gate landed at v1.7.13 (8 scenarios + REPORT in `plans/P6_0_BASELINE/`); **P-6 contract sync at v1.7.14 per D-021** — dense gate split into (1a) ≥40 tok/s engineering (must pass) + (1b) ≥60 tok/s stretch (contingent on C.4/C.5 ≥2.5×); MoE acceptance split into (2a) ≥100 tok/s anchor (cleared at baseline) + (2b) ≥150 aggregate or ≥100 per-row stretch; execution order rewritten to foundation-first (P5.9 hardening → P-6.0.5 → Decision Gate 1 → spec foundation → C.4 spike → B → A); v1.7.14 round-3 review absorbed via stale-text cleanup; **P5.9 hardening complete at v1.7.15** — eight D-021 step 2 sub-units (a..h) closed across commits `0bd931a` / `bbdb7f7` / `9a9bff9` / `2483715` / `aa85e1c` / `dc5ba59` / `5d0f474` / `c385837`: probe double-load fix (27B/31B peaks corrected ~30.5→~15.3/~17.5 GB), Q-012 initial-cohort prefix consultation, Qwen3.5 pre-draft recurrent rollback, sustained 4K/8K context probes, D-009 hot-path audit lock-in, speculative metrics schema, operationalised (4-b) regression gate, full toolchain re-run attestation (2108 passed / 7 skipped, +82 P5.9 tests over the v1.7.13 baseline); see `plans/P6_OPENING.md` and `plans/P6_REVIEW_HANDOFF.md`; **P-6.0.5 measurement expansion complete at v1.7.17 per D-021 step 3** — eight artefact rows landed in `plans/P6_0_5_BASELINE/` (5 mandatory warm-decode + 2 warm-TTFT-pair + 1 target-verify microbench; both opt-in B=4 OOM-flagged rows completed without OOM): dense 27B B=4 = 42.17 ± 0.21 tok/s @ 52% util (2-run; bandwidth util uses runtime-measured 15.13 GB weight footprint, +12% vs v1.7.13's 13.5 GB anchor — see REPORT.md "Weight-footprint reconciliation"; batch-only path to 60 dead, KV-traffic-bound), MoE 35B-A3B B=4 = 188.5 tok/s @ 92% util (still climbing, OOM-safe at 20.6 GB peak; MoE retains 1.5 GB active-weight anchor), MoE 4K peak 23.6 GB (RAM gate clears with 35% margin), warm-TTFT 317 ms dense / 169 ms MoE (3-run reproducibility ±0.3 ms warm), verify-k target-side / zero-drafter-cost ceiling 2.93× at k=8 linear (constrains C.4 / C.5 upper-band claims; real spec gain falls below this by drafter cost + acceptance + bonus-token rule); cross-row REPORT.md closes §1 Q1-Q4 and constitutes the Decision Gate 1 (D-021 step 4) input set; see `plans/P6_0_5_OPENING.md` and `plans/P6_0_5_BASELINE/REPORT.md`; **Decision Gate 1 (D-021 step 4) closed at v1.7.18 per `plans/P6_0_DECISION_GATE_1_OPENING.md`** — (1a) ≥40 tok/s primary unchanged; (1b) ≥60 tok/s reframed as stretch with two-condition survival rule (full-stack measurement clears ≥60, OR Track C.5 tree-shape spike shows headroom beyond the linear k=8 verify ceiling sufficient to make the full-stack projection ≥60 credible; C.4 alone — even at upper-band 2.9× — does not settle (1b)); (2a) ≥100 tok/s aggregate stays as cleared anchor; (2b) reduced to single variant ≥175 tok/s aggregate at B≥3 (per-row variant retired as structurally unreachable, ≥150 thin since cleared at B=3, ≥200 rejected since B≥5 sits in diminishing returns at 92% util); §6 / §7 D-021 step 4 / step 6 / step 8 live-contract sync at v1.7.18, not §13-history-only** |
+| Version      | v1.7.19                                                                    |
+| Last updated | 2026-04-30                                                                 |
+| Status       | P-5 complete; P-5 Acceptance (1)–(4) closed at v1.7.4; (a-real) real-activation xcheck closed at v1.7.5; P-3-C5 closed in slice-prefill regime (C5.5 α-MVP); P-3-E4 batched MoE smoke + scheduler-glue parity closed at v1.7.9; P-5-F pre-RoPE production routing closed at v1.7.6 via the (3b) projection-output capture path (F.1-F.4); (b-static) Qwen3.5-4B PPL vs vqbench REPORT.md baseline closed at v1.7.7; slice-regime + pre_norm hybrid Qwen3.5-0.8B E2E discriminator closed at v1.7.8; per-head Haar rotation landed as opt-in (default OFF) at v1.7.8; per-head D.2a 3-seed re-measurement at v1.7.10 — \|mean_gap\| 0.150 → 0.066 PPL (56% reduction); per-head (b-static) Qwen3.5-4B production-path re-measurement at v1.7.11 — std 5.3× tighter, mean unchanged in SEM, default flip is now an administrative landing, not an empirical question; **P-6 re-scoped from "Weight Streaming" to "Performance Phase" at v1.7.13 per D-017 / D-018 / D-019 — dense Qwen3.5-27B-4bit ≥60 tok/s primary target + MoE Qwen3.5-35B-A3B-4bit ≥100 tok/s stretch validator on 48 GB M5 Pro; P-7 Speculative promoted from T2 to T1; dense layer-streaming deferred to v0.2; Track C speculative grows to five sub-units per D-020 (C.1 draft-target, C.2 ReDrafter, C.3 MTP, C.4 DFlash, C.5 DDTree) and to six sub-units at v1.7.14 round-2 review (C.6 QuantSpec-like self-spec exploratory); P-6.0 measurement gate landed at v1.7.13 (8 scenarios + REPORT in `plans/P6_0_BASELINE/`); **P-6 contract sync at v1.7.14 per D-021** — dense gate split into (1a) ≥40 tok/s engineering (must pass) + (1b) ≥60 tok/s stretch (contingent on C.4/C.5 ≥2.5×); MoE acceptance split into (2a) ≥100 tok/s anchor (cleared at baseline) + (2b) ≥150 aggregate or ≥100 per-row stretch; execution order rewritten to foundation-first (P5.9 hardening → P-6.0.5 → Decision Gate 1 → spec foundation → C.4 spike → B → A); v1.7.14 round-3 review absorbed via stale-text cleanup; **P5.9 hardening complete at v1.7.15** — eight D-021 step 2 sub-units (a..h) closed across commits `0bd931a` / `bbdb7f7` / `9a9bff9` / `2483715` / `aa85e1c` / `dc5ba59` / `5d0f474` / `c385837`: probe double-load fix (27B/31B peaks corrected ~30.5→~15.3/~17.5 GB), Q-012 initial-cohort prefix consultation, Qwen3.5 pre-draft recurrent rollback, sustained 4K/8K context probes, D-009 hot-path audit lock-in, speculative metrics schema, operationalised (4-b) regression gate, full toolchain re-run attestation (2108 passed / 7 skipped, +82 P5.9 tests over the v1.7.13 baseline); see `plans/P6_OPENING.md` and `plans/P6_REVIEW_HANDOFF.md`; **P-6.0.5 measurement expansion complete at v1.7.17 per D-021 step 3** — eight artefact rows landed in `plans/P6_0_5_BASELINE/` (5 mandatory warm-decode + 2 warm-TTFT-pair + 1 target-verify microbench; both opt-in B=4 OOM-flagged rows completed without OOM): dense 27B B=4 = 42.17 ± 0.21 tok/s @ 52% util (2-run; bandwidth util uses runtime-measured 15.13 GB weight footprint, +12% vs v1.7.13's 13.5 GB anchor — see REPORT.md "Weight-footprint reconciliation"; batch-only path to 60 dead, KV-traffic-bound), MoE 35B-A3B B=4 = 188.5 tok/s @ 92% util (still climbing, OOM-safe at 20.6 GB peak; MoE retains 1.5 GB active-weight anchor), MoE 4K peak 23.6 GB (RAM gate clears with 35% margin), warm-TTFT 317 ms dense / 169 ms MoE (3-run reproducibility ±0.3 ms warm), verify-k target-side / zero-drafter-cost ceiling 2.93× at k=8 linear (constrains C.4 / C.5 upper-band claims; real spec gain falls below this by drafter cost + acceptance + bonus-token rule); cross-row REPORT.md closes §1 Q1-Q4 and constitutes the Decision Gate 1 (D-021 step 4) input set; see `plans/P6_0_5_OPENING.md` and `plans/P6_0_5_BASELINE/REPORT.md`; **Decision Gate 1 (D-021 step 4) closed at v1.7.18 per `plans/P6_0_DECISION_GATE_1_OPENING.md`** — (1a) ≥40 tok/s primary unchanged; (1b) ≥60 tok/s reframed as stretch with two-condition survival rule (full-stack measurement clears ≥60, OR Track C.5 tree-shape spike shows headroom beyond the linear k=8 verify ceiling sufficient to make the full-stack projection ≥60 credible; C.4 alone — even at upper-band 2.9× — does not settle (1b)); (2a) ≥100 tok/s aggregate stays as cleared anchor; (2b) reduced to single variant ≥175 tok/s aggregate at B≥3 (per-row variant retired as structurally unreachable, ≥150 thin since cleared at B=3, ≥200 rejected since B≥5 sits in diminishing returns at 92% util); §6 / §7 D-021 step 4 / step 6 / step 8 live-contract sync at v1.7.18, not §13-history-only**; **D-021 step 5 spec foundation closed at v1.7.19** — single-request `Engine.generate` spec path live (`DraftTargetEngine` + `decode_step_multi` verify forward + greedy verifier + bonus emission); three rollback paths bound (target-side KV via `PagedKVCache.rollback` and `SimpleKVCache` per-layer trim, recurrent state via `Qwen3_5Adapter.snapshot_pre_draft_state` + `rollback_state` + replay over the committed prefix, draft-side via `DraftTargetEngine.commit`); cycle-1 byte-exact greedy parity on cached `Qwen/Qwen3-0.6B` + `Qwen/Qwen3.5-0.8B` (long-run parity bounded by fp16 batched-vs-sequential KV reduction-order noise — validated through (h) bench scenarios rather than against a sequential reference); spec-metrics schema v1.7.15 (`silica.bench.spec_metrics.SPECULATIVE_METRIC_FIELDS`) emitted into `ScenarioResult.metadata` via `silica.bench.spec_collector.SpecMetricCollector` (Engine emission + bench runner merge with `validate_speculative_metrics` failing loud); `--speculative {none,draft_target}` CLI flag + two real-model spec-on warm-decode scenarios (`qwen3.5-27b-warm-decode-spec-on` + `qwen3.5-moe-35b-a3b-warm-decode-spec-on`) registered, each quad-gated (target HF cache + target env + drafter HF cache + drafter env via `SpecConfig.draft_gate_env_var`); foundation gate §6.1 + toolchain attestation §6.3 pass (2616 passed / 28 skipped on full non-real-model suite, ruff + mypy clean, 65 scenarios in `--list`); **(c) slice 3 — multi-request hybrid + sliding batched-spec path — deferred as non-blocking performance extension** (the (h) bench rows are B=1 single-request, the `ContinuousBatcher` GLOBAL-only gate at `silica/scheduler/batcher.py:268-279` is preserved, slice 3 lifts that gate by porting (e) slice 2's trim → restore → replay onto per-row dispatch over `BatchKVCache`'s right-padding primitive; planned in a separate orientation); commits in order: `318446b` opening / `58d9fd9` (a) / `0dfadfd`,`31f5a7d`,`cfa599e`,`edf257e` (a2) / `a71bb63` (b) / `d639e82`,`b035c61`,`e68f98f`,`615787d`,`1158c13` (c slices 1+2a+2b) / `74946e2` (d) / `03774f7`,`0bde8cb`,`b76b276` (e) / `c3800e2` (f) / `2ae816c` (bonus overshoot fix surfaced by f) / `139bfbf` (i) / `ee3ac05` (g) / `a6d64bc`,`4c4bb0a` (h slice 1 + slice 2); see `plans/P6_SPEC_FOUNDATION_OPENING.md` §6.1 closure block** |
 | Maintainer   | Xin Zhou                                                                   |
 | Source       | `plans/PLAN.md` (single source of truth)                                    |
 
@@ -1974,6 +1974,165 @@ Local reference implementations sit at the repo root. **Algorithm / architecture
 ---
 
 ## 13. Changelog
+
+- **v1.7.19** (2026-04-30): **D-021 step 5 spec foundation
+  closed.** First implementation phase since P5.9 hardening;
+  every prior P-6 sub-step (P-6.0 measurement, P5.9 hardening,
+  P-6.0.5, Decision Gate 1) was documentation, measurement, or
+  schema-only. v1.7.19 lands the speculative-decoding foundation
+  end-to-end on the single-request engine path.
+
+  **Sub-units (a)..(i), (c) slices 1/2a/2b — all on disk:**
+
+  - **(a)** `silica.speculative.draft_target.DraftTargetEngine`
+    conforms to the I-5 `DraftEngine` Protocol; per-`req_id` keying
+    (slice 2a) + multi-`req_id` `_MultiKVCache` so concurrent
+    requests do not collide on the drafter's `SimpleKVCache`.
+  - **(a2)** `ModelAdapter.decode_step_multi(tokens, kv_handle)`
+    Protocol method ships as a contract slice plus per-adapter
+    real implementations (plain Qwen3, MoE inheritance, hybrid
+    Qwen3.5 via `forward_full`); `silica.speculative.verify`
+    falls back to a sequential `decode_step` loop when an
+    adapter raises `NotImplementedError`.
+  - **(b)** `Engine.generate` invokes
+    `draft_engine.propose` / `commit` unconditionally;
+    `NoopDraftEngine` is the no-op default (byte-equal to the
+    pre-step-5 single-token decode loop).
+  - **(c) slices 1 / 2a / 2b** wire `ContinuousBatcher` for B≥1
+    speculative cohorts under a hard GLOBAL-only gate (slice 3
+    lifts that gate; deferred — see "(c) slice 3 deferred"
+    below). Slice 1 lands the right-trim primitive on
+    `BatchKVCache.prepare(right_padding=...) + finalize()`,
+    slice 2a refactors the drafter to per-`req_id` keying,
+    slice 2b lands the multi-row padded-verify forward with
+    per-row right-trim rollback.
+  - **(d)** `PagedKVCache.rollback(req_id, n_reject)` lands
+    concrete behaviour: shrink `_num_tokens` by `n_reject`,
+    release trailing blocks via `decref` (refcount-respecting,
+    so prefix-cache-pinned blocks survive). `n_reject > current`
+    raises `ValueError` (D-011 loud-fail; speculative rollback
+    must not reach into prefill).
+  - **(e)** Recurrent rollback wired end-to-end. **Slice 1** flips
+    `SimpleKVCache.rollback` from all-or-nothing
+    (`can_trim_prompt_cache`) to per-layer trim, so hybrid lists
+    (DeltaNet `ArraysCache` + GLOBAL `KVCache`) land their
+    attention KV trim correctly. **Slice 2** introduces
+    `SpecRecurrentRollbackAdapter` Protocol mixin and wires
+    `Engine.generate` through the trim → restore → replay
+    sequence (full verify-forward trim by `draft_count + 1`,
+    `rollback_state(un_committed)`, replay
+    `decode_step_multi(verify_input[:1 + yielded_count])`) so
+    attention KV and recurrent state advance in lockstep.
+    Driving rationale + arithmetic in
+    `plans/P6_SPEC_FOUNDATION_E_ORIENTATION.md` §3 [F-3] / [F-3a].
+  - **Bonus overshoot fix (commit `2ae816c`).** Surfaced by (f)
+    parity probing: when the accept-draft yield loop exits
+    naturally with `n == max_tokens`, the in-loop guard misses
+    the boundary and the bonus emit overshoots by one. Fixed
+    via a post-loop `n >= max_tokens` check that sets
+    `stop_hit`; the existing `if stop_hit: break` then
+    suppresses the bonus path. Spec-on now mirrors spec-off's
+    hard cap.
+  - **(f) Greedy parity** — cycle-1 byte equality on cached
+    `Qwen/Qwen3-0.6B` (plain GLOBAL) + `Qwen/Qwen3.5-0.8B`
+    (hybrid DeltaNet + GLOBAL). Beyond cycle 1, fp16 reduction-
+    order noise between batched `decode_step_multi` and
+    per-step `decode_step` flips an argmax somewhere
+    downstream; long real-model spec correctness is validated
+    through the (h) bench scenarios (acceptance rate,
+    throughput, generated-text spot checks) rather than
+    against a sequential reference.
+  - **(g)** `silica.bench.spec_collector.SpecMetricCollector`
+    accumulates propose / verify / rollback / bonus events
+    from the spec engine during a single `Engine.generate` run;
+    `materialize()` returns a dict matching
+    `SPECULATIVE_METRIC_FIELDS` (the v1.7.15 schema), ready for
+    the bench schema validator. `tokens_per_target_forward`
+    counts both yielded drafts AND the bonus token (full reject
+    reads `1.0`, not `0.0`, since the verify forward still
+    emits one bonus); bonus emission is suppressed when
+    `max_tokens` / a stop token cut the cycle short before the
+    bonus path runs. The collector is imported under
+    `TYPE_CHECKING` in `silica.engine` to avoid the
+    `silica.engine` ↔ `silica.bench.runner` cycle; runtime
+    usage is duck-typed.
+  - **(h)** `--speculative {none,draft_target}` CLI flag on
+    `scripts/bench.py` (default `none`, argparse-enforced
+    choices) threads into
+    `BenchRunner(speculative_mode=...)`. Default factory wires
+    `DraftTargetEngine.from_repo(...) + SpecMetricCollector +
+    Engine(..., spec_collector=...)` only under
+    `draft_target` AND `scenario.spec_config is not None`.
+    `_run_one` merges `engine.spec_collector.materialize()`
+    into `ScenarioResult.metadata` and runs
+    `validate_speculative_metrics`; violations flip status to
+    `failed`. Two real-model scenarios registered:
+    `qwen3.5-27b-warm-decode-spec-on` +
+    `qwen3.5-moe-35b-a3b-warm-decode-spec-on`, each
+    quad-gated (target HF cache + target env + drafter HF
+    cache + drafter env via `SpecConfig.draft_gate_env_var`)
+    so neither the target opt-in nor the drafter opt-in can
+    be bypassed.
+  - **(i)** `tests/test_spec_rollback.py` binds the three
+    rollback paths under synthetic patterns A / B / C
+    (full accept / partial / full reject) parametrized over
+    `recurrent ∈ {False, True}`. The OPENING-sketched
+    cached-Qwen3-0.6B real-model rollback row was dropped
+    after empirical investigation: an always-reject drafter
+    still diverges from spec-off after ~4 cycles because the
+    surviving anchor's K/V was written by batched
+    `decode_step_multi` rather than single-token
+    `decode_step`, and mlx-lm's batched matmul reduction
+    order differs in fp16. OPENING §3 (i) / §6.1 (i) /
+    §0 (i) updated in the same commit.
+
+  **Foundation gate §6.1 + toolchain attestation §6.3:** all
+  pass at v1.7.19 — full non-real-model suite at 2616 passed /
+  28 skipped (vs the v1.7.15 baseline of 2108 passed; +508
+  tests across P-6.0.5, Decision Gate 1, and step 5);
+  `ruff check` + `mypy silica` clean across the touched
+  surface; `python scripts/bench.py --list` enumerates 65
+  scenarios (v1.7.18 anchor 63 + 2 spec-on rows from (h)).
+
+  **(c) slice 3 deferred — non-blocking for foundation
+  correctness.** The `ContinuousBatcher` multi-request
+  hybrid + sliding spec path retains its GLOBAL-only gate
+  (`silica/scheduler/batcher.py:268-279`). The two (h) bench
+  rows are B=1 single-request (`Engine.generate`), so the
+  batcher gate is not exercised under the v1.7.19 gates.
+  Slice 3 lifts the gate by porting (e) slice 2's trim →
+  restore → replay sequence onto per-row dispatch over
+  `BatchKVCache`'s right-padding primitive; a separate
+  orientation will plan that work. Step 5 closes without it
+  because every gate in §6.1 (a..i) passes without slice 3.
+
+  **First spec performance number requires real-model row
+  execution.** v1.7.19 lands correctness + observability;
+  actual `tokens_per_target_forward`, `accept_rate`, and
+  spec-on vs spec-off `decode_tok_s` numbers come from
+  manually executing
+  `SILICA_REAL_QWEN3_5_27B=1 SILICA_REAL_QWEN3_5_0_8B_DRAFT=1
+  uv run python scripts/bench.py --speculative draft_target
+  --scenario qwen3.5-27b-warm-decode-spec-on` on a machine
+  with both checkpoints cached, then comparing to
+  `qwen3.5-27b-warm-decode-b1`. Per OPENING §6.2 the
+  Decision Gate 2 ≥1.2× decode-throughput requirement is
+  **tracked, not blocking** at step 5 closure; C.4 / C.5
+  Track work in D-021 step 6+ stacks on the foundation
+  v1.7.19 lands.
+
+  **Closure commits (in chronological order):** `318446b`
+  (step 5 opening) / `58d9fd9` (a) / `0dfadfd`, `31f5a7d`,
+  `cfa599e`, `edf257e` (a2 slices 1-4) / `a71bb63` (b) /
+  `d639e82`, `b035c61`, `e68f98f`, `615787d`, `1158c13`
+  (c deliverable 0 + slices 1 / orientation / 2a / 2b) /
+  `74946e2` (d) / `03774f7`, `0bde8cb`, `b76b276` (e
+  orientation + slices 1 / 2) / `c3800e2` (f) / `2ae816c`
+  (bonus overshoot fix) / `139bfbf` (i + OPENING §3 / §6.1
+  / §0 sync) / `ee3ac05` (g) / `a6d64bc`, `4c4bb0a` (h
+  slices 1 + 2). See
+  `plans/P6_SPEC_FOUNDATION_OPENING.md` §6.1 closure block
+  for the per-sub-unit commit table.
 
 - **v1.7.18** (2026-04-29): **Decision Gate 1 closed (D-021
   step 4).** Doc-only phase, no silica.* code change. Audit

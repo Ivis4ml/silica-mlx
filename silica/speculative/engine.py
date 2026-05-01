@@ -6,9 +6,12 @@ window size `k`, returns up to `k` draft tokens, and is told after verification
 how many were accepted.
 
 Principle 9 stub-replacement: `NoopDraftEngine` is the P-0 baseline
-(propose -> empty, commit -> no-op); `DraftTargetEngine` lands in P-7. The
-integration point — the decode loop calling `propose` / `commit` — is fixed
-from P-0.
+(propose -> empty, commit -> no-op); `DraftTargetEngine` landed in
+D-021 step 5 sub-unit (a) at v1.7.19 (commit ``58d9fd9``). The
+integration point — the decode loop calling `propose` / `commit` —
+is fixed from P-0; spec-off remains the byte-equal default via
+`NoopDraftEngine`, and spec-on is a constructor-time choice on
+`silica.engine.Engine` (no conditional branches in the main loop).
 """
 
 from __future__ import annotations
@@ -24,10 +27,10 @@ class DraftTokens:
     """A speculative draft: up to `k` token ids + optional per-token log-probs.
 
     v0.1 stub (`NoopDraftEngine`) emits an empty `token_ids` and `None`
-    logprobs. A real draft model (P-7 `DraftTargetEngine`) fills both — target
-    verification needs the draft's logprobs to compute accept/reject
-    probabilities. `draft_logprobs`, when present, has the same length as
-    `token_ids`.
+    logprobs. A real draft model (`DraftTargetEngine`, D-021 step 5
+    sub-unit (a)) fills both — target verification needs the draft's
+    logprobs to compute accept/reject probabilities. `draft_logprobs`,
+    when present, has the same length as `token_ids`.
     """
 
     token_ids: tuple[int, ...]
@@ -59,8 +62,9 @@ class NoopDraftEngine:
 
     Installed as the default `DraftEngine` from P-0 so the decode loop can
     call `propose` / `commit` unconditionally — speculative decoding is
-    toggled by swapping this for `DraftTargetEngine` (P-7), not by adding
-    conditional branches in the engine main loop.
+    toggled by swapping this for `DraftTargetEngine` (D-021 step 5
+    sub-unit (a)), not by adding conditional branches in the engine
+    main loop.
     """
 
     def propose(self, ctx: RequestState, k: int) -> DraftTokens:

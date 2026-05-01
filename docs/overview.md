@@ -44,7 +44,7 @@ The `silica` namespace splits into one subpackage per concern:
 | `silica.models` | ModelAdapter protocol + Qwen3, Qwen3.5, Gemma4 adapters |
 | `silica.weights` | WeightProvider protocol + resident impls |
 | `silica.vq` | BlockTQ / RaBitQ codec implementations |
-| `silica.speculative` | Speculative decoding (P-6+) |
+| `silica.speculative` | Speculative decoding — `DraftEngine` Protocol + `DraftTargetEngine` (D-021 step 5 foundation closed at v1.7.19) |
 | `silica.bench` | Benchmark runner over Engine |
 | `silica.chat` | Chat session + CLI front-end |
 | `silica.server` | CLI entry point + HTTP server |

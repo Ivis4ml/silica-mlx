@@ -68,6 +68,7 @@ Symbols are marked:
     - [`silica.bench.report`](#silicabenchreport)
     - [`silica.bench.wikitext`](#silicabenchwikitext)
     - [`silica.bench.vqbench_baseline`](#silicabenchvqbench_baseline)
+    - [`silica.bench.spec_metrics` / `spec_collector`](#silicabenchspec_metrics-silicabenchspec_collector-d-021-step-5-sub-units-g--h)
 12. [`silica.chat`](#silicachat)
     - [`silica.chat.session`](#silicachatsession)
     - [`silica.chat.cli`](#silicachatcli)
@@ -1328,9 +1329,10 @@ adapters. Raises `ValueError` on non-1-D / empty input.
 #### `DraftTokens` *(public, dataclass)*
 
 Speculative draft. Fields: `token_ids: tuple[int, ...]`,
-`draft_logprobs: tuple[float, ...] | None`. `NoopDraftEngine` emits empty;
-P-7 `DraftTargetEngine` fills both (target verification needs draft
-logprobs for accept/reject probabilities).
+`draft_logprobs: tuple[float, ...] | None`. `NoopDraftEngine` emits
+empty; `DraftTargetEngine` (D-021 step 5 sub-unit (a) at v1.7.19)
+fills both (target verification needs draft logprobs for
+accept/reject probabilities).
 
 #### `DraftEngine` *(protocol, I-5)*
 
@@ -1341,9 +1343,123 @@ logprobs for accept/reject probabilities).
 
 #### `NoopDraftEngine` *(public, stub)*
 
-Draft disabled. `propose` returns empty; `commit` no-op. Default wired to
-the main loop from P-0 so speculative decoding is toggled by swapping
-this implementation, not by adding conditional branches.
+Draft disabled. `propose` returns empty; `commit` no-op. Default
+wired to the main loop from P-0 so speculative decoding is toggled
+by swapping this implementation for `DraftTargetEngine`, not by
+adding conditional branches.
+
+### `silica.speculative.draft_target` *(D-021 step 5 sub-unit (a))*
+
+#### `DraftTargetEngine` *(public class)*
+
+Draft-target speculative decoder. Wraps a separate small target
+adapter as the drafter; `propose(ctx, k)` runs `k` greedy
+autoregressive forwards on the drafter to produce speculative
+tokens; `commit(ctx, accepted_len)` rolls the drafter's KV back by
+`γ - accepted_len`. Per-`req_id` keying so concurrent requests do
+not collide on the drafter's `SimpleKVCache` (slice 2a refactor).
+
+Construction:
+
+- **`DraftTargetEngine(adapter, kv)`** — direct construction; the
+  caller owns adapter + KV lifetimes.
+- **`DraftTargetEngine.from_repo(draft_repo: str) -> DraftTargetEngine`**
+  — load `draft_repo` via `silica.models.factory.adapter_for_repo`
+  and swap in a `_MultiKVCache` wrapper so multiple concurrent
+  `req_id`s can hold separate per-request mlx-lm cache lists.
+
+### `silica.speculative.verify`
+
+- **`run_verify_forward(adapter, verify_input, kv_handle) -> (logits, state_delta)`**
+  — runs `adapter.decode_step_multi(verify_input, kv_handle)` (the
+  amortised verify forward). On `NotImplementedError` falls back to
+  a sequential `decode_step` loop that produces `(T, V)` stacked
+  logits with the same effect on KV. Empty input rejected loud.
+- **`greedy_verify(drafts, verify_logits) -> int`** — greedy
+  acceptance under the bonus-token convention: counts the longest
+  prefix of `drafts` matching `argmax(verify_logits[i])`.
+  Module-level so `silica.engine.Engine` and the multi-request
+  speculative path share one verifier.
+
+---
+
+## `silica.bench.spec_metrics`, `silica.bench.spec_collector` *(D-021 step 5 sub-units (g) / (h))*
+
+### `QualityParityStatus` *(enum)*
+
+`PARITY` / `DIVERGED` / `NOT_TESTED`. Phase-exit attestation
+requires `PARITY`; `DIVERGED` retires the variant; `NOT_TESTED`
+is allowed only during exploratory measurement.
+
+### `SPECULATIVE_METRIC_FIELDS` *(frozenset)*
+
+Canonical seven-field schema every Track C speculative variant
+populates: `accept_rate`, `verify_cost_ms`, `draft_cost_ms`,
+`tokens_per_target_forward`, `rollback_count`, `tree_node_visits`,
+`quality_parity_status`. `validate_speculative_metrics(metadata)`
+returns a list of greppable violation tags
+(`spec_metrics_missing:<field>`,
+`spec_metrics_type_error:<field>:...`,
+`spec_metrics_range_error:<field>:...`); empty list means valid.
+
+### `SpecMetricCollector` *(public dataclass)*
+
+Per-scenario speculative-decoding metric accumulator. The bench
+runner constructs one per spec-on scenario, threads it through
+`Engine(spec_collector=...)`, and after generation calls
+`materialize()` to produce the seven-field dict.
+
+Recorders called by `Engine.generate`'s spec branch:
+
+- **`record_propose(*, draft_count, elapsed_ms)`**
+- **`record_verify(*, accepted_len, yielded_count, elapsed_ms)`**
+- **`record_rollback()`** (cycles with `un_committed > 0`)
+- **`record_bonus()`** (bonus emit; suppressed when `max_tokens` /
+  stop-token cut the cycle short before the bonus path runs)
+
+Externally set by the harness:
+
+- **`set_self_spec(value=True)`** — forces `draft_cost_ms` to `0.0`
+  for same-model variants.
+- **`record_parity(status: QualityParityStatus)`** — bench harness
+  sets after running the comparison; default is `NOT_TESTED`.
+
+`materialize() -> dict[str, Any]` returns a validator-clean dict
+where `tokens_per_target_forward = (yielded_drafts + bonus_tokens)
+/ target_forward_count` (full reject reads `1.0`, not `0.0`,
+since the verify forward still emits one bonus).
+
+### `SpecRecurrentRollbackAdapter` *(protocol, D-021 step 5 sub-unit (e))*
+
+`runtime_checkable` Protocol implemented by adapters whose
+recurrent state needs explicit rollback when the speculative
+engine rejects drafts (`Qwen3_5Adapter` and via inheritance
+`Qwen3_5MoeAdapter`). Four helpers — `snapshot_pre_draft_state`,
+`commit_state`, `rollback_state`, `free_state` — drive the
+trim → restore → replay sequence the engine runs on partial
+reject. See `plans/P6_SPEC_FOUNDATION_E_ORIENTATION.md` §3 for
+the arithmetic.
+
+### `SpecConfig` *(public dataclass, frozen)*
+
+Speculative-decoding parameters for a bench scenario. Fields:
+`draft_repo: str`, `verify_k: int = 4`,
+`draft_gate_env_var: str | None = None`. Validates `verify_k >= 1`
+and non-empty `draft_repo`. Scenarios with `spec_config` set opt
+into the bench runner's `--speculative draft_target` path; under
+`--speculative none` they degrade to plain warm-decode.
+
+`Scenario.spec_config: SpecConfig | None = None` is the per-row
+opt-in.
+
+`BenchRunner(speculative_mode="none" | "draft_target")` — kwarg
+threads from `scripts/bench.py --speculative ...`. Default factory
+wires `DraftTargetEngine.from_repo + SpecMetricCollector +
+Engine(...)` only when `mode == "draft_target"` AND
+`scenario.spec_config is not None`. `_run_one` then merges
+`engine.spec_collector.materialize()` into
+`ScenarioResult.metadata` and runs `validate_speculative_metrics`;
+any violation flips the row to `status="failed"`.
 
 ---
 

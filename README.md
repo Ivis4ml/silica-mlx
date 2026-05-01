@@ -20,11 +20,14 @@ Target hardware: M5 Pro 48 GB. Runs Qwen3 (0.6B / 4B / 7B / 14B /
 32B), Qwen3.5 hybrid (0.8B / 4B / 27B), Gemma4-31B dense,
 Qwen3.5-35B-A3B MoE, gemma-4-26B-A4B MoE.
 
-> **Status:** the scheduler core (continuous batching, prefix cache,
-> memory budget), multi-family adapters, and KV codec compression are
-> shipped. OpenAI HTTP server, speculative decoding, and weight
-> streaming for MoE residency remain stubs behind frozen interfaces,
-> scheduled next.
+> **Status (v1.7.19):** the scheduler core (continuous batching,
+> prefix cache, memory budget), multi-family adapters, KV codec
+> compression, and the speculative-decoding foundation
+> (`DraftTargetEngine` + three rollback paths + spec-metrics
+> emission + `--speculative` bench switch — D-021 step 5) are
+> shipped. OpenAI HTTP server and weight streaming for MoE residency
+> remain stubs behind frozen interfaces; the speculative ≥1.2× decode
+> acceptance bullet rolls into Track C.4 / C.5 in P-6.
 
 > **Website.** Project homepage at
 > [ivis4ml.github.io/silica-mlx](https://ivis4ml.github.io/silica-mlx/)
@@ -125,9 +128,18 @@ stubs without changing call sites.
   active-3B / total-35B residency footprint under tighter memory
   budgets without OOM, with decode throughput close to the resident
   baseline. Today, everything stays resident.
-- **Speculative decoding.** Draft-target speculation lands on the
-  frozen `DraftEngine` interface that already lives in the engine
-  main loop. EAGLE / Medusa style schemes are out of scope for v0.1.
+- **Speculative decoding.** Draft-target speculation foundation
+  closed at v1.7.19 (D-021 step 5): `DraftTargetEngine`, multi-token
+  verify forward, target-side KV / recurrent / draft-side rollback,
+  cycle-1 byte-equal greedy parity on cached Qwen3-0.6B and
+  Qwen3.5-0.8B, the seven-field `silica.bench.spec_metrics` schema
+  emitted into `ScenarioResult.metadata`, and a `--speculative
+  draft_target` bench switch with two real-model warm-decode rows
+  (`qwen3.5-27b-warm-decode-spec-on` and
+  `qwen3.5-moe-35b-a3b-warm-decode-spec-on`). Multi-request hybrid
+  batched-spec is deferred (`(c)` slice 3, non-blocking for
+  foundation correctness). EAGLE / Medusa style schemes are out of
+  scope for v0.1.
 - **OpenAI-compatible HTTP server.** `silica-server` binary with
   OpenAI-compatible chat / completions endpoints, plus a session
   layer for per-conversation prefix caching across HTTP requests.
@@ -149,8 +161,8 @@ variable-length SDPA kernel.
 | P-4 | Unified bench harness — runner, oracles, 15 scenarios, JSONL + Markdown reports, vqbench subprocess PPL | ✅ complete |
 | P-4.5 | P-4 exit bridge — chunked-prefill minimal + VectorCodec runtime integration spike | ✅ complete (v1.6.9) |
 | P-5 | VQ KV compression (BlockTQ / RaBitQ) | ✅ complete (v1.7.4 — Acceptance (1)–(4) closed; P-5-F production routing closed at v1.7.6; (b-static) Qwen3.5-4B baseline closed at v1.7.7; per-head opt-in + measurements at v1.7.8 / v1.7.10 / v1.7.11) |
-| P-6 | Performance phase (dense Qwen3.5-27B-4bit ≥40 tok/s primary, ≥60 stretch; MoE 35B-A3B ≥100 anchor cleared, ≥175 aggregate stretch) | In progress — P-6.0 baseline (v1.7.13) + P-6.0.5 measurement expansion (v1.7.17) closed; Decision Gate 1 (D-021 step 4) closed at v1.7.18; Tracks A / B / C / D queued. Dense layer-streaming deferred to v0.2 per D-018. |
-| P-7 | Speculative decoding (DraftTarget / EAGLE / Medusa) | Promoted to T1 at v1.7.13; `DraftEngine` interface frozen, `NoopDraftEngine` is the today-stub. Foundation lands at D-021 step 5; Track C.4 / C.5 spikes follow Decision Gate 1. |
+| P-6 | Performance phase (dense Qwen3.5-27B-4bit ≥40 tok/s primary, ≥60 stretch; MoE 35B-A3B ≥100 anchor cleared, ≥175 aggregate stretch) | In progress — P-6.0 baseline (v1.7.13) + P-6.0.5 measurement expansion (v1.7.17) closed; Decision Gate 1 (D-021 step 4) closed at v1.7.18; **D-021 step 5 spec foundation closed at v1.7.19** (single-request `Engine.generate` spec path + three rollback paths + cycle-1 parity + spec-metrics emission + `--speculative` CLI; multi-request hybrid batched-spec deferred as non-blocking); Tracks A / B / C.4-C.5 / D queued. Dense layer-streaming deferred to v0.2 per D-018. |
+| P-7 | Speculative decoding (DraftTarget / EAGLE / Medusa) | Promoted to T1 at v1.7.13; `DraftEngine` interface frozen. Foundation deliverables (`DraftTargetEngine` + engine integration + spec-metrics + bench switch) closed at D-021 step 5 (v1.7.19); ≥1.2× decode-throughput acceptance is **tracked, not blocking** at foundation closure and will be settled by Track C.4 / C.5 in P-6 per Decision Gate 1. EAGLE / Medusa belong to v0.2. |
 | P-8 | OpenAI-compatible HTTP server + session layer | ⏳ planned (T1 tail, after P-5) |
 
 Legend: ✅ shipped · Stub = wired as the baseline implementation
@@ -372,18 +384,30 @@ without inserting a new `(user, assistant)` pair. Chained
 python -m scripts.bench --all --out bench-results.jsonl --report-md bench-results.md
 python -m scripts.bench --scenario qwen3-0.6b-bgt1-parity
 python -m scripts.bench --list
+
+# D-021 step 5 (h) — speculative-decoding bench rows. Quad-gated:
+# target HF cache + target env var + drafter HF cache (Qwen3.5-0.8B)
+# + drafter env var (SILICA_REAL_QWEN3_5_0_8B_DRAFT). Without
+# --speculative draft_target the row degrades to plain warm-decode
+# against the target alone (drafter checks skipped; spec-off path,
+# byte-identical to the b1 baseline).
+SILICA_REAL_QWEN3_5_27B=1 SILICA_REAL_QWEN3_5_0_8B_DRAFT=1 \
+  python -m scripts.bench \
+  --speculative draft_target \
+  --scenario qwen3.5-27b-warm-decode-spec-on \
+  --out spec-on.jsonl
 ```
 
 Full guide — scenario catalog, dual-gate env vars, `--all-kv-codecs`
-sweep, `--vqbench-xcheck` cross-check column — lives in
-[`docs/bench.md`](docs/bench.md).
+sweep, `--vqbench-xcheck` cross-check column, `--speculative` /
+spec-on rows — lives in [`docs/bench.md`](docs/bench.md).
 
 ---
 
 ## Running the tests
 
 ```bash
-uv run pytest tests           # full suite (currently ~2370 tests, ~80 s)
+uv run pytest tests           # full suite (currently ~2616 tests, ~95 s)
 uv run ruff check .
 uv run mypy silica
 ```
@@ -496,14 +520,32 @@ the structural picture only.
   microbench); Decision Gate 1 (D-021 step 4) closed at v1.7.18 with
   a two-condition (1b) survival rule (full-stack measurement clears
   ≥60, OR Track C.5 tree-shape spike beats the linear k=8 verify
-  ceiling) — see `plans/P6_0_DECISION_GATE_1_OPENING.md`. Tracks A
-  (engine fusion), B (3-bit weights), C (speculative C.1–C.6), D
+  ceiling) — see `plans/P6_0_DECISION_GATE_1_OPENING.md`. **D-021
+  step 5 spec foundation closed at v1.7.19** —
+  `silica.speculative.draft_target.DraftTargetEngine` wired into
+  `Engine.generate`, three rollback paths bound (target-side KV,
+  recurrent state on Qwen3.5 hybrid via snapshot/restore + replay,
+  draft-side via `DraftTargetEngine.commit`), cycle-1 byte-equal
+  greedy parity on cached Qwen3-0.6B + Qwen3.5-0.8B, the v1.7.15
+  spec-metrics schema emitted via `SpecMetricCollector`, and the
+  `--speculative {none,draft_target}` CLI flag plus two real-model
+  warm-decode scenarios (`qwen3.5-27b-warm-decode-spec-on` /
+  `qwen3.5-moe-35b-a3b-warm-decode-spec-on`, both quad-gated on HF
+  cache + env var for target and drafter). Multi-request hybrid
+  batched-spec ((c) slice 3) deferred as a non-blocking performance
+  extension; the `ContinuousBatcher` GLOBAL-only gate stays in
+  place. ≥1.2× decode-throughput acceptance is tracked-not-blocking
+  at foundation closure and rolls into Track C.4 / C.5. Tracks A
+  (engine fusion), B (3-bit weights), C.4 / C.5 spec extensions, D
   (concurrency TTFT), E (paged-attention) queued behind the gate.
   Dense layer-streaming and per-expert MoE residency deferred to
   v0.2 per D-018; the `WeightProvider` interface stays frozen.
-- **P-7** *(in progress, T1 at v1.7.13)* — speculative decoding
-  behind the `DraftEngine` interface (DraftTarget / EAGLE / Medusa).
-  Track C.1–C.6 in P-6 covers the v0.1 speculative implementations;
+- **P-7** *(foundation closed, T1 at v1.7.13)* — speculative
+  decoding behind the `DraftEngine` interface. v0.1 deliverables
+  (`DraftTargetEngine` + integration + spec-metrics + bench switch)
+  satisfied by D-021 step 5 closure at v1.7.19; the ≥1.2× decode
+  acceptance bullet rolls into P-6 Track C.4 / C.5 per Decision
+  Gate 1 (full-stack measurement or C.5 tree-shape spike).
   EAGLE / Medusa-style full ports stay deferred to v0.2 per D-020.
 - **P-8** *(planned)* — OpenAI-compatible HTTP server + session
   layer wrapping `ChatSession` with routing, auth, streaming SSE /
