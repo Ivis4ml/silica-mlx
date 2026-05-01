@@ -113,6 +113,17 @@ class Engine:
         self._spec_collector: SpecMetricCollector | None = spec_collector
 
     @property
+    def spec_collector(self) -> SpecMetricCollector | None:
+        """Read-only accessor for the per-engine speculative-metric
+        collector. The bench runner constructs one collector per spec-on
+        scenario, threads it in via the ``spec_collector`` constructor
+        kwarg, and after generation reads it back through this
+        property to call ``materialize`` and merge the seven schema
+        fields into ``ScenarioResult.metadata``. Returns ``None`` for
+        spec-off scenarios (no collector wired)."""
+        return self._spec_collector
+
+    @property
     def kv_manager(self) -> KVManager:
         """Public accessor for the KV manager.
 

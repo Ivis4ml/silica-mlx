@@ -16,8 +16,11 @@ modulo the optional ``spec_collector.record_*`` calls.
 Scope at (g):
 
   - Single-request ``Engine.generate`` emission. The
-    ``ContinuousBatcher`` multi-request path is **not** wired here;
-    that lands in (h) along with the batched bench scenarios.
+    ``ContinuousBatcher`` multi-request path is **not** wired here.
+    (h)'s two new spec-on bench scenarios are B=1 (warm-decode
+    single-request); the batched / multi-request emission path is
+    deferred to (c) slice 3 once the batcher's hybrid + sliding
+    multi-row recurrent rollback lands.
   - ``quality_parity_status`` is set externally by the harness
     (e.g. the bench runner's parity-check oracle). Default is
     :attr:`QualityParityStatus.NOT_TESTED`; the harness flips it

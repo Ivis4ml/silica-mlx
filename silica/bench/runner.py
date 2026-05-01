@@ -109,6 +109,7 @@ from silica.bench.scenario import (
     Workload,
     hf_cache_path_for_repo,
 )
+from silica.bench.spec_metrics import validate_speculative_metrics
 from silica.bench.vqbench_baseline import (
     VqbenchBaselineResult,
     run_vqbench_baseline,
@@ -222,19 +223,10 @@ def _flatten_vqbench_result(result: VqbenchBaselineResult) -> dict[str, Any]:
     return {f"vqbench_{k}": v for k, v in asdict(result).items()}
 
 
-def _default_engine_factory(
-    scenario: Scenario,
-) -> tuple[ModelAdapter, Engine]:
-    """Load adapter + KV manager for ``scenario.repo`` and build an Engine.
-
-    Imports :mod:`silica.models.factory` lazily so ``silica.bench``
-    stays cheap to import for CLI listing (--list) without pulling
-    in the adapter dispatch table.
-    """
-    from silica.models.factory import adapter_for_repo
-
-    adapter, kv = adapter_for_repo(scenario.repo)
-    return adapter, Engine(adapter, kv)
+# ``_default_engine_factory`` is a method on :class:`BenchRunner` so it
+# can read ``self._speculative_mode`` when deciding whether to wire a
+# ``DraftTargetEngine`` + ``SpecMetricCollector``. See
+# ``BenchRunner._default_engine_factory`` below.
 
 
 def _mlx_reset_peak_memory() -> None:
@@ -317,9 +309,26 @@ class BenchRunner:
         vqbench_python: str | None = None,
         vqbench_runner: VqbenchRunnerFn | None = None,
         vqbench_epsilon: float = 0.01,
+        speculative_mode: str = "none",
     ) -> None:
+        # D-021 step 5 sub-unit (h) slice 1: speculative-decoding
+        # master switch. ``"none"`` (default; backwards-compatible)
+        # ignores any scenario.spec_config and runs all scenarios
+        # spec-off. ``"draft_target"`` activates spec for scenarios
+        # whose spec_config is set; scenarios without spec_config
+        # remain spec-off (no implicit defaulting in slice 1).
+        # Validated loud so a typo from a programmatic caller surfaces
+        # at construction rather than as a silent spec-off run.
+        if speculative_mode not in ("none", "draft_target"):
+            raise ValueError(
+                f"BenchRunner speculative_mode must be 'none' or "
+                f"'draft_target'; got {speculative_mode!r}"
+            )
+        self._speculative_mode: str = speculative_mode
         self._engine_factory: EngineFactory = (
-            engine_factory if engine_factory is not None else _default_engine_factory
+            engine_factory
+            if engine_factory is not None
+            else self._default_engine_factory
         )
         self._direct_batched_reference: DirectBatchedReferenceFn = (
             direct_batched_reference
@@ -431,6 +440,48 @@ class BenchRunner:
         # because the opening pins it; if a later step needs it
         # tunable, add a ``vqbench_pct_epsilon`` kwarg then.
         self._vqbench_epsilon: float = vqbench_epsilon
+
+    def _default_engine_factory(
+        self, scenario: Scenario
+    ) -> tuple[ModelAdapter, Engine]:
+        """Load adapter + KV manager for ``scenario.repo`` and build an
+        Engine.
+
+        D-021 step 5 sub-unit (h) slice 1: when the runner was
+        constructed with ``speculative_mode="draft_target"`` AND the
+        scenario carries a ``spec_config``, this factory wires a
+        ``DraftTargetEngine`` (loaded via ``from_repo`` so it gets a
+        ``_MultiKVCache`` for free) and a fresh ``SpecMetricCollector``
+        into the engine. Otherwise the engine is built spec-off, which
+        is byte-identical to the pre-(h) construction path.
+
+        Imports :mod:`silica.models.factory` lazily so ``silica.bench``
+        stays cheap to import for CLI listing (--list) without pulling
+        in the adapter dispatch table.
+        """
+        from silica.models.factory import adapter_for_repo
+
+        adapter, kv = adapter_for_repo(scenario.repo)
+        if (
+            self._speculative_mode == "draft_target"
+            and scenario.spec_config is not None
+        ):
+            from silica.bench.spec_collector import SpecMetricCollector
+            from silica.speculative.draft_target import DraftTargetEngine
+
+            drafter = DraftTargetEngine.from_repo(
+                scenario.spec_config.draft_repo
+            )
+            collector = SpecMetricCollector()
+            engine = Engine(
+                adapter,
+                kv,
+                draft_engine=drafter,
+                verify_k=scenario.spec_config.verify_k,
+                spec_collector=collector,
+            )
+            return adapter, engine
+        return adapter, Engine(adapter, kv)
 
     def _will_run_vqbench(
         self,
@@ -1010,11 +1061,43 @@ class BenchRunner:
             if ok
             else self._vqbench_metadata_for_silica_not_ok(scenario)
         )
+        # D-021 step 5 sub-unit (h) slice 1: speculative-decoding
+        # metric merge. Driven off ``engine.spec_collector`` (NOT off
+        # ``scenario.spec_config``) so a synthetic test factory that
+        # pre-wires a collector into a fake engine is exercised
+        # identically to the production path. ``materialize`` is
+        # called even when the oracle has already failed, so the JSONL
+        # row carries the partial spec metrics from the run that
+        # produced the failure (debugging signal). A validator
+        # violation flips the row to ``status="failed"`` with a reason
+        # listing the violation tags; an already-failed row keeps its
+        # original reason and only appends the spec-validation note.
+        spec_metadata: dict[str, Any] = {}
+        spec_validation_reason: str | None = None
+        # ``getattr`` with a None default keeps existing test fakes that
+        # do not expose ``spec_collector`` working spec-off; the
+        # production ``Engine`` class always carries the property.
+        spec_collector = getattr(engine, "spec_collector", None)
+        if spec_collector is not None:
+            spec_metadata = spec_collector.materialize()
+            violations = validate_speculative_metrics(spec_metadata)
+            if violations:
+                spec_validation_reason = (
+                    "spec_metrics_invalid:" + ",".join(violations)
+                )
+        if spec_validation_reason is not None:
+            ok = False
+            oracle_reason = (
+                spec_validation_reason
+                if oracle_reason is None
+                else f"{oracle_reason};{spec_validation_reason}"
+            )
         result_metadata: dict[str, Any] = {
             **metadata,
             "seed": seed,
             "codec_id": effective_codec_id,
             **vqbench_metadata,
+            **spec_metadata,
         }
         return ScenarioResult(
             scenario_id=scenario.id,

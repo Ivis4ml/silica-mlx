@@ -399,6 +399,12 @@ class Scenario:
     gate_env_var: str | None = None
     description: str = ""
     vqbench_xcheck: VqbenchXcheckSpec | None = None
+    # D-021 step 5 sub-unit (h): speculative-decoding configuration.
+    # ``None`` (default) keeps the scenario spec-off. A non-None value
+    # opts the scenario into spec mode, but the bench runner only
+    # actually wires ``DraftTargetEngine`` when it is constructed with
+    # ``speculative_mode="draft_target"``. See :class:`SpecConfig`.
+    spec_config: SpecConfig | None = None
 
     def __post_init__(self) -> None:
         # vqbench_xcheck requires OracleKind.PPL: the cross-check
@@ -417,6 +423,40 @@ class Scenario:
                 f"oracle={self.oracle.value!r}. vqbench reproduce "
                 f"scripts report PPL, so other oracles have "
                 f"nothing to cross-check against"
+            )
+
+
+@dataclass(frozen=True)
+class SpecConfig:
+    """D-021 step 5 sub-unit (h): speculative-decoding parameters for a
+    bench scenario.
+
+    A scenario carrying ``spec_config`` declares it WANTS to run under
+    ``--speculative draft_target``; the bench runner reads
+    ``draft_repo`` and ``verify_k`` to wire ``DraftTargetEngine`` +
+    ``SpecMetricCollector`` into the engine. Scenarios without
+    ``spec_config`` (the common case) run spec-off regardless of CLI
+    flag, and scenarios with ``spec_config`` still run spec-off when
+    the CLI passes ``--speculative none`` (the default; backwards-
+    compatible). Frozen so a scenario cannot be mutated mid-run.
+
+    Validates ``verify_k >= 1`` and ``draft_repo != ""`` at
+    construction so a misconfiguration cannot silently disable spec
+    or land at a degenerate forward shape.
+    """
+
+    draft_repo: str
+    verify_k: int = 4
+
+    def __post_init__(self) -> None:
+        if not self.draft_repo:
+            raise ValueError(
+                "SpecConfig.draft_repo must be non-empty (e.g. "
+                "'Qwen/Qwen3.5-0.8B'); got empty string"
+            )
+        if self.verify_k < 1:
+            raise ValueError(
+                f"SpecConfig.verify_k must be >= 1, got {self.verify_k}"
             )
 
 
@@ -480,6 +520,7 @@ __all__ = [
     "Workload",
     "Scenario",
     "ScenarioResult",
+    "SpecConfig",
     "VqbenchXcheckSpec",
     "hf_cache_path_for_repo",
     "OracleFn",
