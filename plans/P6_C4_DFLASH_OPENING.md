@@ -55,12 +55,14 @@ Concretely, the drafter state machine the spike must support is:
    AND simultaneously captures hidden states at the layer ids the
    drafter consumes. This capture path is the new architectural
    surface (see sub-unit (αβ) in §3).
-3. **`commit(ctx, yielded_count)`** — slice the captured verify
-   hiddens to `1 + yielded_count` positions and store as the new
-   `target_hidden` for this `req_id`. This is the *only* draft-side
-   commit work; rejected drafts were never in the draft cache, so
-   draft-side "rollback" is implicit (rejected positions were noise,
-   never written).
+3. **`update_target_hidden(req_id, captured, yielded_count)`** —
+   the `TargetHiddenConsumer` side channel ((β)). Slice the captured
+   verify hiddens to `1 + yielded_count` positions and store as the
+   new `target_hidden` for this `req_id`. The standard
+   `DraftEngine.commit(ctx, accepted_len)` Protocol method stays a
+   no-op for DFlash — draft-side "rollback" is implicit (rejected
+   positions were noise keys/values, never written to the draft
+   cache).
 
 Three upstream-DFlash mechanisms remain **explicitly out of scope**
 for this spike: (a) the **tape-replay verify rollback** is upstream's
@@ -192,12 +194,13 @@ drafter-only-with-hidden-capture number sits just below the gate
   in the upstream registry.
 - **Add `silica.speculative.dflash_drafter.DFlashDrafter`** implementing
   the existing `DraftEngine` Protocol: `propose(ctx, k) -> DraftTokens`,
-  `commit(ctx, yielded_count) -> None`. Per-`req_id` state holds the
+  `commit(ctx, accepted_len) -> None`. Per-`req_id` state holds the
   stored `target_hidden` and the per-layer `ContextOnlyDraftKVCache`s.
-  The K=16 block forward is hidden behind `propose`; the capture path
-  feeds `target_hidden` for the next cycle. Accept-rule + verification
+  The K=16 block forward is hidden behind `propose`; the
+  `TargetHiddenConsumer` side channel (`update_target_hidden`) feeds
+  `target_hidden` for the next cycle. Accept-rule + verification
   continue to use `silica.speculative.verify.greedy_verify`.
-- **Target-conditioned drafter with `commit`-updates-`target_hidden`
+- **Target-conditioned drafter with `update_target_hidden`-side-channel
   semantics.** The wrapper holds, per `req_id`, the stored
   `target_hidden` and the per-layer `ContextOnlyDraftKVCache`s. The
   `target_hidden` shape is **`(1, ctx_len, |L| * hidden_size)`**
@@ -210,10 +213,12 @@ drafter-only-with-hidden-capture number sits just below the gate
   stored `target_hidden` and calls `DFlashDraftModel(noise_embedding=…,
   target_hidden=…, cache=draft_caches)`; the draft forward internally
   appends the target-hidden-derived context to the draft caches via
-  `append_context`. Each `commit(ctx, yielded_count)` slices the
-  verify forward's captured hidden states to `1 + yielded_count`
-  positions, runs the same dict→concat aggregation over
-  `target_layer_ids`, and stores the result as the new
+  `append_context`. Each
+  `update_target_hidden(req_id, captured_dict, yielded_count)` (the
+  `TargetHiddenConsumer` side channel; `DraftEngine.commit` stays a
+  no-op) slices the verify forward's captured hidden states to
+  `1 + yielded_count` positions, runs the same dict→concat aggregation
+  over `target_layer_ids`, and stores the result as the new
   `target_hidden` for the next cycle. Rejected drafts were never
   written to the draft cache (only the noise keys/values for them
   existed, and those are not appended) — so draft-side "rollback" is
@@ -323,10 +328,12 @@ drafter-only-with-hidden-capture number sits just below the gate
 - **Three rollback paths — all inherited from step 5.** Target-side
   KV via `PagedKVCache.rollback` / `SimpleKVCache` per-layer trim;
   target recurrent state via `Qwen3_5Adapter.snapshot_pre_draft_state`
-  / `rollback_state`; draft-side via the drafter's `commit`. The
-  C.4 spike's draft-side `commit(ctx, yielded_count)` only updates
-  the per-`req_id` stored `target_hidden` to
-  `captured_hidden[:, :1 + yielded_count, :]`; the
+  / `rollback_state`; draft-side via the drafter's
+  `TargetHiddenConsumer.update_target_hidden`. The C.4 spike's
+  draft-side `update_target_hidden(req_id, captured, yielded_count)`
+  updates the per-`req_id` stored `target_hidden` to
+  `aggregate(captured)[:, :1 + yielded_count, :]`;
+  `DraftEngine.commit(ctx, accepted_len)` is a no-op. The
   `ContextOnlyDraftKVCache` does not require trimming because
   rejected drafts' noise keys/values were never appended to it (see
   §4.1 state-machine). The DFlash upstream tape-replay mechanism is
@@ -416,8 +423,8 @@ per the project's incremental-execution rule.
    tokens is achievable. This sub-unit is **not** a fallback for
    absent real-model checkpoints — it is the structural-correctness
    tier of the gate in its own right and runs unconditionally as
-   part of the test suite. Also bound: a `commit(ctx, yielded_count)`
-   + `update_target_hidden(req_id, captured, yielded_count)` test
+   part of the test suite. Also bound: an
+   `update_target_hidden(req_id, captured, yielded_count)` test
    that asserts the next `propose` uses a `target_hidden` of length
    `1 + yielded_count`, regardless of what the previous block
    proposed.
@@ -983,11 +990,12 @@ This opening (post-α) absorbs F-1 in §0 / §1 / §2.1 / §2.3 / §3 /
 - §0 / §4.1 carry the corrected state-machine: stored `target_hidden`
   with a per-layer `ContextOnlyDraftKVCache` per `req_id`; `propose`
   consumes the stored `target_hidden` and appends only the
-  target-hidden-derived context internally; `commit(ctx, yielded_count)`
-  updates the stored `target_hidden` to
-  `captured_hidden[:, :1 + yielded_count, :]`; rejected drafts'
-  noise keys/values were never written, so draft-side "rollback"
-  is implicit.
+  target-hidden-derived context internally;
+  `update_target_hidden(req_id, captured, yielded_count)` (the
+  `TargetHiddenConsumer` side channel; (β)) updates the stored
+  `target_hidden` to `aggregate(captured)[:, :1 + yielded_count, :]`;
+  `DraftEngine.commit` is a no-op; rejected drafts' noise keys/values
+  were never written, so draft-side "rollback" is implicit.
 - §3 adds sub-unit (αβ) between α and β: target-hidden capture path
   on `Qwen3_5Adapter` and `qwen3_5_moe.py`, with a microbench for
   `c_capture_hidden(k=16)` (now an explicit term in the §1 speedup

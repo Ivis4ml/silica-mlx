@@ -62,6 +62,7 @@ Sub-unit ordering this skeleton enables:
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -69,6 +70,10 @@ import mlx.core as mx
 
 from silica.core.request import RequestState
 from silica.models.hidden_capture import HiddenCaptureAdapter
+from silica.speculative._dflash_target_ops import (
+    lm_head_logits,
+    target_embed_tokens,
+)
 from silica.speculative.engine import DraftTokens
 
 # Sub-unit (γ): the synthetic emitter consumed by ``propose`` in
@@ -171,6 +176,28 @@ class DFlashDrafter:
         # parity test.
         self._synthetic_emit: SyntheticEmit | None = None
 
+        # Sub-unit (δ.1): per-cycle draft KV cache factory. The real
+        # production path imports ``ContextOnlyDraftKVCache`` from
+        # ``dflash_mlx.model`` (already loaded above via the deferred
+        # import) and binds the upstream sink/window defaults that
+        # ``runtime._resolve_draft_window`` resolves from env vars.
+        # Tests with a fake drafter set ``self._cache_factory = None``
+        # before ``prime`` runs — see ``_build_draft_caches`` for the
+        # placeholder fallback.
+        from dflash_mlx.model import (  # type: ignore[import-not-found]
+            ContextOnlyDraftKVCache,
+        )
+
+        sink = int(os.environ.get("DFLASH_DRAFT_SINK_SIZE", "64"))
+        window = int(os.environ.get("DFLASH_DRAFT_WINDOW_SIZE", "1024"))
+
+        def _make_real_cache() -> Any:
+            return ContextOnlyDraftKVCache(
+                sink_size=sink, window_size=window
+            )
+
+        self._cache_factory: Any = _make_real_cache
+
     @classmethod
     def for_synthetic(
         cls,
@@ -222,6 +249,9 @@ class DFlashDrafter:
         drafter._target_hidden = {}
         drafter._draft_caches = {}
         drafter._synthetic_emit = synthetic_emit
+        # No real drafter model loaded; the cache factory has nothing
+        # to wire. ``_build_draft_caches`` returns ``[]`` in this mode.
+        drafter._cache_factory = None
         return drafter
 
     # --- DraftEngine Protocol ----------------------------------------------
@@ -250,16 +280,6 @@ class DFlashDrafter:
           accepting an over-length block would mask wiring bugs that
           (δ)'s real forward will not tolerate.
         """
-        emit = self._synthetic_emit
-        if emit is None:
-            raise NotImplementedError(
-                "DFlashDrafter.propose: real-mode propose lands at "
-                "sub-unit (δ) (real DFlash forward via "
-                "DFlashDraftModel.__call__). The (β) skeleton + (γ) "
-                "synthetic seam only ship the synthetic-mode path; "
-                "construct via DFlashDrafter.for_synthetic(...) for "
-                "tests, or wait for (δ)."
-            )
         req_id = ctx.request_id
         if req_id not in self._target_hidden:
             raise KeyError(
@@ -269,16 +289,22 @@ class DFlashDrafter:
                 "explicitly."
             )
         target_hidden = self._target_hidden[req_id]
-        token_ids = emit(target_hidden, int(k))
-        token_tuple = tuple(int(t) for t in token_ids)
-        if len(token_tuple) > k:
-            raise ValueError(
-                f"DFlashDrafter.propose: synthetic_emit returned "
-                f"{len(token_tuple)} tokens for k={k}; expected at most "
-                f"k. Loud-fail rather than silently truncate so "
-                "synthetic-emitter wiring bugs surface immediately."
-            )
-        return DraftTokens(token_ids=token_tuple)
+
+        emit = self._synthetic_emit
+        if emit is not None:
+            token_ids = emit(target_hidden, int(k))
+            token_tuple = tuple(int(t) for t in token_ids)
+            if len(token_tuple) > k:
+                raise ValueError(
+                    f"DFlashDrafter.propose: synthetic_emit returned "
+                    f"{len(token_tuple)} tokens for k={k}; expected at "
+                    "most k. Loud-fail rather than silently truncate so "
+                    "synthetic-emitter wiring bugs surface immediately."
+                )
+            return DraftTokens(token_ids=token_tuple)
+
+        # Real-mode propose. (δ.1)
+        return self._propose_real(ctx, req_id, target_hidden, int(k))
 
     def commit(self, ctx: RequestState, accepted_len: int) -> None:
         """No-op per the F-1 state machine (§4.1 of the OPENING).
@@ -291,6 +317,137 @@ class DFlashDrafter:
         Protocol surface uniform across drafters.
         """
         return None
+
+    # --- Real-mode propose internals (δ.1) --------------------------------
+
+    def _propose_real(
+        self,
+        ctx: RequestState,
+        req_id: str,
+        target_hidden: mx.array,
+        k: int,
+    ) -> DraftTokens:
+        """Run a real DFlash block-diffusion forward and return up to
+        ``k`` drafted tokens.
+
+        Mirrors the cycle body of upstream
+        ``dflash_mlx.runtime.generate_dflash_once``:
+
+        1. Pull the staged-first anchor from ``ctx.output_token_ids[-1]``
+           — the engine just yielded that token at the end of the
+           previous cycle (or as the prefill argmax on cycle 1). It is
+           the input position-0 of the verify forward this cycle, and
+           the input position-0 of the drafter forward.
+        2. Build a length-``block_len`` token buffer where position 0
+           is the staged-first and positions ``1..block_len-1`` are
+           ``mask_token_id``. ``block_len = min(k + 1,
+           drafter.block_size)`` — the +1 reserves position 0 for the
+           anchor; positions 1..block_len-1 hold the drafted slots.
+           Returned drafts thus number ``block_len - 1 ≤ k``.
+        3. Embed via the target's input embedding, then call
+           ``DFlashDraftModel(noise_embedding=..., target_hidden=...,
+           cache=draft_caches)``. The drafter forward appends the
+           target-hidden-derived context to the per-layer caches
+           internally; positions 1..block_len-1 of the returned hidden
+           are the drafter's per-position output.
+        4. Project drafter hiddens at positions ``[1:block_len]``
+           through the target's lm-head to logits, then greedy argmax
+           to materialise drafted token ids.
+
+        Loud-fails if ``ctx.output_token_ids`` is empty — that
+        indicates the engine called ``propose`` before the prefill's
+        argmax was yielded, a wiring contract violation.
+        """
+        if not ctx.output_token_ids:
+            raise RuntimeError(
+                "DFlashDrafter._propose_real: ctx.output_token_ids is "
+                "empty; the engine must have yielded at least the "
+                "prefill argmax (the staged-first anchor) before "
+                "calling propose. Engine ε's _drive guarantees this."
+            )
+        staged_first = int(ctx.output_token_ids[-1])
+
+        block_size = self._read_block_size()
+        block_len = min(k + 1, block_size)
+        if block_len < 2:
+            # k=0 or block_size=1 — no draft slots, return empty.
+            return DraftTokens(token_ids=())
+
+        mask_token_id = self._read_mask_token_id()
+
+        # Build (block_len,) buffer: [staged_first, mask, mask, ...].
+        # ``mx.array`` does not support direct item assignment; build
+        # via concatenation.
+        anchor_arr = mx.array([staged_first], dtype=mx.uint32)
+        mask_arr = mx.full(
+            shape=(block_len - 1,),
+            vals=int(mask_token_id),
+            dtype=mx.uint32,
+        )
+        block_token_buffer = mx.concatenate([anchor_arr, mask_arr])
+
+        # Embed via the target-side helper. Output: (1, block_len, hidden).
+        noise_embedding = target_embed_tokens(
+            self._target_adapter, block_token_buffer[None]
+        )
+
+        # Drafter forward — same call shape as upstream
+        # ``DFlashDraftModel.__call__``. ``draft_hidden`` shape:
+        # (1, block_len, drafter_hidden_size).
+        draft_caches = self._draft_caches[req_id]
+        draft_hidden = self._drafter_model(
+            noise_embedding=noise_embedding,
+            target_hidden=target_hidden,
+            cache=draft_caches,
+        )
+
+        # Project positions 1..block_len-1 through target lm-head.
+        # Position 0 is the anchor's prediction (= staged-first's own
+        # next-token), but the engine already has the verify forward
+        # for that — the drafter only contributes the drafted
+        # positions.
+        drafted_hidden = draft_hidden[:, 1:, :]
+        logits = lm_head_logits(self._target_adapter, drafted_hidden)
+        # Greedy argmax → draft tokens. ``mx.argmax`` returns shape
+        # ``(1, block_len-1)``; ``.tolist()`` yields a nested list.
+        drafted = mx.argmax(logits, axis=-1)
+        py_drafts: Any = drafted[0].tolist()
+        token_list: list[int] = [int(t) for t in py_drafts]
+        return DraftTokens(token_ids=tuple(token_list))
+
+    def _read_block_size(self) -> int:
+        """Read ``DFlashDraftModel.block_size`` from the loaded model.
+
+        Set by upstream ``DFlashDraftModel.__init__`` from
+        ``args.dflash_config["block_size"]`` with a fallback. Loud-fail
+        on missing attribute (mirrors ``_read_target_layer_ids``)."""
+        block_size = getattr(self._drafter_model, "block_size", None)
+        if block_size is None:
+            raise RuntimeError(
+                "DFlashDrafter could not read 'block_size' from the "
+                f"loaded drafter model "
+                f"{type(self._drafter_model).__name__}. Upstream sets "
+                "this attribute on DFlashDraftModel; check that "
+                "load_draft_bundle returned a DFlashDraftModel "
+                "instance and that the dflash-mlx version pinned in "
+                "pyproject.toml's [dflash] extras matches the runtime."
+            )
+        return int(block_size)
+
+    def _read_mask_token_id(self) -> int:
+        """Read ``DFlashDraftModel.mask_token_id`` from the loaded model.
+
+        Used to fill the non-anchor slots of the noise-embedding input
+        buffer. Loud-fail on missing attribute."""
+        mask = getattr(self._drafter_model, "mask_token_id", None)
+        if mask is None:
+            raise RuntimeError(
+                "DFlashDrafter could not read 'mask_token_id' from the "
+                f"loaded drafter model "
+                f"{type(self._drafter_model).__name__}. Upstream sets "
+                "this attribute on DFlashDraftModel."
+            )
+        return int(mask)
 
     # --- TargetHiddenConsumer side channel ---------------------------------
 
@@ -446,15 +603,30 @@ class DFlashDrafter:
         return tup
 
     def _build_draft_caches(self) -> list[Any]:
-        """Construct per-layer ``ContextOnlyDraftKVCache`` instances.
+        """Construct the per-layer draft cache list for one ``req_id``.
 
-        The exact ``sink_size`` and ``window_size`` values come from
-        upstream's ``runtime._resolve_draft_window`` defaults and are
-        wired at sub-unit (δ). The (β) skeleton returns an empty list;
-        ``prime`` calls this and stashes the result, but ``propose``
-        (which raises ``NotImplementedError``) never consumes it.
+        Three modes:
+
+        - **Synthetic (no fake drafter model)** — returns ``[]``. The
+          synthetic emitter ignores the cache list, so an empty list
+          is sufficient and avoids importing ``dflash_mlx`` indirectly.
+        - **Fake drafter for δ.1 tests** — ``self._drafter_model`` is a
+          test fake whose ``.layers`` attribute drives the cache-list
+          length, but no ``_cache_factory`` is wired. Returns a list
+          of ``None`` placeholders of the right length, which the fake
+          drafter's ``__call__`` ignores.
+        - **Real production (η)** — ``self._cache_factory`` is set in
+          ``__init__`` to construct a fresh
+          ``dflash_mlx.model.ContextOnlyDraftKVCache`` per drafter
+          layer.
         """
-        return []
+        drafter = self._drafter_model
+        if drafter is None or not hasattr(drafter, "layers"):
+            return []
+        factory = getattr(self, "_cache_factory", None)
+        if factory is None:
+            return [None] * len(drafter.layers)
+        return [factory() for _ in drafter.layers]
 
 
 __all__ = ["DFlashDrafter"]

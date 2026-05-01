@@ -58,6 +58,7 @@ def _build(
     drafter._target_hidden = {}
     drafter._draft_caches = {}
     drafter._synthetic_emit = None
+    drafter._cache_factory = None
     return drafter, hidden_size
 
 
@@ -290,15 +291,16 @@ def _make_ctx(req_id: str = "req-0") -> Any:
     return RequestState(request=req)
 
 
-def test_real_mode_propose_raises_until_delta() -> None:
-    """Real-mode ``propose`` (no synthetic emitter installed) raises
-    ``NotImplementedError`` pending sub-unit (δ)'s real DFlash
-    forward. The (γ) synthetic seam routes around this raise via
-    ``DFlashDrafter.for_synthetic(...)``."""
+def test_real_mode_propose_requires_primed_request() -> None:
+    """Real-mode ``propose`` (no synthetic emitter installed) routes
+    through ``_propose_real`` per sub-unit (δ.1). The unprimed-request
+    guard is the first check it hits — engine ε guarantees priming
+    after ``prefill_with_capture``; unit tests that bypass priming
+    surface the wiring violation here."""
     drafter, _ = _build()
     assert drafter._synthetic_emit is None
     ctx = _make_ctx()
-    with pytest.raises(NotImplementedError, match="sub-unit \\(δ\\)"):
+    with pytest.raises(KeyError, match="not primed"):
         drafter.propose(ctx, k=4)
 
 
