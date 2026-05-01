@@ -58,6 +58,7 @@ from silica.models.capabilities import (
     ModelCapabilities,
     capabilities_from_attention_pattern,
 )
+from silica.models.hidden_capture import run_qwen3_5_forward_with_capture
 from silica.models.pre_norm_capture import (
     _PreNormCaptureBufferHolder,
     apply_k_norm_then_rope_to_block,
@@ -211,6 +212,39 @@ class Qwen3_5Adapter:
         logits = forward_full(self._model, tokens, cache_list)
         return logits, StateDelta(
             _recurrent_bytes=self._recurrent_state_bytes(cache_list)
+        )
+
+    def decode_step_multi_with_capture(
+        self,
+        tokens: mx.array,
+        kv_handle: KVHandle,
+        capture_layer_ids: frozenset[int],
+    ) -> tuple[mx.array, dict[int, mx.array], StateDelta]:
+        # D-021 step 6 (αβ.1) — opt-in hidden-state capture path for
+        # target-conditioned drafters (DFlash, future C.3 MTP head, C.6
+        # self-spec). Mirrors ``decode_step_multi``'s contract for
+        # logits and ``StateDelta``; additionally returns the
+        # ``{layer_id: hidden_state}`` dict the (β) ``DFlashDrafter``
+        # consumes as its ``target_hidden`` input. Layer-id convention:
+        # ``0`` = embedding output (pre-layer-stack); ``i + 1`` for
+        # ``i ∈ [0, num_hidden_layers)`` = output of ``model.layers[i]``.
+        # Empty ``capture_layer_ids`` returns an empty captured dict
+        # and is logits-equivalent to ``decode_step_multi`` (modulo MLX
+        # dispatch reductions; pinned by
+        # ``tests/test_qwen3_5_capture_hidden.py``).
+        cache_list = self._kv_manager.cache_list(kv_handle.req_id)
+        logits, captured = run_qwen3_5_forward_with_capture(
+            self._model,
+            tokens,
+            cache_list,
+            capture_layer_ids,
+        )
+        return (
+            logits,
+            captured,
+            StateDelta(
+                _recurrent_bytes=self._recurrent_state_bytes(cache_list)
+            ),
         )
 
     # --- P-5-F F.1: PreNormCaptureAdapter implementation ---

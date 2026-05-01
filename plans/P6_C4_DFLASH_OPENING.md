@@ -135,13 +135,21 @@ are deferred — the spike does **not** harvest them, so silica's
 `c_verify(k)` and recurrent rollback cost stay at their step-5 anchors.
 
 Under that scope, the predicted speedup band is bounded by what
-drafter-cost reduction alone delivers: **roughly 1.4-2.0×** at α ∈
-[0.5, 0.7], shifted ~10% lower than the pre-α "1.5-2.2×" estimate
-to reflect the new `c_capture_hidden(k)` term. The drafter is
-**stateful per `req_id`** by design (target-conditioned with a
-streaming draft KV cache; see §4.1) — `c_draft_block` is paid in
-full per cycle, but the cache amortises target-hidden context across
-cycles so the cumulative drafter cost stays sublinear in cycle count.
+drafter-cost reduction alone delivers. The pre-α framing was
+"1.5-2.2× at α ∈ [0.5, 0.7]"; F-1 surfaced the new
+`c_capture_hidden(k)` denominator term, which provisionally shifted
+the band to "1.4-2.0×" pending measurement. **Sub-unit (αβ.1)
+measured `c_capture_hidden(k=16)` at -0.4% on cached Qwen3.5-0.8B**
+(within jitter; see `plans/P6_C4_DFLASH/REPORT.md`), so the band
+reverts to **1.5-2.2×** for the post-(αβ.1) prediction. A 27B-target
+measurement at the actual `|target_layer_ids|` from the upstream
+drafter checkpoint may shift this within the band, not below it
+(see §5.5 OQ-5 closure note + REPORT.md "Interpretation"). The
+drafter is **stateful per `req_id`** by design (target-conditioned
+with a streaming draft KV cache; see §4.1) — `c_draft_block` is paid
+in full per cycle, but the cache amortises target-hidden context
+across cycles so the cumulative drafter cost stays sublinear in
+cycle count.
 Upstream's "5.2× single-request HumanEval" claim is on a stack that
 includes both the `verify_qmm` kernel and tape-replay verify on a
 CUDA target; the silica-integrated number for a *drafter-only*
@@ -158,7 +166,7 @@ full-DFlash-port proposal beyond step 6. If it lands ≤1.8×, (1b)
 retires unless the C.5 spike rescues it independently — and a "port
 the verify-side kernels too" follow-up may be reconsidered if the
 drafter-only-with-hidden-capture number sits just below the gate
-(≥1.4×).
+(≥1.5×).
 
 ---
 
@@ -687,31 +695,36 @@ for it because the verify-side optimisations (tape-replay verify +
 separate full-DFlash-port proposal beyond step 6. The spike is the
 experiment that turns this prediction band into a number.
 
-### 5.5 OQ-5 — `c_capture_hidden(k)` cost on silica's stock-MLX verify
+### 5.5 OQ-5 — `c_capture_hidden(k)` cost on silica's stock-MLX verify (closed favourably at αβ.1)
 
-**Question.** What is the additive cost of capturing target hidden
-states at the drafter-consumed layer ids during the verify forward,
-relative to silica's existing `c_verify(k=16)` baseline (1.494× a
-single target forward at k=4 per P-6.0.5 Unit 7)?
+**Closed at sub-unit (αβ.1) on Qwen3.5-0.8B, 2026-05-01.**
+`c_capture_hidden(k=16)` measured at **-0.41%** (within jitter)
+relative to the `decode_step_multi(k=16)` baseline; capture is
+effectively free on the 0.8B fixture for `|capture_layer_ids| = 3`.
+Full microbench in `plans/P6_C4_DFLASH/REPORT.md`. The §1 prediction
+band reverts to "1.5-2.2× at α ∈ [0.5, 0.7]" pending the dense 27B
+real-target row at (η).
 
-**Resolution method.** Sub-unit (αβ): a microbench row that runs
-`decode_step_multi(k=16)` with capture **disabled** vs **enabled**
-and records the wall-clock delta. If MLX's compute graph fuses the
+**Question (preserved as historical context).** What is the additive
+cost of capturing target hidden states at the drafter-consumed layer
+ids during the verify forward, relative to silica's existing
+`c_verify(k=16)` baseline (1.494× a single target forward at k=4 per
+P-6.0.5 Unit 7)?
+
+**Why it mattered.** The C.4 speedup denominator includes
+`c_capture_hidden(k)` — see §1. If MLX's compute graph fuses the
 intermediate-layer outputs into the same forward pass without a
 second eval, the additive cost is small (<5% of baseline verify);
 if MLX requires materialising the intermediate states with
 `mx.eval(...)` separately, the additive cost is larger and shifts
-the §1 prediction band.
+the §1 prediction band. The 0.8B measurement says the former is what
+MLX does; (αβ.2) and (η) re-measure on MoE / 27B respectively to
+confirm the inference scales. The dense 27B at upstream's actual
+`|target_layer_ids|` (read from `z-lab/Qwen3.5-27B-DFlash`'s
+checkpoint config in sub-unit (β)) is the load-bearing
+re-measurement.
 
-**Why it matters.** The C.4 speedup denominator includes
-`c_capture_hidden(k)` — see §1. The §1 prediction band shifted from
-"1.5-2.2× at α ∈ [0.5, 0.7]" (pre-α framing without this term) to
-"1.4-2.0×" pending (αβ)'s actual measurement. If
-`c_capture_hidden(k=16) ≈ 0`, the band shifts back toward 1.5-2.2×;
-if `c_capture_hidden(k=16)` is comparable to a fraction of the
-verify forward (≥10%), the spike's gate-clear probability shrinks.
-
-This OQ replaces the pre-α "stateful re-drafting hook" question:
+This OQ replaced the pre-α "stateful re-drafting hook" question:
 upstream's drafter is **stateful by design** (per F-1 finding), so
 that question was never coherent.
 
