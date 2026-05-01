@@ -1975,6 +1975,118 @@ Local reference implementations sit at the repo root. **Algorithm / architecture
 
 ## 13. Changelog
 
+- **v1.7.20** (2026-05-01): **D-021 step 6 C.4 DFlash spike closed
+  — gate FAILED at 0.482× silica-integrated speedup on dense
+  27B-4bit; (1b) ≥60 tok/s stretch survival now hinges entirely
+  on the C.5 tree-shape spike (D-021 step 8).** Eight sub-units
+  shipped across the spike: orientation (commit `d7d63e4`),
+  α native-runtime + Python-API verification of `bstnxbt/dflash-mlx`
+  + F-1 architecture finding (`92168c7`), αβ.1 Qwen3.5 dense
+  target-hidden capture path (`dfb4931`), αβ.2 MoE inheritance pin
+  (`e8e470d`), αβ.3 prefill capture seed + cached-prefix regression
+  (`921a190`), β `DFlashDrafter` skeleton + `TargetHiddenConsumer`
+  Protocol (`142c7ed`) + β follow-up
+  (env-name parity / `target_layer_ids` model-instance read)
+  (`8874115`), γ synthetic emitter seam + oracle-replay design
+  (`71f6eec`), ε engine integration + cycle-1 byte-exact parity
+  on cached `Qwen/Qwen3.5-0.8B` (`28d4395`), δ.1 real-mode propose
+  mechanics + target-ops surface (`7dbdd21`) + δ.1 follow-up
+  (env vars / token-content assertion / `__all__`) (`bad055a`),
+  ζ bench wiring (`--speculative dflash` + two `-c4-dflash`
+  scenarios + quad-gating + `SpecConfig.kind` discriminator)
+  (`7f7221e`) + ζ doc cleanup (`1b39e83`), and η.1 dense
+  real-checkpoint attestation against
+  `mlx-community/Qwen3.5-27B-4bit` + `z-lab/Qwen3.5-27B-DFlash`
+  (this commit). All 86 silica modules ruff + mypy clean; 2632
+  passed / 84 skipped under `SILICA_SKIP_MODEL_TESTS=1`; 33
+  drafter-unit tests + 5 engine-wiring tests + 1 cycle-1 parity
+  test + 19 ζ bench-wiring tests + 4 αβ.1 + 5 αβ.2 + 5 αβ.3 cache-gated
+  tests all pass.
+
+  **(η.1) measurement (load-bearing):**
+
+  - Spec-on warm `decode_tok_s = 7.74` vs the v1.7.13 P-6.0
+    `qwen3.5-27b-warm-decode-b1` anchor at 16.05 → **0.482×
+    silica-integrated speedup**, 52% slower than spec-off.
+  - `accept_rate = 0.0881` (8.8%) — dramatically below the §1
+    prediction band's α ∈ [0.5, 0.7] floor.
+  - `draft_cost_ms = 35.70` ≫ `verify_cost_ms = 2.45`. The 2B BF16
+    drafter dominates a 4-bit target's verify forward by 15×.
+  - `tokens_per_target_forward = 2.32`; `rollback_count = 165`
+    (effectively every cycle rolls back).
+  - `peak_memory_mb = 19,043` (target 15.3 GB + drafter ≈ 3.4 GB).
+  - Bench row `status="failed"` due to
+    `warm_decode_row_0_warmup_did_not_stabilize` (rel_std exceeded
+    5%); the rate instability is itself a rollback-variance signal.
+    Numerical fields are still valid — the failure is on the
+    rate-stability invariant, not on count or schema.
+
+  **F-1 architecture finding from α** reshaped the spike: upstream
+  `DFlashDraftModel.__call__` is **target-conditioned** (consumes
+  the target's hidden states at specific layer ids), with a
+  per-layer streaming `ContextOnlyDraftKVCache`. Pre-α framing
+  ("stateless drafter + no-op `commit`") was structurally wrong;
+  the rewrite (`92168c7`) installed the correct state machine
+  (per-`req_id` `target_hidden` of shape `(1, ctx_len, |L| *
+  hidden_size)` aggregated via upstream's
+  `extract_context_feature_from_dict` convention; the
+  `TargetHiddenConsumer` Protocol mixin's
+  `prime` / `update_target_hidden` / `free_target_hidden`
+  side channel routes captured hiddens orthogonal to the I-5
+  `DraftEngine` surface, so C.1 / Noop drafters stay
+  Protocol-conformant unchanged).
+
+  **Gate decision (PLAN.md §13 D-021 step 6 verbatim):** measured
+  0.482× is well below the ≥1.8× engineering-continue floor and
+  the ≥2.5× (1b) survival contribution threshold. **C.4 dense path
+  retires** as a (1a) ≥40 tok/s lever and as a (1b) ≥60 tok/s
+  contributor. Per the v1.7.18 Decision Gate 1 reframe, with C.4
+  retired the (1b) survival path narrows to the **C.5 tree-shape
+  spike alone** (D-021 step 8); if C.5 is not pursued, (1b)
+  retires entirely. (1a) ≥40 tok/s primary stays unchanged
+  (already cleared at v1.7.17 P-6.0.5 baseline at 42.17 tok/s).
+
+  **Three findings explain the 0.48× outcome** (full analysis in
+  `plans/P6_C4_DFLASH/REPORT.md` (η.1) Interpretation):
+
+  1. Drafter cost dominates verify cost by 15×. The 2B BF16
+     drafter is slower per forward than the 4-bit target's
+     verify forward, even at a single position.
+  2. Accept rate collapsed to 8.8%. The
+     `z-lab/Qwen3.5-27B-DFlash` checkpoint trains against the
+     full-precision Qwen3.5-27B target; the 4-bit-quantised
+     target's argmax distribution diverges from what the drafter
+     expects. OQ-7's α-closure ("upstream `DRAFT_REGISTRY` maps
+     the 4-bit MLX target ID, so pairing is supported") was
+     **necessary but not sufficient** — the registry says the
+     pairing loads, not that the accept rate is preserved.
+  3. Rollbacks dominate decode time. With a rollback every cycle
+     plus the 35.7 ms drafter cost, each cycle yields 2.32 tokens
+     for ≈40 ms of work + ≈80 ms of rollback/replay = ≈19 tok/s
+     peak per-cycle, but rollback variability flattens the warm
+     aggregate to 7.74 tok/s.
+
+  **MoE row (η.2) skipped** per the user's pre-agreed "if dense
+  < 1.5× don't run MoE" constraint. Cross-target sensitivity adds
+  no signal here — MoE on a parallel drafter would face the same
+  4-bit-target-vs-BF16-drafter pairing problem.
+
+  **Follow-up open questions** (not in spike scope): would a
+  `--quantize-draft` 4-bit drafter recover accept rate; would
+  porting upstream's `verify_qmm` int4 Metal kernel + tape-replay
+  verify lift the silica-integrated number toward upstream's
+  5.2× claim; what is the actual measured upstream baseline on
+  the same fixture. All three are exploratory follow-ups beyond
+  step 6's silica-integrated decision; see
+  `plans/P6_C4_DFLASH/REPORT.md` (η.1) "Follow-up open questions".
+
+  **Sub-unit commits in order:** `d7d63e4` (orientation) /
+  `92168c7` (α + F-1 revision) / `dfb4931` (αβ.1) / `e8e470d`
+  (αβ.2) / `921a190` (αβ.3) / `142c7ed` (β) / `8874115`
+  (β follow-up) / `71f6eec` (γ) / `28d4395` (ε) / `7dbdd21`
+  (δ.1) / `bad055a` (δ.1 follow-up) / `7f7221e` (ζ) / `1b39e83`
+  (ζ doc cleanup) / **this commit** (η.1).
+
 - **v1.7.19** (2026-04-30): **D-021 step 5 spec foundation
   closed.** First implementation phase since P5.9 hardening;
   every prior P-6 sub-step (P-6.0 measurement, P5.9 hardening,
