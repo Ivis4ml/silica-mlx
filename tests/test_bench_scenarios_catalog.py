@@ -863,3 +863,91 @@ def test_qwen3_5_moe_35b_a3b_warm_ttft_pair_is_dual_gated() -> None:
         )
     }
     assert moe_gates == {"SILICA_REAL_QWEN3_5_MOE"}
+
+
+# ---------- D-021 step 5 sub-unit (h) — spec-on warm-decode rows ---------
+
+
+def test_qwen3_5_27b_warm_decode_spec_on_shape() -> None:
+    scenario = get_scenario("qwen3.5-27b-warm-decode-spec-on")
+    assert scenario.repo == "mlx-community/Qwen3.5-27B-4bit"
+    assert scenario.oracle == OracleKind.WARM_DECODE
+    assert scenario.workload.max_batch_size == 1
+    assert scenario.workload.max_tokens == 384
+    # Target gate matches the b1 cousin so the existing 16 GB target
+    # opt-in is preserved verbatim; drafter gate lives on spec_config.
+    assert scenario.gate_env_var == "SILICA_REAL_QWEN3_5_27B"
+    assert scenario.spec_config is not None
+    assert scenario.spec_config.draft_repo == "Qwen/Qwen3.5-0.8B"
+    assert scenario.spec_config.verify_k == 4
+    assert (
+        scenario.spec_config.draft_gate_env_var
+        == "SILICA_REAL_QWEN3_5_0_8B_DRAFT"
+    )
+
+
+def test_qwen3_5_moe_warm_decode_spec_on_shape() -> None:
+    scenario = get_scenario("qwen3.5-moe-35b-a3b-warm-decode-spec-on")
+    assert scenario.repo == "mlx-community/Qwen3.5-35B-A3B-4bit"
+    assert scenario.oracle == OracleKind.WARM_DECODE
+    assert scenario.workload.max_batch_size == 1
+    assert scenario.workload.max_tokens == 384
+    assert scenario.gate_env_var == "SILICA_REAL_QWEN3_5_MOE"
+    assert scenario.spec_config is not None
+    assert scenario.spec_config.draft_repo == "Qwen/Qwen3.5-0.8B"
+    assert scenario.spec_config.verify_k == 4
+    assert (
+        scenario.spec_config.draft_gate_env_var
+        == "SILICA_REAL_QWEN3_5_0_8B_DRAFT"
+    )
+
+
+def test_spec_on_rows_share_target_gate_with_b1_cousin() -> None:
+    """Lock-in: the spec-on row's target ``gate_env_var`` is identical
+    to its b1 cousin's. Without this invariant, a regression that
+    weakens the spec-on target gate (e.g. swapping in the drafter env
+    var as the only opt-in) would let a user with only the drafter
+    flag set trigger an unintended 16 GB / 20 GB target load."""
+    pairs = [
+        ("qwen3.5-27b-warm-decode-spec-on", "qwen3.5-27b-warm-decode-b1"),
+        (
+            "qwen3.5-moe-35b-a3b-warm-decode-spec-on",
+            "qwen3.5-moe-35b-a3b-warm-decode-b1",
+        ),
+    ]
+    for spec_id, b1_id in pairs:
+        spec_on = get_scenario(spec_id)
+        b1 = get_scenario(b1_id)
+        assert spec_on.gate_env_var == b1.gate_env_var, (
+            f"{spec_id!r} target gate {spec_on.gate_env_var!r} drifted "
+            f"from b1 cousin {b1_id!r} {b1.gate_env_var!r}"
+        )
+
+
+def test_spec_on_rows_share_drafter_with_b1_baselines() -> None:
+    """Both spec-on rows mirror their b1 cousins on workload shape so
+    spec-on vs spec-off comparisons key on a single axis (the spec
+    activation), not on prompt / max_tokens drift."""
+    spec_on_27b = get_scenario("qwen3.5-27b-warm-decode-spec-on")
+    b1_27b = get_scenario("qwen3.5-27b-warm-decode-b1")
+    assert spec_on_27b.workload.prompts == b1_27b.workload.prompts
+    assert spec_on_27b.workload.max_tokens == b1_27b.workload.max_tokens
+    assert spec_on_27b.workload.max_batch_size == b1_27b.workload.max_batch_size
+
+    spec_on_moe = get_scenario("qwen3.5-moe-35b-a3b-warm-decode-spec-on")
+    b1_moe = get_scenario("qwen3.5-moe-35b-a3b-warm-decode-b1")
+    assert spec_on_moe.workload.prompts == b1_moe.workload.prompts
+    assert spec_on_moe.workload.max_tokens == b1_moe.workload.max_tokens
+    assert spec_on_moe.workload.max_batch_size == b1_moe.workload.max_batch_size
+
+
+def test_b1_warm_decode_baselines_carry_no_spec_config() -> None:
+    """The b1 baseline rows must NOT carry ``spec_config`` — the
+    spec-on rows are the dedicated spec entry points; mixing the
+    two would make ``--speculative`` flip behaviour on rows users
+    expect to be plain warm-decode."""
+    for sid in (
+        "qwen3.5-27b-warm-decode-b1",
+        "qwen3.5-moe-35b-a3b-warm-decode-b1",
+    ):
+        assert get_scenario(sid).spec_config is None

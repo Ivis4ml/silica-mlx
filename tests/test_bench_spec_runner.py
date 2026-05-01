@@ -145,9 +145,16 @@ def _create_cache_dir(repo: str) -> Path:
     return cache
 
 
+_FAKE_DRAFT_REPO_FOR_SCENARIO = "test-owner/test-fake-spec-draft-default"
+
+
 def _spec_scenario(*, with_spec_config: bool = True) -> Scenario:
     """SMOKE scenario sized so the runner's smoke oracle accepts the
-    fake engine's pre-programmed token stream."""
+    fake engine's pre-programmed token stream. The default
+    ``spec_config`` uses a fake drafter repo (no real HF download)
+    and carries no drafter env-var gate, so cache-only tests need
+    only create the drafter cache dir to clear the (h)-revision
+    drafter weak gate."""
     return Scenario(
         id="fake-spec-smoke",
         repo=_FAKE_REPO,
@@ -159,7 +166,10 @@ def _spec_scenario(*, with_spec_config: bool = True) -> Scenario:
         ),
         oracle=OracleKind.SMOKE,
         spec_config=(
-            SpecConfig(draft_repo="Qwen/Qwen3.5-0.8B", verify_k=4)
+            SpecConfig(
+                draft_repo=_FAKE_DRAFT_REPO_FOR_SCENARIO,
+                verify_k=4,
+            )
             if with_spec_config
             else None
         ),
@@ -191,6 +201,7 @@ def test_spec_metadata_merged_into_result_when_collector_present(
     fake_home_cache: Path,
 ) -> None:
     _create_cache_dir(_FAKE_REPO)
+    _create_cache_dir(_FAKE_DRAFT_REPO_FOR_SCENARIO)
     adapter = _FakeAdapter()
     engine = _SpecFakeEngine([1, 2, 3, 4], spec_collector=_populated_collector())
     runner = BenchRunner(
@@ -225,6 +236,7 @@ def test_spec_validator_violation_flips_result_to_failed(
     """A collector whose materialise() omits a schema field must surface
     as ``status="failed"`` with the violation tag in ``reason``."""
     _create_cache_dir(_FAKE_REPO)
+    _create_cache_dir(_FAKE_DRAFT_REPO_FOR_SCENARIO)
 
     class _BrokenCollector:
         def materialize(self) -> dict[str, Any]:
@@ -366,3 +378,157 @@ def test_smoke_spec_off_scenario_unchanged_by_h_wiring(
         )
 
 
+
+
+# ---------- D-021 (h) revision — drafter cache + drafter env gates --------
+
+
+_DRAFT_REPO = "test-owner/test-fake-spec-draft"
+_TARGET_GATE = "SILICA_FAKE_SPEC_TARGET"
+_DRAFT_GATE = "SILICA_FAKE_SPEC_DRAFT"
+
+
+def _quad_gated_spec_scenario() -> Scenario:
+    """Mirror the production spec-on scenarios' gate shape: target env
+    via ``Scenario.gate_env_var``, drafter env via
+    ``SpecConfig.draft_gate_env_var``."""
+    return Scenario(
+        id="fake-spec-quad-gated",
+        repo=_FAKE_REPO,
+        workload=Workload(
+            name="fake-spec",
+            prompts=("hello",),
+            max_tokens=4,
+            max_batch_size=1,
+        ),
+        oracle=OracleKind.SMOKE,
+        gate_env_var=_TARGET_GATE,
+        spec_config=SpecConfig(
+            draft_repo=_DRAFT_REPO,
+            verify_k=4,
+            draft_gate_env_var=_DRAFT_GATE,
+        ),
+    )
+
+
+def _adapter_engine_pair() -> tuple[_FakeAdapter, _SpecFakeEngine]:
+    return _FakeAdapter(), _SpecFakeEngine(
+        [1, 2, 3, 4], spec_collector=_populated_collector()
+    )
+
+
+def test_spec_on_skips_when_target_env_var_unset(
+    fake_home_cache: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Target env var unset → scenario skips before any model load,
+    matching the b1 cousin's existing opt-in semantics."""
+    _create_cache_dir(_FAKE_REPO)
+    _create_cache_dir(_DRAFT_REPO)
+    monkeypatch.delenv(_TARGET_GATE, raising=False)
+    monkeypatch.setenv(_DRAFT_GATE, "1")
+    adapter, engine = _adapter_engine_pair()
+    runner = BenchRunner(
+        engine_factory=_factory_returning(adapter, engine),
+        reset_peak=lambda: None,
+        read_peak_mb=lambda: None,
+        speculative_mode="draft_target",
+    )
+    [result] = runner.run([_quad_gated_spec_scenario()])
+    assert result.status == "skipped"
+    assert result.reason == f"env_var_not_set:{_TARGET_GATE}"
+
+
+def test_spec_on_skips_when_draft_env_var_unset(
+    fake_home_cache: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Drafter env var unset → scenario skips even when target gates
+    are clean. Without this the runner would proceed to construct
+    ``DraftTargetEngine.from_repo`` for an unopted-in checkpoint."""
+    _create_cache_dir(_FAKE_REPO)
+    _create_cache_dir(_DRAFT_REPO)
+    monkeypatch.setenv(_TARGET_GATE, "1")
+    monkeypatch.delenv(_DRAFT_GATE, raising=False)
+    adapter, engine = _adapter_engine_pair()
+    runner = BenchRunner(
+        engine_factory=_factory_returning(adapter, engine),
+        reset_peak=lambda: None,
+        read_peak_mb=lambda: None,
+        speculative_mode="draft_target",
+    )
+    [result] = runner.run([_quad_gated_spec_scenario()])
+    assert result.status == "skipped"
+    assert result.reason == f"draft_env_var_not_set:{_DRAFT_GATE}"
+
+
+def test_spec_on_skips_when_draft_cache_missing(
+    fake_home_cache: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Drafter HF cache absent → scenario skips. Without this the
+    runner would attempt to download the drafter mid-run, surfacing
+    as a network error rather than a clean skip."""
+    _create_cache_dir(_FAKE_REPO)
+    # Deliberately do NOT create the drafter cache.
+    monkeypatch.setenv(_TARGET_GATE, "1")
+    monkeypatch.setenv(_DRAFT_GATE, "1")
+    adapter, engine = _adapter_engine_pair()
+    runner = BenchRunner(
+        engine_factory=_factory_returning(adapter, engine),
+        reset_peak=lambda: None,
+        read_peak_mb=lambda: None,
+        speculative_mode="draft_target",
+    )
+    [result] = runner.run([_quad_gated_spec_scenario()])
+    assert result.status == "skipped"
+    assert result.reason is not None
+    assert result.reason.startswith("draft_cache_missing:")
+
+
+def test_spec_off_mode_skips_only_target_gates_for_spec_scenario(
+    fake_home_cache: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Under ``speculative_mode="none"``, drafter checks are skipped:
+    the row runs as plain warm-decode against the target only. Drafter
+    env / cache absence does not surface as a skip."""
+    _create_cache_dir(_FAKE_REPO)
+    # Drafter cache absent + env var unset, but mode is "none".
+    monkeypatch.setenv(_TARGET_GATE, "1")
+    monkeypatch.delenv(_DRAFT_GATE, raising=False)
+    adapter, engine = _adapter_engine_pair()
+    # Engine carries no collector under spec-off so no spec metadata merges.
+    engine_no_spec = _SpecFakeEngine([1, 2, 3, 4], spec_collector=None)
+    runner = BenchRunner(
+        engine_factory=_factory_returning(adapter, engine_no_spec),
+        reset_peak=lambda: None,
+        read_peak_mb=lambda: None,
+        speculative_mode="none",
+    )
+    [result] = runner.run([_quad_gated_spec_scenario()])
+    # Target gates clear, drafter checks skipped → row runs as plain
+    # warm-decode against the target.
+    assert result.status == "ok", result.reason
+
+
+def test_spec_on_runs_when_all_four_gates_pass(
+    fake_home_cache: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Positive control: target cache + target env + drafter cache +
+    drafter env all clean, scenario runs to completion."""
+    _create_cache_dir(_FAKE_REPO)
+    _create_cache_dir(_DRAFT_REPO)
+    monkeypatch.setenv(_TARGET_GATE, "1")
+    monkeypatch.setenv(_DRAFT_GATE, "1")
+    adapter, engine = _adapter_engine_pair()
+    runner = BenchRunner(
+        engine_factory=_factory_returning(adapter, engine),
+        reset_peak=lambda: None,
+        read_peak_mb=lambda: None,
+        speculative_mode="draft_target",
+    )
+    [result] = runner.run([_quad_gated_spec_scenario()])
+    assert result.status == "ok", result.reason
+    assert "accept_rate" in result.metadata

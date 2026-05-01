@@ -443,10 +443,22 @@ class SpecConfig:
     Validates ``verify_k >= 1`` and ``draft_repo != ""`` at
     construction so a misconfiguration cannot silently disable spec
     or land at a degenerate forward shape.
+
+    ``draft_gate_env_var`` is the second-tier gate the bench runner
+    checks (in addition to ``Scenario.gate_env_var``) when
+    ``speculative_mode == "draft_target"``. Without it, a user with
+    only the drafter checkpoint cached could trigger an unintended
+    target-checkpoint load (the b1 cousin's existing
+    ``SILICA_REAL_QWEN3_5_27B`` opt-in would be bypassed by the
+    spec-on row's gate). The runner also weak-gates on the drafter
+    HF cache directory existing, mirroring ``Scenario.repo`` cache
+    semantics. ``None`` means "no extra env-var gate" — only the
+    drafter cache weak gate applies.
     """
 
     draft_repo: str
     verify_k: int = 4
+    draft_gate_env_var: str | None = None
 
     def __post_init__(self) -> None:
         if not self.draft_repo:

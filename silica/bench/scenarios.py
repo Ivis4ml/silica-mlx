@@ -136,6 +136,7 @@ from pathlib import Path
 from silica.bench.scenario import (
     OracleKind,
     Scenario,
+    SpecConfig,
     VqbenchXcheckSpec,
     Workload,
 )
@@ -2454,6 +2455,104 @@ _QWEN3_5_MOE_WARM_TTFT_PAIR = Scenario(
 )
 
 
+# --- D-021 step 5 sub-unit (h) — spec-on warm-decode scenarios -----------
+#
+# These mirror ``qwen3.5-27b-warm-decode-b1`` and
+# ``qwen3.5-moe-35b-a3b-warm-decode-b1`` exactly (same workload shape,
+# same target checkpoint), with two additions:
+#
+#   1. ``spec_config = SpecConfig(draft_repo="Qwen/Qwen3.5-0.8B",
+#      verify_k=4)`` — opts the scenario into the bench runner's
+#      ``--speculative draft_target`` path (slice 1 wiring). The draft
+#      repo and verify_k match (f) parity setup; the drafter is the
+#      hybrid 0.8B family member that exercises the (e) recurrent
+#      rollback path on real weights when a partial reject fires.
+#
+#   2. Dual-gate widening — both rows now require the existing target
+#      env var (``SILICA_REAL_QWEN3_5_27B`` / ``SILICA_REAL_QWEN3_5_MOE``)
+#      AND a new ``SILICA_REAL_QWEN3_5_0_8B_DRAFT`` flag for the drafter
+#      checkpoint. Without the drafter env var the scenario skips even
+#      if the target weights are present, because the drafter is a
+#      separate ~1.5 GB checkpoint that must be opted into independently.
+#
+# Both rows are B=1 — the multi-request batched-spec path is deferred
+# to (c) slice 3, which lifts the GLOBAL-only gate on the
+# ``ContinuousBatcher`` spec branch.
+# The spec-on rows are quad-gated: target HF cache, target env var
+# (matching the b1 cousin's gate so the existing target opt-in is
+# preserved verbatim), drafter HF cache, drafter env var. The runner's
+# ``_check_gates`` reads ``Scenario.gate_env_var`` for the target
+# strong gate and ``spec_config.draft_gate_env_var`` for the drafter
+# strong gate; both cache checks come from the runner's existing
+# weak-gate machinery (target via ``Scenario.repo``, drafter via
+# ``spec_config.draft_repo``). Drafter checks only fire when the
+# runner is constructed with ``speculative_mode="draft_target"`` —
+# under the default ``"none"`` these rows behave like plain
+# warm-decode rows on the target alone.
+
+_QWEN3_5_27B_WARM_DECODE_SPEC_ON = Scenario(
+    id="qwen3.5-27b-warm-decode-spec-on",
+    repo="mlx-community/Qwen3.5-27B-4bit",
+    workload=_warm_decode_workload(max_batch_size=1, max_tokens=384),
+    oracle=OracleKind.WARM_DECODE,
+    gate_env_var="SILICA_REAL_QWEN3_5_27B",
+    spec_config=SpecConfig(
+        draft_repo="Qwen/Qwen3.5-0.8B",
+        verify_k=4,
+        draft_gate_env_var="SILICA_REAL_QWEN3_5_0_8B_DRAFT",
+    ),
+    description=(
+        "**D-021 step 5 sub-unit (h) — dense 27B spec-on warm-decode.** "
+        "Mirrors ``qwen3.5-27b-warm-decode-b1`` (B=1, 128-token prompt, "
+        "384-token generation, max_tokens=384) but routes through the "
+        "speculative engine when invoked under "
+        "``--speculative draft_target``. Drafter is "
+        "``Qwen/Qwen3.5-0.8B`` (hybrid DeltaNet + GLOBAL); ``verify_k=4`` "
+        "(γ=3) matches the (f) parity setup and the Unit-7 microbench "
+        "regime sweet spot. Bench metadata picks up the seven "
+        "``silica.bench.spec_metrics`` fields (acceptance rate, "
+        "verify / draft cost ms, tokens-per-target-forward, rollback "
+        "count, parity status). Quad-gated under "
+        "``--speculative draft_target``: (1) target HF cache hit, "
+        "(2) ``SILICA_REAL_QWEN3_5_27B`` for the 16 GB target weights, "
+        "(3) drafter HF cache hit on ``Qwen/Qwen3.5-0.8B``, (4) "
+        "``SILICA_REAL_QWEN3_5_0_8B_DRAFT`` for the drafter checkpoint. "
+        "Under default ``--speculative none`` the row runs as plain "
+        "warm-decode against the target only (drafter checks skipped) — "
+        "same numbers as the b1 baseline."
+    ),
+)
+
+
+_QWEN3_5_MOE_WARM_DECODE_SPEC_ON = Scenario(
+    id="qwen3.5-moe-35b-a3b-warm-decode-spec-on",
+    repo="mlx-community/Qwen3.5-35B-A3B-4bit",
+    workload=_warm_decode_workload(max_batch_size=1, max_tokens=384),
+    oracle=OracleKind.WARM_DECODE,
+    gate_env_var="SILICA_REAL_QWEN3_5_MOE",
+    spec_config=SpecConfig(
+        draft_repo="Qwen/Qwen3.5-0.8B",
+        verify_k=4,
+        draft_gate_env_var="SILICA_REAL_QWEN3_5_0_8B_DRAFT",
+    ),
+    description=(
+        "**D-021 step 5 sub-unit (h) — MoE 35B-A3B spec-on warm-decode.** "
+        "MoE counterpart to ``qwen3.5-27b-warm-decode-spec-on``; "
+        "mirrors ``qwen3.5-moe-35b-a3b-warm-decode-b1`` shape (B=1, "
+        "384-token generation) with the same drafter "
+        "(``Qwen/Qwen3.5-0.8B``, ``verify_k=4``). The same drafter "
+        "across dense and MoE rows isolates the target-side bandwidth "
+        "delta from drafter cost — both scenarios share an identical "
+        "drafter forward path so any spec-throughput gap reads as a "
+        "target architecture signal. Quad-gated under "
+        "``--speculative draft_target``: (1) target HF cache hit, "
+        "(2) ``SILICA_REAL_QWEN3_5_MOE`` for the MoE target weights, "
+        "(3) drafter HF cache hit on ``Qwen/Qwen3.5-0.8B``, (4) "
+        "``SILICA_REAL_QWEN3_5_0_8B_DRAFT`` for the drafter checkpoint."
+    ),
+)
+
+
 BUILTIN_SCENARIOS: dict[str, Scenario] = {
     _QWEN3_0_6B_SMOKE.id: _QWEN3_0_6B_SMOKE,
     _QWEN3_0_6B_B1_PARITY.id: _QWEN3_0_6B_B1_PARITY,
@@ -2538,6 +2637,11 @@ BUILTIN_SCENARIOS: dict[str, Scenario] = {
     _QWEN3_5_MOE_WARM_DECODE_B1_4K.id: _QWEN3_5_MOE_WARM_DECODE_B1_4K,
     _QWEN3_5_27B_WARM_TTFT_PAIR.id: _QWEN3_5_27B_WARM_TTFT_PAIR,
     _QWEN3_5_MOE_WARM_TTFT_PAIR.id: _QWEN3_5_MOE_WARM_TTFT_PAIR,
+    # D-021 step 5 sub-unit (h) — spec-on warm-decode (real models,
+    # quad-gated; --speculative draft_target activates the spec
+    # path, otherwise these run as plain warm-decode).
+    _QWEN3_5_27B_WARM_DECODE_SPEC_ON.id: _QWEN3_5_27B_WARM_DECODE_SPEC_ON,
+    _QWEN3_5_MOE_WARM_DECODE_SPEC_ON.id: _QWEN3_5_MOE_WARM_DECODE_SPEC_ON,
 }
 
 

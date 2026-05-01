@@ -842,3 +842,59 @@ def test_cli_report_md_detail_order_is_scenario_major(
         "### `qwen3-0.6b-long-in-short-out` (seed=42)",
         "### `qwen3-0.6b-long-in-short-out` (seed=43)",
     ]
+
+
+# ---------- D-021 step 5 sub-unit (h) — --speculative flag ----------------
+
+
+class TestSpeculativeFlag:
+    """``--speculative {none,draft_target}`` activates the bench
+    runner's spec path. Default ``none`` is byte-identical to pre-(h)
+    runs; ``draft_target`` wires ``DraftTargetEngine`` +
+    ``SpecMetricCollector`` for scenarios with ``spec_config``."""
+
+    def test_default_argparse_value_is_none(self) -> None:
+        bench = _load_bench_cli_module()
+        ns = bench.build_parser().parse_args([])
+        assert ns.speculative == "none"
+
+    def test_explicit_draft_target_accepted(self) -> None:
+        bench = _load_bench_cli_module()
+        ns = bench.build_parser().parse_args(["--speculative", "draft_target"])
+        assert ns.speculative == "draft_target"
+
+    def test_unknown_value_rejected(self) -> None:
+        bench = _load_bench_cli_module()
+        with pytest.raises(SystemExit):
+            bench.build_parser().parse_args(["--speculative", "auto"])
+
+    def test_cli_help_mentions_draft_target_choice(self) -> None:
+        result = _run_cli("--help")
+        assert result.returncode == 0
+        assert "--speculative" in result.stdout
+        assert "draft_target" in result.stdout
+
+
+# ---------- D-021 step 5 sub-unit (h) — spec-on scenarios in --list ------
+
+
+def test_cli_list_surfaces_spec_on_warm_decode_rows() -> None:
+    """Both ``qwen3.5-27b-warm-decode-spec-on`` and
+    ``qwen3.5-moe-35b-a3b-warm-decode-spec-on`` must appear in
+    ``--list`` output so ``silica-bench --speculative draft_target
+    --scenario qwen3.5-27b-warm-decode-spec-on`` is a discoverable
+    invocation. Mirrors ``test_cli_list_does_not_require_pythonpath``
+    but for the new ids."""
+    result = _run_cli("--list")
+    assert result.returncode == 0, (
+        f"--list exited {result.returncode}: stderr={result.stderr!r}"
+    )
+    lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
+    expected_ids = [
+        "qwen3.5-27b-warm-decode-spec-on",
+        "qwen3.5-moe-35b-a3b-warm-decode-spec-on",
+    ]
+    for sid in expected_ids:
+        assert any(ln.startswith(f"{sid}\t") for ln in lines), (
+            f"expected {sid!r} in --list output, got: {result.stdout!r}"
+        )

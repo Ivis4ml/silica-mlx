@@ -182,6 +182,24 @@ def build_parser() -> argparse.ArgumentParser:
             "here. Only meaningful with --vqbench-xcheck"
         ),
     )
+    p.add_argument(
+        "--speculative",
+        choices=["none", "draft_target"],
+        default="none",
+        help=(
+            "speculative-decoding mode (D-021 step 5 sub-unit (h)). "
+            "Default ``none`` runs every scenario spec-off and is "
+            "byte-identical to pre-(h) bench rows. ``draft_target`` "
+            "activates spec for any scenario whose ``spec_config`` is "
+            "set (e.g. ``qwen3.5-27b-warm-decode-spec-on``); the "
+            "runner wires a ``DraftTargetEngine`` loaded from the "
+            "scenario's ``draft_repo`` plus a ``SpecMetricCollector`` "
+            "into the engine, and after generation merges the seven "
+            "speculative-metric fields into ``ScenarioResult.metadata``. "
+            "Scenarios without ``spec_config`` always run spec-off "
+            "regardless of this flag"
+        ),
+    )
     return p
 
 
@@ -432,6 +450,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         vqbench_xcheck_enabled=args.vqbench_xcheck,
         vqbench_python=args.vqbench_python,
         vqbench_epsilon=args.vqbench_epsilon,
+        speculative_mode=args.speculative,
     )
     results = runner.run(scenarios)
     _print_table(results)

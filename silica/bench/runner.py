@@ -249,7 +249,9 @@ def _mlx_peak_memory_mb() -> float | None:
         return None
 
 
-def _check_gates(scenario: Scenario) -> str | None:
+def _check_gates(
+    scenario: Scenario, *, speculative_mode: str = "none"
+) -> str | None:
     """Return skip reason or ``None`` if the scenario is runnable.
 
     Two gates, matching the existing dual-gate pattern:
@@ -267,6 +269,17 @@ def _check_gates(scenario: Scenario) -> str | None:
     tokenizer input; the cost asymmetry between "HF cache hit +
     wikitext missing" and "HF cache hit + wikitext present" is
     large enough to warrant a gate check, not a runtime raise.
+
+    D-021 step 5 sub-unit (h): when the runner is going to actually
+    activate spec for this scenario (``speculative_mode == "draft_target"``
+    AND ``scenario.spec_config is not None``), the drafter checkpoint's
+    cache and ``spec_config.draft_gate_env_var`` (if set) are checked
+    on top of the target's existing gates. This keeps the spec-on
+    rows quad-gated (target cache, target env, drafter cache,
+    drafter env) without
+    bypassing the target's existing opt-in. Under
+    ``speculative_mode == "none"`` the drafter checks are skipped —
+    the scenario runs as plain warm-decode.
     """
     cache = hf_cache_path_for_repo(scenario.repo)
     if not cache.exists():
@@ -281,6 +294,16 @@ def _check_gates(scenario: Scenario) -> str | None:
         wp = Path(str(wikitext_path))
         if not wp.is_file():
             return f"wikitext_cache_missing:{wp}"
+    if (
+        speculative_mode == "draft_target"
+        and scenario.spec_config is not None
+    ):
+        draft_cache = hf_cache_path_for_repo(scenario.spec_config.draft_repo)
+        if not draft_cache.exists():
+            return f"draft_cache_missing:{draft_cache}"
+        draft_env = scenario.spec_config.draft_gate_env_var
+        if draft_env is not None and os.environ.get(draft_env) != "1":
+            return f"draft_env_var_not_set:{draft_env}"
     return None
 
 
@@ -768,7 +791,9 @@ class BenchRunner:
         # Gate check first: skipped rows never touch the engine, so
         # cache-missing scenarios do not accidentally block on a
         # download prompt or a model-factory KeyError.
-        skip_reason = _check_gates(scenario)
+        skip_reason = _check_gates(
+            scenario, speculative_mode=self._speculative_mode
+        )
         if skip_reason is not None:
             return ScenarioResult(
                 scenario_id=scenario.id,
