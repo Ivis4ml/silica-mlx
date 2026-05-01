@@ -168,6 +168,34 @@ read in-editor while iterating.
   `qwen3_5_moe.py` (analogous to P-5-F (3b)). Upstream tape-replay
   verify, `verify_qmm` int4 Metal kernel, and target speculative
   hooks remain explicit non-goals (deferred full-DFlash port).
+  **Closed at v1.7.20 with gate FAILED** — η.1 measured 0.482×
+  silica-integrated speedup (vs ≥1.8× floor) due to drafter cost
+  domination (35.7 ms drafter vs 2.45 ms verify) + accept-rate
+  collapse (0.088 vs predicted 0.5-0.7) on the 4-bit target. C.4
+  dense path retires; (1b) ≥60 tok/s now hinges on C.5 alone (D-021
+  step 8, **not auto-queued**).
+- [`P6_C4_DFLASH/REPORT.md`](../plans/P6_C4_DFLASH/REPORT.md) — the
+  spike's measurement bundle; (αβ.1) / (αβ.2) `c_capture_hidden(k=16)`
+  microbenches at noise level; (η.1) dense 27B real-checkpoint
+  attestation with the gate-FAILED call + three findings + follow-up
+  open questions (quantize-draft, full-DFlash kernel port, upstream
+  baseline).
+
+### D-021 step 7 — Track B 3-bit weights (orientation)
+
+- [`P6_TRACK_B_3BIT_OPENING.md`](../plans/P6_TRACK_B_3BIT_OPENING.md) —
+  opening for Track B 3-bit weight option. PLAN.md §13 step 7 gate
+  quoted verbatim (loader + PPL oracle first, then 27B 3-bit
+  warm-decode; pass quality gate; if 3-bit lifts dense from 16 → 21-24
+  tok/s, stack with spec; if quality or MLX path is unstable, ship
+  opt-in). Three sub-units B.1 / B.2 / B.3 (loader smoke + bench
+  registration; WikiText-2 PPL cross-check; 27B 3-bit warm-decode
+  attestation). Two acceptance gates: ΔPPL ≤ 0.5 absolute OR ≤ 5%
+  relative (quality); ≥21 tok/s = 1.31× over 16.05 anchor
+  (performance). Mainline lever after C.4 retirement; multiplies with
+  any future spec lever. mlx-lm already supports 3-bit kernels — no
+  silica/* runtime kernel work expected; the heavy lifting is
+  upstream's.
 
 ## Side track: chat CLI redesign
 
