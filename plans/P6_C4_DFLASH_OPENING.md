@@ -352,20 +352,28 @@ per the project's incremental-execution rule.
    2026-05-01** — closes OQ-1, OQ-2, OQ-3, OQ-7 favourably; surfaces
    F-1 architecture finding that triggered this opening revision.
 2. **(αβ) Target-hidden capture path on silica's target adapters.**
-   Extend `Qwen3_5Adapter` and `qwen3_5_moe.py` with a capture-enabled
-   variant of `decode_step_multi(k)` that returns both verify logits
-   and selected-layer hidden states. Pattern follows the P-5-F (3b)
-   projection-output capture surface (capture proxy installed at
-   load time, layer ids configurable). Microbench
-   `c_capture_hidden(k=16)` — the additive cost vs the existing
-   verify forward — and record into `plans/P6_C4_DFLASH/REPORT.md`
-   as a precondition row. Tests: capture-disabled path is byte-exact
-   with the v1.7.19 `decode_step_multi(k)` baseline; capture-enabled
-   path returns hidden-state slices at the requested layer ids whose
-   shapes match `(1, k, hidden_dim)`. Other adapters
-   (`qwen3.py`, `gemma4.py`, `gemma4_moe.py`) gain a
-   `NotImplementedError` stub on the capture path; out-of-scope
-   adapters surface a clear error rather than silent fallback.
+   Three slices:
+   - **(αβ.1)** Dense `Qwen3_5Adapter`: `decode_step_multi_with_capture`
+     sibling method routing through a custom forward helper that
+     captures requested layer-output slices into a dict; +
+     `c_capture_hidden(k=16)` microbench. **Closed.**
+   - **(αβ.2)** MoE `Qwen3_5MoeAdapter`: inheritance pin (the dense
+     helper lifts unchanged via `Qwen3_5MoeAdapter(Qwen3_5Adapter)`
+     because mlx-lm's `qwen3_5_moe.Model` extends `qwen3_5.Model`
+     directly); cached-MoE microbench row. **Closed.**
+   - **(αβ.3)** Prefill capture seed + cached-prefix regression:
+     adapter-side `prefill_with_capture` returning last-position logits
+     + `(1, prompt_len, hidden_dim)` hidden slices so the (β) wrapper
+     can seed cycle-1 `target_hidden`; tests pinning capture-enabled
+     verify after a real `prefill` call (non-empty cache state, real
+     mask offsets); doc cleanup of the αβ.1 / αβ.2 measurement residue.
+     **Closed.**
+   Other adapters (`qwen3.py`, `gemma4.py`, `gemma4_moe.py`) do **not**
+   need the capture path — no upstream DFlash drafter targets them in
+   `dflash_mlx.generate.DRAFT_REGISTRY`. The
+   `isinstance(adapter, HiddenCaptureAdapter)` check at the (β)
+   wrapper-construction site is the gate that prevents
+   silently-wrong fallback.
 3. **(β) `silica.speculative.dflash_drafter` skeleton.** A
    `DFlashDrafter` class implementing `DraftEngine` whose `__init__`
    takes a drafter checkpoint identifier, a target adapter handle
@@ -695,15 +703,21 @@ for it because the verify-side optimisations (tape-replay verify +
 separate full-DFlash-port proposal beyond step 6. The spike is the
 experiment that turns this prediction band into a number.
 
-### 5.5 OQ-5 — `c_capture_hidden(k)` cost on silica's stock-MLX verify (closed favourably at αβ.1)
+### 5.5 OQ-5 — `c_capture_hidden(k)` cost on silica's stock-MLX verify (closed favourably at αβ.1 / αβ.2)
 
-**Closed at sub-unit (αβ.1) on Qwen3.5-0.8B, 2026-05-01.**
-`c_capture_hidden(k=16)` measured at **-0.41%** (within jitter)
-relative to the `decode_step_multi(k=16)` baseline; capture is
-effectively free on the 0.8B fixture for `|capture_layer_ids| = 3`.
-Full microbench in `plans/P6_C4_DFLASH/REPORT.md`. The §1 prediction
-band reverts to "1.5-2.2× at α ∈ [0.5, 0.7]" pending the dense 27B
-real-target row at (η).
+**Closed across (αβ.1) and (αβ.2) on 2026-05-01.** Refined dense
+Qwen3.5-0.8B: `c_capture_hidden(k=16)` = **+0.92%** (12.78 ms
+baseline → 12.90 ms capture; reused-adapter methodology, the
+canonical row in `plans/P6_C4_DFLASH/REPORT.md`). MoE
+Qwen3.5-35B-A3B-4bit: `c_capture_hidden(k=16)` = **-3.56%** (45.26
+ms → 43.64 ms; negative delta within per-iter jitter on a 20 GB
+sparse-MoE checkpoint). Both deltas are in measurement-noise range
+at `|capture_layer_ids| = 3`; capture is effectively free on both
+fixtures. The §1 prediction band reverts to "1.5-2.2× at α ∈
+[0.5, 0.7]" pending the dense 27B real-target row at (η). An earlier
+"-0.41%" figure on the 0.8B fixture was load-dominated under the
+per-iter-load methodology and is preserved in the REPORT as a
+methodology-audit row.
 
 **Question (preserved as historical context).** What is the additive
 cost of capturing target hidden states at the drafter-consumed layer

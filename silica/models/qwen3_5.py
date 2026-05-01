@@ -247,6 +247,38 @@ class Qwen3_5Adapter:
             ),
         )
 
+    def prefill_with_capture(
+        self,
+        tokens: mx.array,
+        kv_handle: KVHandle,
+        capture_layer_ids: frozenset[int],
+    ) -> tuple[mx.array, dict[int, mx.array], StateDelta]:
+        # D-021 step 6 (αβ.3) — prefill seed for target-conditioned
+        # drafters. Cycle 1's ``target_hidden`` does not exist until
+        # the prompt has been forwarded through the target; this method
+        # produces it as the captured-hiddens dict from a prefill
+        # forward. The returned logits are last-position only to match
+        # ``prefill``'s existing contract (the engine samples the bonus
+        # token from those for cycle 1; the full-position logits are
+        # not needed because greedy_verify operates on the verify
+        # forward only, not on prefill).
+        cache_list = self._kv_manager.cache_list(kv_handle.req_id)
+        logits_full, captured = run_qwen3_5_forward_with_capture(
+            self._model,
+            tokens,
+            cache_list,
+            capture_layer_ids,
+        )
+        # Match ``prefill``'s ``forward(...)`` -> (V,) contract.
+        logits_last: mx.array = logits_full[-1]
+        return (
+            logits_last,
+            captured,
+            StateDelta(
+                _recurrent_bytes=self._recurrent_state_bytes(cache_list)
+            ),
+        )
+
     # --- P-5-F F.1: PreNormCaptureAdapter implementation ---
 
     def install_pre_norm_capture(

@@ -196,3 +196,126 @@ def test_capture_invalid_layer_id_is_silently_dropped() -> None:
     )
 
     assert set(captured.keys()) == {0}
+
+
+# --- (αβ.3) prefill capture seed + cached-prefix regression -----------------
+
+
+@pytest.mark.skipif(_QWEN3_5_SKIP, reason=_QWEN3_5_SKIP_REASON)
+def test_prefill_with_capture_empty_matches_prefill_last_pos_logits() -> None:
+    """``prefill_with_capture(tokens, kv, frozenset())`` produces the
+    same last-position logits as ``prefill(tokens, kv)`` and an empty
+    captured dict. This is the cycle-1 seed precondition: the engine
+    must be able to call ``prefill_with_capture`` instead of
+    ``prefill`` without changing the next-token argmax."""
+    adapter_a, kv_a = Qwen3_5Adapter.from_hf_repo(REPO)
+    adapter_b, kv_b = Qwen3_5Adapter.from_hf_repo(REPO)
+
+    req_id = "prefill-capture-empty-test"
+    handle_a = KVHandle(req_id=req_id)
+    handle_b = KVHandle(req_id=req_id)
+    kv_a.reserve_for_prefill(req_id, [])  # type: ignore[arg-type]
+    kv_b.reserve_for_prefill(req_id, [])  # type: ignore[arg-type]
+
+    prompt_tokens = mx.array([101, 202, 303, 404, 505], dtype=mx.int32)
+
+    logits_a, _ = adapter_a.prefill(prompt_tokens, handle_a)
+    logits_b, captured, _ = adapter_b.prefill_with_capture(
+        prompt_tokens, handle_b, frozenset()
+    )
+
+    assert captured == {}
+    # ``prefill`` returns ``(V,)`` last-position; both must agree.
+    assert logits_a.shape == logits_b.shape
+    a_top1 = int(mx.argmax(logits_a).item())
+    b_top1 = int(mx.argmax(logits_b).item())
+    assert a_top1 == b_top1, (
+        f"prefill argmax mismatch: a={a_top1}, b={b_top1}"
+    )
+    diff = float(mx.max(mx.abs(logits_a - logits_b)).item())
+    bound = 1e-4 * float(mx.max(mx.abs(logits_a)).item()) + 1e-3
+    assert diff <= bound, f"|a - b|_max={diff:.4e} exceeds bound={bound:.4e}"
+
+
+@pytest.mark.skipif(_QWEN3_5_SKIP, reason=_QWEN3_5_SKIP_REASON)
+def test_prefill_with_capture_returns_full_prompt_hiddens() -> None:
+    """Non-empty capture during prefill returns hidden-state slices of
+    shape ``(1, prompt_len, hidden_dim)`` — one captured frame per
+    prompt position. This is the cycle-1 ``target_hidden`` source the
+    (β) ``DFlashDrafter.prime(req_id, target_hidden)`` will consume."""
+    adapter, kv = Qwen3_5Adapter.from_hf_repo(REPO)
+
+    req_id = "prefill-capture-shape-test"
+    handle = KVHandle(req_id=req_id)
+    kv.reserve_for_prefill(req_id, [])  # type: ignore[arg-type]
+
+    prompt_tokens = mx.array([101, 202, 303, 404, 505], dtype=mx.int32)
+    prompt_len = int(prompt_tokens.size)
+
+    num_layers = adapter.config.num_layers
+    requested = frozenset({0, num_layers // 2, num_layers})
+
+    logits, captured, _ = adapter.prefill_with_capture(
+        prompt_tokens, handle, requested
+    )
+
+    assert logits.shape == (adapter.config.vocab_size,) or (
+        # mlx-lm padded vocab; assert the model actually produced a
+        # 1-D logit row whose length matches the loop path.
+        len(logits.shape) == 1 and logits.shape[0] >= adapter.config.vocab_size
+    )
+    assert set(captured.keys()) == set(requested)
+    hidden_dim = adapter.config.hidden_size
+    for layer_id in sorted(requested):
+        h = captured[layer_id]
+        assert h.shape == (1, prompt_len, hidden_dim), (
+            f"layer {layer_id}: shape {h.shape} != "
+            f"(1, {prompt_len}, {hidden_dim})"
+        )
+
+
+@pytest.mark.skipif(_QWEN3_5_SKIP, reason=_QWEN3_5_SKIP_REASON)
+def test_capture_after_prefill_matches_decode_step_multi_after_prefill() -> None:
+    """The production spec-on cycle runs ``decode_step_multi`` *after*
+    a prompt prefill, so the per-layer cache holds prompt KV and
+    ``create_attention_mask`` / ``create_ssm_mask`` are computed
+    against a non-empty offset. Pin that the capture path produces
+    bit-equivalent logits in this regime, not just the empty-cache
+    regime that ``test_capture_disabled_matches_decode_step_multi``
+    pins. (αβ.3) regression."""
+    adapter_a, kv_a = Qwen3_5Adapter.from_hf_repo(REPO)
+    adapter_b, kv_b = Qwen3_5Adapter.from_hf_repo(REPO)
+
+    req_id = "capture-after-prefill-test"
+    handle_a = KVHandle(req_id=req_id)
+    handle_b = KVHandle(req_id=req_id)
+    kv_a.reserve_for_prefill(req_id, [])  # type: ignore[arg-type]
+    kv_b.reserve_for_prefill(req_id, [])  # type: ignore[arg-type]
+
+    # Prefill the same prompt on both adapters so the per-layer cache
+    # holds identical prompt KV state on each side.
+    prompt_tokens = mx.array([101, 202, 303, 404, 505], dtype=mx.int32)
+    adapter_a.prefill(prompt_tokens, handle_a)
+    adapter_b.prefill(prompt_tokens, handle_b)
+
+    # Now run a verify window with non-empty cache.
+    verify_tokens = mx.array(TOKEN_IDS, dtype=mx.int32)
+    logits_baseline, _ = adapter_a.decode_step_multi(verify_tokens, handle_a)
+
+    num_layers = adapter_b.config.num_layers
+    requested = frozenset({0, num_layers // 2, num_layers})
+    logits_capture, captured, _ = adapter_b.decode_step_multi_with_capture(
+        verify_tokens, handle_b, requested
+    )
+
+    assert logits_capture.shape == logits_baseline.shape
+    _greedy_argmax_equal(logits_capture, logits_baseline)
+    _per_element_close(logits_capture, logits_baseline)
+
+    # Hidden-shape contract holds with the prefilled cache state.
+    hidden_dim = adapter_b.config.hidden_size
+    for layer_id in sorted(requested):
+        h = captured[layer_id]
+        assert h.shape == (1, T, hidden_dim), (
+            f"layer {layer_id}: shape {h.shape} != (1, {T}, {hidden_dim})"
+        )

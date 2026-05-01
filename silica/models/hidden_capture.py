@@ -193,6 +193,32 @@ class HiddenCaptureAdapter(Protocol):
         """
         ...
 
+    def prefill_with_capture(
+        self,
+        tokens: mx.array,
+        kv_handle: KVHandle,
+        capture_layer_ids: frozenset[int],
+    ) -> tuple[mx.array, dict[int, mx.array], StateDelta]:
+        """Run a single-request prefill forward and capture hidden states.
+
+        Required by target-conditioned drafters (DFlash, future C.3
+        MTP head, C.6 self-spec) to seed the cycle-1 ``target_hidden``
+        before any verify forward runs. The (β) ``DFlashDrafter``
+        wrapper consumes the captured slices via a ``prime(req_id,
+        target_hidden)`` side-channel before its first ``propose``
+        call.
+
+        Returns ``(last_pos_logits, captured, state_delta)`` where
+        ``last_pos_logits`` has shape ``(V,)`` matching ``prefill``'s
+        existing contract (the engine samples the bonus token from
+        this), ``captured`` is the layer-id-to-hidden-state dict with
+        each value at shape ``(1, prompt_len, hidden_dim)``, and
+        ``state_delta`` is the recurrent-bytes accounting payload.
+        Empty ``capture_layer_ids`` returns ``{}`` and reproduces
+        ``prefill``'s last-position logits within MLX dispatch noise.
+        """
+        ...
+
 
 __all__ = [
     "HiddenCaptureAdapter",

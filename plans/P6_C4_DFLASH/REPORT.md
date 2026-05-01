@@ -21,24 +21,32 @@ fixture. The measurement constrains the §1 prediction band's new
 ### Setup
 
 - Fixture: cached `Qwen/Qwen3.5-0.8B` (HF cache hit; same path the
-  step 5 (f) parity test uses).
+  step 5 (f) parity test uses). Layer count = 24 (silica's
+  `config.num_layers`); hidden_size = 1024.
 - Workload: single-request `decode_step_multi(k=16)` vs
   `decode_step_multi_with_capture(k=16, capture_layer_ids)`.
-  Capture set: `{0, num_layers // 2, num_layers}` = three layer
-  outputs (embedding pre-stack, mid-stack, post-stack). 28 hidden
-  layers on 0.8B → captured set `{0, 14, 28}`.
-- Measurement protocol: each iteration loads a fresh `Qwen3_5Adapter`
-  to start from an empty KV cache (matches the cycle-1 cost the F-1
-  state-machine re-runs at every cycle's verify forward; warm-cache
-  amortisation is downstream and out-of-scope for this row). 3 warmup
-  iterations + 20 measurement iterations; **median** wall-clock
-  reported. Materialisation forced via `mx.eval(logits, *captured)`.
+  Capture set: `{0, num_layers // 2, num_layers} = {0, 12, 24}` —
+  three layer outputs (embedding pre-stack, mid-stack, post-stack).
+- Canonical methodology (reused-adapter): adapter loaded once at the
+  start of the bench; each iteration runs ``decode_step_multi`` (or
+  the capture variant) under a fresh ``req_id`` and frees the
+  per-request state (`SimpleKVCache.free` + `Qwen3_5Adapter.free_state`)
+  before the next iteration. This isolates the per-cycle verify cost
+  the (β) `DFlashDrafter` will actually pay, without the 20 GB MoE
+  load cost dominating the wall-clock as it did under the original
+  per-iter-load variant. 3 warmup iterations + 20 measurement
+  iterations; **median** wall-clock reported. Materialisation forced
+  via `mx.eval(logits, *captured)`.
 - Hardware: M5 Pro 48 GB (silica's primary target).
 - Script: `scripts/microbench_capture_hidden.py` —
   ```text
   python -m scripts.microbench_capture_hidden \
-      --repo Qwen/Qwen3.5-0.8B --k 16 --warmup 3 --iters 20
+      --repo Qwen/Qwen3.5-0.8B --k 16 --warmup 3 --iters 30
   ```
+  An older variant of the script reloaded the adapter on every
+  iteration (cycle-1 cold each time). That methodology's numbers are
+  preserved in the "Result" table below as a methodology-audit row;
+  the canonical numbers come from the reused-adapter run.
 
 ### Result
 

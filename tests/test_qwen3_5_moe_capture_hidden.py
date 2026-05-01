@@ -158,3 +158,79 @@ def test_moe_capture_enabled_returns_hidden_slices_with_correct_shape() -> None:
         assert h.shape == (1, T, hidden_dim), (
             f"layer {layer_id}: shape {h.shape} != (1, {T}, {hidden_dim})"
         )
+
+
+# --- (αβ.3) prefill capture seed + cached-prefix regression on MoE ---------
+
+
+@pytest.mark.skipif(_QWEN3_5_MOE_SKIP, reason=_QWEN3_5_MOE_SKIP_REASON)
+def test_moe_prefill_with_capture_returns_full_prompt_hiddens() -> None:
+    """MoE prefill capture: returned dict has the requested keys; each
+    value has shape ``(1, prompt_len, hidden_dim)``. (αβ.3) inheritance
+    pin: the dense prefill_with_capture lifts to the MoE adapter via
+    Qwen3_5MoeAdapter(Qwen3_5Adapter)."""
+    adapter, kv = Qwen3_5MoeAdapter.from_hf_repo(REPO)
+
+    req_id = "moe-prefill-capture-shape-test"
+    handle = KVHandle(req_id=req_id)
+    kv.reserve_for_prefill(req_id, [])  # type: ignore[arg-type]
+
+    prompt_tokens = mx.array([101, 202, 303, 404, 505], dtype=mx.int32)
+    prompt_len = int(prompt_tokens.size)
+
+    num_layers = adapter.config.num_layers
+    requested = frozenset({0, num_layers // 2, num_layers})
+
+    _, captured, _ = adapter.prefill_with_capture(
+        prompt_tokens, handle, requested
+    )
+
+    assert set(captured.keys()) == set(requested)
+    hidden_dim = adapter.config.hidden_size
+    for layer_id in sorted(requested):
+        h = captured[layer_id]
+        assert h.shape == (1, prompt_len, hidden_dim), (
+            f"layer {layer_id}: shape {h.shape} != "
+            f"(1, {prompt_len}, {hidden_dim})"
+        )
+
+
+@pytest.mark.skipif(_QWEN3_5_MOE_SKIP, reason=_QWEN3_5_MOE_SKIP_REASON)
+def test_moe_capture_after_prefill_matches_decode_step_multi() -> None:
+    """MoE cached-prefix regression: same as the dense (αβ.3) test on
+    Qwen3.5-0.8B but on the 35B-A3B-4bit MoE checkpoint. Pins that
+    capture-after-prompt-prefill produces bit-equivalent verify logits
+    against the non-empty cache state, not just the empty-cache
+    regime."""
+    adapter_a, kv_a = Qwen3_5MoeAdapter.from_hf_repo(REPO)
+    adapter_b, kv_b = Qwen3_5MoeAdapter.from_hf_repo(REPO)
+
+    req_id = "moe-capture-after-prefill-test"
+    handle_a = KVHandle(req_id=req_id)
+    handle_b = KVHandle(req_id=req_id)
+    kv_a.reserve_for_prefill(req_id, [])  # type: ignore[arg-type]
+    kv_b.reserve_for_prefill(req_id, [])  # type: ignore[arg-type]
+
+    prompt_tokens = mx.array([101, 202, 303, 404, 505], dtype=mx.int32)
+    adapter_a.prefill(prompt_tokens, handle_a)
+    adapter_b.prefill(prompt_tokens, handle_b)
+
+    verify_tokens = mx.array(TOKEN_IDS, dtype=mx.int32)
+    logits_baseline, _ = adapter_a.decode_step_multi(verify_tokens, handle_a)
+
+    num_layers = adapter_b.config.num_layers
+    requested = frozenset({0, num_layers // 2, num_layers})
+    logits_capture, captured, _ = adapter_b.decode_step_multi_with_capture(
+        verify_tokens, handle_b, requested
+    )
+
+    assert logits_capture.shape == logits_baseline.shape
+    _greedy_argmax_equal(logits_capture, logits_baseline)
+    _per_element_close(logits_capture, logits_baseline)
+
+    hidden_dim = adapter_b.config.hidden_size
+    for layer_id in sorted(requested):
+        h = captured[layer_id]
+        assert h.shape == (1, T, hidden_dim), (
+            f"layer {layer_id}: shape {h.shape} != (1, {T}, {hidden_dim})"
+        )
