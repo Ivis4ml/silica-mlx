@@ -101,7 +101,7 @@ const Footer = () => (
       <div className="foot-grid">
         <div className="foot-col">
           <div className="brand">
-            <div className="brand-mark">sm</div>
+            <div className="brand-mark">SLMX</div>
             <span>silica-mlx</span>
           </div>
           <p className="foot-tagline">Continuous-batching LLM serving on Apple Silicon. vLLM-core architecture, MLX-native.</p>
@@ -141,7 +141,7 @@ const Nav = () => (
   <nav className="nav">
     <div className="container nav-inner">
       <a className="brand" href="#" style={{ textDecoration: "none", color: "inherit" }}>
-        <div className="brand-mark">sm</div>
+        <div className="brand-mark">SLMX</div>
         <span>silica-mlx</span>
       </a>
       <div className="nav-links">

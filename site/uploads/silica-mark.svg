@@ -6,11 +6,11 @@
     </linearGradient>
   </defs>
   <rect x="2" y="2" width="84" height="84" rx="22" ry="22" fill="url(#silicaInk)"/>
-  <text x="44" y="60"
+  <text x="44" y="55"
         text-anchor="middle"
         font-family="ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Monaco, Consolas, monospace"
-        font-size="44"
+        font-size="28"
         font-weight="700"
-        letter-spacing="-2.2"
-        fill="#fbfbfa">sm</text>
+        letter-spacing="-1.4"
+        fill="#fbfbfa">SLMX</text>
 </svg>
