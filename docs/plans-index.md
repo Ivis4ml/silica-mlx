@@ -181,21 +181,59 @@ read in-editor while iterating.
   open questions (quantize-draft, full-DFlash kernel port, upstream
   baseline).
 
-### D-021 step 7 — Track B 3-bit weights (orientation)
+### D-021 step 7 — Track B 3-bit weights (native candidate retired at v1.7.21)
 
 - [`P6_TRACK_B_3BIT_OPENING.md`](../plans/P6_TRACK_B_3BIT_OPENING.md) —
-  opening for Track B 3-bit weight option. PLAN.md §13 step 7 gate
+  opening doc for Track B 3-bit weight option. PLAN.md §13 step 7 gate
   quoted verbatim (loader + PPL oracle first, then 27B 3-bit
   warm-decode; pass quality gate; if 3-bit lifts dense from 16 → 21-24
   tok/s, stack with spec; if quality or MLX path is unstable, ship
   opt-in). Three sub-units B.1 / B.2 / B.3 (loader smoke + bench
   registration; WikiText-2 PPL cross-check; 27B 3-bit warm-decode
-  attestation). Two acceptance gates: ΔPPL ≤ 0.5 absolute OR ≤ 5%
-  relative (quality); ≥21 tok/s = 1.31× over 16.05 anchor
-  (performance). Mainline lever after C.4 retirement; multiplies with
-  any future spec lever. mlx-lm already supports 3-bit kernels — no
-  silica/* runtime kernel work expected; the heavy lifting is
-  upstream's.
+  attestation). Quality gate is **both-pass**: ΔPPL_abs ≤ 0.5 AND
+  ΔPPL_rel ≤ 5% (the user-confirmed reading; the opening's earlier
+  "OR" wording was tightened during pre-B.1 review). Performance gate
+  for B.3: ≥ 21 tok/s = 1.31× over the 16.05 b1 anchor.
+
+- [`P6_TRACK_B/REPORT.md`](../plans/P6_TRACK_B/REPORT.md) —
+  measurement bundle. **Track B native 3-bit candidate retired after
+  the B.2 quality gate failed; B.3 not run; gate not relaxed.**
+  - **B.1 PASS** — `NexVeridian/Qwen3.5-27B-3bit` loaded cleanly via
+    `silica.models.factory.adapter_for_repo`; 4-token smoke generate
+    succeeded; peak `11.16 GiB` clears both forms of the §6.1 B.1
+    memory gate (`≤ 13 GiB` absolute and `≥ 20%` relative reduction
+    against the 4-bit anchor 15.34 GiB; measured 27.2% reduction).
+  - **B.2 FAIL** — paired WikiText-2 chunked-NLL PPL rows
+    (`qwen3.5-27b-wikitext-ppl-{4bit,3bit}`) measured `ppl = 6.9082`
+    on the 4-bit anchor and `ppl = 8.0719` on the 3-bit candidate
+    over the same 511 scored positions. ΔPPL_abs = +1.1637 (gate
+    ≤ 0.5 — FAIL by 0.66 PPL); ΔPPL_rel = +16.85% (gate ≤ 5% — FAIL
+    by ≈12 percentage points). Both bounds breached on a both-pass
+    gate.
+  - **B.3 not run** — Track B's both-pass acceptance over (B.1
+    memory, B.2 quality, B.3 speedup) is already retired at B.2;
+    speedup numbers cannot rescue a candidate whose pre-declared
+    quality bound is breached. Per the user-confirmed framing
+    ("速度数字没有决策价值"), B.3 is not authorised against this
+    checkpoint. The `qwen3.5-27b-warm-decode-b1-3bit` scenario
+    registered at B.1 stays in the catalog as the load-bearing
+    artefact for any future re-attempt — only `repo` + gate envs
+    swap when a better candidate appears.
+  - **Gate not relaxed.** 17% PPL drift in exchange for 27% memory
+    headroom + projected 1.31× speed lift does not meet the
+    mainline-performance-lever bar this step declared.
+  - **Follow-up gated on a small read-only candidate survey** for
+    activation-aware / smaller-group-size / AWQ-style Qwen3.5-27B
+    3-bit MLX checkpoints. **No auto re-conversion of the ~52 GB
+    full-precision weights** — survey first, conversion only on a
+    documented motivation. Mainline next move stays the C.5 tree-
+    shape spike (D-021 step 8) for the (1b) ≥60 tok/s survival path.
+
+  Sub-unit commits in order: `9299294` opening / `adb52cd` orientation
+  three-fix / `aa150d2` OQ-1 favourable close (`NexVeridian` found) /
+  `62e36c3` (B.1) loader smoke + bench scenario / `eba7e26` (B.2)
+  negative-result closure + ΔPPL measurement / **this commit**
+  (PLAN + plans-index sync).
 
 ## Side track: chat CLI redesign
 

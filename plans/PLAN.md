@@ -2,9 +2,9 @@
 
 | Field        | Value                                                                      |
 | ------------ | -------------------------------------------------------------------------- |
-| Version      | v1.7.19                                                                    |
-| Last updated | 2026-04-30                                                                 |
-| Status       | P-5 complete; P-5 Acceptance (1)–(4) closed at v1.7.4; (a-real) real-activation xcheck closed at v1.7.5; P-3-C5 closed in slice-prefill regime (C5.5 α-MVP); P-3-E4 batched MoE smoke + scheduler-glue parity closed at v1.7.9; P-5-F pre-RoPE production routing closed at v1.7.6 via the (3b) projection-output capture path (F.1-F.4); (b-static) Qwen3.5-4B PPL vs vqbench REPORT.md baseline closed at v1.7.7; slice-regime + pre_norm hybrid Qwen3.5-0.8B E2E discriminator closed at v1.7.8; per-head Haar rotation landed as opt-in (default OFF) at v1.7.8; per-head D.2a 3-seed re-measurement at v1.7.10 — \|mean_gap\| 0.150 → 0.066 PPL (56% reduction); per-head (b-static) Qwen3.5-4B production-path re-measurement at v1.7.11 — std 5.3× tighter, mean unchanged in SEM, default flip is now an administrative landing, not an empirical question; **P-6 re-scoped from "Weight Streaming" to "Performance Phase" at v1.7.13 per D-017 / D-018 / D-019 — dense Qwen3.5-27B-4bit ≥60 tok/s primary target + MoE Qwen3.5-35B-A3B-4bit ≥100 tok/s stretch validator on 48 GB M5 Pro; P-7 Speculative promoted from T2 to T1; dense layer-streaming deferred to v0.2; Track C speculative grows to five sub-units per D-020 (C.1 draft-target, C.2 ReDrafter, C.3 MTP, C.4 DFlash, C.5 DDTree) and to six sub-units at v1.7.14 round-2 review (C.6 QuantSpec-like self-spec exploratory); P-6.0 measurement gate landed at v1.7.13 (8 scenarios + REPORT in `plans/P6_0_BASELINE/`); **P-6 contract sync at v1.7.14 per D-021** — dense gate split into (1a) ≥40 tok/s engineering (must pass) + (1b) ≥60 tok/s stretch (contingent on C.4/C.5 ≥2.5×); MoE acceptance split into (2a) ≥100 tok/s anchor (cleared at baseline) + (2b) ≥150 aggregate or ≥100 per-row stretch; execution order rewritten to foundation-first (P5.9 hardening → P-6.0.5 → Decision Gate 1 → spec foundation → C.4 spike → B → A); v1.7.14 round-3 review absorbed via stale-text cleanup; **P5.9 hardening complete at v1.7.15** — eight D-021 step 2 sub-units (a..h) closed across commits `0bd931a` / `bbdb7f7` / `9a9bff9` / `2483715` / `aa85e1c` / `dc5ba59` / `5d0f474` / `c385837`: probe double-load fix (27B/31B peaks corrected ~30.5→~15.3/~17.5 GB), Q-012 initial-cohort prefix consultation, Qwen3.5 pre-draft recurrent rollback, sustained 4K/8K context probes, D-009 hot-path audit lock-in, speculative metrics schema, operationalised (4-b) regression gate, full toolchain re-run attestation (2108 passed / 7 skipped, +82 P5.9 tests over the v1.7.13 baseline); see `plans/P6_OPENING.md` and `plans/P6_REVIEW_HANDOFF.md`; **P-6.0.5 measurement expansion complete at v1.7.17 per D-021 step 3** — eight artefact rows landed in `plans/P6_0_5_BASELINE/` (5 mandatory warm-decode + 2 warm-TTFT-pair + 1 target-verify microbench; both opt-in B=4 OOM-flagged rows completed without OOM): dense 27B B=4 = 42.17 ± 0.21 tok/s @ 52% util (2-run; bandwidth util uses runtime-measured 15.13 GB weight footprint, +12% vs v1.7.13's 13.5 GB anchor — see REPORT.md "Weight-footprint reconciliation"; batch-only path to 60 dead, KV-traffic-bound), MoE 35B-A3B B=4 = 188.5 tok/s @ 92% util (still climbing, OOM-safe at 20.6 GB peak; MoE retains 1.5 GB active-weight anchor), MoE 4K peak 23.6 GB (RAM gate clears with 35% margin), warm-TTFT 317 ms dense / 169 ms MoE (3-run reproducibility ±0.3 ms warm), verify-k target-side / zero-drafter-cost ceiling 2.93× at k=8 linear (constrains C.4 / C.5 upper-band claims; real spec gain falls below this by drafter cost + acceptance + bonus-token rule); cross-row REPORT.md closes §1 Q1-Q4 and constitutes the Decision Gate 1 (D-021 step 4) input set; see `plans/P6_0_5_OPENING.md` and `plans/P6_0_5_BASELINE/REPORT.md`; **Decision Gate 1 (D-021 step 4) closed at v1.7.18 per `plans/P6_0_DECISION_GATE_1_OPENING.md`** — (1a) ≥40 tok/s primary unchanged; (1b) ≥60 tok/s reframed as stretch with two-condition survival rule (full-stack measurement clears ≥60, OR Track C.5 tree-shape spike shows headroom beyond the linear k=8 verify ceiling sufficient to make the full-stack projection ≥60 credible; C.4 alone — even at upper-band 2.9× — does not settle (1b)); (2a) ≥100 tok/s aggregate stays as cleared anchor; (2b) reduced to single variant ≥175 tok/s aggregate at B≥3 (per-row variant retired as structurally unreachable, ≥150 thin since cleared at B=3, ≥200 rejected since B≥5 sits in diminishing returns at 92% util); §6 / §7 D-021 step 4 / step 6 / step 8 live-contract sync at v1.7.18, not §13-history-only**; **D-021 step 5 spec foundation closed at v1.7.19** — single-request `Engine.generate` spec path live (`DraftTargetEngine` + `decode_step_multi` verify forward + greedy verifier + bonus emission); three rollback paths bound (target-side KV via `PagedKVCache.rollback` and `SimpleKVCache` per-layer trim, recurrent state via `Qwen3_5Adapter.snapshot_pre_draft_state` + `rollback_state` + replay over the committed prefix, draft-side via `DraftTargetEngine.commit`); cycle-1 byte-exact greedy parity on cached `Qwen/Qwen3-0.6B` + `Qwen/Qwen3.5-0.8B` (long-run parity bounded by fp16 batched-vs-sequential KV reduction-order noise — validated through (h) bench scenarios rather than against a sequential reference); spec-metrics schema v1.7.15 (`silica.bench.spec_metrics.SPECULATIVE_METRIC_FIELDS`) emitted into `ScenarioResult.metadata` via `silica.bench.spec_collector.SpecMetricCollector` (Engine emission + bench runner merge with `validate_speculative_metrics` failing loud); `--speculative {none,draft_target}` CLI flag + two real-model spec-on warm-decode scenarios (`qwen3.5-27b-warm-decode-spec-on` + `qwen3.5-moe-35b-a3b-warm-decode-spec-on`) registered, each quad-gated (target HF cache + target env + drafter HF cache + drafter env via `SpecConfig.draft_gate_env_var`); foundation gate §6.1 + toolchain attestation §6.3 pass (2616 passed / 28 skipped on full non-real-model suite, ruff + mypy clean, 65 scenarios in `--list`); **(c) slice 3 — multi-request hybrid + sliding batched-spec path — deferred as non-blocking performance extension** (the (h) bench rows are B=1 single-request, the `ContinuousBatcher` GLOBAL-only gate at `silica/scheduler/batcher.py:268-279` is preserved, slice 3 lifts that gate by porting (e) slice 2's trim → restore → replay onto per-row dispatch over `BatchKVCache`'s right-padding primitive; planned in a separate orientation); commits in order: `318446b` opening / `58d9fd9` (a) / `0dfadfd`,`31f5a7d`,`cfa599e`,`edf257e` (a2) / `a71bb63` (b) / `d639e82`,`b035c61`,`e68f98f`,`615787d`,`1158c13` (c slices 1+2a+2b) / `74946e2` (d) / `03774f7`,`0bde8cb`,`b76b276` (e) / `c3800e2` (f) / `2ae816c` (bonus overshoot fix surfaced by f) / `139bfbf` (i) / `ee3ac05` (g) / `a6d64bc`,`4c4bb0a` (h slice 1 + slice 2); see `plans/P6_SPEC_FOUNDATION_OPENING.md` §6.1 closure block** |
+| Version      | v1.7.21                                                                    |
+| Last updated | 2026-05-01                                                                 |
+| Status       | P-5 complete; P-5 Acceptance (1)–(4) closed at v1.7.4; (a-real) real-activation xcheck closed at v1.7.5; P-3-C5 closed in slice-prefill regime (C5.5 α-MVP); P-3-E4 batched MoE smoke + scheduler-glue parity closed at v1.7.9; P-5-F pre-RoPE production routing closed at v1.7.6 via the (3b) projection-output capture path (F.1-F.4); (b-static) Qwen3.5-4B PPL vs vqbench REPORT.md baseline closed at v1.7.7; slice-regime + pre_norm hybrid Qwen3.5-0.8B E2E discriminator closed at v1.7.8; per-head Haar rotation landed as opt-in (default OFF) at v1.7.8; per-head D.2a 3-seed re-measurement at v1.7.10 — \|mean_gap\| 0.150 → 0.066 PPL (56% reduction); per-head (b-static) Qwen3.5-4B production-path re-measurement at v1.7.11 — std 5.3× tighter, mean unchanged in SEM, default flip is now an administrative landing, not an empirical question; **P-6 re-scoped from "Weight Streaming" to "Performance Phase" at v1.7.13 per D-017 / D-018 / D-019 — dense Qwen3.5-27B-4bit ≥60 tok/s primary target + MoE Qwen3.5-35B-A3B-4bit ≥100 tok/s stretch validator on 48 GB M5 Pro; P-7 Speculative promoted from T2 to T1; dense layer-streaming deferred to v0.2; Track C speculative grows to five sub-units per D-020 (C.1 draft-target, C.2 ReDrafter, C.3 MTP, C.4 DFlash, C.5 DDTree) and to six sub-units at v1.7.14 round-2 review (C.6 QuantSpec-like self-spec exploratory); P-6.0 measurement gate landed at v1.7.13 (8 scenarios + REPORT in `plans/P6_0_BASELINE/`); **P-6 contract sync at v1.7.14 per D-021** — dense gate split into (1a) ≥40 tok/s engineering (must pass) + (1b) ≥60 tok/s stretch (contingent on C.4/C.5 ≥2.5×); MoE acceptance split into (2a) ≥100 tok/s anchor (cleared at baseline) + (2b) ≥150 aggregate or ≥100 per-row stretch; execution order rewritten to foundation-first (P5.9 hardening → P-6.0.5 → Decision Gate 1 → spec foundation → C.4 spike → B → A); v1.7.14 round-3 review absorbed via stale-text cleanup; **P5.9 hardening complete at v1.7.15** — eight D-021 step 2 sub-units (a..h) closed across commits `0bd931a` / `bbdb7f7` / `9a9bff9` / `2483715` / `aa85e1c` / `dc5ba59` / `5d0f474` / `c385837`: probe double-load fix (27B/31B peaks corrected ~30.5→~15.3/~17.5 GB), Q-012 initial-cohort prefix consultation, Qwen3.5 pre-draft recurrent rollback, sustained 4K/8K context probes, D-009 hot-path audit lock-in, speculative metrics schema, operationalised (4-b) regression gate, full toolchain re-run attestation (2108 passed / 7 skipped, +82 P5.9 tests over the v1.7.13 baseline); see `plans/P6_OPENING.md` and `plans/P6_REVIEW_HANDOFF.md`; **P-6.0.5 measurement expansion complete at v1.7.17 per D-021 step 3** — eight artefact rows landed in `plans/P6_0_5_BASELINE/` (5 mandatory warm-decode + 2 warm-TTFT-pair + 1 target-verify microbench; both opt-in B=4 OOM-flagged rows completed without OOM): dense 27B B=4 = 42.17 ± 0.21 tok/s @ 52% util (2-run; bandwidth util uses runtime-measured 15.13 GB weight footprint, +12% vs v1.7.13's 13.5 GB anchor — see REPORT.md "Weight-footprint reconciliation"; batch-only path to 60 dead, KV-traffic-bound), MoE 35B-A3B B=4 = 188.5 tok/s @ 92% util (still climbing, OOM-safe at 20.6 GB peak; MoE retains 1.5 GB active-weight anchor), MoE 4K peak 23.6 GB (RAM gate clears with 35% margin), warm-TTFT 317 ms dense / 169 ms MoE (3-run reproducibility ±0.3 ms warm), verify-k target-side / zero-drafter-cost ceiling 2.93× at k=8 linear (constrains C.4 / C.5 upper-band claims; real spec gain falls below this by drafter cost + acceptance + bonus-token rule); cross-row REPORT.md closes §1 Q1-Q4 and constitutes the Decision Gate 1 (D-021 step 4) input set; see `plans/P6_0_5_OPENING.md` and `plans/P6_0_5_BASELINE/REPORT.md`; **Decision Gate 1 (D-021 step 4) closed at v1.7.18 per `plans/P6_0_DECISION_GATE_1_OPENING.md`** — (1a) ≥40 tok/s primary unchanged; (1b) ≥60 tok/s reframed as stretch with two-condition survival rule (full-stack measurement clears ≥60, OR Track C.5 tree-shape spike shows headroom beyond the linear k=8 verify ceiling sufficient to make the full-stack projection ≥60 credible; C.4 alone — even at upper-band 2.9× — does not settle (1b)); (2a) ≥100 tok/s aggregate stays as cleared anchor; (2b) reduced to single variant ≥175 tok/s aggregate at B≥3 (per-row variant retired as structurally unreachable, ≥150 thin since cleared at B=3, ≥200 rejected since B≥5 sits in diminishing returns at 92% util); §6 / §7 D-021 step 4 / step 6 / step 8 live-contract sync at v1.7.18, not §13-history-only**; **D-021 step 5 spec foundation closed at v1.7.19** — single-request `Engine.generate` spec path live (`DraftTargetEngine` + `decode_step_multi` verify forward + greedy verifier + bonus emission); three rollback paths bound (target-side KV via `PagedKVCache.rollback` and `SimpleKVCache` per-layer trim, recurrent state via `Qwen3_5Adapter.snapshot_pre_draft_state` + `rollback_state` + replay over the committed prefix, draft-side via `DraftTargetEngine.commit`); cycle-1 byte-exact greedy parity on cached `Qwen/Qwen3-0.6B` + `Qwen/Qwen3.5-0.8B` (long-run parity bounded by fp16 batched-vs-sequential KV reduction-order noise — validated through (h) bench scenarios rather than against a sequential reference); spec-metrics schema v1.7.15 (`silica.bench.spec_metrics.SPECULATIVE_METRIC_FIELDS`) emitted into `ScenarioResult.metadata` via `silica.bench.spec_collector.SpecMetricCollector` (Engine emission + bench runner merge with `validate_speculative_metrics` failing loud); `--speculative {none,draft_target}` CLI flag + two real-model spec-on warm-decode scenarios (`qwen3.5-27b-warm-decode-spec-on` + `qwen3.5-moe-35b-a3b-warm-decode-spec-on`) registered, each quad-gated (target HF cache + target env + drafter HF cache + drafter env via `SpecConfig.draft_gate_env_var`); foundation gate §6.1 + toolchain attestation §6.3 pass (2616 passed / 28 skipped on full non-real-model suite, ruff + mypy clean, 65 scenarios in `--list`); **(c) slice 3 — multi-request hybrid + sliding batched-spec path — deferred as non-blocking performance extension** (the (h) bench rows are B=1 single-request, the `ContinuousBatcher` GLOBAL-only gate at `silica/scheduler/batcher.py:268-279` is preserved, slice 3 lifts that gate by porting (e) slice 2's trim → restore → replay onto per-row dispatch over `BatchKVCache`'s right-padding primitive; planned in a separate orientation); commits in order: `318446b` opening / `58d9fd9` (a) / `0dfadfd`,`31f5a7d`,`cfa599e`,`edf257e` (a2) / `a71bb63` (b) / `d639e82`,`b035c61`,`e68f98f`,`615787d`,`1158c13` (c slices 1+2a+2b) / `74946e2` (d) / `03774f7`,`0bde8cb`,`b76b276` (e) / `c3800e2` (f) / `2ae816c` (bonus overshoot fix surfaced by f) / `139bfbf` (i) / `ee3ac05` (g) / `a6d64bc`,`4c4bb0a` (h slice 1 + slice 2); see `plans/P6_SPEC_FOUNDATION_OPENING.md` §6.1 closure block**; **D-021 step 6 C.4 DFlash spike closed at v1.7.20 — gate FAILED at 0.482× silica-integrated speedup on dense 27B-4bit** (η.1 measurement on cached `mlx-community/Qwen3.5-27B-4bit` + `z-lab/Qwen3.5-27B-DFlash`; `accept_rate = 0.0881`, `draft_cost_ms = 35.70` ≫ `verify_cost_ms = 2.45`, `rollback_count = 165`; 0.482× is well below the ≥1.8× engineering-continue floor and the ≥2.5× (1b) survival contribution threshold; C.4 dense path retires as a (1a) lever and as a (1b) contributor; per the v1.7.18 Decision Gate 1 reframe the (1b) ≥60 tok/s survival path narrows to the C.5 tree-shape spike alone — D-021 step 8 — if C.5 is not pursued (1b) retires entirely; (1a) ≥40 tok/s primary stays unchanged at 42.17 tok/s P-6.0.5 baseline; see `plans/P6_C4_DFLASH/REPORT.md` (η.1) and v1.7.20 changelog); **D-021 step 7 Track B native 3-bit candidate retired at v1.7.21 — B.2 quality gate FAILED on `NexVeridian/Qwen3.5-27B-3bit`** (ΔPPL_abs = +1.1637 vs ≤ 0.5 bound; ΔPPL_rel = +16.85% vs ≤ 5% bound — both forms of the §6.1 B.2 both-pass gate breached; B.1 memory PASS held the loader smoke at 11.16 GiB / -27.2% reduction on `mlx-community/Qwen3.5-27B-4bit` anchor 15.34 GiB; B.3 27B 3-bit warm-decode attestation **not run** — B.2 quality breach retires the candidate before any speedup measurement is decision-relevant; **gate not relaxed** — 17% PPL drift in exchange for 27% memory + a projected 1.31× speed lift does not meet the mainline-performance-lever bar; follow-up survey only if a better activation-aware / smaller-group-size / AWQ-style 3-bit MLX checkpoint appears, no auto re-conversion of full-precision weights from this commit; see `plans/P6_TRACK_B/REPORT.md` (B.2) and v1.7.21 changelog) |
 | Maintainer   | Xin Zhou                                                                   |
 | Source       | `plans/PLAN.md` (single source of truth)                                    |
 
@@ -1531,7 +1531,27 @@ Append-only. New decisions go at the end; old ones are not edited. Revocations /
      (no runtime change), pass quality gate, then 27B 3-bit
      warm-decode. If 3-bit lifts dense from 16 → 21-24 tok/s,
      stack with spec; if quality or MLX path is unstable, ship
-     opt-in.
+     opt-in. **Status: native 3-bit candidate retired at
+     v1.7.21.** B.1 memory PASS on `NexVeridian/Qwen3.5-27B-3bit`
+     (peak 11.16 GiB, -27.2% reduction vs the 4-bit anchor —
+     both `≤ 13 GiB` absolute and `≥ 20%` relative forms clear);
+     B.2 quality gate FAILED both bounds (ΔPPL_abs = +1.1637 vs
+     ≤ 0.5; ΔPPL_rel = +16.85% vs ≤ 5%) on the WikiText-2
+     chunked-NLL oracle paired against the 4-bit anchor; B.3 27B
+     3-bit warm-decode attestation **not run** — quality breach
+     retires the candidate before speedup is decision-relevant.
+     **Gate not relaxed**: 17% PPL drift in exchange for 27%
+     memory + a projected 1.31× speed lift does not meet the
+     mainline-performance-lever bar declared in this step. The
+     27% memory headroom and ~30 tok/s 3-bit bandwidth ceiling
+     are real but only valuable if a *different* 3-bit checkpoint
+     can land them inside the quality gate. **Follow-up gated on
+     a small read-only survey** for activation-aware / smaller-
+     group-size / AWQ-style Qwen3.5-27B 3-bit MLX checkpoints;
+     no auto re-conversion of the ~52 GB full-precision weights
+     from this branch. Audit trail at
+     `plans/P6_TRACK_B/REPORT.md` (B.1 + B.2 sub-units) and
+     `plans/P6_TRACK_B_3BIT_OPENING.md`.
   8. **C.5 / C.2 / C.3 selection — and C.6 QuantSpec-like
      self-spec exploratory option.** Driven by C.4 outcome.
      If C.4 acceptance is high, C.5 reuses the same drafter and
@@ -1974,6 +1994,128 @@ Local reference implementations sit at the repo root. **Algorithm / architecture
 ---
 
 ## 13. Changelog
+
+- **v1.7.21** (2026-05-01): **D-021 step 7 Track B native 3-bit
+  candidate retired — B.2 quality gate FAILED on
+  `NexVeridian/Qwen3.5-27B-3bit`.** Closes the Track B sub-step
+  with a clean negative result: B.1 PASSED, B.2 FAILED, B.3 not
+  run, gate not relaxed, follow-up only on a measurably better
+  3-bit candidate.
+
+  **(B.2) measurement (load-bearing):**
+
+  - WikiText-2 chunked-NLL PPL oracle (`chunk_size=256`,
+    `max_tokens=512`, `seed=0`,
+    `codec_quality_path="prefix_store_pre_norm"`,
+    `kv_codec=None`) run against two paired bench rows so the
+    oracle config is byte-equal across them and ΔPPL is a
+    weight-bits-only signal.
+  - 4-bit anchor row `qwen3.5-27b-wikitext-ppl-4bit`
+    (`mlx-community/Qwen3.5-27B-4bit`,
+    `gate_env_var=SILICA_REAL_QWEN3_5_27B`):
+    `ppl = 6.9082` over 511 scored token positions.
+  - 3-bit candidate row `qwen3.5-27b-wikitext-ppl-3bit`
+    (`NexVeridian/Qwen3.5-27B-3bit`,
+    `gate_env_var=SILICA_REAL_QWEN3_5_27B_3BIT`):
+    `ppl = 8.0719` over the same 511 token positions.
+  - **ΔPPL_abs = +1.1637** vs the §6.1 B.2 ≤ 0.5 bound — FAIL by
+    0.66 PPL.
+  - **ΔPPL_rel = +16.85%** vs the §6.1 B.2 ≤ 5% bound — FAIL by
+    ≈12 percentage points.
+  - Gate is **both-pass** (abs AND rel must clear); both bounds
+    breached → gate **FAIL**.
+
+  **(B.1) memory PASS held** (recorded for completeness):
+
+  - `peak_after_generate = 11.16 GiB` on the
+    `Engine.generate("Hello", max_tokens=4)` smoke against
+    `NexVeridian/Qwen3.5-27B-3bit`.
+  - 4-bit anchor `peak = 15.34 GiB` (v1.7.14 P-6.0 corrected).
+  - Reduction = **27.2%** — both the absolute form (`≤ 13.0
+    GiB`) and the relative form (`≥ 20% reduction`) of the §6.1
+    B.1 gate clear.
+
+  **(B.3) disposition: not run.** Track B's PLAN §13 step 7
+  acceptance is a both-pass gate over (B.1 memory, B.2 quality,
+  B.3 speedup). With B.2 closed FAIL, B.3's outcome cannot
+  rescue Track B as currently configured — even an
+  unconditional B.3 PASS would ship a model whose pre-declared
+  quality bound is breached. Per the user-facing constraint
+  ("速度数字没有决策价值"), B.3 is not authorised against this
+  candidate. The `qwen3.5-27b-warm-decode-b1-3bit` scenario
+  registered at B.1 close stays in the catalog as a load-
+  bearing artefact for any future re-attempt against a
+  different 3-bit checkpoint (the row's `repo` is the load-
+  bearing knob to swap).
+
+  **Gate decision: candidate retired, gate not relaxed.** A 17%
+  PPL drift in exchange for 27% memory headroom and a projected
+  1.31× speed lift does not meet the mainline-performance-lever
+  bar this step declared. The pre-declared bound is honoured by
+  retiring the candidate, not by retro-loosening the bound to fit
+  the measurement. Two interpretations are consistent with the
+  data and both leave the disposition unchanged:
+
+  1. The candidate-specific calibration is suboptimal —
+     `mlx_lm.convert -q --bits 3` against `Qwen/Qwen3.5-27B`
+     with default group size and zero-point handling is more
+     sensitive to the calibration distribution at 3 bits than
+     at 4. A re-converted checkpoint with a different group
+     size (e.g. 32 instead of 64) or with AWQ/GPTQ-style
+     activation-aware calibration could plausibly close part of
+     the gap.
+  2. Pure weight-only 3-bit is too aggressive at 27B — well-
+     calibrated weight-only Q3 typically pays 5-12% PPL on
+     models in the 7B-30B band; 17% puts this candidate on the
+     high-but-plausible side.
+
+  In either reading the bound is breached. **Follow-up is gated
+  on a small read-only candidate survey** — if a better
+  activation-aware / smaller-group-size / AWQ-style Qwen3.5-27B
+  3-bit MLX checkpoint surfaces, the existing B.2 paired rows
+  re-run against it cleanly with only `repo` + gate envs
+  swapped. **No auto re-conversion of the ~52 GB full-precision
+  weights from this branch** — survey first, conversion only on
+  a documented motivation.
+
+  **MoE 3-bit not opened.** Track B was scoped against dense
+  Qwen3.5-27B from the outset; MoE Qwen3.5-35B-A3B-4bit already
+  clears (2a) at 188.5 tok/s P-6.0.5 baseline and the (2b)
+  ≥175 aggregate stretch is in pursuit through different levers
+  (B≥3 batching), not through bit-width reduction.
+
+  **Materials landed:**
+
+  - `silica/bench/scenarios.py`: registered
+    `qwen3.5-27b-wikitext-ppl-{4bit,3bit}` paired PPL rows
+    (independent gate envs; one repo per row preserves
+    `Scenario.repo`'s one-repo-per-row invariant; ΔPPL is REPORT-
+    side bookkeeping rather than a runner-side dual-load).
+  - `tests/test_bench_qwen3_5_27b_ppl_b2.py`: 6 scenario-shape
+    tests pin both rows registered, repo + gate divergence,
+    oracle config equality, no-spec-no-codec invariant,
+    `BUILTIN_SCENARIOS` floor at ≥ 70.
+  - `tests/test_bench_3bit_b1_scenario.py`: B.1 count test
+    loosened from `== 68` to `>= 68` so B.2's two added rows do
+    not retro-gate it (same precedent as ζ's `>= 67` loosen).
+  - `plans/P6_TRACK_B/REPORT.md`: appended (B.2) section with
+    measurement table, gate evaluation, two-reading
+    interpretation, B.3 disposition, materials list.
+  - `plans/P6_TRACK_B/ppl_{4bit,3bit}_run.jsonl`: per-row bench
+    JSONL outputs as the load-bearing measurement provenance
+    (511 scored token positions in each, matching `n_tokens` so
+    the ΔPPL difference is model-only).
+
+  **Toolchain:** ruff clean (silica + tests + scripts), mypy
+  clean (85 source files), `SILICA_SKIP_MODEL_TESTS=1` baseline
+  2647 passed / 86 skipped (post-B.1 2640 + 6 new B.2 scenario-
+  shape tests + 1 absorbed by the existing `>=` count tests).
+
+  **Sub-unit commits in order:** `9299294` opening / `adb52cd`
+  orientation three-fix / `aa150d2` OQ-1 favourable close
+  (NexVeridian found) / `62e36c3` (B.1) loader smoke + bench
+  scenario / `eba7e26` (B.2) negative-result closure + ΔPPL
+  measurement / **this commit** (PLAN + plans-index sync).
 
 - **v1.7.20** (2026-05-01): **D-021 step 6 C.4 DFlash spike closed
   — gate FAILED at 0.482× silica-integrated speedup on dense
