@@ -1579,7 +1579,30 @@ Append-only. New decisions go at the end; old ones are not edited. Revocations /
      spike shows headroom over the linear k=8 verify ceiling
      (P-6.0.5 Unit 7, 2.93× target-side / zero-drafter-cost)
      sufficient to make the full-stack projection ≥60 credible,
-     (1b) survives. The existing C.5 description below
+     (1b) survives. **Status: orientation opened at v1.7.22
+     post-C.4 retirement** — see
+     `plans/P6_C5_DDTREE_OPENING.md`. The opening reframes C.5
+     as a *decision spike*, not a DDTree implementation
+     continuation. The gating empirical metric is **measured
+     `coverage@b`** (Pr(target argmax ∈ drafter top-b)) for
+     b ∈ {4, 8, 16}, **not** linear top-1 accept rate α — at
+     C.4-measured α=0.088 the independence-bound envelope tops
+     at ≈4.82 tokens/cycle even at b=16, but real greedy tree
+     branches share the same drafter logits and are correlated,
+     so coverage@b must be measured directly. Sub-units run
+     coverage-checking ahead of any DDTree port: α (orientation
+     itself) → β.1 (single bench run on the v1.7.19 (h)
+     `qwen3.5-27b-warm-decode-spec-on` row, target `mlx-
+     community/Qwen3.5-27B-4bit` × drafter `Qwen/Qwen3.5-0.8B`,
+     yields linear α + drafter cost + rollback) → β.2 (stand-
+     alone read-only `coverage@b` probe with tokenizer-
+     alignment guard, bypasses the spec engine entirely) → γ.1
+     upstream survey → γ.2 implementation → δ attestation.
+     Retirement bar: `coverage@4` AND `coverage@8` AND
+     `coverage@16` all < 0.15 → close §13 step 8 without a
+     DDTree port; depth-only highs escalate rather than auto-
+     retire. No code in α; β.1 + β.2 use only existing cached
+     weights and existing scenario / forward-call primitives. The existing C.5 description below
      ("If C.4 acceptance is high, C.5 reuses the same drafter
      and adds the tree-verification path") becomes prerequisite
      framing for the spike rather than the gate itself. If C.4

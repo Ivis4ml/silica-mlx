@@ -250,7 +250,49 @@ read in-editor while iterating.
   three-fix / `aa150d2` OQ-1 favourable close (`NexVeridian` found) /
   `62e36c3` (B.1) loader smoke + bench scenario / `eba7e26` (B.2)
   negative-result closure + ΔPPL measurement / `3d52e00`
-  (PLAN + plans-index sync) / **this commit** (follow-up survey).
+  (PLAN + plans-index sync) / `44bd928` (follow-up survey).
+
+### D-021 step 8 — C.5 tree-shape decision spike (orientation)
+
+- [`P6_C5_DDTREE_OPENING.md`](../plans/P6_C5_DDTREE_OPENING.md) —
+  orientation document for the C.5 tree-shape spike. **Reframed
+  as a decision spike, not a DDTree implementation
+  continuation.** Post-C.4-retirement (v1.7.20) and Track B
+  retirement (v1.7.21), C.5 is the only surviving leg of the
+  v1.7.18 (1b) ≥60 tok/s two-condition rule; this orientation
+  decides whether to spend implementation effort *before* any
+  `silica.speculative.ddtree` code is written.
+
+  Load-bearing concept correction: the gating empirical metric
+  is **measured `coverage@b`** = Pr(target argmax ∈ drafter
+  top-b) for b ∈ {4, 8, 16}, **not** linear top-1 accept rate
+  α. C.4 measured α=0.088 against the 4-bit Qwen3.5-27B target;
+  the independence-bound envelope `1 - (1-α)^b` is only an
+  optimistic upper bound assuming b independent draws, but
+  real greedy tree branches are the same drafter's top-b
+  candidates and are correlated. Coverage@b must therefore be
+  measured directly, not inferred from α.
+
+  Sub-units: α (this orientation) → β.1 (single bench run on
+  the v1.7.19 (h) `qwen3.5-27b-warm-decode-spec-on` scenario,
+  yields linear α + drafter cost + rollback for the cached
+  `mlx-community/Qwen3.5-27B-4bit` × `Qwen/Qwen3.5-0.8B`
+  pairing) → β.2 (stand-alone read-only top-b coverage probe
+  with tokenizer-alignment guard; bypasses the spec engine; no
+  new download) → γ.1 upstream `humanrouter/ddtree-mlx` survey
+  → γ.2 minimal `silica.speculative.ddtree` implementation → δ
+  real-checkpoint attestation. Implementation does not start
+  until α + β.1 + β.2 + γ.1 all PASS.
+
+  Decision matrix (§9 of the opening): retire only if
+  `coverage@4` AND `coverage@8` AND `coverage@16` are all
+  < 0.15; depth-only highs escalate to user decision rather
+  than auto-retire. No gate relaxation — the (1b) ≥60 tok/s
+  bar is the bar.
+
+  Sub-unit commits in order: **this commit** (orientation +
+  PLAN.md §13 step 8 inline status sync); β.1 / β.2 /
+  γ / δ pending separate authorisation.
 
 ## Side track: chat CLI redesign
 
