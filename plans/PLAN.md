@@ -1549,9 +1549,26 @@ Append-only. New decisions go at the end; old ones are not edited. Revocations /
      a small read-only survey** for activation-aware / smaller-
      group-size / AWQ-style Qwen3.5-27B 3-bit MLX checkpoints;
      no auto re-conversion of the ~52 GB full-precision weights
-     from this branch. Audit trail at
-     `plans/P6_TRACK_B/REPORT.md` (B.1 + B.2 sub-units) and
-     `plans/P6_TRACK_B_3BIT_OPENING.md`.
+     from this branch. **Survey closed empty on 2026-05-01**: no
+     viable better-calibrated MLX-native 3-bit matched-family
+     candidate exists on HF Hub. The two known matched-family MLX
+     3-bit checkpoints both use the `mlx_lm.convert -q --bits 3`
+     recipe at default `group_size=64` without any activation-
+     aware step; activation-aware methods (AWQ / GPTQ /
+     AutoRound / DWQ / OptiQ) are well represented for
+     Qwen3.5-27B at 4 bits in the MLX ecosystem but at 3 bits
+     exist only in transformers/GPTQ form on abliterated or
+     distilled bases, neither of which is matched-family or
+     directly mlx-lm loadable. **Track B native 3-bit lever is
+     therefore fully retired pending a future checkpoint;**
+     re-look triggers (an MLX-native activation-aware 3-bit sib
+     to the existing 4-bit `*-DWQ` / `*-OptiQ-4bit` /
+     `*-GPTQ-Int4` / `*-AutoRound` line; an mlx-lm calibration
+     step at 3 bits; explicit model-card PPL evidence) live in
+     the survey doc and are watch-list items, not deliverables.
+     Audit trail at `plans/P6_TRACK_B/REPORT.md` (B.1 + B.2
+     sub-units), `plans/P6_TRACK_B_3BIT_OPENING.md`, and
+     `plans/P6_TRACK_B_FOLLOWUP_SURVEY.md`.
   8. **C.5 / C.2 / C.3 selection — and C.6 QuantSpec-like
      self-spec exploratory option.** Driven by C.4 outcome.
      If C.4 acceptance is high, C.5 reuses the same drafter and

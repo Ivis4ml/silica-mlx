@@ -228,12 +228,29 @@ read in-editor while iterating.
     full-precision weights** — survey first, conversion only on a
     documented motivation. Mainline next move stays the C.5 tree-
     shape spike (D-021 step 8) for the (1b) ≥60 tok/s survival path.
+  - **Survey closed empty on 2026-05-01.** No viable better-
+    calibrated MLX-native 3-bit matched-family candidate exists on
+    HF Hub: the only matched-family MLX 3-bit checkpoints
+    (`NexVeridian/Qwen3.5-27B-3bit`,
+    `RepublicOfKorokke/Qwen3.5-27B-mlx-lm-3bit`) both use
+    `mlx_lm.convert -q --bits 3` at default `group_size=64`
+    without any activation-aware step; activation-aware methods
+    (AWQ / GPTQ / AutoRound / DWQ / OptiQ) for Qwen3.5-27B exist
+    in MLX at 4 bits but not at 3 bits. Track B native 3-bit
+    lever is therefore fully retired pending a future checkpoint.
+
+- [`P6_TRACK_B_FOLLOWUP_SURVEY.md`](../plans/P6_TRACK_B_FOLLOWUP_SURVEY.md) —
+  read-only HF Hub survey doc; per-candidate verdicts table,
+  acceptance criteria for any future re-attempt, and re-look
+  triggers (MLX-native activation-aware 3-bit sib to the existing
+  4-bit DWQ / OptiQ / GPTQ / AutoRound line; mlx-lm 3-bit
+  calibration step; explicit model-card PPL evidence).
 
   Sub-unit commits in order: `9299294` opening / `adb52cd` orientation
   three-fix / `aa150d2` OQ-1 favourable close (`NexVeridian` found) /
   `62e36c3` (B.1) loader smoke + bench scenario / `eba7e26` (B.2)
-  negative-result closure + ΔPPL measurement / **this commit**
-  (PLAN + plans-index sync).
+  negative-result closure + ΔPPL measurement / `3d52e00`
+  (PLAN + plans-index sync) / **this commit** (follow-up survey).
 
 ## Side track: chat CLI redesign
 
