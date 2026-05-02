@@ -1971,6 +1971,90 @@ _QWEN3_5_27B_WARM_DECODE_B1 = Scenario(
 )
 
 
+# D-021 step 7 sub-unit (B.2) — Qwen3.5-27B WikiText-2 PPL rows.
+# Two scenarios paired by id (-4bit / -3bit) measure relative drift
+# between the two cached MLX quantizations on the same chunked-NLL
+# config the 0.6B PPL rows use. Gate is REPORT-side (sub-unit (B.2)
+# of plans/P6_TRACK_B/REPORT.md): ΔPPL_abs = ppl_3bit − ppl_4bit ≤
+# 0.5 AND ΔPPL_rel = ΔPPL_abs / ppl_4bit ≤ 0.05 — both bounds must
+# pass. The runner consumes one scenario per row, so the runner is
+# unchanged; the REPORT reads both outputs from the bench JSONL and
+# computes the deltas. Each row is gated independently so a user
+# with only one of the two checkpoints cached cannot trigger the
+# other's load.
+#
+# Chunked-NLL config inherited verbatim from
+# ``_WIKITEXT_PPL_ORACLE_CONFIG`` — measuring relative drift between
+# 4-bit and 3-bit, not an absolute leaderboard PPL. The 27B context
+# is much longer than the 0.6B family but the same chunk_size=256 /
+# max_tokens=512 config exercises the relative-drift signal cleanly
+# at lower cost than scaling chunks to 27B's full context window.
+
+_QWEN3_5_27B_WIKITEXT_PPL_4BIT = Scenario(
+    id="qwen3.5-27b-wikitext-ppl-4bit",
+    repo="mlx-community/Qwen3.5-27B-4bit",
+    workload=Workload(
+        name="wikitext-ppl-4bit",
+        prompts=(),
+        max_tokens=0,
+        max_batch_size=1,
+        prefix_cache=False,
+        temperature=0.0,
+        top_p=1.0,
+        kv_codec=None,
+    ),
+    oracle=OracleKind.PPL,
+    oracle_config=dict(_WIKITEXT_PPL_ORACLE_CONFIG),
+    gate_env_var="SILICA_REAL_QWEN3_5_27B",
+    description=(
+        "**D-021 step 7 sub-unit (B.2) — 4-bit baseline PPL row.** "
+        "Teacher-forced streaming PPL on WikiText-2 raw test split "
+        "(chunk_size=256, max_tokens=512 — same config the 0.6B "
+        "rows use). Pairs with ``qwen3.5-27b-wikitext-ppl-3bit`` "
+        "for the 3-bit-vs-4-bit relative-drift gate; the (B.2) "
+        "REPORT.md reads both rows' ``ScenarioResult.metadata.ppl`` "
+        "from the bench JSONL and computes ΔPPL_abs / ΔPPL_rel "
+        "against the gate (both bounds must pass: abs ≤ 0.5 AND "
+        "rel ≤ 0.05). Gated independently on SILICA_REAL_QWEN3_5_27B "
+        "because the 4-bit checkpoint is ~16 GB on disk; cache also "
+        "weak-gated. WikiText-2 fixture must be cached at "
+        "~/.cache/silica/wikitext2-test.txt (populate via "
+        "scripts/prepare_wikitext2_cache.py if missing)."
+    ),
+)
+
+
+_QWEN3_5_27B_WIKITEXT_PPL_3BIT = Scenario(
+    id="qwen3.5-27b-wikitext-ppl-3bit",
+    repo="NexVeridian/Qwen3.5-27B-3bit",
+    workload=Workload(
+        name="wikitext-ppl-3bit",
+        prompts=(),
+        max_tokens=0,
+        max_batch_size=1,
+        prefix_cache=False,
+        temperature=0.0,
+        top_p=1.0,
+        kv_codec=None,
+    ),
+    oracle=OracleKind.PPL,
+    oracle_config=dict(_WIKITEXT_PPL_ORACLE_CONFIG),
+    gate_env_var="SILICA_REAL_QWEN3_5_27B_3BIT",
+    description=(
+        "**D-021 step 7 sub-unit (B.2) — 3-bit candidate PPL row.** "
+        "Mirrors ``qwen3.5-27b-wikitext-ppl-4bit`` shape exactly but "
+        "loads ``NexVeridian/Qwen3.5-27B-3bit`` (the matched-family "
+        "native MLX 3-bit checkpoint identified at B.1's HF lookup). "
+        "Pairs with the 4-bit baseline row for the (B.2) REPORT-side "
+        "ΔPPL gate (both bounds must pass: abs ≤ 0.5 AND rel ≤ 0.05). "
+        "Gated independently on SILICA_REAL_QWEN3_5_27B_3BIT so a "
+        "user with only the 4-bit cached cannot trigger the 11 GB "
+        "3-bit load. WikiText-2 fixture cache requirement same as the "
+        "4-bit cousin."
+    ),
+)
+
+
 # D-021 step 7 sub-unit (B.1) — 3-bit Qwen3.5-27B warm-decode row.
 # Mirrors ``qwen3.5-27b-warm-decode-b1``'s shape exactly (same
 # workload, oracle, max_batch_size, max_tokens) so silica-integrated
@@ -2790,6 +2874,12 @@ BUILTIN_SCENARIOS: dict[str, Scenario] = {
     # NexVeridian/Qwen3.5-27B-3bit checkpoint, gated independently
     # under SILICA_REAL_QWEN3_5_27B_3BIT.
     _QWEN3_5_27B_WARM_DECODE_B1_3BIT.id: _QWEN3_5_27B_WARM_DECODE_B1_3BIT,
+    # D-021 step 7 sub-unit (B.2) — 27B WikiText-2 PPL rows; paired
+    # 4-bit baseline + 3-bit candidate, gated independently. (B.2)
+    # REPORT.md reads both rows' ScenarioResult.metadata.ppl and
+    # computes ΔPPL_abs / ΔPPL_rel against the both-bounds-pass gate.
+    _QWEN3_5_27B_WIKITEXT_PPL_4BIT.id: _QWEN3_5_27B_WIKITEXT_PPL_4BIT,
+    _QWEN3_5_27B_WIKITEXT_PPL_3BIT.id: _QWEN3_5_27B_WIKITEXT_PPL_3BIT,
 }
 
 

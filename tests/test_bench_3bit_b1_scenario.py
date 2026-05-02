@@ -45,10 +45,12 @@ def test_b1_3bit_scenario_registered() -> None:
     assert sc.id == "qwen3.5-27b-warm-decode-b1-3bit"
 
 
-def test_builtin_scenarios_count_is_68() -> None:
-    """v1.7.20 catalog had 67 scenarios; B.1 adds the b1-3bit row.
-    Tracked explicitly so an accidental catalog change is caught."""
-    assert len(BUILTIN_SCENARIOS) == 68
+def test_builtin_scenarios_count_is_at_least_68() -> None:
+    """v1.7.20 catalog had 67 scenarios; B.1 adds the b1-3bit row,
+    which puts the floor at 68. Loosened to ``>= 68`` so later
+    catalog growth (e.g. B.2's PPL rows) does not retro-gate this
+    invariant — same precedent as ζ's ``>= 67`` loosening."""
+    assert len(BUILTIN_SCENARIOS) >= 68
 
 
 def test_b1_3bit_workload_shape_matches_b1_cousin() -> None:
