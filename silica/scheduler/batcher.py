@@ -250,6 +250,16 @@ class ContinuousBatcher:
             raise ValueError(
                 f"max_batch_size must be >= 1, got {max_batch_size}"
             )
+        # 2026-05-03 cycle 4: chunked-lazy-decode opt-in (default 1 =
+        # byte-identical to pre-cycle behavior). Reads same env var as
+        # ``Engine._drive``: ``SILICA_DECODE_CHUNK``. See
+        # ``_decode_phase_chunked`` for trade-offs.
+        import os as _os
+        try:
+            _chunk_env = int(_os.environ.get("SILICA_DECODE_CHUNK", "1"))
+        except ValueError:
+            _chunk_env = 1
+        self._decode_chunk: int = max(1, _chunk_env)
         # D-021 step 5 sub-unit (c) slice 1: validate ``verify_k`` at
         # construction so a misconfiguration cannot silently disable
         # spec or land at a degenerate forward shape mid-step. Mirrors
@@ -532,6 +542,16 @@ class ContinuousBatcher:
             return []
         if any(r.state.status == RequestStatus.PREFILL for r in self._rows):
             return self._prefill_phase()
+        # 2026-05-03 cycle 4: optional chunked-lazy-decode dispatch.
+        # Gate: only when SILICA_DECODE_CHUNK > 1, no spec, no
+        # slice-prefill (which needs per-step state capture).
+        chunk = getattr(self, "_decode_chunk", 1)
+        if (
+            chunk > 1
+            and not self._spec_active()
+            and not self._slice_prefill_active()
+        ):
+            return self._decode_phase_chunked(chunk)
         return self._decode_phase()
 
     # --- phase methods ---
@@ -1647,6 +1667,71 @@ class ContinuousBatcher:
         """
         return not isinstance(self._draft_engine, NoopDraftEngine)
 
+    def _decode_phase_chunked(self, chunk: int) -> list[BatchEvent]:
+        """2026-05-03 cycle 4: chunked-lazy-decode for B>1 warm-decode.
+
+        Defers per-step ``.item()`` materialisation across ``chunk``
+        consecutive decode forwards. The chain is (lazy):
+        ``logits[k] = forward(argmax(logits[k-1]), cache)``. A single
+        ``mx.eval`` at the end of the chunk forces evaluation; per-step
+        sampling + token emission then run from the materialised logits.
+
+        Trade-offs:
+            - Stop-token check is per-step within the chunk; if a row
+              hits stop_token at step k < chunk-1, the chunk completes
+              and subsequent tokens for that row become unused (work is
+              effectively wasted but emission is correctly suppressed
+              on terminal rows).
+            - Slice-prefill capture is not supported in chunked mode
+              (skipped). Warm-decode workload doesn't use slice-prefill.
+            - Spec-active path skipped — chunked-decode does not
+              compose with verify-forward sub-stepping. Spec routes
+              through ``_decode_phase_spec`` even with chunk env set.
+
+        Argmax-vs-sampler note: the chunk uses ``mx.argmax`` to predict
+        the next-step input lazily. Under greedy decoding (temperature=0)
+        this matches the sampler exactly. Under sampling (temperature>0)
+        this approximates the dependency chain — the *sampler* is still
+        the one that produces emitted tokens (called per-step on the
+        materialised logits below), but the chain that drives the
+        forward pass uses argmax. For the warm-decode bench (greedy
+        only) this is identical to the unchunked path.
+        """
+        if self._spec_active():
+            return self._decode_phase_spec()
+        assert self._batch_cache is not None
+        pending_logits: list[mx.array] = []
+        next_tokens: mx.array | None = None
+        for k in range(chunk):
+            if k == 0:
+                tokens = self._build_decode_tokens()  # (B, 1)
+            else:
+                # Lazy argmax of previous step's logits → next step input.
+                # next_tokens shape: (B, 1) int32, matches _build_decode_tokens.
+                assert next_tokens is not None
+                tokens = next_tokens
+            logits = forward_batched(
+                self._model, tokens, list(self._batch_cache)
+            )  # (B, V)
+            pending_logits.append(logits)
+            # Lazy: don't materialise yet
+            next_tokens = mx.argmax(
+                logits, axis=-1, keepdims=True
+            ).astype(mx.int32)
+        # Single sync for the whole chunk's forward chain.
+        mx.eval(pending_logits[-1])
+
+        # Sample + emit per step. Each call materialises one step's
+        # logits (now resident, no extra eval needed) and runs the
+        # sampler/stop-token logic.
+        all_events: list[BatchEvent] = []
+        for logits_k in pending_logits:
+            events_k = self._sample_and_emit_batched(
+                logits_k, is_prefill=False
+            )
+            all_events.extend(events_k)
+        return all_events
+
     def _decode_phase(self) -> list[BatchEvent]:
         """One batched forward at ``T=1`` over all rows.
 
@@ -1914,11 +1999,23 @@ class ContinuousBatcher:
             if row.state.is_terminal:
                 continue
             row_logits = batched_logits[i]  # (V,)
-            history_ids = list(row.prompt_ids) + list(row.generated)
-            history = mx.array(history_ids, dtype=mx.int32)
-            token_scalar = self._sampler.sample(
-                row_logits, history, row.params
-            )
+            # 2026-05-03 cycle 6: skip the per-token history mx.array
+            # allocation in greedy mode. Sampler.sample returns argmax
+            # immediately when params.is_greedy without reading history;
+            # the prior unconditional mx.array(...) allocation forced a
+            # per-token sync that the greedy fast path doesn't need.
+            # Passes the empty list to keep the signature unchanged for
+            # the non-greedy path.
+            if row.params.is_greedy:
+                token_scalar = self._sampler.sample(
+                    row_logits, [], row.params
+                )
+            else:
+                history_ids = list(row.prompt_ids) + list(row.generated)
+                history = mx.array(history_ids, dtype=mx.int32)
+                token_scalar = self._sampler.sample(
+                    row_logits, history, row.params
+                )
             tok = int(token_scalar.item())
             row.generated.append(tok)
             events.append(BatchEvent.token(row.req_index, tok))

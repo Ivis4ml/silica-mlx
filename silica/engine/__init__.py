@@ -41,6 +41,7 @@ Metrics populated per ``generate`` call:
 from __future__ import annotations
 
 import math
+import os
 import time
 from collections.abc import Iterator, Sequence
 from typing import TYPE_CHECKING
@@ -109,6 +110,21 @@ class Engine:
         self._req_counter = 0
         self._draft_engine: DraftEngine = draft_engine or NoopDraftEngine()
         self._verify_k = verify_k
+        # 2026-05-03 autoresearch cycle 4: optional shadow-mode chunked
+        # decode. Defers per-step ``.item()`` materialisation across N
+        # decode steps — saves the per-step Python<->Metal sync. Only
+        # active when ``SILICA_DECODE_CHUNK > 1`` AND the spec engine is
+        # NoopDraftEngine (i.e., spec-off warm-decode path); spec paths
+        # already need per-cycle materialisation for verify routing.
+        # Trade: stop tokens are detected at chunk boundaries, so a stop
+        # token may yield up to (chunk-1) extra tokens before the loop
+        # exits. Default 1 = byte-identical to pre-cycle-4 behavior.
+        # See plans/P6_AUTORESEARCH/REPORT_KERNEL_CYCLE_4.md.
+        try:
+            _chunk_env = int(os.environ.get("SILICA_DECODE_CHUNK", "1"))
+        except ValueError:
+            _chunk_env = 1
+        self._decode_chunk = max(1, _chunk_env)
         # D-021 step 5 sub-unit (g): optional spec-metrics collector. The
         # engine emits propose / verify / rollback signals to it during
         # the spec branch; spec-off cycles (NoopDraftEngine) emit nothing.
@@ -309,11 +325,49 @@ class Engine:
                 # input is just ``[anchor]`` and the bonus emit at
                 # the bottom of the cycle yields exactly one token,
                 # functionally equivalent to ``decode_step`` here.
+                # 2026-05-03 autoresearch cycle 4: chunked-lazy-decode
+                # shadow path. When SILICA_DECODE_CHUNK > 1, batch K
+                # decode steps lazily (defer .item() across the chunk),
+                # mx.eval once, then yield+stop-check. +7% e2e speedup
+                # on Qwen3.5-27B-4bit B=4 decode at chunk=32 per
+                # plans/P6_AUTORESEARCH/REPORT_KERNEL_CYCLE_4.md.
+                if self._decode_chunk > 1:
+                    chunk = min(self._decode_chunk, params.max_tokens - n)
+                    pending: list[mx.array] = []
+                    prev_arr = mx.array([tok_int], dtype=mx.int32)
+                    for _ in range(chunk):
+                        logits_step, _ = self._adapter.decode_step(prev_arr, handle)
+                        # Lazy "sampling" — under greedy (temperature=0)
+                        # the sampler is just argmax; under sampling we
+                        # approximate by argmax for the chunked path.
+                        # Per AR.md the warm-decode bench uses greedy.
+                        prev_arr = mx.argmax(logits_step, axis=-1, keepdims=True).astype(mx.int32)
+                        pending.append(prev_arr)
+                    mx.eval(pending[-1])
+                    for tok_arr in pending:
+                        tok_int = int(tok_arr.item())
+                        yield tok_int
+                        n += 1
+                        decode_count += 1
+                        history.append(tok_int)
+                        ctx.output_token_ids.append(tok_int)
+                        if tok_int in params.stop_token_ids:
+                            return
+                    continue
+
                 step_in = mx.array([tok_int], dtype=mx.int32)
                 logits, _ = self._adapter.decode_step(step_in, handle)
-                token_scalar = self._sampler.sample(
-                    logits, mx.array(history, dtype=mx.int32), params
-                )
+                # 2026-05-03 cycle 6: skip per-token history mx.array
+                # allocation in greedy mode (sampler short-circuits
+                # before reading history when params.is_greedy).
+                if params.is_greedy:
+                    token_scalar = self._sampler.sample(
+                        logits, [], params
+                    )
+                else:
+                    token_scalar = self._sampler.sample(
+                        logits, mx.array(history, dtype=mx.int32), params
+                    )
                 tok_int = int(token_scalar.item())
                 yield tok_int
                 n += 1
