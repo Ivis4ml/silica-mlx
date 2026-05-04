@@ -58,6 +58,12 @@ docs = [
 dflash = [
     "dflash-mlx>=0.1.0,<0.2",
 ]
+# 2026-05-03: P-6 autoresearch loop progress charts (Karpathy-style ledger
+# visualisation in plans/P6_AUTORESEARCH_PROGRESS_*.png). Default install
+# stays slim; opt in via ``pip install 'silica-mlx[bench]'`` for plotting.
+bench = [
+    "matplotlib>=3.8",
+]
 
 [dependency-groups]
 dev = [
