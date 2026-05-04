@@ -71,6 +71,35 @@ def test_flash_attention_decode_matches_mlx_sdpa(
     assert err < 5e-4, f"{kernel_fn.__name__} max-abs {err} > tolerance, gated={gated}"
 
 
+@pytest.mark.parametrize(("B", "H_q", "H_kv", "T_kv", "D"), [
+    (4, 24, 4, 128, 256),
+    (16, 24, 4, 512, 256),
+])
+@pytest.mark.parametrize("gated", [False, True])
+@pytest.mark.parametrize(
+    "kernel_fn",
+    [flash_attention_decode_v8, flash_attention_decode_v10],
+    ids=["v8", "v10"],
+)
+def test_flash_attention_decode_v8_v10_match_mlx_sdpa_bf16(
+    B: int, H_q: int, H_kv: int, T_kv: int, D: int, gated: bool, kernel_fn
+) -> None:
+    mx.random.seed(1)
+    q = (mx.random.normal((B, H_q, 1, D)) * 0.1).astype(mx.bfloat16)
+    k = (mx.random.normal((B, H_kv, T_kv, D)) * 0.1).astype(mx.bfloat16)
+    v = (mx.random.normal((B, H_kv, T_kv, D)) * 0.1).astype(mx.bfloat16)
+    gate = (mx.random.normal((B, H_q, 1, D)) * 0.5).astype(mx.bfloat16) if gated else None
+    mx.eval(q, k, v)
+    if gate is not None:
+        mx.eval(gate)
+
+    out_ref = _ref(q, k, v, gate=gate)
+    out = kernel_fn(q, k, v, gate=gate)
+    mx.eval(out_ref, out)
+    err = _maxabs(out, out_ref)
+    assert err < 5e-3, f"{kernel_fn.__name__} bf16 max-abs {err} > tolerance, gated={gated}"
+
+
 def test_flash_attention_decode_v6_rejects_T_q_gt_1() -> None:
     q = mx.zeros((1, 24, 2, 256), dtype=mx.float16)
     k = mx.zeros((1, 4, 32, 256), dtype=mx.float16)

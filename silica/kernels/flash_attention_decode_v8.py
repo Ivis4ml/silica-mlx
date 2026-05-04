@@ -155,6 +155,18 @@ _FORWARD_SOURCE = """
 """
 
 
+_FORWARD_SOURCE_BF16 = (
+    _FORWARD_SOURCE
+    .replace("threadgroup half k_tile", "threadgroup bfloat16_t k_tile")
+    .replace("threadgroup half v_tile", "threadgroup bfloat16_t v_tile")
+    .replace("half4", "bfloat4")
+    .replace(
+        "partial += float(metal::dot(q_vec4, k_vec4));",
+        "partial += metal::dot(float4(q_vec4), float4(k_vec4));",
+    )
+)
+
+
 _MERGE_SOURCE = """
     constexpr uint D = 256u;
     constexpr uint TPS = 32u;
@@ -212,17 +224,18 @@ _MERGE_SOURCE = """
 """
 
 
-_FWD_KERNEL: object | None = None
+_FWD_KERNEL_FP16: object | None = None
+_FWD_KERNEL_BF16: object | None = None
 _MERGE_KERNEL_PLAIN: object | None = None
 _MERGE_KERNEL_GATED: object | None = None
 
 
-def _build_fwd() -> object:
+def _build_fwd(*, bf16: bool) -> object:
     return mx.fast.metal_kernel(
-        name="silica_flash_attention_decode_v8_fwd",
+        name=f"silica_flash_attention_decode_v8_fwd_{'bf16' if bf16 else 'fp16'}",
         input_names=["q", "k", "v", "scale_buf"],
         output_names=["partial_o", "partial_m", "partial_l"],
-        source=_FORWARD_SOURCE,
+        source=_FORWARD_SOURCE_BF16 if bf16 else _FORWARD_SOURCE,
         ensure_row_contiguous=True,
     )
 
@@ -260,9 +273,7 @@ def flash_attention_decode_v8(
 
     n_splits = (T_kv + SPLIT_K - 1) // SPLIT_K
 
-    global _FWD_KERNEL, _MERGE_KERNEL_PLAIN, _MERGE_KERNEL_GATED
-    if _FWD_KERNEL is None:
-        _FWD_KERNEL = _build_fwd()
+    global _FWD_KERNEL_FP16, _FWD_KERNEL_BF16, _MERGE_KERNEL_PLAIN, _MERGE_KERNEL_GATED
     merge_holder = _MERGE_KERNEL_GATED if has_gate else _MERGE_KERNEL_PLAIN
     if merge_holder is None:
         merge_holder = _build_merge(has_gate)
@@ -273,8 +284,16 @@ def flash_attention_decode_v8(
 
     if q.dtype == mx.float16:
         tdtype = mx.float16
+        fwd_holder = _FWD_KERNEL_FP16
+        if fwd_holder is None:
+            fwd_holder = _build_fwd(bf16=False)
+            _FWD_KERNEL_FP16 = fwd_holder
     elif q.dtype == mx.bfloat16:
         tdtype = mx.bfloat16
+        fwd_holder = _FWD_KERNEL_BF16
+        if fwd_holder is None:
+            fwd_holder = _build_fwd(bf16=True)
+            _FWD_KERNEL_BF16 = fwd_holder
     else:
         raise ValueError(f"only fp16/bf16; got {q.dtype}")
 
@@ -283,7 +302,7 @@ def flash_attention_decode_v8(
     fwd_grid_x = n_fwd_tg * threads_per_tg
     scale_arr = mx.array([float(scale)], dtype=mx.float32)
 
-    p_o, p_m, p_l = _FWD_KERNEL(  # type: ignore[operator]
+    p_o, p_m, p_l = fwd_holder(  # type: ignore[operator]
         inputs=[q, k, v, scale_arr],
         template=[
             ("T", tdtype), ("HQ", H_q), ("HKV", H_kv), ("TKV", T_kv),

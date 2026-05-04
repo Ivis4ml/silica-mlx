@@ -151,7 +151,7 @@ def install(model: Any) -> dict[str, bool]:
                 and num_q_heads == 24
                 and num_kv_heads == 4
                 and mask is None
-                and queries.dtype == mx.float16
+                and queries.dtype in (mx.float16, mx.bfloat16)
             )
             if v10_eligible:
                 # gate is currently (B, L, num_q_heads, head_dim/2) — wait, let's recheck.

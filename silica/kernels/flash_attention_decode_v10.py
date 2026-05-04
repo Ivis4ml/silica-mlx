@@ -141,16 +141,33 @@ _SINGLE_PASS_SOURCE = """
 """
 
 
-_SINGLE_PASS_KERNEL_PLAIN: object | None = None
-_SINGLE_PASS_KERNEL_GATED: object | None = None
+_SINGLE_PASS_SOURCE_BF16 = (
+    _SINGLE_PASS_SOURCE
+    .replace("threadgroup half k_tile", "threadgroup bfloat16_t k_tile")
+    .replace("threadgroup half v_tile", "threadgroup bfloat16_t v_tile")
+    .replace("half4", "bfloat4")
+    .replace(
+        "partial += float(metal::dot(q_local_vec[vi], k_vec4));",
+        "partial += metal::dot(float4(q_local_vec[vi]), float4(k_vec4));",
+    )
+)
 
 
-def _build_single_pass(has_gate: bool) -> object:
+_SINGLE_PASS_KERNEL_PLAIN_FP16: object | None = None
+_SINGLE_PASS_KERNEL_GATED_FP16: object | None = None
+_SINGLE_PASS_KERNEL_PLAIN_BF16: object | None = None
+_SINGLE_PASS_KERNEL_GATED_BF16: object | None = None
+
+
+def _build_single_pass(has_gate: bool, *, bf16: bool) -> object:
     return mx.fast.metal_kernel(
-        name=f"silica_flash_attention_decode_v10_single_{'gated' if has_gate else 'plain'}",
+        name=(
+            "silica_flash_attention_decode_v10_single_"
+            f"{'gated' if has_gate else 'plain'}_{'bf16' if bf16 else 'fp16'}"
+        ),
         input_names=["q", "k", "v", "scale_buf", "gate"],
         output_names=["out"],
-        source=_SINGLE_PASS_SOURCE,
+        source=_SINGLE_PASS_SOURCE_BF16 if bf16 else _SINGLE_PASS_SOURCE,
         ensure_row_contiguous=True,
     )
 
@@ -181,21 +198,37 @@ def flash_attention_decode_v10(
     if has_gate and gate.shape != q.shape:
         raise ValueError("gate shape mismatch")
 
-    global _SINGLE_PASS_KERNEL_PLAIN, _SINGLE_PASS_KERNEL_GATED
-    kernel_holder = _SINGLE_PASS_KERNEL_GATED if has_gate else _SINGLE_PASS_KERNEL_PLAIN
-    if kernel_holder is None:
-        kernel_holder = _build_single_pass(has_gate)
-        if has_gate:
-            _SINGLE_PASS_KERNEL_GATED = kernel_holder
-        else:
-            _SINGLE_PASS_KERNEL_PLAIN = kernel_holder
-
     if q.dtype == mx.float16:
         tdtype = mx.float16
+        bf16 = False
     elif q.dtype == mx.bfloat16:
         tdtype = mx.bfloat16
+        bf16 = True
     else:
         raise ValueError(f"only fp16/bf16; got {q.dtype}")
+
+    global _SINGLE_PASS_KERNEL_PLAIN_FP16, _SINGLE_PASS_KERNEL_GATED_FP16
+    global _SINGLE_PASS_KERNEL_PLAIN_BF16, _SINGLE_PASS_KERNEL_GATED_BF16
+    if bf16:
+        kernel_holder = (
+            _SINGLE_PASS_KERNEL_GATED_BF16 if has_gate else _SINGLE_PASS_KERNEL_PLAIN_BF16
+        )
+        if kernel_holder is None:
+            kernel_holder = _build_single_pass(has_gate, bf16=True)
+            if has_gate:
+                _SINGLE_PASS_KERNEL_GATED_BF16 = kernel_holder
+            else:
+                _SINGLE_PASS_KERNEL_PLAIN_BF16 = kernel_holder
+    else:
+        kernel_holder = (
+            _SINGLE_PASS_KERNEL_GATED_FP16 if has_gate else _SINGLE_PASS_KERNEL_PLAIN_FP16
+        )
+        if kernel_holder is None:
+            kernel_holder = _build_single_pass(has_gate, bf16=False)
+            if has_gate:
+                _SINGLE_PASS_KERNEL_GATED_FP16 = kernel_holder
+            else:
+                _SINGLE_PASS_KERNEL_PLAIN_FP16 = kernel_holder
 
     threads_per_tg = 32 * 6
     n_tg = B * H_kv
