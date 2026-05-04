@@ -39,15 +39,28 @@ The original prompt below quotes a 13.5 GB weight footprint and a ~22.7 tok/s B=
 
 The AR.md "Stop conditions" §"are CLEARED. See `plans/P6_AUTORESEARCH_FINAL_REPORT.md` for the comprehensive 23-cycle write-up. New numbers + new levers + new retired tracks below — supersede earlier addenda where they conflict.
 
-### Updated running-best line (supersedes earlier 42.17 / 193.9 anchors)
+### Updated running-best line (supersedes earlier 42.17 / 193.9 anchors; cycle-27 correction applied)
 
 | Frame | Value | Composition |
 | --- | ---: | --- |
-| Within strict 36 GB envelope | **206.2 ± 0.5 tok/s at B=52** (4.89× cycle-1 baseline) | C10 axis-shift × C12 bf16-state-peak-save × C11 v10 FA-decode kernel |
-| Within 48 GB hardware ceiling | **232.2 ± 0.3 tok/s at B=64** (5.51× cycle-1 baseline) | same stack at higher B |
-| (1b) ≥60 milestone | **CLEARED 3.44× (envelope) / 3.87× (ceiling)** | — |
+| Within strict 36 GB envelope | **204.5 ± ~1.5 tok/s at B=52** (4.85× cycle-1 baseline) | C10 axis-shift × C12 bf16-state-peak-save |
+| Within 48 GB hardware ceiling | **~230 tok/s at B=64** (~5.45× cycle-1 baseline; needs re-measurement under corrected v10 path) | same stack at higher B |
+| (1b) ≥60 milestone | **CLEARED 3.41× (envelope)** | — |
 
-The 42.17 baseline is now historical. Running-best on `qwen3.5-27b-warm-decode-*` row family lives at **206.2 within 36 GB envelope** as of cycle 14 (2026-05-04).
+The 42.17 baseline is now historical.
+
+**2026-05-04 cycle 27 correction (Codex review, opus-codex branch merge)**:
+the cycle-12 shadow_install patch had a dtype defect (`queries.dtype ==
+mx.float16`) that prevented v10 FA-decode from firing on the Qwen3.5 bf16
+production path. Cycle-14's claimed "+5.4 tok/s = 3.4σ KEEP from v10+bf16
+stack" was attribution error: v10 was never firing AND small n=3 σ
+underestimated the actual ~±1.5 tok/s run-to-run variance. After Codex's
+bf16-native v10 fix landed and cycle 27's 8-reproduction reverify,
+**v10 contributes +0.5 tok/s at B=52 — within noise, not a measurable
+E2E lever**. The honest running-best is bf16 state alone at B=52,
+attributed to C10+C12 composition. v10 retains microbench wins
+(1.28-2.14× over mlx) but they don't translate to E2E at production B
+because attention is a small fraction of step time.
 
 ### New durable levers (compose with prior C10 axis-shift)
 

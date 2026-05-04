@@ -1,25 +1,48 @@
 # Silica-MLX P-6 Autoresearch — Final Report
-## 23-cycle journey, 2026-05-02 → 2026-05-04
+## 23-cycle journey + cycle 27 correction, 2026-05-02 → 2026-05-04
 
 | Field | Value |
 | --- | --- |
 | Phase | P-6 (performance) |
 | Target | dense `mlx-community/Qwen3.5-27B-4bit` on M5 Pro 48 GB |
-| Branch | `opus` |
-| MLX stack | mlx 0.31.1 + mlx-lm 0.31.2 + mlx-metal 0.31.1 (pinned; cycle-11 found 0.31.2 broke determinism) |
+| Branch | `opus` (Codex review merged from `opus-codex` 2026-05-04) |
+| MLX stack | mlx 0.31.1 + mlx-lm 0.31.2 + mlx-metal 0.31.1 (pinned in pyproject.toml; cycle-11 found 0.31.2 broke determinism) |
 | Date opened | 2026-05-02 |
 | Date closed | 2026-05-04 |
+| Correction | **Cycle 27 (Codex review)** revealed cycle-12 shadow-install dtype defect: v10 FA-decode never fired at the bf16 production path. Numbers below revised. |
 
 ---
 
-## 1. Mission outcome
+## 1. Mission outcome — REVISED (cycle 27 correction)
 
 | Layer | Cycle-1 baseline | Final | Multiple |
 | --- | ---: | ---: | ---: |
-| Within strict 36 GB envelope | 42.17 ± 0.21 tok/s (B=4) | **206.2 ± 0.5 tok/s (B=52, v10+bf16 stack)** | **4.89×** |
-| Within 48 GB hardware ceiling | n/a | **232.2 ± 0.3 tok/s (B=64, v10+bf16 stack)** | **5.51×** |
-| (1b) ≥60 tok/s milestone | not cleared | **CLEARED 3.44× (envelope) / 3.87× (ceiling)** | — |
-| Stop conditions per AR.md §"Stop conditions" | none cleared | **2 of 3 cleared**: (i) reproduced ≥60 milestone via 3.44×; (ii) reproduced new running-best ≥3σ above 42.17 with clean attribution | — |
+| Within strict 36 GB envelope | 42.17 ± 0.21 tok/s (B=4) | **204.5 ± ~1.5 tok/s (B=52, bf16 state)** | **4.85×** |
+| Within 48 GB hardware ceiling | n/a | **~230 tok/s (B=64, bf16 state) — pending re-measurement** | ~5.45× |
+| (1b) ≥60 tok/s milestone | not cleared | **CLEARED 3.41× (envelope)** | — |
+| Stop conditions per AR.md §"Stop conditions" | none cleared | **2 of 3 cleared** | — |
+
+**Pre-correction claim (from cycle 14, attribution defective):** 206.2 ±
+0.5 tok/s at B=52 with "v10+bf16 stack". Cycle 27 revealed v10 FA-decode
+kernel was never firing (cycle-12 shadow_install patch checked
+`mx.float16` but Qwen3.5 decode is bf16). After Codex's bf16 v10 fix
+landed and 8 reproductions with proper variance characterization:
+
+- B=52 with v10 firing (n=5): 204.7 ± 1.2 tok/s
+- B=52 bf16-only baseline (n=3): 204.2 ± 1.1 tok/s
+- Δ = +0.5 tok/s — within noise
+
+**The honest within-envelope running-best is bf16 state alone at B=52.**
+v10 has measurable kernel-level wins (1.28-2.14× over mlx in microbench)
+that don't translate to E2E at B=52 — same finding as cycle-12's "v10
+alone at B=48 = 0% E2E", which was correct in conclusion despite the
+underlying dtype bug.
+
+**Lever attribution corrected**: C10 axis-shift × C12 bf16-state
+peak-save → 4.85× cycle-1 baseline. v10 FA-decode kernel does NOT
+contribute measurably at the production B regime; it remains a
+correctness-validated tool with 1.28-2.14× kernel-level wins available
+for future workloads where attention is a larger fraction of step time.
 
 ---
 
