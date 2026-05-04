@@ -1,0 +1,7 @@
+{"kind": "skip_schedule", "skip_from_end": 4, "exit_layer": 60, "n_positions": 96, "matches": 36, "agreement": 0.375, "ts": "2026-05-03T19:51:25.323765+00:00"}
+{"kind": "skip_schedule", "skip_from_end": 8, "exit_layer": 56, "n_positions": 96, "matches": 29, "agreement": 0.3020833333333333, "ts": "2026-05-03T19:51:25.323765+00:00"}
+{"kind": "skip_schedule", "skip_from_end": 16, "exit_layer": 48, "n_positions": 96, "matches": 17, "agreement": 0.17708333333333334, "ts": "2026-05-03T19:51:25.323765+00:00"}
+{"kind": "skip_schedule", "skip_from_end": 24, "exit_layer": 40, "n_positions": 96, "matches": 16, "agreement": 0.16666666666666666, "ts": "2026-05-03T19:51:25.323765+00:00"}
+{"kind": "skip_schedule", "skip_from_end": 32, "exit_layer": 32, "n_positions": 96, "matches": 5, "agreement": 0.052083333333333336, "ts": "2026-05-03T19:51:25.323765+00:00"}
+{"kind": "skip_schedule", "skip_from_end": 48, "exit_layer": 16, "n_positions": 96, "matches": 2, "agreement": 0.020833333333333332, "ts": "2026-05-03T19:51:25.323765+00:00"}
+{"kind": "summary", "ts": "2026-05-03T19:51:25.323765+00:00", "repo": "mlx-community/Qwen3.5-27B-4bit", "n_layers": 64, "n_positions_captured": 96, "skip_schedules_tested": [4, 8, 16, 24, 32, 48], "agreements_by_skip": {"4": 0.375, "8": 0.3020833333333333, "16": 0.17708333333333334, "24": 0.16666666666666666, "32": 0.052083333333333336, "48": 0.020833333333333332}}
