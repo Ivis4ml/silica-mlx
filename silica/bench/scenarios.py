@@ -2162,6 +2162,32 @@ def _warm_decode_b_scenario(b: int) -> "Scenario":
     P-6.0.5 framing of "B=4 is the headroom limit" reflected the
     measurement scope, not the hardware ceiling.
     """
+    # B-specific status note. The 60 tok/s milestone is the (1b) stretch
+    # bar; cycle 10 measured B=8 = ~43 tok/s (below 60) and B=12 = >60.
+    # Cycle 13 / 28 declared running-best KEEPs at B=52 / B=64.
+    if b == 52:
+        status_note = (
+            "**B=52 is the cycle-13 within-envelope KEEP at 204 ± 1 tok/s** "
+            "(n=6 across 2 sessions per cycle 33; peak ~35.5 GB; "
+            "requires `SILICA_USE_BF16_DELTANET_STATE=1`)."
+        )
+    elif b == 64:
+        status_note = (
+            "**B=64 is the cycle-28 hardware-ceiling KEEP at 231.9 ± 0.3 tok/s** "
+            "(n=3 bf16-only; peak ~40 GB; B=66 transition crosses the "
+            "architectural cliff at the 40 GB peak boundary per cycle 29)."
+        )
+    elif b >= 12:
+        status_note = (
+            f"B={b} sits within the 36 GB envelope and crosses the 60 tok/s "
+            f"milestone per the cycle-10 sweep."
+        )
+    else:
+        status_note = (
+            f"B={b} sits within the 36 GB envelope but is below the 60 tok/s "
+            f"milestone (cycle-10 measured B=8 ~ 43 tok/s); part of the high-B "
+            f"sweep for envelope characterization and small-B baselines."
+        )
     return Scenario(
         id=f"qwen3.5-27b-warm-decode-b{b}",
         repo="mlx-community/Qwen3.5-27B-4bit",
@@ -2172,8 +2198,7 @@ def _warm_decode_b_scenario(b: int) -> "Scenario":
             f"**Cycle 10 (2026-05-03) — dense 27B B={b} warm-decode.** "
             f"Same workload shape as warm-decode-b4 (128-token prompt, "
             f"384-token generation, max_tokens=384) at higher batch. "
-            f"Cycle-10 probe found B={b} sits comfortably within the "
-            f"36 GB envelope and exceeds the 60 tok/s aggregate gate. "
+            f"{status_note} "
             f"Dual-gated on SILICA_REAL_QWEN3_5_27B."
         ),
     )
@@ -2285,7 +2310,28 @@ _QWEN3_5_MOE_WARM_DECODE_B3 = Scenario(
 
 
 def _moe_warm_decode_b_scenario(b: int) -> "Scenario":
-    """Cycle 34: MoE B-axis extension to test cycles 12+13 lever portability."""
+    """Cycle 34/35: MoE B-axis sweep that tests cycles 12+13 lever portability."""
+    if b == 128:
+        status_note = (
+            f"**B={b} is the cycle-35 hardware-ceiling KEEP at 791.8 ± 5.2 tok/s** "
+            f"aggregate (peak 47.96 GB at the 48 GB cap; n=3; the largest "
+            f"absolute throughput observed across the 35-cycle effort)."
+        )
+    elif b == 64:
+        status_note = (
+            f"**B={b} is the cycle-34 within-envelope KEEP at 464.1 ± 0.7 tok/s** "
+            f"aggregate (peak 33.8 GB; n=3 per cycle 35 reverify)."
+        )
+    elif b >= 96:
+        status_note = (
+            f"B={b} is part of the cycle-35 hardware-ceiling sweep that "
+            f"culminates in the B=128 KEEP."
+        )
+    else:
+        status_note = (
+            f"B={b} is part of the cycle-34 portability sweep that culminates "
+            f"in the B=64 within-envelope KEEP."
+        )
     return Scenario(
         id=f"qwen3.5-moe-35b-a3b-warm-decode-b{b}",
         repo="mlx-community/Qwen3.5-35B-A3B-4bit",
@@ -2293,11 +2339,11 @@ def _moe_warm_decode_b_scenario(b: int) -> "Scenario":
         oracle=OracleKind.WARM_DECODE,
         gate_env_var="SILICA_REAL_QWEN3_5_MOE",
         description=(
-            f"**P-6 MoE B={b} cycle-34 portability test.** Tests whether the "
+            f"**P-6 MoE B={b} cycle-34/35 portability sweep.** Tests whether the "
             f"cycle-12 bf16 DeltaNet state lever and cycle-13 axis-shift "
             f"transfer to the MoE 35B-A3B variant. Set "
-            f"`SILICA_USE_BF16_DELTANET_STATE=1` for the bf16 path. **B={b} "
-            f"has not been validated on real hardware** — opt-in stretch."
+            f"`SILICA_USE_BF16_DELTANET_STATE=1` for the bf16 path. "
+            f"{status_note}"
         ),
     )
 
