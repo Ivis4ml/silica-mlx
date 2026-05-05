@@ -1579,33 +1579,28 @@ Append-only. New decisions go at the end; old ones are not edited. Revocations /
      spike shows headroom over the linear k=8 verify ceiling
      (P-6.0.5 Unit 7, 2.93× target-side / zero-drafter-cost)
      sufficient to make the full-stack projection ≥60 credible,
-     (1b) survives. **Status: orientation opened at v1.7.22
-     post-C.4 retirement** — see
-     `plans/P6_C5_DDTREE_OPENING.md`. The opening reframes C.5
-     as a *decision spike*, not a DDTree implementation
-     continuation. The gating empirical metric is **measured
-     `coverage@b`** (Pr(target argmax ∈ drafter top-b)) for
-     b ∈ {4, 8, 16}, **not** linear top-1 accept rate α — at
-     C.4-measured α=0.088 the independence-bound envelope tops
-     at ≈4.82 tokens/cycle even at b=16, but real greedy tree
-     branches share the same drafter logits and are correlated,
-     so coverage@b must be measured directly. Sub-units run
-     coverage-checking ahead of any DDTree port: α (orientation
-     itself) → β.1 (single bench run on the v1.7.19 (h)
-     `qwen3.5-27b-warm-decode-spec-on` row, target `mlx-
-     community/Qwen3.5-27B-4bit` × drafter `Qwen/Qwen3.5-0.8B`,
-     yields linear α + drafter cost + rollback) → β.2 (stand-
-     alone read-only `coverage@b` probe with tokenizer-
-     alignment guard, bypasses the spec engine entirely) → γ.1
-     upstream survey → γ.2 implementation → δ attestation.
-     Retirement bar: `coverage@4` AND `coverage@8` AND
-     `coverage@16` all < 0.15 → close §13 step 8 without a
-     DDTree port; depth-only highs escalate rather than auto-
-     retire. No code in α; β.1 + β.2 use only existing cached
-     weights and existing scenario / forward-call primitives. The existing C.5 description below
-     ("If C.4 acceptance is high, C.5 reuses the same drafter
-     and adds the tree-verification path") becomes prerequisite
-     framing for the spike rather than the gate itself. If C.4
+     (1b) survives. **Status: clean-retired at v1.7.22.** The
+     C.5 orientation and β measurement bundle landed as a
+     decision spike, not a DDTree implementation continuation
+     (`plans/P6_C5_DDTREE_OPENING.md`,
+     `plans/P6_C5_DDTREE/REPORT.md`). The β.2 coverage matrix
+     did not clear the pre-declared b ≤ 16 implementation floor
+     (`coverage@4=0.14`, `@8=0.20`, `@16=0.26`; only
+     `coverage@32=0.34` crossed 0.30 outside the gate window),
+     which initially placed C.5 in the escalation band. Opus
+     cycle 23 then closed the escalation escape hatch by measuring
+     production-B verify cost: B=52 k=64 costs **8105 ms** vs
+     B=1 k=64 at 190 ms and plain decode at the same B around
+     252 ms/step (`~206 tok/s` aggregate). Recomputed at the
+     actual operating point, tree-spec projects to roughly
+     **10 tok/s aggregate**, a net loss. A γ.1 survey would need
+     evidence for breaking B-axis scaling, not only k-axis
+     wide-tree cost, so γ.1 is not opened and no
+     `silica.speculative.ddtree` port is authorised. The old C.5
+     implementation description below ("If C.4 acceptance is
+     high, C.5 reuses the same drafter and adds the
+     tree-verification path") remains historical framing, not live
+     scope. If C.4
      draft quality is mediocre, try MTP head (C.3) or ReDrafter
      (C.2). C.2 KD pass only if C.1 / C.4 are insufficient and
      (1b) is still in pursuit.
@@ -2034,6 +2029,27 @@ Local reference implementations sit at the repo root. **Algorithm / architecture
 ---
 
 ## 13. Changelog
+
+- **v1.7.22** (2026-05-05): **D-021 step 8 C.5 DDTree clean-retired
+  after the production-B verify-cost closure.** The β.1 / β.2 C.5
+  measurement bundle in `plans/P6_C5_DDTREE/REPORT.md` initially landed
+  in the pre-declared escalation band: `coverage@4=0.14`,
+  `coverage@8=0.20`, `coverage@16=0.26`, with `coverage@32=0.34`
+  informative but outside the b ∈ {4, 8, 16} implementation gate.
+  Opus cycle 23 then measured the missing production operating point
+  directly: B=52 k=64 verify cost is **8105 ms**, roughly 42× the
+  B=1 k=64 cost (`190 ms`) and far above the same-B plain-decode step
+  (`~252 ms`, `~206 tok/s` aggregate). Recomputed honestly, tree-spec
+  at B=52 is `drafter 300 ms + verify 8105 ms`, or roughly
+  **10 tok/s aggregate**, a net loss against plain decode. This closes
+  the γ.1 escape hatch: a DDTree / wide-tree survey would need to break
+  B-axis scaling at production batch, not merely k-axis tree width.
+  **Disposition:** no γ.1 read-only survey, no
+  `silica.speculative.ddtree` port, and no C.5 contribution to the
+  (1b) ≥60 tok/s survival path. The negative result is retained as an
+  audit trail; a future re-open requires measured sublinear verify cost
+  at the actual production B. `docs/plans-index.md` now links the
+  closure alongside the opening.
 
 - **v1.7.21** (2026-05-01): **D-021 step 7 Track B native 3-bit
   candidate retired — B.2 quality gate FAILED on

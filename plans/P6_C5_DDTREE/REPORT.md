@@ -203,7 +203,8 @@ Equality was not expected; neither probe fails.
 | **`coverage@b ∈ [0.15, 0.30)` at b ∈ {4, 8, 16}; nothing reaches 0.30** | **escalate; user decides** | `@8=0.20`, `@16=0.26` both in band; nothing at b ≤ 16 reaches 0.30 | **yes** |
 | `coverage@4` AND `@8` AND `@16` all < 0.15 | retire entirely | `@4=0.14` only just below; `@8=0.20`, `@16=0.26` clearly above | **no** |
 
-**Disposition: escalate.** The measurement does *not* clear
+**Initial disposition: escalate (superseded by the cycle-23
+production-B closure below).** The measurement does *not* clear
 γ-implement (b ≤ 16 ceiling at 0.26), but does *not* trigger
 clean retire either (`@8`, `@16` are well above 0.15).
 
@@ -280,6 +281,45 @@ remains retire (1b).
 
 ---
 
+## Cycle-23 production-B closure
+
+Opus cycle 23 measured the missing production operating point:
+target-verify cost over `B ∈ {1, 4, 16, 52}` and
+`k ∈ {1, 4, 16, 64}`. The decisive row is:
+
+| B | k=1 | k=4 | k=16 | k=64 |
+| - | ---: | ---: | ----: | ----: |
+| 52 | 242 ms | 642 ms | 1967 ms | **8105 ms** |
+
+The earlier cycle-22 tree-spec projection used the B=1 k=64
+cost (`190 ms`) and therefore missed the B dimension. At the
+actual high-throughput dense operating point, B=52 k=64 costs
+`8105 ms` — roughly 42x the B=1 k=64 cost and far above the
+plain-decode step at the same B (`~252 ms`, `~206 tok/s`
+aggregate). Recomputing the tree-spec envelope with measured
+B=52 costs gives:
+
+`drafter 300 ms + verify 8105 ms -> ~0.19 tok/s/row -> ~10 tok/s aggregate`
+
+That is a net loss against plain decode, not a path to (1b).
+
+This supersedes the γ.1 escape hatch. The prior escalation
+question was whether a read-only survey of `humanrouter/ddtree-mlx`
+could find a wide-tree verifier that broke the **k-axis** cost
+at T=32. Cycle 23 shows that a viable production path would also
+need to break the **B-axis** scaling at B=52. That is a different
+and stronger requirement than the DDTree wide-tree kernel claim,
+and there is no measured evidence for it on this stack.
+
+**Final disposition: clean retire.** Do not open γ.1, do not port
+`silica.speculative.ddtree`, and close the D-021 step 8 C.5 leg
+as a measurement-backed negative result. Re-opening requires a
+fundamentally different verifier with measured sublinear cost at
+the actual production B, not a kernel survey that only improves
+tree width.
+
+---
+
 ## Materials landed
 
 - `plans/P6_C5_DDTREE/spec_on_b1_alpha_probe.jsonl` — β.1
@@ -306,10 +346,8 @@ remains retire (1b).
 
 ## PLAN / plans-index disposition
 
-**Not synced in this commit.** Per the user's pre-declared
-order, PLAN.md §13 step 8 inline status and
-`docs/plans-index.md` get updated only after the user reads
-this REPORT and chooses between **retire (1b)** and
-**authorise γ.1 read-only kernel survey**. Until that
-decision lands, the v1.7.22 orientation status remains the
-live PLAN entry.
+Synced in the closure commit. PLAN.md §13 D-021 step 8 and
+`docs/plans-index.md` record C.5 as clean-retired by the
+cycle-23 production-B verify-cost matrix. The old escalation
+band is retained above as an audit trail, but it is no longer
+the live disposition.

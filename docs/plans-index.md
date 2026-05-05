@@ -252,7 +252,7 @@ read in-editor while iterating.
   negative-result closure + ΔPPL measurement / `3d52e00`
   (PLAN + plans-index sync) / `44bd928` (follow-up survey).
 
-### D-021 step 8 — C.5 tree-shape decision spike (orientation)
+### D-021 step 8 — C.5 tree-shape decision spike (closed)
 
 - [`P6_C5_DDTREE_OPENING.md`](../plans/P6_C5_DDTREE_OPENING.md) —
   orientation document for the C.5 tree-shape spike. **Reframed
@@ -273,7 +273,7 @@ read in-editor while iterating.
   candidates and are correlated. Coverage@b must therefore be
   measured directly, not inferred from α.
 
-  Sub-units: α (this orientation) → β.1 (single bench run on
+  Planned sub-units at opening time: α (this orientation) → β.1 (single bench run on
   the v1.7.19 (h) `qwen3.5-27b-warm-decode-spec-on` scenario,
   yields linear α + drafter cost + rollback for the cached
   `mlx-community/Qwen3.5-27B-4bit` × `Qwen/Qwen3.5-0.8B`
@@ -281,18 +281,31 @@ read in-editor while iterating.
   with tokenizer-alignment guard; bypasses the spec engine; no
   new download) → γ.1 upstream `humanrouter/ddtree-mlx` survey
   → γ.2 minimal `silica.speculative.ddtree` implementation → δ
-  real-checkpoint attestation. Implementation does not start
-  until α + β.1 + β.2 + γ.1 all PASS.
+  real-checkpoint attestation. The closure report supersedes this
+  plan after β.1 / β.2 plus the production-B verify-cost matrix.
 
-  Decision matrix (§9 of the opening): retire only if
-  `coverage@4` AND `coverage@8` AND `coverage@16` are all
-  < 0.15; depth-only highs escalate to user decision rather
-  than auto-retire. No gate relaxation — the (1b) ≥60 tok/s
-  bar is the bar.
+- [`P6_C5_DDTREE/REPORT.md`](../plans/P6_C5_DDTREE/REPORT.md) —
+  β.1 / β.2 measurement bundle and final closure. The pre-declared
+  matrix initially escalated: `coverage@4=0.14`, `coverage@8=0.20`,
+  `coverage@16=0.26`, with `coverage@32=0.34` outside the
+  implementation gate. Opus cycle 23 then measured production-B
+  verify cost and closed the escape hatch: B=52 k=64 costs
+  **8105 ms** vs B=1 k=64 at `190 ms`, while plain decode at the
+  same B is roughly `252 ms` per step (`~206 tok/s` aggregate).
+  A viable DDTree path would need to break B-axis scaling at
+  production batch, not only k-axis tree width. **Final
+  disposition:** C.5 clean-retired; no γ.1 survey and no
+  `silica.speculative.ddtree` port.
 
-  Sub-unit commits in order: **this commit** (orientation +
-  PLAN.md §13 step 8 inline status sync); β.1 / β.2 /
-  γ / δ pending separate authorisation.
+  The original decision matrix is retained in the report as audit
+  trail: β.2 alone escalated rather than auto-retired, but cycle 23
+  supplied the missing production-cost evidence and converted the
+  disposition to clean retire. No gate relaxation — the (1b) ≥60
+  tok/s bar is the bar.
+
+  Sub-unit commits in order: `eed5204` (orientation), `03226d7`
+  (β.2 probe + tests), `309af8c` (β.1 / β.2 measurement bundle),
+  then this closure sync.
 
 ## Side track: chat CLI redesign
 
