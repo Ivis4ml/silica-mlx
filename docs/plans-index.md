@@ -307,6 +307,43 @@ read in-editor while iterating.
   (β.2 probe + tests), `309af8c` (β.1 / β.2 measurement bundle),
   then this closure sync.
 
+### D-022 — P-6 small-B dispatch / latency line (opened at v1.7.24)
+
+- [`P6_SMALL_B_OPENING.md`](../plans/P6_SMALL_B_OPENING.md) —
+  actionable opening for the small-B latency / dispatch attack
+  declared as next P-6 research direction at v1.7.24, recorded
+  formally as D-022 in `PLAN.md` §9. Replaces "next direction
+  hint" with sub-unit-level commands, gates, and stop conditions.
+
+  Five sub-units (α–ε): α sonnet-side baseline refresh
+  (unconditional; B=4/B=8/B=12 warm-decode + decode-step + layer-
+  internal attribution; cycle-27 variance discipline as gate);
+  β attention `mx.compile` graph-trace with cache reroute
+  (conditional, targets the ~22% full-attn bucket per cycle-1
+  B=4 step-share); γ MLP `mx.compile` close (low priority,
+  negative-confirmation reverify of cycle 17); δ `mx.eval`
+  cadence / per-layer loop sync hygiene (Python-side, bounded by
+  the 4% overhead ceiling); ε mlx 0.32+ async-copy upstream
+  waitlist (do not open).
+
+  Goal framing: interactive single-row latency / TTFT, **not**
+  throughput parity (per-row at B=4 already exceeds per-row at
+  B=52). Non-goals: no new Metal kernels, no spec-decode reopen,
+  no high-B axis extension as primary objective, no Tier-2 opus
+  kernel imports without explicit user authorization (the
+  `silica/kernels/` public surface stays at v10 + slim
+  shadow_install per the v1.7.23 narrowing).
+
+  Tools landed in v1.7.24 Step 4 are α's executable surface:
+  warm-decode-b{4,8,12} scenarios in `silica.bench.scenarios`,
+  attribution microbenches at
+  `silica/bench/microbench/{decode_step,layer_internal}_attribution.py`,
+  slim `silica.kernels.shadow_install` with the
+  `SILICA_USE_BF16_DELTANET_STATE` / `SILICA_USE_FA_DECODE_V10`
+  flags, and the `mlx==0.31.1 / mlx-lm==0.31.2 / mlx-metal==0.31.1`
+  pin attested by `tests/test_p2_preload_parity.py`. No tool
+  debt blocks the first measurement.
+
 ## Side track: chat CLI redesign
 
 - [`CHAT_CLI_OPENING.md`](../plans/CHAT_CLI_OPENING.md) — the design
