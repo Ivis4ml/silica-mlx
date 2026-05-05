@@ -2284,6 +2284,34 @@ _QWEN3_5_MOE_WARM_DECODE_B3 = Scenario(
 )
 
 
+def _moe_warm_decode_b_scenario(b: int) -> "Scenario":
+    """Cycle 34: MoE B-axis extension to test cycles 12+13 lever portability."""
+    return Scenario(
+        id=f"qwen3.5-moe-35b-a3b-warm-decode-b{b}",
+        repo="mlx-community/Qwen3.5-35B-A3B-4bit",
+        workload=_warm_decode_workload(max_batch_size=b, max_tokens=384),
+        oracle=OracleKind.WARM_DECODE,
+        gate_env_var="SILICA_REAL_QWEN3_5_MOE",
+        description=(
+            f"**P-6 MoE B={b} cycle-34 portability test.** Tests whether the "
+            f"cycle-12 bf16 DeltaNet state lever and cycle-13 axis-shift "
+            f"transfer to the MoE 35B-A3B variant. Set "
+            f"`SILICA_USE_BF16_DELTANET_STATE=1` for the bf16 path. **B={b} "
+            f"has not been validated on real hardware** — opt-in stretch."
+        ),
+    )
+
+
+_QWEN3_5_MOE_WARM_DECODE_B8_C34 = _moe_warm_decode_b_scenario(8)
+_QWEN3_5_MOE_WARM_DECODE_B16_C34 = _moe_warm_decode_b_scenario(16)
+_QWEN3_5_MOE_WARM_DECODE_B24_C34 = _moe_warm_decode_b_scenario(24)
+_QWEN3_5_MOE_WARM_DECODE_B32_C34 = _moe_warm_decode_b_scenario(32)
+_QWEN3_5_MOE_WARM_DECODE_B48_C34 = _moe_warm_decode_b_scenario(48)
+_QWEN3_5_MOE_WARM_DECODE_B64_C34 = _moe_warm_decode_b_scenario(64)
+_QWEN3_5_MOE_WARM_DECODE_B80_C34 = _moe_warm_decode_b_scenario(80)
+_QWEN3_5_MOE_WARM_DECODE_B96_C34 = _moe_warm_decode_b_scenario(96)
+
+
 _QWEN3_5_MOE_WARM_DECODE_B4 = Scenario(
     id="qwen3.5-moe-35b-a3b-warm-decode-b4",
     repo="mlx-community/Qwen3.5-35B-A3B-4bit",
@@ -2892,6 +2920,14 @@ BUILTIN_SCENARIOS: dict[str, Scenario] = {
     _QWEN3_5_MOE_WARM_DECODE_B1.id: _QWEN3_5_MOE_WARM_DECODE_B1,
     _QWEN3_5_MOE_WARM_DECODE_B2.id: _QWEN3_5_MOE_WARM_DECODE_B2,
     _QWEN3_5_MOE_WARM_DECODE_B4.id: _QWEN3_5_MOE_WARM_DECODE_B4,
+    _QWEN3_5_MOE_WARM_DECODE_B8_C34.id: _QWEN3_5_MOE_WARM_DECODE_B8_C34,
+    _QWEN3_5_MOE_WARM_DECODE_B16_C34.id: _QWEN3_5_MOE_WARM_DECODE_B16_C34,
+    _QWEN3_5_MOE_WARM_DECODE_B24_C34.id: _QWEN3_5_MOE_WARM_DECODE_B24_C34,
+    _QWEN3_5_MOE_WARM_DECODE_B32_C34.id: _QWEN3_5_MOE_WARM_DECODE_B32_C34,
+    _QWEN3_5_MOE_WARM_DECODE_B48_C34.id: _QWEN3_5_MOE_WARM_DECODE_B48_C34,
+    _QWEN3_5_MOE_WARM_DECODE_B64_C34.id: _QWEN3_5_MOE_WARM_DECODE_B64_C34,
+    _QWEN3_5_MOE_WARM_DECODE_B80_C34.id: _QWEN3_5_MOE_WARM_DECODE_B80_C34,
+    _QWEN3_5_MOE_WARM_DECODE_B96_C34.id: _QWEN3_5_MOE_WARM_DECODE_B96_C34,
     _GEMMA4_MOE_WARM_DECODE_B1.id: _GEMMA4_MOE_WARM_DECODE_B1,
     # P5.9 step 2(d) — sustained 4K / 8K context memory probes
     # (dual-gated, real models).
