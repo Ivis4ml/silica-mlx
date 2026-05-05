@@ -2152,6 +2152,55 @@ _QWEN3_5_27B_WARM_DECODE_B4 = Scenario(
 )
 
 
+def _warm_decode_b_scenario(b: int) -> "Scenario":
+    """2026-05-03 cycle 10: higher-B warm-decode rows for the dense 27B
+    running-best frame. AR.md §"Hardware-limit map": "B is chosen to
+    maximise aggregate while respecting the 36 GB peak-memory ceiling."
+    Cycle 10 microbench probe found that aggregate tok/s climbs cleanly
+    through B=12 (>60), B=24 (>105), B=32 (>135) without OOM and well
+    within the 36 GB envelope (peak ~26 GB at B=32). The earlier
+    P-6.0.5 framing of "B=4 is the headroom limit" reflected the
+    measurement scope, not the hardware ceiling.
+    """
+    return Scenario(
+        id=f"qwen3.5-27b-warm-decode-b{b}",
+        repo="mlx-community/Qwen3.5-27B-4bit",
+        workload=_warm_decode_workload(max_batch_size=b, max_tokens=384),
+        oracle=OracleKind.WARM_DECODE,
+        gate_env_var="SILICA_REAL_QWEN3_5_27B",
+        description=(
+            f"**Cycle 10 (2026-05-03) — dense 27B B={b} warm-decode.** "
+            f"Same workload shape as warm-decode-b4 (128-token prompt, "
+            f"384-token generation, max_tokens=384) at higher batch. "
+            f"Cycle-10 probe found B={b} sits comfortably within the "
+            f"36 GB envelope and exceeds the 60 tok/s aggregate gate. "
+            f"Dual-gated on SILICA_REAL_QWEN3_5_27B."
+        ),
+    )
+
+
+_QWEN3_5_27B_WARM_DECODE_B8 = _warm_decode_b_scenario(8)
+_QWEN3_5_27B_WARM_DECODE_B12 = _warm_decode_b_scenario(12)
+_QWEN3_5_27B_WARM_DECODE_B16 = _warm_decode_b_scenario(16)
+_QWEN3_5_27B_WARM_DECODE_B24 = _warm_decode_b_scenario(24)
+_QWEN3_5_27B_WARM_DECODE_B32 = _warm_decode_b_scenario(32)
+_QWEN3_5_27B_WARM_DECODE_B40 = _warm_decode_b_scenario(40)
+_QWEN3_5_27B_WARM_DECODE_B44 = _warm_decode_b_scenario(44)
+_QWEN3_5_27B_WARM_DECODE_B48 = _warm_decode_b_scenario(48)
+# 2026-05-04 cycle 13: B>48 reach scenarios for the bf16-state-headroom probe.
+# bf16 DeltaNet state saves ~3.5 GB peak vs fp32, opening room above the
+# cycle-10 B=48 / 33.95 GB cap toward the 36 GB AR.md envelope.
+_QWEN3_5_27B_WARM_DECODE_B52 = _warm_decode_b_scenario(52)
+_QWEN3_5_27B_WARM_DECODE_B53 = _warm_decode_b_scenario(53)
+_QWEN3_5_27B_WARM_DECODE_B56 = _warm_decode_b_scenario(56)
+_QWEN3_5_27B_WARM_DECODE_B60 = _warm_decode_b_scenario(60)
+_QWEN3_5_27B_WARM_DECODE_B64 = _warm_decode_b_scenario(64)
+_QWEN3_5_27B_WARM_DECODE_B66 = _warm_decode_b_scenario(66)
+_QWEN3_5_27B_WARM_DECODE_B68 = _warm_decode_b_scenario(68)
+_QWEN3_5_27B_WARM_DECODE_B72 = _warm_decode_b_scenario(72)
+_QWEN3_5_27B_WARM_DECODE_B80 = _warm_decode_b_scenario(80)
+
+
 _GEMMA4_31B_WARM_DECODE_B1 = Scenario(
     id="gemma4-31b-warm-decode-b1",
     repo="mlx-community/gemma-4-31b-4bit",
@@ -2233,6 +2282,37 @@ _QWEN3_5_MOE_WARM_DECODE_B3 = Scenario(
         "plans/P6_0_5_OPENING.md §3.3."
     ),
 )
+
+
+def _moe_warm_decode_b_scenario(b: int) -> "Scenario":
+    """Cycle 34: MoE B-axis extension to test cycles 12+13 lever portability."""
+    return Scenario(
+        id=f"qwen3.5-moe-35b-a3b-warm-decode-b{b}",
+        repo="mlx-community/Qwen3.5-35B-A3B-4bit",
+        workload=_warm_decode_workload(max_batch_size=b, max_tokens=384),
+        oracle=OracleKind.WARM_DECODE,
+        gate_env_var="SILICA_REAL_QWEN3_5_MOE",
+        description=(
+            f"**P-6 MoE B={b} cycle-34 portability test.** Tests whether the "
+            f"cycle-12 bf16 DeltaNet state lever and cycle-13 axis-shift "
+            f"transfer to the MoE 35B-A3B variant. Set "
+            f"`SILICA_USE_BF16_DELTANET_STATE=1` for the bf16 path. **B={b} "
+            f"has not been validated on real hardware** — opt-in stretch."
+        ),
+    )
+
+
+_QWEN3_5_MOE_WARM_DECODE_B8_C34 = _moe_warm_decode_b_scenario(8)
+_QWEN3_5_MOE_WARM_DECODE_B16_C34 = _moe_warm_decode_b_scenario(16)
+_QWEN3_5_MOE_WARM_DECODE_B24_C34 = _moe_warm_decode_b_scenario(24)
+_QWEN3_5_MOE_WARM_DECODE_B32_C34 = _moe_warm_decode_b_scenario(32)
+_QWEN3_5_MOE_WARM_DECODE_B48_C34 = _moe_warm_decode_b_scenario(48)
+_QWEN3_5_MOE_WARM_DECODE_B64_C34 = _moe_warm_decode_b_scenario(64)
+_QWEN3_5_MOE_WARM_DECODE_B72_C34 = _moe_warm_decode_b_scenario(72)
+_QWEN3_5_MOE_WARM_DECODE_B80_C34 = _moe_warm_decode_b_scenario(80)
+_QWEN3_5_MOE_WARM_DECODE_B96_C34 = _moe_warm_decode_b_scenario(96)
+_QWEN3_5_MOE_WARM_DECODE_B112_C35 = _moe_warm_decode_b_scenario(112)
+_QWEN3_5_MOE_WARM_DECODE_B128_C35 = _moe_warm_decode_b_scenario(128)
 
 
 _QWEN3_5_MOE_WARM_DECODE_B4 = Scenario(
@@ -2843,6 +2923,17 @@ BUILTIN_SCENARIOS: dict[str, Scenario] = {
     _QWEN3_5_MOE_WARM_DECODE_B1.id: _QWEN3_5_MOE_WARM_DECODE_B1,
     _QWEN3_5_MOE_WARM_DECODE_B2.id: _QWEN3_5_MOE_WARM_DECODE_B2,
     _QWEN3_5_MOE_WARM_DECODE_B4.id: _QWEN3_5_MOE_WARM_DECODE_B4,
+    _QWEN3_5_MOE_WARM_DECODE_B8_C34.id: _QWEN3_5_MOE_WARM_DECODE_B8_C34,
+    _QWEN3_5_MOE_WARM_DECODE_B16_C34.id: _QWEN3_5_MOE_WARM_DECODE_B16_C34,
+    _QWEN3_5_MOE_WARM_DECODE_B24_C34.id: _QWEN3_5_MOE_WARM_DECODE_B24_C34,
+    _QWEN3_5_MOE_WARM_DECODE_B32_C34.id: _QWEN3_5_MOE_WARM_DECODE_B32_C34,
+    _QWEN3_5_MOE_WARM_DECODE_B48_C34.id: _QWEN3_5_MOE_WARM_DECODE_B48_C34,
+    _QWEN3_5_MOE_WARM_DECODE_B64_C34.id: _QWEN3_5_MOE_WARM_DECODE_B64_C34,
+    _QWEN3_5_MOE_WARM_DECODE_B72_C34.id: _QWEN3_5_MOE_WARM_DECODE_B72_C34,
+    _QWEN3_5_MOE_WARM_DECODE_B80_C34.id: _QWEN3_5_MOE_WARM_DECODE_B80_C34,
+    _QWEN3_5_MOE_WARM_DECODE_B96_C34.id: _QWEN3_5_MOE_WARM_DECODE_B96_C34,
+    _QWEN3_5_MOE_WARM_DECODE_B112_C35.id: _QWEN3_5_MOE_WARM_DECODE_B112_C35,
+    _QWEN3_5_MOE_WARM_DECODE_B128_C35.id: _QWEN3_5_MOE_WARM_DECODE_B128_C35,
     _GEMMA4_MOE_WARM_DECODE_B1.id: _GEMMA4_MOE_WARM_DECODE_B1,
     # P5.9 step 2(d) — sustained 4K / 8K context memory probes
     # (dual-gated, real models).
@@ -2854,6 +2945,23 @@ BUILTIN_SCENARIOS: dict[str, Scenario] = {
     # real models. See plans/P6_0_5_OPENING.md.
     _QWEN3_5_27B_WARM_DECODE_B2.id: _QWEN3_5_27B_WARM_DECODE_B2,
     _QWEN3_5_27B_WARM_DECODE_B4.id: _QWEN3_5_27B_WARM_DECODE_B4,
+    _QWEN3_5_27B_WARM_DECODE_B8.id: _QWEN3_5_27B_WARM_DECODE_B8,
+    _QWEN3_5_27B_WARM_DECODE_B12.id: _QWEN3_5_27B_WARM_DECODE_B12,
+    _QWEN3_5_27B_WARM_DECODE_B16.id: _QWEN3_5_27B_WARM_DECODE_B16,
+    _QWEN3_5_27B_WARM_DECODE_B24.id: _QWEN3_5_27B_WARM_DECODE_B24,
+    _QWEN3_5_27B_WARM_DECODE_B32.id: _QWEN3_5_27B_WARM_DECODE_B32,
+    _QWEN3_5_27B_WARM_DECODE_B40.id: _QWEN3_5_27B_WARM_DECODE_B40,
+    _QWEN3_5_27B_WARM_DECODE_B44.id: _QWEN3_5_27B_WARM_DECODE_B44,
+    _QWEN3_5_27B_WARM_DECODE_B48.id: _QWEN3_5_27B_WARM_DECODE_B48,
+    _QWEN3_5_27B_WARM_DECODE_B52.id: _QWEN3_5_27B_WARM_DECODE_B52,
+    _QWEN3_5_27B_WARM_DECODE_B53.id: _QWEN3_5_27B_WARM_DECODE_B53,
+    _QWEN3_5_27B_WARM_DECODE_B56.id: _QWEN3_5_27B_WARM_DECODE_B56,
+    _QWEN3_5_27B_WARM_DECODE_B60.id: _QWEN3_5_27B_WARM_DECODE_B60,
+    _QWEN3_5_27B_WARM_DECODE_B64.id: _QWEN3_5_27B_WARM_DECODE_B64,
+    _QWEN3_5_27B_WARM_DECODE_B66.id: _QWEN3_5_27B_WARM_DECODE_B66,
+    _QWEN3_5_27B_WARM_DECODE_B68.id: _QWEN3_5_27B_WARM_DECODE_B68,
+    _QWEN3_5_27B_WARM_DECODE_B72.id: _QWEN3_5_27B_WARM_DECODE_B72,
+    _QWEN3_5_27B_WARM_DECODE_B80.id: _QWEN3_5_27B_WARM_DECODE_B80,
     _QWEN3_5_MOE_WARM_DECODE_B3.id: _QWEN3_5_MOE_WARM_DECODE_B3,
     _QWEN3_5_MOE_WARM_DECODE_B1_4K.id: _QWEN3_5_MOE_WARM_DECODE_B1_4K,
     _QWEN3_5_27B_WARM_TTFT_PAIR.id: _QWEN3_5_27B_WARM_TTFT_PAIR,
