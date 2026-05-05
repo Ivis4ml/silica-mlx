@@ -24,10 +24,12 @@ OUTDIR = Path(__file__).resolve().parent.parent / "plans"
 
 
 # Cycle-by-cycle running best (decode_tok_s on warm-decode-* row family)
-CYCLES = list(range(1, 32))
+CYCLES = list(range(1, 36))
 # CYCLE 27 CORRECTION: cycle-14's claimed 206.2 was attribution error (v10
 # wasn't firing due to dtype defect). Honest running-best is bf16-only at
 # B=52 ≈ 204.5 ± ~1.5 tok/s, attributed to C10 axis-shift × C12 bf16 peak save.
+# Cycles 32-35 are post-23-cycle continuation (dense unchanged; MoE
+# secondary track unlocked).
 RUNNING_BEST = [42.17] * 9 + [
     193.9,                              # C10
     193.3, 192.5,                       # C11, C12
@@ -38,8 +40,10 @@ RUNNING_BEST = [42.17] * 9 + [
     204.5,                              # C24 dep pin
     204.5, 204.5,                       # C25, C26
     204.5,                              # C27 correction landed
-    204.5,                              # C28 ceiling 232 re-measured
+    204.5,                              # C28 ceiling 231.9 re-measured
     204.5, 204.5, 204.5,                # C29 cliff / C30 88% / C31 parity
+    204.5, 204.5,                       # C32 chart re-render / C33 variance
+    204.5, 204.5,                       # C34 MoE / C35 MoE B=128 (dense unchanged)
 ]
 CYCLE_LABELS = [
     "C1\norient", "C2\nsimple\nkernels", "C3\nQMM naive", "C4\nlazy chain",
@@ -50,8 +54,19 @@ CYCLE_LABELS = [
     "C21\ndrafter", "C22\ndesign", "C23\nspec end", "C24\ndep pin",
     "C25\nreverify", "C26\nbf16 FA fix", "C27 ⭐\ncorrection",
     "C28\nceiling 232", "C29\ncliff arch", "C30\ndeltanet 88%",
-    "C31\ndeltanet parity",
+    "C31\ndeltanet parity", "C32\ncharts", "C33\nvariance",
+    "C34 MoE\nportability", "C35 MoE\nB=128 ⭐⭐",
 ]
+
+# MoE 35B-A3B secondary-track running-best (cycles 1, 34, 35 are the milestones)
+MOE_CYCLES = list(range(1, 36))
+# Baseline 188.5 from cycle 1; first MoE secondary KEEP at cycle 34 (464.1
+# at B=64); B=128 hardware-ceiling unlock at cycle 35 (791.8).
+MOE_RUNNING_BEST = (
+    [188.5] * 33                       # C1-C33 stay at MoE B=4 baseline
+    + [464.1]                          # C34 portability test KEEP at B=64
+    + [791.8]                          # C35 B=128 expert-amortisation unlock
+)
 
 # B-sweep through Engine.generate_batch (warm-decode oracle results).
 # Cycle 10 fp32 state up through B=48; cycle 13 bf16 state from B=52 onward.
@@ -92,6 +107,11 @@ FA_T_KV = [128, 256, 512, 1024]
 FA_SILICA_P50 = [0.28, 0.44, 0.71, 1.07]   # ms
 FA_MLX_P50 = [0.51, 0.70, 0.89, 1.35]
 
+# MoE 35B-A3B B-sweep at bf16 DeltaNet state (cycle 34 + cycle 35 measurements)
+MOE_B_SWEEP = [4, 8, 16, 32, 48, 64, 72, 80, 96, 128]
+MOE_B_SWEEP_AGG = [188.5, 242.0, 306.3, 384.8, 434.3, 464.1, 444.5, 447.9, 467.1, 791.8]
+MOE_B_SWEEP_PEAK_GB = [20.0, 21.7, 23.4, 26.8, 30.3, 33.8, 35.5, 37.3, 40.8, 47.96]
+
 # Cycles 10-14 KEEP ladder — the running-best progression with each compositional add.
 # Cycle 27/28 corrected: v10 was not firing due to dtype bug; bf16-only
 # at B=52/64 is the honest running-best.
@@ -114,8 +134,28 @@ def render() -> None:
     ax_a = fig.add_subplot(gs[0, :])
     xs = list(range(len(CYCLES)))
     ax_a.plot(xs, RUNNING_BEST, "o-", color="#2ca02c", linewidth=3,
-              markersize=12, zorder=5, label="running best")
+              markersize=12, zorder=5, label="dense 27B running best (primary)")
     ax_a.fill_between(xs, RUNNING_BEST, alpha=0.15, color="#2ca02c", zorder=1)
+
+    # MoE 35B-A3B secondary-track running-best (cycles 1, 34, 35 mark the steps)
+    ax_a.plot(xs, MOE_RUNNING_BEST, "s-", color="#d4a017", linewidth=2.5,
+              markersize=8, zorder=4, alpha=0.85,
+              label="MoE 35B-A3B running best (secondary)")
+    # Annotate the MoE step values
+    ax_a.annotate(f"{188.5:.1f}\nC1 MoE B=4", (0, 188.5), xytext=(8, 8),
+                  textcoords="offset points", ha="left",
+                  fontsize=8, color="#d4a017")
+    ax_a.annotate(f"{464.1:.1f}\nC34 MoE B=64\n(secondary KEEP)",
+                  (33, 464.1), xytext=(-110, -36),
+                  textcoords="offset points", ha="left",
+                  fontsize=8, color="#d4a017", fontweight="bold",
+                  arrowprops=dict(arrowstyle="->", color="#d4a017", lw=1))
+    ax_a.annotate(f"{791.8:.1f}\nC35 MoE B=128\n(48 GB hardware ceiling)",
+                  (34, 791.8), xytext=(-180, 6),
+                  textcoords="offset points", ha="left",
+                  fontsize=9, color="#d4a017", fontweight="bold",
+                  arrowprops=dict(arrowstyle="->", color="#d4a017", lw=1.5),
+                  bbox=dict(boxstyle="round,pad=0.3", facecolor="#fff8e1", edgecolor="#d4a017"))
 
     # Reference horizontal lines
     ax_a.axhline(60, color="#ff7f0e", linestyle="--", linewidth=2, alpha=0.7,
@@ -177,14 +217,15 @@ def render() -> None:
               fontsize=9, color="#1976d2", fontweight="bold")
 
     ax_a.set_xticks(xs)
-    ax_a.set_xticklabels(CYCLE_LABELS, fontsize=9)
+    ax_a.set_xticklabels(CYCLE_LABELS, fontsize=8)
     ax_a.set_ylabel("decode_tok_s (B chosen to maximise aggregate)", fontsize=11)
-    ax_a.set_title("Silica-MLX P-6 Autoresearch: 31-cycle running-best trajectory on dense Qwen3.5-27B-4bit\n"
-                   "C10 axis-shift (42.17→193.9); C13 envelope-extension (200.8); C27 correction → 204.5/231.9 (v10 was phantom); C30/C31 close DeltaNet kernel-headroom question (parity)",
+    ax_a.set_title("Silica-MLX P-6 Autoresearch: 35-cycle running-best trajectory\n"
+                   "Dense 27B (primary): 42.17 → 204.5 envelope / 231.9 hardware (5.50×). "
+                   "MoE 35B-A3B (secondary): 188.5 → 464.1 envelope / 791.8 hardware (4.20×; cycles 34-35).",
                    fontsize=11, fontweight="bold")
     ax_a.legend(loc="upper left", fontsize=10)
     ax_a.grid(True, alpha=0.3, linestyle="--")
-    ax_a.set_ylim(0, 250)
+    ax_a.set_ylim(0, 850)
 
     # ============================================================
     # Panel B: B-sweep curve (cycle 10 fp32 + cycle 13 bf16-state)
@@ -246,33 +287,49 @@ def render() -> None:
     ax_b.set_ylim(0, 260)
 
     # ============================================================
-    # Panel C: cycle 11 FA-decode kernel ablation (silica vs mlx across T_kv)
+    # Panel C: MoE 35B-A3B B-sweep at bf16 DeltaNet state (cycles 34-35)
     # ============================================================
     ax_c = fig.add_subplot(gs[1, 1])
-    ax_c.plot(FA_T_KV, FA_SILICA_P50, "o-", color="#1976d2", linewidth=2.5,
-              markersize=10, label="silica v8/v10 (cycle 11)")
-    ax_c.plot(FA_T_KV, FA_MLX_P50, "s-", color="#2ca02c", linewidth=2.5,
-              markersize=10, label="mlx mx.fast.scaled_dot_product_attention")
-    for tk, sp, mp in zip(FA_T_KV, FA_SILICA_P50, FA_MLX_P50):
-        r = sp / mp
-        ax_c.annotate(f"{sp:.2f}", (tk, sp), xytext=(0, -15),
+    moe_x = MOE_B_SWEEP
+    ax_c.plot(moe_x, MOE_B_SWEEP_AGG, "s-", color="#d4a017", linewidth=2.5,
+              markersize=10, label="MoE bf16 state (cycles 34-35)")
+    for x, v in zip(moe_x, MOE_B_SWEEP_AGG):
+        ax_c.annotate(f"{v:.1f}", (x, v), xytext=(0, 10),
                       textcoords="offset points", ha="center",
-                      fontsize=8, color="#1976d2")
-        ax_c.annotate(f"{mp:.2f}", (tk, mp), xytext=(0, 8),
-                      textcoords="offset points", ha="center",
-                      fontsize=8, color="#2ca02c")
-        ax_c.annotate(f"{r:.2f}×", (tk, (sp + mp) / 2),
-                      xytext=(15, 0), textcoords="offset points",
-                      fontsize=8, color="#666", fontweight="bold")
-    ax_c.set_xlabel("T_kv")
-    ax_c.set_ylabel("p50 latency at B=48 (ms, lower better)", fontsize=10)
-    ax_c.set_title("Panel C: cycle 11 FA-decode kernel — silica beats mlx 1.25-1.81×\n"
-                   "(kernel-level victory, no E2E delta because attn is 22% of warm-decode-b48 step)",
+                      fontsize=8)
+    # Mark the cycle 34 + cycle 35 KEEPs
+    ax_c.scatter([64], [464.1], s=200, marker="*", color="#2ca02c",
+                 edgecolor="black", zorder=5,
+                 label="C34 secondary KEEP (within 36 GB)")
+    ax_c.scatter([128], [791.8], s=240, marker="*", color="#d4a017",
+                 edgecolor="black", zorder=5,
+                 label="C35 secondary KEEP (48 GB hardware)")
+    ax_c.annotate("expert routing\namortisation\nthreshold near B=128\n(8/256 experts active;\n~4 activations/expert)",
+                  xy=(128, 791.8), xytext=(80, 650), fontsize=8, color="#888",
+                  arrowprops=dict(arrowstyle="->", color="#888"),
+                  bbox=dict(boxstyle="round,pad=0.3", facecolor="#fafafa", edgecolor="#888"))
+
+    # Memory envelope twin axis
+    ax_c2 = ax_c.twinx()
+    ax_c2.bar(moe_x, MOE_B_SWEEP_PEAK_GB, alpha=0.18, color="#d62728",
+              width=4.0, zorder=1)
+    ax_c2.axhline(36, color="#d62728", linestyle="--", linewidth=1.2, alpha=0.5)
+    ax_c2.text(4, 36.7, "36 GB envelope", fontsize=7, color="#d62728")
+    ax_c2.axhline(48, color="#d62728", linestyle=":", linewidth=1.2, alpha=0.4)
+    ax_c2.text(4, 48.7, "48 GB hardware", fontsize=7, color="#d62728")
+    ax_c2.set_ylabel("peak memory (GB)", fontsize=9, color="#d62728")
+    ax_c2.set_ylim(0, 55)
+    ax_c2.tick_params(axis="y", labelcolor="#d62728", labelsize=8)
+
+    ax_c.set_xlabel("B (max_batch_size)")
+    ax_c.set_ylabel("MoE aggregate decode_tok_s", fontsize=10, color="#d4a017")
+    ax_c.tick_params(axis="y", labelcolor="#d4a017")
+    ax_c.set_title("Panel C: MoE 35B-A3B-4bit B-sweep — secondary track (cycles 34-35)\n"
+                   "Per-row throughput non-monotonic; B=128 = 791.8 ± 5.2 (4.20× MoE C1)",
                    fontsize=10, fontweight="bold")
-    ax_c.set_xscale("log", base=2)
-    ax_c.set_xticks(FA_T_KV)
-    ax_c.set_xticklabels([str(t) for t in FA_T_KV])
-    ax_c.legend(loc="upper left", fontsize=9)
+    ax_c.set_xticks(moe_x)
+    ax_c.legend(loc="upper left", fontsize=8)
+    ax_c.set_ylim(0, 850)
     ax_c.grid(True, alpha=0.3, linestyle="--")
 
     # ============================================================
@@ -304,9 +361,10 @@ def render() -> None:
     ax_d.grid(True, alpha=0.3, linestyle="--", axis="y")
 
     fig.suptitle(
-        "Silica-MLX P-6 Autoresearch — Final Summary (cycles 1-31, 2026-05-02 → 2026-05-04)\n"
-        "Mission: push dense Qwen3.5-27B-4bit on M5 Pro 48 GB toward the hardware limit.\n"
-        "Result: 42.17 → 204.5 envelope KEEP (4.85×) / 231.9 hardware ceiling (5.50×) [C27 corrected]; C30/C31 close DeltaNet kernel-headroom (parity with mlx); C29 cliff is architectural; 22 kernels; 2779 tests pass.",
+        "Silica-MLX P-6 Autoresearch — Summary (cycles 1-35, 2026-05-02 → 2026-05-04)\n"
+        "Mission: push Qwen3.5 production checkpoints on M5 Pro 48 GB toward the hardware limit.\n"
+        "Dense 27B (primary): 42.17 → 204.5 envelope KEEP (4.85×) / 231.9 hardware ceiling (5.50×) [C27/C28 corrected]; "
+        "MoE 35B-A3B (secondary, cycles 34-35): 188.5 → 464.1 envelope / 791.8 hardware (4.20×; expert routing amortisation at B=128).",
         fontsize=12, fontweight="bold", y=0.99,
     )
 

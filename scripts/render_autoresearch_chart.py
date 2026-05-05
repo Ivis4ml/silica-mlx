@@ -39,6 +39,18 @@ REFERENCE_LINES_DECODE = [
     (81.16, "B=4 weights ceiling (81.16 tok/s)", "#444444", ":"),
 ]
 
+REFERENCE_LINES_MOE = [
+    (60.00, "(1b) milestone (60 tok/s)", "#ff7f0e", "--"),
+    (188.50, "MoE B=4 baseline (188.50 tok/s)", "#2ca02c", "-"),
+    (464.4, "C34 within-envelope KEEP (464.4 tok/s)", "#1976d2", ":"),
+    (791.8, "C35 hardware-ceiling KEEP (791.8 tok/s)", "#d4a017", ":"),
+]
+
+REFERENCE_LINES_BY_METRIC = {
+    "decode_tok_s": REFERENCE_LINES_DECODE,
+    "moe_decode_tok_s": REFERENCE_LINES_MOE,
+}
+
 
 def load_ledger(path: Path) -> list[dict[str, str]]:
     with path.open() as fh:
@@ -88,12 +100,12 @@ def render(rows: list[dict[str, str]], metric: str, outpath: Path) -> None:
         ax.step(running_best_xs, running_best_ys, where="post",
                 color="#2ca02c", linewidth=2, label="running best", zorder=2)
 
-    # Reference horizontal lines
-    if metric == "decode_tok_s":
-        for y, label, color, linestyle in REFERENCE_LINES_DECODE:
-            ax.axhline(y, color=color, linestyle=linestyle, linewidth=1, alpha=0.7)
-            ax.text(len(rows) + 0.3, y, label, fontsize=7, va="center",
-                    color=color)
+    # Reference horizontal lines (metric-specific)
+    ref_lines = REFERENCE_LINES_BY_METRIC.get(metric, [])
+    for y, label, color, linestyle in ref_lines:
+        ax.axhline(y, color=color, linestyle=linestyle, linewidth=1, alpha=0.7)
+        ax.text(len(rows) + 0.3, y, label, fontsize=7, va="center",
+                color=color)
 
     # Status legend (shown only for present statuses)
     present_statuses = sorted({r["status"].strip() for r in rows})

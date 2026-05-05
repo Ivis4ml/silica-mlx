@@ -102,18 +102,19 @@ def render_cycle_summary() -> None:
     """Render a per-cycle activity / kept-improvement panel."""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15.5, 5.5))
 
-    # Per-cycle deliverables (from cycle reports). 31 cycles total; cycles 24-26
-    # contributed by Codex review (opus-codex branch); cycles 27-31 are
-    # post-merge corrections + new probes.
-    cycles = list(range(1, 32))
+    # Per-cycle deliverables (from cycle reports). 35 cycles total; cycles
+    # 24-26 contributed by Codex review (opus-codex branch); cycles 27-31
+    # close dense 27B characterisation; cycles 32-35 add MoE secondary
+    # track + post-23-cycle continuation work.
+    cycles = list(range(1, 36))
     new_kernels = [0, 3, 1, 0, 0, 1, 4, 5, 2, 0, 8, 0, 0, 0, 0, 0, 0,
-                   0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+                   0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0]
     new_probes = [1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                  0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 1, 1]
+                  0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1]
     discards = [0, 0, 5, 1, 1, 1, 1, 4, 2, 0, 1, 0, 1, 2, 4, 0, 0,
-                0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0]
+                0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0]
     diagnostics = [4, 1, 4, 4, 2, 1, 5, 1, 0, 4, 4, 3, 2, 1, 1, 3, 1,
-                   1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1]
+                   1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 0, 1, 0, 1]
 
     width = 0.2
     xs = list(range(len(cycles)))
@@ -155,7 +156,15 @@ def render_cycle_summary() -> None:
         204.5,  # C27: corrected attribution (KEEP-revision)
         204.5,  # C28: B=64 ceiling re-measured (within-envelope unchanged)
         204.5, 204.5, 204.5,  # C29 cliff / C30 decomp / C31 deltanet parity
+        204.5, 204.5,  # C32 chart re-render / C33 variance characterisation
+        204.5, 204.5,  # C34 MoE portability / C35 MoE B=128 (dense unchanged)
     ]
+    # MoE 35B-A3B secondary-track overlay (steps at C1, C34, C35)
+    moe_running_best = (
+        [188.5] * 33  # C1-C33: MoE B=4 cycle-1 baseline
+        + [464.1]     # C34: first MoE secondary KEEP (B=64 within 36 GB)
+        + [791.8]     # C35: B=128 hardware-ceiling (expert amortisation)
+    )
     cycle_labels_full = [
         "C1 orient", "C2 simple", "C3 QMM naive", "C4 lazy chain",
         "C5 batcher", "C6 simdgroup", "C7 tune v3-v6", "C8 v7-v11",
@@ -165,10 +174,14 @@ def render_cycle_summary() -> None:
         "C21 drafter", "C22 design", "C23 spec end", "C24 dep pin",
         "C25 reverify", "C26 bf16 FA fix", "C27 ⭐ correction",
         "C28 ceiling 232", "C29 cliff arch", "C30 deltanet 88%",
-        "C31 deltanet parity",
+        "C31 deltanet parity", "C32 charts", "C33 variance",
+        "C34 MoE port", "C35 MoE B=128 ⭐⭐",
     ]
     ax2.plot(xs, running_best, "o-", color="#2ca02c", linewidth=2.5,
-             markersize=10, zorder=3, label="running best (warm-decode-b48)")
+             markersize=10, zorder=3, label="dense 27B running best (primary)")
+    ax2.plot(xs, moe_running_best, "s-", color="#d4a017", linewidth=2.0,
+             markersize=8, zorder=3, alpha=0.85,
+             label="MoE 35B-A3B running best (secondary)")
     ax2.axhline(60, color="#ff7f0e", linestyle="--", linewidth=1.5,
                 label="(1b) milestone (60 tok/s)")
     ax2.axhline(81.16, color="#444", linestyle=":", linewidth=1,
@@ -189,21 +202,35 @@ def render_cycle_summary() -> None:
         arrowprops=dict(arrowstyle="->", color="#2ca02c", lw=1.2),
         bbox=dict(boxstyle="round,pad=0.3", facecolor="#e8f5e9", edgecolor="#2ca02c"),
     )
-    # C28 corrected demonstrated ceiling
-    ax2.axhline(231.9, color="#d4a017", linestyle=":", linewidth=1.5, alpha=0.6)
-    ax2.text(31, 234.5, "C28 demonstrated ceiling B=64 bf16 = 231.9 ± 0.3 tok/s\n(corrected from C14's 232.2 with v10+bf16 phantom; within 48 GB hardware)",
-             fontsize=8, color="#d4a017", ha="right", fontweight="bold")
+    # C28 corrected demonstrated ceiling (dense)
+    ax2.axhline(231.9, color="#1976d2", linestyle=":", linewidth=1.5, alpha=0.6)
+    ax2.text(34, 234.5, "C28 dense ceiling B=64 bf16 = 231.9 ± 0.3",
+             fontsize=8, color="#1976d2", ha="right", fontweight="bold")
+    # C35 MoE secondary track unlock annotation
+    ax2.annotate(
+        "C35 ⭐⭐ MoE B=128 = 791.8 ± 5.2\n(48 GB hardware ceiling; expert\nrouting amortisation crossed)",
+        xy=(34, 791.8), xytext=(20, 720),
+        fontsize=8, color="#d4a017", ha="center", fontweight="bold",
+        arrowprops=dict(arrowstyle="->", color="#d4a017", lw=1.2),
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="#fff8e1", edgecolor="#d4a017"),
+    )
+    ax2.annotate(
+        "C34 MoE B=64 = 464.1 ± 0.7\n(36 GB envelope KEEP)",
+        xy=(33, 464.1), xytext=(18, 400),
+        fontsize=7, color="#d4a017", ha="center",
+        arrowprops=dict(arrowstyle="->", color="#d4a017", lw=1.0),
+    )
 
     ax2.set_xticks(xs)
     ax2.set_xticklabels(cycle_labels_full, rotation=20, ha="right", fontsize=8)
     ax2.set_ylabel("decode_tok_s")
-    ax2.set_title("Running best across 31 cycles — C10 BREAKTHROUGH 193.9 → C13 200.8 → C14 (retracted)\n"
-                  "C27 correction: v10 dtype bug → 204.5 envelope / 231.9 hardware; C28-C31 close characterisation (cliff arch / DeltaNet 88% but kernel parity)")
-    ax2.set_ylim(0, 250)
+    ax2.set_title("Running best across 35 cycles — dense 27B primary at 204.5 envelope / 231.9 hardware (5.50× C1)\n"
+                  "MoE 35B-A3B secondary unlocked C34-C35: 188.5 → 464.1 envelope → 791.8 hardware (4.20× MoE C1)")
+    ax2.set_ylim(0, 850)
     ax2.legend(loc="upper left", fontsize=8)
     ax2.grid(True, alpha=0.3, linestyle="--")
 
-    fig.suptitle("Silica-MLX P-6 Autoresearch — cycle-by-cycle progress (31 cycles, 2026-05-02 → 2026-05-04)",
+    fig.suptitle("Silica-MLX P-6 Autoresearch — cycle-by-cycle progress (35 cycles, 2026-05-02 → 2026-05-04)",
                  fontsize=11, fontweight="bold", y=0.99)
     fig.tight_layout()
     out = OUTDIR / "P6_AUTORESEARCH_PROGRESS_CYCLES.png"
