@@ -102,12 +102,18 @@ def render_cycle_summary() -> None:
     """Render a per-cycle activity / kept-improvement panel."""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15.5, 5.5))
 
-    # Per-cycle deliverables (from cycle reports)
-    cycles = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
-    new_kernels = [0, 3, 1, 0, 0, 1, 4, 5, 2, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-    new_probes = [1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1]
-    discards = [0, 0, 5, 1, 1, 1, 1, 4, 2, 0, 1, 0, 1, 2, 4, 0, 0, 0, 0, 0, 0, 0, 1]
-    diagnostics = [4, 1, 4, 4, 2, 1, 5, 1, 0, 4, 4, 3, 2, 1, 1, 3, 1, 1, 1, 1, 1, 1, 0]
+    # Per-cycle deliverables (from cycle reports). 31 cycles total; cycles 24-26
+    # contributed by Codex review (opus-codex branch); cycles 27-31 are
+    # post-merge corrections + new probes.
+    cycles = list(range(1, 32))
+    new_kernels = [0, 3, 1, 0, 0, 1, 4, 5, 2, 0, 8, 0, 0, 0, 0, 0, 0,
+                   0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+    new_probes = [1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
+                  0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 1, 1]
+    discards = [0, 0, 5, 1, 1, 1, 1, 4, 2, 0, 1, 0, 1, 2, 4, 0, 0,
+                0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0]
+    diagnostics = [4, 1, 4, 4, 2, 1, 5, 1, 0, 4, 4, 3, 2, 1, 1, 3, 1,
+                   1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1]
 
     width = 0.2
     xs = list(range(len(cycles)))
@@ -134,14 +140,32 @@ def render_cycle_summary() -> None:
     # Cycle 13: bf16 state's peak-memory headroom unlocks B-axis past 48 ->
     #           B=52 = 200.8 within strict envelope (NEW RUNNING-BEST);
     #           B=64 = 229.8 within hardware ceiling (DEMONSTRATED CEILING)
-    running_best = [42.17] * 9 + [193.9, 193.3, 192.5, 200.8, 206.2, 206.2, 206.2, 206.2, 206.2, 206.2, 206.2, 206.2, 206.2, 206.2]
+    # CYCLE 27 CORRECTION: cycle-14's claimed 206.2 was attribution error
+    # (v10 wasn't firing due to dtype defect; small n=3 σ underestimated true
+    # variance). Corrected running-best is 204.5 ± ~1.5 at B=52 bf16.
+    running_best = [42.17] * 9 + [
+        193.9,  # C10 BREAKTHROUGH
+        193.3, 192.5,  # C11/C12: kernel + state probes 0% E2E at fixed B
+        200.8,  # C13: bf16 peak save unlocks B=52
+        204.5,  # C14 (corrected from 206.2)
+        204.5, 204.5, 204.5, 204.5,  # C15-18: local-optimum confirmation
+        204.5, 204.5, 204.5, 204.5, 204.5,  # C19-23: spec-decode arm closes
+        204.5,  # C24: codex dep pin
+        204.5, 204.5,  # C25/C26: codex reverify
+        204.5,  # C27: corrected attribution (KEEP-revision)
+        204.5,  # C28: B=64 ceiling re-measured (within-envelope unchanged)
+        204.5, 204.5, 204.5,  # C29 cliff / C30 decomp / C31 deltanet parity
+    ]
     cycle_labels_full = [
         "C1 orient", "C2 simple", "C3 QMM naive", "C4 lazy chain",
         "C5 batcher", "C6 simdgroup", "C7 tune v3-v6", "C8 v7-v11",
-        "C9 v12-v13", "C10 B=48", "C11 FA-decode", "C12 bf16 probe",
-        "C13 B=52 bf16", "C14 ⭐ stack", "C15 confirm", "C16 confirm",
-        "C17 confirm", "C18 confirm", "C19 cov@64=0.40", "C20 verify cost",
-        "C21 drafter", "C22 design", "C23 spec dead-end",
+        "C9 v12-v13", "C10 ⭐ B=48", "C11 FA-decode", "C12 bf16 probe",
+        "C13 B=52 bf16", "C14 (retracted)", "C15 confirm", "C16 confirm",
+        "C17 confirm", "C18 confirm", "C19 cov@64", "C20 verify cost",
+        "C21 drafter", "C22 design", "C23 spec end", "C24 dep pin",
+        "C25 reverify", "C26 bf16 FA fix", "C27 ⭐ correction",
+        "C28 ceiling 232", "C29 cliff arch", "C30 deltanet 88%",
+        "C31 deltanet parity",
     ]
     ax2.plot(xs, running_best, "o-", color="#2ca02c", linewidth=2.5,
              markersize=10, zorder=3, label="running best (warm-decode-b48)")
@@ -157,29 +181,29 @@ def render_cycle_summary() -> None:
                      textcoords="offset points", ha="center", fontsize=8,
                      color="#2ca02c")
 
-    # C14 envelope KEEP — flat through C15-C23
+    # C27 corrected envelope KEEP (replaces C14's retracted claim)
     ax2.annotate(
-        "C14 ⭐ envelope KEEP:\nB=52 v10+bf16 = 206.2 ± 0.5\n(within 36 GB)\nC15-C18 kernel local optimum\nC19-C23 spec-decode arm closed\n(cov@64=40.5% but verify-cost wall)",
-        xy=(22, 206.2), xytext=(15, 80),
+        "C27 ⭐ envelope KEEP (corrected):\nB=52 bf16 = 204.5 ± ~1.5 (4.85× C1)\n(C14 claim 206.2 was retracted —\nv10 didn't fire due to dtype bug;\nrunning-best stable since C13/C14)\nC30: DeltaNet 88% / C31: kernel parity\nLoop reaches genuine closed state",
+        xy=(26, 204.5), xytext=(15, 78),
         fontsize=7, color="#2ca02c", ha="center", fontweight="bold",
         arrowprops=dict(arrowstyle="->", color="#2ca02c", lw=1.2),
         bbox=dict(boxstyle="round,pad=0.3", facecolor="#e8f5e9", edgecolor="#2ca02c"),
     )
-    # C14 demonstrated ceiling line
-    ax2.axhline(232.2, color="#d4a017", linestyle=":", linewidth=1.5, alpha=0.6)
-    ax2.text(15.4, 235, "C14 demonstrated ceiling B=64 v10+bf16 = 232.2 tok/s\n(within 48 GB hardware)",
+    # C28 corrected demonstrated ceiling
+    ax2.axhline(231.9, color="#d4a017", linestyle=":", linewidth=1.5, alpha=0.6)
+    ax2.text(31, 234.5, "C28 demonstrated ceiling B=64 bf16 = 231.9 ± 0.3 tok/s\n(corrected from C14's 232.2 with v10+bf16 phantom; within 48 GB hardware)",
              fontsize=8, color="#d4a017", ha="right", fontweight="bold")
 
     ax2.set_xticks(xs)
     ax2.set_xticklabels(cycle_labels_full, rotation=20, ha="right", fontsize=8)
     ax2.set_ylabel("decode_tok_s")
-    ax2.set_title("Running best across cycles — C10 193.9, C13/C14 lifts to 206.2 envelope / 232.2 hardware\n"
-                  "C14 COMPOSITION; C15-18 kernel optimum; C19-23 spec-decode research thread closes (cov@64=40.5% but B×k verify-cost wall makes spec infeasible)")
+    ax2.set_title("Running best across 31 cycles — C10 BREAKTHROUGH 193.9 → C13 200.8 → C14 (retracted)\n"
+                  "C27 correction: v10 dtype bug → 204.5 envelope / 231.9 hardware; C28-C31 close characterisation (cliff arch / DeltaNet 88% but kernel parity)")
     ax2.set_ylim(0, 250)
     ax2.legend(loc="upper left", fontsize=8)
     ax2.grid(True, alpha=0.3, linestyle="--")
 
-    fig.suptitle("Silica-MLX P-6 Autoresearch — cycle-by-cycle progress (23 cycles, 2026-05-02 → 2026-05-04)",
+    fig.suptitle("Silica-MLX P-6 Autoresearch — cycle-by-cycle progress (31 cycles, 2026-05-02 → 2026-05-04)",
                  fontsize=11, fontweight="bold", y=0.99)
     fig.tight_layout()
     out = OUTDIR / "P6_AUTORESEARCH_PROGRESS_CYCLES.png"

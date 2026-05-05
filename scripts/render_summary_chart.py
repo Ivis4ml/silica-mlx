@@ -24,40 +24,42 @@ OUTDIR = Path(__file__).resolve().parent.parent / "plans"
 
 
 # Cycle-by-cycle running best (decode_tok_s on warm-decode-* row family)
-CYCLES = list(range(1, 24))
-RUNNING_BEST = [42.17] * 9 + [193.9, 193.3, 192.5, 200.8, 206.2, 206.2, 206.2, 206.2, 206.2, 206.2, 206.2, 206.2, 206.2, 206.2]
+CYCLES = list(range(1, 32))
+# CYCLE 27 CORRECTION: cycle-14's claimed 206.2 was attribution error (v10
+# wasn't firing due to dtype defect). Honest running-best is bf16-only at
+# B=52 ≈ 204.5 ± ~1.5 tok/s, attributed to C10 axis-shift × C12 bf16 peak save.
+RUNNING_BEST = [42.17] * 9 + [
+    193.9,                              # C10
+    193.3, 192.5,                       # C11, C12
+    200.8,                              # C13 (bf16 peak save unlocks B=52)
+    204.5,                              # C14 (corrected from 206.2)
+    204.5, 204.5, 204.5, 204.5,         # C15-18 confirmation
+    204.5, 204.5, 204.5, 204.5, 204.5,  # C19-23 spec-decode arm
+    204.5,                              # C24 dep pin
+    204.5, 204.5,                       # C25, C26
+    204.5,                              # C27 correction landed
+    204.5,                              # C28 ceiling 232 re-measured
+    204.5, 204.5, 204.5,                # C29 cliff / C30 88% / C31 parity
+]
 CYCLE_LABELS = [
-    "C1\norient",
-    "C2\nsimple\nkernels",
-    "C3\nQMM naive",
-    "C4\nlazy chain",
-    "C5\nbatcher",
-    "C6\nsimdgroup",
-    "C7\nv3-v6",
-    "C8\nv7-v11",
-    "C9\nv12-v13",
-    "C10\nB=48",
-    "C11\nFA-decode",
-    "C12\nbf16 probe",
-    "C13\nB=52 bf16",
-    "C14 ⭐\nstack",
-    "C15\nconfirm",
-    "C16\nconfirm",
-    "C17\nconfirm",
-    "C18\nconfirm",
-    "C19\ncov@64",
-    "C20\nverify",
-    "C21\ndrafter",
-    "C22\ndesign",
-    "C23\nspec end",
+    "C1\norient", "C2\nsimple\nkernels", "C3\nQMM naive", "C4\nlazy chain",
+    "C5\nbatcher", "C6\nsimdgroup", "C7\nv3-v6", "C8\nv7-v11",
+    "C9\nv12-v13", "C10 ⭐\nB=48", "C11\nFA-decode", "C12\nbf16 probe",
+    "C13\nB=52 bf16", "C14\n(retracted)", "C15\nconfirm", "C16\nconfirm",
+    "C17\nconfirm", "C18\nconfirm", "C19\ncov@64", "C20\nverify",
+    "C21\ndrafter", "C22\ndesign", "C23\nspec end", "C24\ndep pin",
+    "C25\nreverify", "C26\nbf16 FA fix", "C27 ⭐\ncorrection",
+    "C28\nceiling 232", "C29\ncliff arch", "C30\ndeltanet 88%",
+    "C31\ndeltanet parity",
 ]
 
 # B-sweep through Engine.generate_batch (warm-decode oracle results).
 # Cycle 10 fp32 state up through B=48; cycle 13 bf16 state from B=52 onward.
-# Cycle 14 adds B=53/66/68 probes and bumps B=52/64 to the v10+bf16 stack tunes.
+# CYCLE 27/28 CORRECTION: B=52 / B=64 numbers revised — v10 was not firing
+# due to dtype defect; running-best is bf16-state alone, not v10+bf16 stack.
 B_SWEEP = [4, 8, 12, 16, 24, 32, 40, 44, 48, 52, 56, 60, 64, 66, 72]
 B_SWEEP_AGG = [42.17, 43.0, 63.1, 81.1, 112.8, 150.6, 171.6, 183.3, 193.9,
-               206.2, 212.2, 219.1, 232.2, 166.8, 173.2]
+               204.5, 212.2, 219.1, 231.9, 166.8, 173.2]
 B_SWEEP_PEAK_GB = [17.1, 18.7, 20.2, 21.7, 24.8, 27.9, 30.8, 32.4, 33.95,
                    35.52, 36.90, 38.45, 40.01, 40.79, 43.36]
 B_SWEEP_BF16 = [False] * 9 + [True] * 6
@@ -91,13 +93,15 @@ FA_SILICA_P50 = [0.28, 0.44, 0.71, 1.07]   # ms
 FA_MLX_P50 = [0.51, 0.70, 0.89, 1.35]
 
 # Cycles 10-14 KEEP ladder — the running-best progression with each compositional add.
+# Cycle 27/28 corrected: v10 was not firing due to dtype bug; bf16-only
+# at B=52/64 is the honest running-best.
 E2E_LABELS = ["C10 baseline\nB=48 fp32\n(n=3)",
               "C13 B=52\nbf16 only\n(n=3)",
-              "C14 ⭐ B=52\nv10+bf16 stack\n(n=3) ENVELOPE",
-              "C13 B=64\nbf16 only\n(n=3)",
-              "C14 ⭐⭐ B=64\nv10+bf16 stack\n(n=3) HARDWARE"]
-E2E_MEANS = [193.9, 200.8, 206.2, 229.8, 232.2]
-E2E_ERRORS = [0.6, 1.5, 0.5, 2.0, 0.3]
+              "C27 ⭐ B=52\nbf16 only\n(n=8) ENVELOPE",
+              "C28 B=64 v10\n(n=3) regression",
+              "C28 ⭐⭐ B=64\nbf16 only (n=3)\nHARDWARE"]
+E2E_MEANS = [193.9, 200.8, 204.5, 230.2, 231.9]
+E2E_ERRORS = [0.6, 1.5, 1.5, 1.6, 0.3]
 
 
 def render() -> None:
@@ -156,21 +160,27 @@ def render() -> None:
                   arrowprops=dict(arrowstyle="->", color="#666", lw=1),
                   bbox=dict(boxstyle="round,pad=0.3", facecolor="#fafafa", edgecolor="#666"))
     # C13 second-breakthrough annotation
-    ax_a.annotate("C13 SECOND BREAKTHROUGH\nbf16 state's peak save (3.5 GB)\nunlocks B-axis past cycle-10 cap\n→ B=52 = 200.8 strict-envelope KEEP\n→ B=64 = 229.8 hardware ceiling",
+    ax_a.annotate("C13 SECOND BREAKTHROUGH\nbf16 state's peak save (3.5 GB)\nunlocks B-axis past C10 cap\n→ B=52 = 200.8 envelope (corrected)\n→ B=64 = 231.9 ± 0.3 ceiling",
                   xy=(12, 200.8), xytext=(11.0, 130),
-                  fontsize=10, color="#d4a017", ha="center", fontweight="bold",
+                  fontsize=9, color="#d4a017", ha="center", fontweight="bold",
                   arrowprops=dict(arrowstyle="->", color="#d4a017", lw=1.5),
                   bbox=dict(boxstyle="round,pad=0.4", facecolor="#fff8e1", edgecolor="#d4a017"))
-    # Add the demonstrated ceiling line
-    ax_a.axhline(229.8, color="#1976d2", linestyle="--", linewidth=1.5, alpha=0.5)
-    ax_a.text(0.05, 232, "C13 demonstrated ceiling B=64 = 229.8 (within 48 GB hardware)",
+    # C27 correction annotation
+    ax_a.annotate("C27 ⭐ CORRECTION\nv10 dtype bug found by Codex\n— v10 was not firing in C12-C26\nrunning-best: 204.5 ± ~1.5\n(C14 phantom 206.2 retracted)",
+                  xy=(26, 204.5), xytext=(22, 60),
+                  fontsize=9, color="#9467bd", ha="center", fontweight="bold",
+                  arrowprops=dict(arrowstyle="->", color="#9467bd", lw=1.5),
+                  bbox=dict(boxstyle="round,pad=0.4", facecolor="#f3e5f5", edgecolor="#9467bd"))
+    # Updated demonstrated ceiling line (corrected)
+    ax_a.axhline(231.9, color="#1976d2", linestyle="--", linewidth=1.5, alpha=0.5)
+    ax_a.text(0.05, 234, "C28 demonstrated ceiling B=64 bf16-only = 231.9 ± 0.3 (corrected from C14's phantom 232.2)",
               fontsize=9, color="#1976d2", fontweight="bold")
 
     ax_a.set_xticks(xs)
     ax_a.set_xticklabels(CYCLE_LABELS, fontsize=9)
     ax_a.set_ylabel("decode_tok_s (B chosen to maximise aggregate)", fontsize=11)
-    ax_a.set_title("Silica-MLX P-6 Autoresearch: 23-cycle running-best trajectory on dense Qwen3.5-27B-4bit\n"
-                   "C10 axis-shift (42.17 → 193.9); C13 envelope-extension (200.8); C14 v10+bf16 stack (206.2 envelope, 232.2 hardware); C15-18 kernel local optimum; C19-23 spec-decode research thread closes",
+    ax_a.set_title("Silica-MLX P-6 Autoresearch: 31-cycle running-best trajectory on dense Qwen3.5-27B-4bit\n"
+                   "C10 axis-shift (42.17→193.9); C13 envelope-extension (200.8); C27 correction → 204.5/231.9 (v10 was phantom); C30/C31 close DeltaNet kernel-headroom question (parity)",
                    fontsize=11, fontweight="bold")
     ax_a.legend(loc="upper left", fontsize=10)
     ax_a.grid(True, alpha=0.3, linestyle="--")
@@ -198,10 +208,10 @@ def render() -> None:
                       fontsize=8)
 
     # Mark the C14 stack KEEPs
-    ax_b.scatter([52], [206.2], s=200, marker="*", color="#2ca02c",
-                 edgecolor="black", zorder=5, label="C14 envelope KEEP (v10+bf16)")
-    ax_b.scatter([64], [232.2], s=200, marker="*", color="#d4a017",
-                 edgecolor="black", zorder=5, label="C14 hardware ceiling (v10+bf16)")
+    ax_b.scatter([52], [204.5], s=200, marker="*", color="#2ca02c",
+                 edgecolor="black", zorder=5, label="C27 envelope KEEP (bf16-only, corrected)")
+    ax_b.scatter([64], [231.9], s=200, marker="*", color="#d4a017",
+                 edgecolor="black", zorder=5, label="C28 hardware ceiling (bf16-only, corrected)")
     ax_b.annotate("CLIFF at 40 GB peak\nB=64 → B=66\n229.8 → 166.8 (-26%)",
                   xy=(66, 166.8), xytext=(58, 120), fontsize=8, color="#888",
                   arrowprops=dict(arrowstyle="->", color="#888"),
@@ -227,8 +237,8 @@ def render() -> None:
     ax_b.set_xlabel("B (max_batch_size)")
     ax_b.set_ylabel("aggregate decode_tok_s", fontsize=10, color="#1976d2")
     ax_b.tick_params(axis="y", labelcolor="#1976d2")
-    ax_b.set_title("Panel B: B-sweep — C10 fp32 (B≤48) + C13/C14 bf16+v10 stack (B=52..64)\n"
-                   "Aggregate climbs 42.17 → 232.2 (5.51×); sharp cliff past 40 GB peak",
+    ax_b.set_title("Panel B: B-sweep — C10 fp32 (B≤48) + C13 bf16-state (B=52..64) corrected\n"
+                   "Aggregate climbs 42.17 → 231.9 (5.50×); cliff past 40 GB peak (architectural per C29)",
                    fontsize=10, fontweight="bold")
     ax_b.grid(True, alpha=0.3, linestyle="--")
     ax_b.set_xticks(bx)
@@ -279,24 +289,24 @@ def render() -> None:
                       fontsize=10, fontweight="bold")
     ax_d.axhline(193.9, color="#1976d2", linestyle="--", linewidth=1.5, alpha=0.4,
                  label="C10 baseline = 193.9")
-    ax_d.axhline(206.2, color="#2ca02c", linestyle="--", linewidth=1.5, alpha=0.6,
-                 label="C14 envelope KEEP = 206.2")
-    ax_d.axhline(232.2, color="#d4a017", linestyle="--", linewidth=1.5, alpha=0.6,
-                 label="C14 hardware ceiling = 232.2")
+    ax_d.axhline(204.5, color="#2ca02c", linestyle="--", linewidth=1.5, alpha=0.6,
+                 label="C27 envelope KEEP = 204.5 (corrected)")
+    ax_d.axhline(231.9, color="#d4a017", linestyle="--", linewidth=1.5, alpha=0.6,
+                 label="C28 hardware ceiling = 231.9 (corrected)")
     ax_d.set_xticks(xs)
     ax_d.set_xticklabels(E2E_LABELS, fontsize=10)
     ax_d.set_ylabel("decode_tok_s on warm-decode-bN", fontsize=11)
-    ax_d.set_title("Panel D: KEEP ladder — C10 baseline → C13 bf16-only → C14 v10+bf16 stack\n"
-                   "C14 envelope: 206.2 (4.89× C1, 3.4σ over C13). C14 ceiling: 232.2 (5.51× C1).",
+    ax_d.set_title("Panel D: corrected KEEP ladder — C10 → C13 → C27 (v10 phantom retracted)\n"
+                   "C27 envelope: 204.5 ± 1.5 (4.85× C1, bf16-only). C28 ceiling: 231.9 ± 0.3 (5.50× C1).",
                    fontsize=11, fontweight="bold")
     ax_d.set_ylim(180, 245)
     ax_d.legend(loc="upper left", fontsize=9)
     ax_d.grid(True, alpha=0.3, linestyle="--", axis="y")
 
     fig.suptitle(
-        "Silica-MLX P-6 Autoresearch — Final Summary (cycles 1-23, 2026-05-02 → 2026-05-04)\n"
+        "Silica-MLX P-6 Autoresearch — Final Summary (cycles 1-31, 2026-05-02 → 2026-05-04)\n"
         "Mission: push dense Qwen3.5-27B-4bit on M5 Pro 48 GB toward the hardware limit.\n"
-        "Result: 42.17 → 206.2 envelope KEEP (4.89×) / 232.2 hardware ceiling (5.51×); C19-23 spec-decode arm: cov@64=40.5% feasible but B×k verify-cost wall blocks net throughput; 21 kernels; 2779 tests pass.",
+        "Result: 42.17 → 204.5 envelope KEEP (4.85×) / 231.9 hardware ceiling (5.50×) [C27 corrected]; C30/C31 close DeltaNet kernel-headroom (parity with mlx); C29 cliff is architectural; 22 kernels; 2779 tests pass.",
         fontsize=12, fontweight="bold", y=0.99,
     )
 
