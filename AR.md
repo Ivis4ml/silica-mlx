@@ -39,13 +39,24 @@ The original prompt below quotes a 13.5 GB weight footprint and a ~22.7 tok/s B=
 
 The AR.md "Stop conditions" §"are CLEARED. See `plans/P6_AUTORESEARCH_FINAL_REPORT.md` for the comprehensive 23-cycle write-up. New numbers + new levers + new retired tracks below — supersede earlier addenda where they conflict.
 
-### Updated running-best line (supersedes earlier 42.17 / 193.9 anchors; cycle-27 correction applied)
+### Updated running-best line (supersedes earlier 42.17 / 193.9 anchors; cycle-27/28/33/34/35 corrections applied)
+
+Dense Qwen3.5-27B-4bit (primary):
 
 | Frame | Value | Composition |
 | --- | ---: | --- |
-| Within strict 36 GB envelope | **204.5 ± ~1.5 tok/s at B=52** (4.85× cycle-1 baseline) | C10 axis-shift × C12 bf16-state-peak-save |
-| Within 48 GB hardware ceiling | **~230 tok/s at B=64** (~5.45× cycle-1 baseline; needs re-measurement under corrected v10 path) | same stack at higher B |
-| (1b) ≥60 milestone | **CLEARED 3.41× (envelope)** | — |
+| Within strict 36 GB envelope | **204 ± 1 tok/s at B=52** (4.85× cycle-1 baseline; n=6 across 2 sessions per cycle 33) | C10 axis-shift × C12 bf16-state-peak-save |
+| Within 48 GB hardware ceiling | **231.9 ± 0.3 tok/s at B=64 bf16-only** (5.50× cycle-1 baseline; n=3 per cycle 28) | same stack at higher B; v10 contribution within-noise to slightly negative at B=64 |
+| (1b) ≥60 milestone | **CLEARED 3.40× (envelope) / 3.87× (hardware ceiling)** | — |
+
+MoE Qwen3.5-35B-A3B-4bit (secondary; cycles 34-35 — methodology portability validation):
+
+| Frame | Value | Composition |
+| --- | ---: | --- |
+| Within strict 36 GB envelope | **464.1 ± 0.7 tok/s at B=64** (peak 33.8 GB; 2.46× cycle-1 MoE B=4 baseline 188.5; n=3 per cycle 35) | C12 bf16-state + C10 axis-shift transfer cleanly via shared `gated_delta` shadow patch |
+| Within 48 GB hardware ceiling | **791.8 ± 5.2 tok/s at B=128** (peak 47.96 GB; 4.20× MoE cycle-1; n=3 per cycle 35) | same stack at higher B; expert routing amortisation crosses utilisation threshold near B=128 (8 of 256 experts active per token) |
+
+The MoE secondary track is the largest absolute throughput in the 33-cycle research effort. Per the AR.md secondary-track classification, MoE wins are valuable but do not substitute for dense progress; the primary running-best line stays anchored on dense 27B.
 
 The 42.17 baseline is now historical.
 
@@ -148,6 +159,30 @@ AR.md §"Stop conditions" defines three. After 23 cycles:
 3. Measurement-anchored declaration that the open-lever set cannot multiplicatively reach 60 — **N/A** because (1) and (2) already cleared
 
 **The autoresearch loop has reached a legitimate stop.** Future loops resuming on this target should start from `plans/P6_AUTORESEARCH_FINAL_REPORT.md` and the TODO list above; do not re-run the cycle 1-14 lever set without first re-verifying the running-best line via a 3-reproduction warm-decode-b52 run with `SILICA_USE_FA_DECODE_V10=1` `SILICA_USE_BF16_DELTANET_STATE=1`.
+
+## 2026-05-04 — Cycles 28-35 update (post-23-cycle continuation)
+
+After the cycle-23 closure the loop was reopened by user request to (a) verify cycle-27's attribution correction at the hardware ceiling, (b) probe the 40 GB cliff for movability, (c) attribute the remaining E2E cost, and (d) test methodology portability to the MoE secondary track. Net findings:
+
+- **Cycle 28 (dense 27B B=64 hardware ceiling re-measured under corrected v10 path)**: bf16-only at B=64 = **231.9 ± 0.3 tok/s** (n=3); bf16+v10 at B=64 = 230.2 ± 1.6 (n=3, v10 firing). v10 contribution = -1.7 tok/s, marginally negative at production B. Hardware ceiling stays at ~232 tok/s but attribution is now bf16-only (not v10+bf16 stack as cycle 14 had claimed).
+- **Cycle 29 (40 GB cliff movability)**: Three allocator-hint probes at B=66 (cache_limit, memory_limit, wired_limit) leave the cliff in place. **The cliff is architectural** (likely M5 Pro SLC threshold or unified memory bandwidth contention near 48 GB system cap), not allocator policy. To break further requires mlx 0.32+ async-copy (external) or mx.compile graph-trace cache rerouting (4-6 hour integration).
+- **Cycle 30 (per-step attribution at B=64)**: DeltaNet **87.9%** / full-attn 12.5% / overhead 0.3%. DeltaNet share grew from 74% (B=4) to 88% (B=64) because state R/W scales with B. Explains why v10 FA-decode kernel had no E2E impact at B=64 — full-attention is a small fraction.
+- **Cycle 31 (silica `gated_delta_v2`)**: Vectorised bfloat4 K/V/Q + float4 state R/W microbench at production shape (Hk=16, Hv=48, Dk=Dv=128). Correctness PASS (3e-5 fp16 ULP at all B). Speedup vs mlx: **1.001× at B=64** — mlx's existing kernel is at near-HBM-bandwidth limit on state R/W; vectorisation changes load instruction count but not data volume. The cycle-11 v6→v7 trick that gave 1.4-1.7× on FA-decode does not transfer to DeltaNet. Cycle 30's DeltaNet share at 88% **does NOT yield a reachable kernel lever** on this stack.
+- **Cycle 33 (variance characterisation)**: 6 reps across 2 sessions at B=52 bf16-only: 203.75 ± 0.83 tok/s. Within-session σ 0.4-1.1; between-session drift 0.9; combined ~1 tok/s. Sharpens cycle-27's σ from ~1.5 to ~1.0. Honest dense-track running-best: **204 ± 1 tok/s at B=52 bf16-only** within strict envelope.
+- **Cycle 34 (MoE 35B-A3B portability)**: cycles 12+13 levers (bf16 state + axis-shift) transfer cleanly via inherited `Qwen3_5MoeAdapter` and shared `gated_delta` shadow patch. NEW MoE secondary-track within-envelope running-best: **464.4 tok/s at B=64** (peak 33.8 GB; 2.46× MoE B=4 baseline 188.5; +146%). Cycle 35 n=3 reproduction tightens to **464.1 ± 0.7 tok/s**.
+- **Cycle 35 (MoE B-axis push at hardware ceiling)**: NEW MoE secondary-track running-best at hardware ceiling: **791.8 ± 5.2 tok/s at B=128** with bf16 DeltaNet state (peak 47.96 GB at 48 GB hardware ceiling; 4.20× MoE B=4 baseline; n=3 reps 785.8/794.5/795.0). Per-row throughput non-monotonic (7.25 → 4.87 → 6.18) reflects expert routing utilisation crossing amortisation threshold near B=128 (8 of 256 experts active per token; ~4 activations/expert/step at B=128 vs 2 at B=64). **MoE has fundamentally different B-scaling structure than dense 27B** — expert sparsity bypasses the dense activation pressure that produces dense's 40 GB cliff. **Largest absolute throughput in the 33-cycle research effort.**
+
+### Implications for the autoresearch loop
+
+- **Dense 27B primary track is closed at ~232 tok/s** within 48 GB hardware ceiling. Cycle 30's identification of DeltaNet at 88% step share + cycle 31's bandwidth-limit finding + cycle 29's architectural-cliff finding together close the load-bearing kernel-and-allocator levers on this stack. Future dense progress requires mlx 0.32+ async-copy or mx.compile cache rerouting.
+- **MoE secondary track is open and productive.** Cycle 34-35 demonstrate that the cycle-12+13 methodology generalises across architectures within the Qwen3.5 family. The same lever set delivers 791.8 tok/s on MoE 35B-A3B at hardware ceiling vs 232 tok/s on dense 27B at the same ceiling — MoE is the genuinely faster regime when expert sparsity is exploited at high B.
+- **AR.md secondary-track classification holds**: MoE wins on the qwen3.5-moe-35b-a3b-warm-decode-* row family go on the secondary chart; primary dense 27B running-best line stays anchored at 204 envelope / 232 hardware.
+
+### MoE expert-amortisation note (cycle 35)
+
+The B=128 jump from 467 (B=96) to 791.8 (B=128) is +69% — far above any per-row improvement seen on dense 27B's B-sweep. Mechanism: each MoE step routes 8 experts × B tokens. At B=64 each expert sees ~2 activations on average (`8×64 / 256 = 2.0`); at B=128 each sees ~4 (`8×128 / 256 = 4.0`). Crossing 3-4 activations per expert per step is enough for expert weight loads to amortise across multiple tokens, dominating the per-token cost ratio.
+
+For future MoE workloads this suggests B should be chosen to keep expected-activations-per-expert ≥ 4 whenever peak memory allows.
 
 ---
 
