@@ -22,6 +22,8 @@ turboquant_plus/
 mini-sglang/
 vllm/
 vqbench/
+flash-attention/
+gram-newton-schulz/
 
 
 # Environment
