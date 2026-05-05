@@ -115,6 +115,14 @@ class Qwen3_5Adapter:
         # mlx-lm's load() returns Union[2tuple, 3tuple]; the 2-tuple variant
         # applies with return_config omitted.
         model, tokenizer = _mlx_lm_load(repo)  # type: ignore[misc]
+        # Apply shadow-mode kernel installs (env-flag gated; no-op when off).
+        # See silica/kernels/shadow_install.py for SILICA_USE_FA_DECODE_V10
+        # and SILICA_USE_BF16_DELTANET_STATE.
+        try:
+            from silica.kernels import shadow_install
+            shadow_install.install(model)
+        except ImportError:
+            pass
         kv = SimpleKVCache.from_model(model)
         return cls(model, tokenizer, kv_manager=kv), kv
 
