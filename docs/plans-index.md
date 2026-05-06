@@ -347,6 +347,58 @@ read in-editor while iterating.
   new evidence such as mlx async-copy primitives, a different kernel
   path, or a different model architecture.
 
+### D-023 — Gemma 4 MTP drafter pre-projection (Track C external reopen probe)
+
+- [`MTP_GEMMA4_PRE_PROJECTION.md`](../plans/MTP_GEMMA4_PRE_PROJECTION.md) —
+  half-day external spike against Google's Gemma 4 multi-token-prediction
+  (MTP) drafter, opened as D-023 in `PLAN.md` §9 at v1.7.29 and running
+  before P-8 OpenAI HTTP server work begins. External evidence on the
+  v1.7.20-22 closed Track C line; D-023 is a new entry, not a C.3
+  reopen, because the current Silica production target
+  `mlx-community/Qwen3.5-27B-4bit` ships no MTP weights and Gemma 4 is
+  a new family + new public drafter. Spike runs entirely outside
+  `silica.*` through `mlx_vlm` (canonical CLI form `python -m
+  mlx_vlm.generate --model … --draft-model … --draft-block-size … --temp 0`);
+  native silica integration only triggers on a measured B=1 per-row ≥
+  1.3× speedup gate at the decision row.
+
+  **Pairing + feasibility caveat at the top.** The advertised MTP pair
+  is target `mlx-community/gemma-4-31B-it-bf16` (~62.5 GB BF16,
+  exceeds M5 Pro 48 GB unified memory) + drafter
+  `mlx-community/gemma-4-31B-it-assistant-bf16` (~939 MB BF16). The
+  cached `mlx-community/gemma-4-31b-4bit` (17 GB) is the non-IT 4-bit
+  variant and is **not the supported MTP target**. Whether D-023 can
+  run on this hardware depends on a supported-pairing verification
+  (does an MTP-supported 4-bit IT target variant exist? does mlx-vlm
+  support mixed precision?) — the load-bearing pre-spike step in §3
+  with four outcomes A/B/C/D.
+
+  Sections in the spike doc: provenance (D-023 vs C.3 reopen with
+  narrowed Qwen3.5 production-target framing), license-verify (待核查
+  — official Apache-2.0 vs `mlx-community` conversion-metadata
+  `License: gemma`, reuse decision deferred), supported-pairing +
+  hardware-feasibility verification (the load-bearing gate; outcomes
+  A/B/C/D), runtime deps (`mlx-vlm` dev-only via `uv add --dev`; pin
+  status against the `mlx==0.31.1 / mlx-lm==0.31.2 / mlx-metal==0.31.1`
+  toolchain), HF cache check (cached non-IT 4-bit base is not the
+  supported target; advertised BF16 pair not cached and exceeds 48 GB
+  ceiling), measurement plan (`draft_block_size ∈ {2, 3, 6, 9}` ×
+  `B ∈ {1, 4}`, `k_candidates = block_size − 1`; `block_size = 6` is
+  the card's single-request recommendation, `block_size = 3` the
+  batched recommendation, `block_size = 2` is the verify-cost-floor
+  diagnostic row only), decision-row vs diagnostic-row distinction,
+  variance discipline with B=1 noise-floor caveat, rough projection
+  (intuition only — does not contribute to gate decision), measured-gate
+  matrix (top-down: PAIR-INFEASIBLE / GREEDY-PARITY-FAIL /
+  DRAFT-VERIFY-WALL hard blocks first, then B=1-PASS / B=4-ONLY-PASS /
+  NEGATIVE pass-or-close rows), native-integration-gap analysis
+  (`Gemma4Adapter` does not implement `HiddenCaptureAdapter`; runtime
+  gate at `silica/bench/runner.py:537` raises `NotImplementedError`;
+  native MTP wiring requires extending `decode_step_multi_with_capture`
+  + `prefill_with_capture` to `Gemma4Adapter` first), and a verdict
+  template populated only after the spike runs. P-8 opens cleanly
+  after D-023 settles in any direction.
+
 ## Side track: chat CLI redesign
 
 - [`CHAT_CLI_OPENING.md`](../plans/CHAT_CLI_OPENING.md) — the design
