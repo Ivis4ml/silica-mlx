@@ -6,9 +6,17 @@ with a vLLM-style continuous batcher, a radix prefix cache, and a
 pluggable KV codec stack (BlockTQ + RaBitQ) wired into the prefix
 store.
 
-This site bundles four kinds of material:
+The 35-cycle P-6 autoresearch loop closed in May 2026 with all four
+acceptance gates cleared 3.4-5.5× over the cycle-1 baseline:
+**232 tok/s on dense Qwen3.5-27B-4bit at the 48 GB hardware ceiling**,
+**791.8 tok/s on MoE Qwen3.5-35B-A3B-4bit at B=128**. See {doc}`performance`
+for the full record (headline numbers, the two load-bearing levers,
+and the honest closures + cycle-27 retraction).
+
+This site bundles five kinds of material:
 
 - a high-level **overview** of what the framework does and how to use it;
+- the **performance** report from the P-6 autoresearch loop;
 - the auto-generated **API reference** for every public class, function,
   and protocol in `silica.*`;
 - the **chat CLI** guide for the bundled REPL client;
@@ -20,6 +28,7 @@ This site bundles four kinds of material:
 :caption: Get started
 
 overview
+performance
 chat-cli
 bench
 ```

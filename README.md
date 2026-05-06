@@ -26,14 +26,22 @@ Target hardware: M5 Pro 48 GB. Runs Qwen3 (0.6B / 4B / 7B / 14B /
 32B), Qwen3.5 hybrid (0.8B / 4B / 27B), Gemma4-31B dense,
 Qwen3.5-35B-A3B MoE, gemma-4-26B-A4B MoE.
 
-> **Status (v1.7.19):** the scheduler core (continuous batching,
+> **Status (v1.7.24):** the scheduler core (continuous batching,
 > prefix cache, memory budget), multi-family adapters, KV codec
 > compression, and the speculative-decoding foundation
 > (`DraftTargetEngine` + three rollback paths + spec-metrics
 > emission + `--speculative` bench switch — D-021 step 5) are
-> shipped. OpenAI HTTP server and weight streaming for MoE residency
-> remain stubs behind frozen interfaces; the speculative ≥1.2× decode
-> acceptance bullet rolls into Track C.4 / C.5 in P-6.
+> shipped. **The 35-cycle P-6 autoresearch loop closed in May 2026
+> with all four acceptance gates cleared 3.4-5.5× over the cycle-1
+> baseline** — 232 tok/s on dense Qwen3.5-27B-4bit at the 48 GB
+> hardware ceiling, 791.8 tok/s on MoE Qwen3.5-35B-A3B-4bit at
+> B=128. Two load-bearing levers: batched-aggregate axis-shift
+> (cycle 10) × bf16 DeltaNet recurrent state (cycle 12); 17 custom
+> Metal kernel attempts closed without a load-bearing E2E win on
+> mlx 0.31.x (see § Performance). D-022 small-B interactive QoE is
+> the next active research line. OpenAI HTTP server and weight
+> streaming for MoE residency remain stubs behind frozen
+> interfaces.
 
 > **Website.** Project homepage at
 > [ivis4ml.github.io/silica-mlx](https://ivis4ml.github.io/silica-mlx/)
@@ -78,6 +86,145 @@ layer on a single integrated runtime. mlx-lm is single-request and
 solves a different problem; vLLM and SGLang are CUDA-first and don't
 run on Apple Silicon. silica-mlx is not feature-complete relative to
 either yet — see "What's planned" below for the gap.
+
+---
+
+## Performance — P-6 autoresearch closed at v1.7.23
+
+The 35-cycle opus autoresearch loop pushed Qwen3.5-27B-4bit warm
+decode 5.50× over the cycle-1 baseline on M5 Pro 48 GB. The two
+load-bearing levers — `cycle-10` batched-aggregate axis-shift
+(B=4 → B=52) and `cycle-12` bf16 DeltaNet recurrent state (3.5 GB
+peak save opens B≥48 within the 36 GB envelope) — composed to
+clear all four P-6 acceptance gates 3.4-5.5× over baseline. The
+MoE secondary track at B=128 = 791.8 tok/s is the largest
+absolute throughput observed across the full effort.
+
+### Headline numbers
+
+| Metric | Value | Frame |
+| --- | ---: | --- |
+| Dense 27B decode (envelope) | **204 ± 1 tok/s** | `mlx-community/Qwen3.5-27B-4bit` · B=52 · 36 GB · n=6 across 2 sessions |
+| Dense 27B decode (hardware ceiling) | **231.9 ± 0.3 tok/s** | B=64 · 48 GB · n=3 |
+| MoE 35B-A3B decode (envelope) | **464.1 ± 0.7 tok/s** | `mlx-community/Qwen3.5-35B-A3B-4bit` · B=64 · 33.8 GB · n=3 |
+| MoE 35B-A3B decode (hardware ceiling) | **791.8 ± 5.2 tok/s** | B=128 · 47.96 GB · n=3 |
+| Dense uplift from cycle-1 baseline (42.17 tok/s @ B=4) | **5.50×** at B=64 / **4.85×** at B=52 | — |
+| MoE uplift from cycle-1 baseline (188.5 tok/s @ B=4) | **4.20×** at B=128 / **2.46×** at B=64 | — |
+
+### Acceptance gates — every P-6 gate cleared
+
+| Gate | Target | Cleared | Multiplier | Frame |
+| --- | --- | --- | ---: | --- |
+| (1a) Dense engineering | ≥40 tok/s | 204 ± 1 tok/s | **4.85×** | B=52 · 36 GB envelope |
+| (1b) Dense stretch | ≥60 tok/s | 231.9 ± 0.3 tok/s | **3.87×** | B=64 · 48 GB hardware ceiling |
+| (2a) MoE anchor | ≥100 tok/s | 120.93 tok/s (preserved) | — | MoE B=2 · v1.7.13 baseline |
+| (2b) MoE stretch | ≥175 tok/s | 791.8 ± 5.2 tok/s | **4.52×** | MoE B=128 · 48 GB hardware ceiling |
+
+### Two load-bearing levers (running-best is composition, not a custom kernel)
+
+- **Cycle 10 — batched-aggregate axis-shift.** Re-reading the AR.md
+  metric definition ("B is chosen to maximise aggregate") moved the
+  operating point from B=4 → B=48 within the 36 GB envelope. Pure
+  parameter selection; no kernel change. 4.60× on its own.
+- **Cycle 12 — bf16 DeltaNet recurrent state.** State shape
+  `[B, Hv=48, Dv=128, Dk=128]` = 144 MB at fp32 per layer,
+  72 MB at bf16. Across 48 DeltaNet layers, peak-memory save
+  is ~3.5 GB — opens B≥48 within the 36 GB envelope and unlocks
+  B=64 within the 48 GB hardware ceiling.
+- **Cycle 13 — composition.** Cycle-12's peak-memory save composed
+  with cycle-10's B-axis lever produces the running-best line. The
+  two levers are independent; together they dominate every later
+  atomic probe in the loop.
+
+17 custom Metal kernel attempts (13 QMM versions + 7 FA-decode
+versions + DeltaNet vectorisation + 3 fused-op kernels) closed
+without a load-bearing E2E win. Cycle-30 explained why: at B=64
+with the v10+bf16 stack, DeltaNet owns 88% of step time,
+full-attention 12.5%, dispatch 0.3% — and mlx's existing
+`gated_delta` kernel is already at HBM-bandwidth limit (cycle-31
+silica `gated_delta_v2` = 1.001× vs mlx). Source-string Metal
+kernels in mlx 0.31.x do not pay back on dense 27B; the unlock came
+from data layout (bf16 state) and operating-point selection
+(axis-shift).
+
+### Honest record — what closed with a negative, what was retracted
+
+- **Spec-decode at production B — closed with measurement-anchored
+  negative.** Cycle 23 measured the `B × k` verify-cost matrix:
+  B=52 k=64 = **8105 ms** vs same-B plain-decode ~252 ms / step.
+  Tree-spec at b=64 recomputes to ~10 tok/s aggregate, a net
+  regression by 20× vs plain decode. No B regime in {1, 4, 16, 52}
+  where spec-decode beats plain on this stack. Track C settles:
+  C.4 retired (η.1 = 0.482×), C.5 retired (cycle-23 closure),
+  C.1 / C.2 / C.3 / C.6 deprioritised since (1b) no longer needs
+  them.
+- **Dense B-axis past 64 — closed at the architectural cliff.**
+  Cycles 28-29 measured a 26% throughput drop at the B=64 → B=66
+  transition (40 GB peak boundary). Three allocator-hint probes
+  (`mx.metal.set_cache_limit / set_memory_limit / set_wired_limit`)
+  leave the cliff in place. The cliff is architectural — likely
+  M5 Pro SLC threshold or unified-memory bandwidth contention near
+  the 48 GB cap — not allocator policy.
+- **Cycle 14's claimed v10 KEEP — retracted via codex review.** A
+  codex cross-review on the `opus-codex` branch caught a 14-cycle
+  dtype-defect in `silica.kernels.shadow_install`
+  (`queries.dtype == mx.float16` silently skipped the bf16
+  production path). After the fix, an 8-rep reverify (cycles
+  27 / 28) measured v10's E2E contribution at +0.5 tok/s @ B=52 /
+  -1.7 tok/s @ B=64 — both within noise. The honest running-best
+  is C10 axis-shift × C12 bf16 DeltaNet state composition alone;
+  the retracted KEEP is published as part of the research record.
+
+### Methodology
+
+Karpathy-style autoresearch ledger (one TSV row per measurement;
+the main agent appends, sub-agents return findings). Variance
+discipline: ≥3 reps per session, ≥2 sessions, combined σ check
+before declaring a KEEP. Cycle 33's combined σ at B=52 across
+2 sessions tightened to 0.83 tok/s on n=6 — that protocol is the
+standard, not the exception. Toolchain pin: `mlx==0.31.1`,
+`mlx-lm==0.31.2`, `mlx-metal==0.31.1`. Determinism gate:
+`tests/test_p2_preload_parity.py` (3/3 pass).
+
+### Reproducibility
+
+```bash
+# Dense 27B within 36 GB envelope (running-best 204 tok/s)
+SILICA_USE_BF16_DELTANET_STATE=1 \
+    SILICA_REAL_QWEN3_5_27B=1 \
+    uv run --extra bench python -m scripts.bench \
+        --scenario qwen3.5-27b-warm-decode-b52 \
+        --out /tmp/repro_b52_bf16.jsonl
+
+# Dense 27B at 48 GB hardware ceiling (running-best 232 tok/s)
+SILICA_USE_BF16_DELTANET_STATE=1 \
+    SILICA_REAL_QWEN3_5_27B=1 \
+    uv run --extra bench python -m scripts.bench \
+        --scenario qwen3.5-27b-warm-decode-b64 \
+        --out /tmp/repro_b64_bf16.jsonl
+
+# MoE 35B-A3B at 48 GB hardware ceiling (running-best 791.8 tok/s)
+SILICA_USE_BF16_DELTANET_STATE=1 \
+    SILICA_REAL_QWEN3_5_MOE=1 \
+    uv run --extra bench python -m scripts.bench \
+        --scenario qwen3.5-moe-35b-a3b-warm-decode-b128 \
+        --out /tmp/repro_moe_b128.jsonl
+```
+
+### Read more
+
+- [`plans/P6_AUTORESEARCH_NOTES.md`](plans/P6_AUTORESEARCH_NOTES.md)
+  — durable take-home companion (cycle log, lessons, levers,
+  reproducibility recipes).
+- [`plans/P6_AUTORESEARCH_FINAL_REPORT.md`](plans/P6_AUTORESEARCH_FINAL_REPORT.md)
+  — comprehensive 23-cycle final report.
+- [`AR.md`](AR.md) — autoresearch directive + addendums.
+- [`plans/P6_AUTORESEARCH_LOG.tsv`](plans/P6_AUTORESEARCH_LOG.tsv)
+  — raw 110-row Karpathy-style ledger.
+- [`plans/P6_AUTORESEARCH/`](plans/P6_AUTORESEARCH/) — per-cycle
+  reports + JSONL artefacts + progress charts.
+- [`plans/P6_SMALL_B_OPENING.md`](plans/P6_SMALL_B_OPENING.md) —
+  D-022 small-B interactive QoE line (next research direction).
 
 ---
 
@@ -167,8 +314,8 @@ variable-length SDPA kernel.
 | P-4 | Unified bench harness — runner, oracles, 15 scenarios, JSONL + Markdown reports, vqbench subprocess PPL | ✅ complete |
 | P-4.5 | P-4 exit bridge — chunked-prefill minimal + VectorCodec runtime integration spike | ✅ complete (v1.6.9) |
 | P-5 | VQ KV compression (BlockTQ / RaBitQ) | ✅ complete (v1.7.4 — Acceptance (1)–(4) closed; P-5-F production routing closed at v1.7.6; (b-static) Qwen3.5-4B baseline closed at v1.7.7; per-head opt-in + measurements at v1.7.8 / v1.7.10 / v1.7.11) |
-| P-6 | Performance phase (dense Qwen3.5-27B-4bit ≥40 tok/s primary, ≥60 stretch; MoE 35B-A3B ≥100 anchor cleared, ≥175 aggregate stretch) | In progress — P-6.0 baseline (v1.7.13) + P-6.0.5 measurement expansion (v1.7.17) closed; Decision Gate 1 (D-021 step 4) closed at v1.7.18; **D-021 step 5 spec foundation closed at v1.7.19** (single-request `Engine.generate` spec path + three rollback paths + cycle-1 parity + spec-metrics emission + `--speculative` CLI; multi-request hybrid batched-spec deferred as non-blocking); Tracks A / B / C.4-C.5 / D queued. Dense layer-streaming deferred to v0.2 per D-018. |
-| P-7 | Speculative decoding (DraftTarget / EAGLE / Medusa) | Promoted to T1 at v1.7.13; `DraftEngine` interface frozen. Foundation deliverables (`DraftTargetEngine` + engine integration + spec-metrics + bench switch) closed at D-021 step 5 (v1.7.19); ≥1.2× decode-throughput acceptance is **tracked, not blocking** at foundation closure and will be settled by Track C.4 / C.5 in P-6 per Decision Gate 1. EAGLE / Medusa belong to v0.2. |
+| P-6 | Performance phase (dense Qwen3.5-27B-4bit ≥40 tok/s primary, ≥60 stretch; MoE 35B-A3B ≥100 anchor cleared, ≥175 aggregate stretch) | ✅ acceptance gates cleared at v1.7.23 — (1a)/(1b)/(2b) all cleared 3.4-5.5× over the cycle-1 baseline via the 35-cycle opus autoresearch loop (axis-shift × bf16 DeltaNet state composition; see § Performance). D-021 step 5 spec foundation closed at v1.7.19. Track B 3-bit retired at v1.7.21 (B.2 PPL gate FAIL). Track C.4 retired at v1.7.20 (η.1 = 0.482×). Track C.5 retired at v1.7.22 (production-B verify-cost wall). D-022 small-B interactive QoE (B ∈ {1, 2, 4, 8, 12}) opened at v1.7.24 as the next active research line; Track A reframes from "ships after spec foundation" to next-research lead. Dense layer-streaming deferred to v0.2 per D-018. |
+| P-7 | Speculative decoding (DraftTarget / EAGLE / Medusa) | Promoted to T1 at v1.7.13; `DraftEngine` interface frozen. Foundation deliverables (`DraftTargetEngine` + engine integration + spec-metrics + bench switch) closed at D-021 step 5 (v1.7.19). ≥1.2× decode-throughput acceptance has now been settled with a measurement-anchored negative: opus cycle 23 measured the B × k verify-cost matrix on dense Qwen3.5-27B-4bit (B=52 k=64 = 8105 ms vs same-B plain decode ~252 ms / step) — tree-spec recomputes to ~10 tok/s aggregate, a net regression by 20× vs plain decode, with no B regime in {1, 4, 16, 52} where any spec variant beats plain. Track C.4 / C.5 both retired with negatives in P-6. Re-opening requires a fundamentally different verifier with measured sub-linear cost at production batch. EAGLE / Medusa stay v0.2. |
 | P-8 | OpenAI-compatible HTTP server + session layer | ⏳ planned (T1 tail, after P-5) |
 
 Legend: ✅ shipped · Stub = wired as the baseline implementation

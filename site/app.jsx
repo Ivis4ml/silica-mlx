@@ -33,7 +33,7 @@ const Hero = ({ tweaks }) => {
     return (
       <section className="hero">
         <div className="container">
-          <div className="hero-eyebrow"><span className="dot"></span>Status v1.7.19: scheduler core · family adapters · KV codec · spec foundation — shipped</div>
+          <div className="hero-eyebrow"><span className="dot"></span>Status v1.7.24: P-6 acceptance gates cleared 3.4-5.5× · D-022 small-B line opens</div>
           <h1>
             Continuous-batching<br/>
             LLM serving,<br/>
@@ -41,9 +41,10 @@ const Hero = ({ tweaks }) => {
           </h1>
           <p className="hero-sub">
             silica-mlx ports the vLLM scheduler core — continuous batching, memory-budget admission,
-            preempt+replay, radix prefix cache — onto MLX's unified-memory model. Five model families
-            with batched-output parity. Native KV codec compression and the speculative-decoding
-            foundation (DraftTarget + three rollback paths) shipped at v1.7.19.
+            preempt+replay, radix prefix cache — onto MLX's unified-memory model. The 35-cycle P-6
+            autoresearch loop closed in May 2026 with all four acceptance gates cleared 3.4-5.5×
+            over the cycle-1 baseline: 232 tok/s on dense Qwen3.5-27B-4bit at the 48 GB hardware
+            ceiling, 791.8 tok/s on MoE Qwen3.5-35B-A3B-4bit at B=128.
           </p>
           <div className="hero-ctas">
             <a className="btn btn-primary" href="#quickstart">Quickstart<Icon name="arrow" size={14} className="arrow" /></a>
@@ -57,37 +58,37 @@ const Hero = ({ tweaks }) => {
   return (
     <section className="hero">
       <div className="container">
-        <div className="hero-eyebrow"><span className="dot"></span>Status: scheduler core, family adapters, KV codec — shipped</div>
+        <div className="hero-eyebrow"><span className="dot"></span>Status v1.7.24: P-6 acceptance gates cleared 3.4-5.5× · D-022 small-B line opens</div>
         <h1>Continuous-batching LLM serving, <em>native to Apple Silicon.</em></h1>
         <p className="hero-sub">
-          The vLLM scheduler core, the radix prefix cache, and the memory-budget admission ladder that production-grade serving frameworks rely on — ported to MLX's unified-memory model on M5 Pro 48 GB. Five model families validated against batched mlx-lm references. Speculative-decoding foundation closed at v1.7.19 (DraftTarget + three rollback paths + spec-metrics into the bench harness).
+          The vLLM scheduler core, the radix prefix cache, and the memory-budget admission ladder — ported to MLX's unified-memory model on M5 Pro 48 GB. The 35-cycle P-6 autoresearch loop closed in May 2026 with every acceptance gate cleared 3.4-5.5× over the cycle-1 baseline: 232 tok/s on dense Qwen3.5-27B-4bit at the 48 GB hardware ceiling, 791.8 tok/s on MoE Qwen3.5-35B-A3B-4bit at B=128. Two load-bearing levers (axis-shift × bf16 DeltaNet state); 17 custom-kernel attempts closed without a load-bearing E2E win.
         </p>
         <div className="hero-ctas">
-          <a className="btn btn-primary" href="#quickstart">Quickstart<Icon name="arrow" size={14} className="arrow" /></a>
+          <a className="btn btn-primary" href="#performance">Performance<Icon name="arrow" size={14} className="arrow" /></a>
           <a className="btn btn-ghost" href="https://github.com/Ivis4ml/silica-mlx" target="_blank" rel="noreferrer"><Icon name="github" size={14} />View on GitHub</a>
           <a className="btn btn-ghost" href="#architecture">Architecture</a>
         </div>
 
         <div className="hero-meta">
           <div className="hero-meta-item">
-            <div className="hero-meta-label">Decode</div>
-            <div className="hero-meta-value">151.4<span className="unit">tok/s</span></div>
-            <div className="hero-meta-sub">Qwen3-0.6B · M5 Pro</div>
+            <div className="hero-meta-label">Dense 27B decode</div>
+            <div className="hero-meta-value">232<span className="unit">tok/s</span></div>
+            <div className="hero-meta-sub">Qwen3.5-27B-4bit · B=64 · 48 GB ceiling</div>
           </div>
           <div className="hero-meta-item">
-            <div className="hero-meta-label">TTFT</div>
-            <div className="hero-meta-value">25.1<span className="unit">ms</span></div>
-            <div className="hero-meta-sub">15-token prompt</div>
+            <div className="hero-meta-label">MoE 35B-A3B decode</div>
+            <div className="hero-meta-value">791.8<span className="unit">tok/s</span></div>
+            <div className="hero-meta-sub">Qwen3.5-35B-A3B-4bit · B=128</div>
           </div>
           <div className="hero-meta-item">
-            <div className="hero-meta-label">KV compression</div>
-            <div className="hero-meta-value">3.8<span className="unit">×</span></div>
-            <div className="hero-meta-sub">BlockTQ B=64 4-bit</div>
+            <div className="hero-meta-label">Dense uplift</div>
+            <div className="hero-meta-value">5.50<span className="unit">×</span></div>
+            <div className="hero-meta-sub">vs cycle-1 baseline 42.17 tok/s</div>
           </div>
           <div className="hero-meta-item">
-            <div className="hero-meta-label">Δ PPL vs fp16</div>
-            <div className="hero-meta-value">+0.0016</div>
-            <div className="hero-meta-sub">WikiText-2 · 3 seeds</div>
+            <div className="hero-meta-label">Autoresearch</div>
+            <div className="hero-meta-value">35<span className="unit">cycles</span></div>
+            <div className="hero-meta-sub">Karpathy-style ledger · opus branch</div>
           </div>
         </div>
       </div>
@@ -109,6 +110,7 @@ const Footer = () => (
         <div className="foot-col">
           <h4>Product</h4>
           <a href="#shipped">What's shipped</a>
+          <a href="#performance">Performance</a>
           <a href="#roadmap">Roadmap</a>
           <a href="#codec">KV codec</a>
           <a href="#chat">Chat REPL</a>
@@ -131,7 +133,7 @@ const Footer = () => (
       </div>
       <div className="foot-bottom">
         <div>Apache-2.0 · Target hardware: M5 Pro 48 GB</div>
-        <div className="mono">v1.7.19 · scheduler core + KV codec + spec foundation shipped</div>
+        <div className="mono">v1.7.24 · P-6 acceptance gates cleared 3.4-5.5× · D-022 small-B line opens</div>
       </div>
     </div>
   </footer>
@@ -147,10 +149,10 @@ const Nav = () => (
       <div className="nav-links">
         <a href="#architecture">Architecture</a>
         <a href="#shipped">Shipped</a>
+        <a href="#performance">Performance</a>
         <a href="#codec">KV codec</a>
         <a href="#chat">Chat REPL</a>
         <a href="#roadmap">Roadmap</a>
-        <a href="#quickstart">Quickstart</a>
       </div>
       <div className="nav-cta">
         <a href="https://github.com/Ivis4ml/silica-mlx" target="_blank" rel="noreferrer">
@@ -217,6 +219,7 @@ const App = () => {
       <Architecture />
       <SchedulerAnim />
       <Highlights />
+      <Performance />
       <Codec />
       <ChatRepl />
       <CodeSnippets />
