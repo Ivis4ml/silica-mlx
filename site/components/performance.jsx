@@ -12,97 +12,97 @@
 
 const PerfDensePoints = [
   // [seq, tok_s, status, cycle?, label?, description?]
-  [1, 42.17, "keep", "C1", "baseline 42.17 tok/s",
-    "Dense 27B B=4 warm decode at 52% bandwidth utilisation. Per-step decomposition: DeltaNet 74% / full-attn 22% / overhead 4%. The denominator for every later uplift number."],
+  [1, 42.17, "keep", "C1", "starting point",
+    "Where we begin. Generating tokens for 4 simultaneous requests on Qwen3.5-27B (a 27-billion-parameter model) reaches 42 tokens per second per request — about 52% of what the M5 Pro chip's memory bandwidth ought to allow. Every later number is compared against this one."],
   [2, 6.54, "discard", null, null,
-    "C5 DDTree β.1 spec-on row. 0.408× speedup vs plain decode."],
+    "First speculative-decoding probe — a small companion model guesses tokens, the big model verifies. Slower than plain decoding (about 40% the speed). Retired."],
   [3, 7.74, "discard", null, null,
-    "C4 DFlash η.1 — drafter accept rate 0.088 with verify_cost ≪ draft_cost; 0.482× speedup. Track C.4 retired."],
+    "Block-diffusion drafter probe. Drafter took longer than the speedup it provided. Retired."],
   [4, 17.10, "discard", null, null,
-    "Cycle 4 lazy-chain / chunked-decode probe. Fails the warm-decode oracle stability gate."],
+    "Tried letting the GPU evaluate several decode steps before syncing. Broke a stability check. Retired."],
   [5, 39.99, "diag", null, null,
-    "Cycle 1 e2e baseline at D=128 head dim, no kernel changes."],
+    "Re-baselined at a different attention-head dimension. Just for measurement; no change."],
   [6, 41.00, "discard", null, null,
-    "AR_GREEDY_SKIP_HISTORY — sampler-side history-array skip. Below baseline."],
+    "Skipped a small array allocation in the sampler hot path. Tiny regression. Retired."],
   [7, 42.39, "discard", null, null,
-    "AR_E2E_GATED_OUTPUT_D32 — first fused gated-output kernel attempt at D=32. Discard."],
+    "First custom GPU kernel attempt — fused output gate. No measurable benefit. Retired."],
   [8, 42.53, "discard", null, null,
-    "AR_E2E_GATED_SILU_D32 — fused gated-silu kernel attempt. Discard."],
+    "Fused activation kernel (silu × multiply). No benefit. Retired."],
   [9, 42.68, "diag", null, null,
-    "AR_E2E_BASELINE_D32 — production-shape e2e baseline at D=32 head dim."],
+    "Re-baselined at production attention shape. Within noise of cycle 1."],
   [10, 43.0, "diag", null, null,
-    "AR_BATCHED_AGG_B8 — first axis-shift probe. B=8 = ~43 tok/s; below the 60 bar."],
+    "First step of the batch sweep: 8 simultaneous requests. Just above baseline."],
   [11, 63.1, "keep", null, null,
-    "AR_BATCHED_AGG_B12 — first KEEP. B=12 = 63.1 tok/s, crosses the (1b) ≥60 stretch bar at the first non-baseline B."],
+    "First win: 12 requests at once = 63 tok/s. The first time we crossed the 60 tok/s stretch goal — without writing any new code. Just a different batch size."],
   [12, 81.1, "diag", null, null,
-    "AR_BATCHED_AGG_B16. Aggregate keeps climbing cleanly."],
+    "16 requests at once. Throughput keeps climbing cleanly."],
   [13, 112.8, "diag", null, null,
-    "AR_BATCHED_AGG_B24. ~2.7× the cycle-1 baseline."],
+    "24 requests at once — about 2.7× the starting point already."],
   [14, 150.6, "keep", null, null,
-    "AR_BATCHED_AGG_B32. KEEP at 3.6× cycle-1; peak ~26 GB, well within envelope."],
+    "32 requests: 150 tok/s, 3.6× the start. Memory peak ~26 GB, well within budget."],
   [15, 171.6, "keep", null, null,
-    "AR_BATCHED_AGG_B40. 4.07× cycle-1."],
+    "40 requests: 172 tok/s. About 4× the start."],
   [16, 183.3, "keep", null, null,
-    "AR_BATCHED_AGG_B44. 4.35× cycle-1; approaching the 36 GB envelope ceiling."],
+    "44 requests: 183 tok/s. Approaching the strict 36 GB memory budget."],
   [17, 193.9, "keep", "C10", "axis-shift @ B=48",
-    "AR_BATCHED_AGG_B48 — the cycle-10 breakthrough. 4.60× cycle-1 with no kernel change. Peak 33.95 GB. The single biggest leverage event in the loop, produced by re-reading the AR.md metric definition (\"B is chosen to maximise aggregate\")."],
+    "The breakthrough. Batching 48 requests together = 4.6× the starting throughput, with no kernel change at all. The trick was just re-reading our own goal: \"maximize total tokens per second across the batch\", not per individual request. Memory peak 34 GB, still inside the 36 GB budget. Nine prior cycles of GPU-kernel hacking had moved nothing — this single parameter choice did."],
   [18, 193.3, "diag", null, null,
-    "AR_FA_V10_E2E_B48 — cycle-11 v10 FA-decode kernel at B=48. Microbench wins 1.25-1.81× over mlx SDPA but E2E 0% at this B. (Composition story: cycle-30 attribution shows DeltaNet at 88% step time when high-B; attention is small.)"],
+    "Tested a custom GPU attention kernel at this batch size. Wins on a microbenchmark, but flat at the system level — attention is only a small slice of total step time at high batch."],
   [19, 192.5, "diag", null, null,
-    "AR_BF16_DELTANET_STATE_E2E_B48 — cycle-12 bf16 state at B=48. 0% E2E directly, but produces 3.5 GB peak save that opens B≥48."],
-  [20, 200.8, "keep", "C13", "envelope KEEP @ B=52",
-    "AR_BF16_AGG_B52 — cycle-13 composition KEEP. C12's peak save composed with C10's B-axis lever pushes B from 48 → 52. 18σ above C10. The 193 wall was a B=48 cap, not a hardware wall."],
+    "Tried storing the recurrent state in 16-bit floats instead of 32-bit. Same speed at this batch, but frees ~3.5 GB of memory — the seed for the next breakthrough."],
+  [20, 200.8, "keep", "C13", "the composition win",
+    "Composition. The 16-bit memory save from cycle 12 doesn't speed anything up by itself, but it frees enough headroom to push from 48 to 52 requests in batch — and that bump pushes throughput past 200 tok/s, still inside the 36 GB budget. Two cheap parameter changes beat every kernel attempt."],
   [21, 212.2, "diag", null, null,
-    "AR_BF16_AGG_B56."],
+    "56 requests at once. Past the strict 36 GB budget but inside the 48 GB chip-memory cap."],
   [22, 219.1, "diag", null, null,
-    "AR_BF16_AGG_B60."],
+    "60 requests."],
   [23, 229.8, "keep", null, null,
-    "AR_BF16_AGG_B64 — within the 48 GB hardware ceiling. 5.45× cycle-1."],
+    "64 requests: 230 tok/s. About 5.5× the starting point — pushing right against the 48 GB chip memory limit."],
   [24, 166.8, "discard", null, null,
-    "AR_BF16_AGG_B66 — across the architectural cliff at the 40 GB peak boundary. 26% drop vs B=64."],
+    "Tried 66 requests. Throughput collapsed 26%. We hit a hardware cliff at the 40 GB memory peak — beyond it, the chip stops scaling. Three allocator settings tried; the cliff is in the chip itself, not our code."],
   [25, 169.1, "discard", null, null,
-    "AR_BF16_AGG_B68 — also past the cliff."],
+    "68 requests — also past the cliff."],
   [26, 173.2, "discard", null, null,
-    "AR_BF16_AGG_B72. Cycles 28-29 confirm the cliff is architectural — three allocator-hint probes (mx.metal.set_cache_limit / set_memory_limit / set_wired_limit) leave it in place."],
+    "72 requests — confirming the pattern. Dense 27B can't benefit from larger batches on this chip."],
   [27, 206.2, "retracted", "C14→C27", "retracted",
-    "Cycle 14 claimed v10+bf16 stack at B=52 = 206.2 tok/s as a +5.4 tok/s = 3.4σ KEEP over cycle-13's 200.8. Codex review on opus-codex caught the 14-cycle dtype defect: shadow_install checked queries.dtype == mx.float16 but the production path is bf16 — v10 was never firing. After the bf16-native fix, cycles 27/28 reverify measured v10's E2E contribution at +0.5 tok/s @ B=52, within noise. This KEEP is retracted; the dot is preserved as part of the research record."],
+    "A retracted result. Cycle 14 claimed a 5-tok/s gain at batch=52 from a custom GPU attention kernel. Two weeks later a code review caught a bug — the code checked for the wrong floating-point format and the kernel was silently being skipped on the production model. After the fix, the kernel's real contribution measured to within noise (~0.5 tok/s, statistically zero). The honest credit goes to cycles 10 and 12; we kept this dot on the chart so the retraction stays visible."],
   [28, 232.2, "retracted", "C14→C27", "retracted",
-    "Cycle 14 also claimed B=64 = 232.2 with the v10+bf16 stack. Same dtype defect; v10 was not firing. Cycle 28 reverify at corrected v10 path measured 230.2 ± 1.6 (with v10) vs 231.9 ± 0.3 (bf16-only) — v10 marginally hurts, within noise. The honest hardware-ceiling KEEP is the bf16-only number, two indices to the right of this dot."],
+    "Same retracted experiment at batch=64. Cycle 14 reported 232 tok/s with the custom kernel; the code-review fix showed it was actually slightly slower than the simpler version (still within noise). The real ceiling result comes two indices later, at 231.9."],
   [29, 197.05, "diag", null, null,
-    "AR_C26_BF16_FA_E2E_B52 — first reverify after the codex bf16 fix. Within the cycle-25 envelope; not a KEEP."],
+    "First re-check after the code-review fix. Within the cycle-13 range; no new claim."],
   [30, 200.14, "diag", null, null,
-    "AR_C25_B52_REVERIFY_CONDA_MISS — codex re-run under conda; near cycle-13 envelope."],
+    "Re-check under one Python environment — back near cycle-13."],
   [31, 185.30, "diag", null, null,
-    "AR_C25_B52_REVERIFY_UV_MISS — codex re-run under uv; ~10% below conda mean. Cycle 25 attributed this to between-environment drift, not regression."],
-  [32, 231.9, "keep", "C28", "ceiling 231.9 ± 0.3",
-    "AR_C28_HARDWARE_CEILING_REVERIFY — the honest hardware-ceiling KEEP at B=64 with bf16-only stack (n=3). Replaces cycle-14's retracted 232.2. 5.50× cycle-1 baseline; 3.87× the (1b) gate."],
-  [33, 204.0, "keep", "C33", "envelope 204 ± 1 n=6",
-    "AR_C33_B52_VARIANCE_TIGHTEN — n=6 reverify across 2 sessions tightened combined σ at B=52 to 0.83 tok/s. Final running-best within envelope: 204 ± 1 tok/s. This is the protocol standard for variance discipline going forward."],
+    "Re-check under a different Python environment — about 10% lower. Identified as between-environment drift, not a regression."],
+  [32, 231.9, "keep", "C28", "honest ceiling",
+    "The honest hardware-ceiling result: 232 tok/s at batch=64, measured 3 times with tight agreement (±0.3 tok/s). About 5.5× the starting point, just inside the 48 GB chip memory limit. This number replaces the cycle-14 retracted claim."],
+  [33, 204.0, "keep", "C33", "tightened envelope",
+    "Final tighten. Re-measured at batch=52 across 6 runs in two sessions: 204 ± 1 tok/s. This is the running-best within the strict 36 GB memory budget. The variance protocol used here (multiple sessions, combined error check) is now the standard for any future claim."],
 ];
 
 const PerfMoePoints = [
-  [1, 188.5, "keep", "C1", "baseline 188.5 tok/s",
-    "MOE_27B_B4 baseline — Qwen3.5-35B-A3B-4bit at B=4. 92% bandwidth utilisation; the (2a) ≥100 anchor was already cleared at the v1.7.13 baseline."],
+  [1, 188.5, "keep", "C1", "starting point",
+    "Same starting line for the mixture-of-experts version. 188 tok/s for 4 simultaneous requests on Qwen3.5-35B-A3B (a 35-billion-parameter MoE model — larger total weights but only 8 of 256 experts active per token). The original ≥100 tok/s goal was already satisfied here at the baseline."],
   [2, 181.4, "diag", null, null,
-    "AR_C34_MOE_B4_BF16 — bf16 DeltaNet state at B=4 on MoE. Slightly below cycle-1 because B=4 amortises poorly on MoE."],
+    "Tried the 16-bit recurrent state on MoE at 4 requests. Slightly below baseline — 4 requests amortizes poorly on this architecture."],
   [3, 242.0, "diag", null, null,
-    "AR_C34_MOE_B8 — first cycle-12 lever on MoE B-axis sweep."],
+    "8 requests. Climbing."],
   [4, 306.3, "diag", null, null,
-    "AR_C34_MOE_B16."],
+    "16 requests."],
   [5, 384.8, "diag", null, null,
-    "AR_C34_MOE_B32."],
+    "32 requests."],
   [6, 434.3, "diag", null, null,
-    "AR_C34_MOE_B48."],
+    "48 requests."],
   [7, 464.4, "keep", "C34", "envelope KEEP @ B=64",
-    "AR_C34_MOE_PORTABILITY_KEEP — peak 33.8 GB (within 36 GB envelope), n=3. Same C10×C12 lever stack transferred via the shared gated_delta shadow patch. 2.46× MoE cycle-1 baseline."],
+    "MoE win within the strict memory budget. 464 tok/s at 64 simultaneous requests, peak 33.8 GB. Same parameter changes from cycles 10 and 12 ported over to MoE via a shared memory hook. About 2.5× the MoE starting point."],
   [8, 447.9, "discard", null, null,
-    "AR_C34_MOE_B80 — past the envelope, throughput dips."],
+    "80 requests — past the strict budget, throughput dips."],
   [9, 444.5, "discard", null, null,
-    "AR_C35_MOE_B72 — also slightly below."],
+    "72 requests."],
   [10, 467.1, "diag", null, null,
-    "AR_C35_MOE_B96 — climbing again as we approach the hardware-ceiling sweep."],
-  [11, 791.8, "keep", "C35", "ceiling 791.8 @ B=128",
-    "AR_C35_MOE_B128_HARDWARE_KEEP — peak 47.96 GB at the 48 GB cap, n=3. 4.20× MoE cycle-1; 1.71× cycle-34 B=64 KEEP. The largest absolute throughput observed across the full 35-cycle effort. Per-row throughput non-monotonic — expert routing amortisation crosses the threshold near B=128 (~4 activations per expert per step at B=128 vs 2 at B=64)."],
+    "96 requests — climbing again as we sweep toward the chip-memory limit."],
+  [11, 791.8, "keep", "C35", "the biggest result",
+    "The biggest result of the entire 35-cycle effort. 792 tok/s at 128 simultaneous requests on the MoE model, sitting almost exactly at the 48 GB chip memory limit (peak 47.96 GB), measured 3 times. About 4.2× the MoE starting point. Unlike dense 27B, the MoE architecture doesn't hit a memory cliff at this size — only 8 of 256 experts are active per token, so each token's active-weight footprint is much smaller."],
 ];
 
 const PerfTracks = {
@@ -297,14 +297,14 @@ const PerfLedger = ({ trackKey, animateKey, onSelect, activeIdx }) => {
               <circle
                 cx={cx}
                 cy={cy}
-                r={isActive ? 8 : 6}
+                r={isActive ? 6 : 5}
                 className="perf-svg-dot perf-svg-dot-retracted"
               />
             ) : (
               <circle
                 cx={cx}
                 cy={cy}
-                r={isActive ? 7.5 : (isKeep ? 5.5 : 3.4)}
+                r={isActive ? 6 : (isKeep ? 4.5 : 2.8)}
                 className={`perf-svg-dot perf-svg-dot-${status}`}
               />
             )}
@@ -312,7 +312,7 @@ const PerfLedger = ({ trackKey, animateKey, onSelect, activeIdx }) => {
               <circle
                 cx={cx}
                 cy={cy}
-                r={14}
+                r={11}
                 className="perf-svg-dot-ring"
                 fill="none"
               />
@@ -692,28 +692,30 @@ const Performance = () => {
           font-family: var(--font-sans);
           overflow: visible;
         }
-        .perf-svg-grid { stroke: var(--rule-2); stroke-width: 1; }
-        .perf-svg-tick { fill: var(--ink-3); font-size: 11px; }
+        .perf-svg-grid { stroke: var(--rule-2); stroke-width: 0.75; opacity: 0.7; }
+        .perf-svg-tick { fill: var(--ink-3); font-size: 11px; font-weight: 500; }
         .perf-svg-axis-title {
-          fill: var(--ink-3);
-          font-size: 11px;
-          letter-spacing: 0.04em;
+          fill: var(--ink-4);
+          font-size: 10px;
+          letter-spacing: 0.06em;
           text-transform: uppercase;
+          font-weight: 500;
         }
         .perf-svg-baseline {
           stroke: var(--ink-4);
-          stroke-width: 1;
-          stroke-dasharray: 4 5;
-          opacity: 0.5;
+          stroke-width: 0.75;
+          stroke-dasharray: 3 4;
+          opacity: 0.45;
         }
-        .perf-svg-baseline-label { fill: var(--ink-3); font-size: 10px; }
+        .perf-svg-baseline-label { fill: var(--ink-3); font-size: 10px; font-weight: 500; }
         .perf-svg-best {
           fill: none;
           stroke: var(--accent);
-          stroke-width: 2.4;
+          stroke-width: 1.6;
           stroke-linejoin: round;
           stroke-linecap: round;
           transition: stroke-dashoffset 60ms linear;
+          filter: drop-shadow(0 0.5px 1px var(--accent-soft));
         }
         .perf-svg-dot-g {
           opacity: 0;
@@ -725,26 +727,27 @@ const Performance = () => {
           opacity: 1;
         }
         .perf-svg-dot {
-          transition: r 180ms ease;
+          transition: r 200ms ease;
         }
         .perf-svg-dot-keep { fill: var(--accent); }
-        .perf-svg-dot-diag { fill: var(--ink-3); opacity: 0.55; }
-        .perf-svg-dot-discard { fill: var(--ink-4); opacity: 0.35; }
+        .perf-svg-dot-diag { fill: var(--ink-3); opacity: 0.5; }
+        .perf-svg-dot-discard { fill: var(--ink-4); opacity: 0.32; }
         .perf-svg-dot-retracted {
           fill: var(--bg-elev);
           stroke: var(--ink-3);
-          stroke-width: 1.6;
-          stroke-dasharray: 2.5 2;
+          stroke-width: 1.2;
+          stroke-dasharray: 2 2;
+          opacity: 0.85;
         }
         .perf-svg-dot-ring {
           stroke: var(--accent);
-          stroke-width: 1.4;
+          stroke-width: 1;
           opacity: 0;
-          animation: perfRing 1.6s infinite ease-out;
+          animation: perfRing 1.8s infinite ease-out;
         }
         @keyframes perfRing {
-          0% { opacity: 0.6; r: 8; }
-          100% { opacity: 0; r: 18; }
+          0% { opacity: 0.45; r: 7; }
+          100% { opacity: 0; r: 14; }
         }
         .perf-svg-anno-g {
           opacity: 0;
@@ -756,18 +759,19 @@ const Performance = () => {
         }
         .perf-svg-anno-tick {
           stroke: var(--accent);
-          stroke-width: 1;
-          opacity: 0.55;
+          stroke-width: 0.75;
+          opacity: 0.45;
         }
         .perf-svg-anno-cycle {
           fill: var(--accent);
-          font-size: 11px;
-          font-weight: 700;
-          letter-spacing: 0.02em;
+          font-size: 10px;
+          font-weight: 600;
+          letter-spacing: 0.04em;
         }
         .perf-svg-anno-label {
-          fill: var(--ink-2);
+          fill: var(--ink-3);
           font-size: 10px;
+          font-weight: 500;
           letter-spacing: 0.01em;
         }
 
