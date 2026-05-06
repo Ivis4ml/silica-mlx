@@ -37,7 +37,7 @@ The original prompt below quotes a 13.5 GB weight footprint and a ~22.7 tok/s B=
 
 ## 2026-05-04 — Autoresearch loop closed legitimately (23 cycles)
 
-The AR.md "Stop conditions" §"are CLEARED. See `plans/P6_AUTORESEARCH_FINAL_REPORT.md` for the comprehensive 23-cycle write-up. New numbers + new levers + new retired tracks below — supersede earlier addenda where they conflict.
+The P6_AUTORESEARCH.md "Stop conditions" §"are CLEARED. See `plans/P6_AUTORESEARCH_FINAL_REPORT.md` for the comprehensive 23-cycle write-up. New numbers + new levers + new retired tracks below — supersede earlier addenda where they conflict.
 
 ### Updated running-best line (supersedes earlier 42.17 / 193.9 anchors; cycle-27/28/33/34/35 corrections applied)
 
@@ -56,7 +56,7 @@ MoE Qwen3.5-35B-A3B-4bit (secondary; cycles 34-35 — methodology portability va
 | Within strict 36 GB envelope | **464.1 ± 0.7 tok/s at B=64** (peak 33.8 GB; 2.46× cycle-1 MoE B=4 baseline 188.5; n=3 per cycle 35) | C12 bf16-state + C10 axis-shift transfer cleanly via shared `gated_delta` shadow patch |
 | Within 48 GB hardware ceiling | **791.8 ± 5.2 tok/s at B=128** (peak 47.96 GB; 4.20× MoE cycle-1; n=3 per cycle 35) | same stack at higher B; expert routing amortisation crosses utilisation threshold near B=128 (8 of 256 experts active per token) |
 
-The MoE secondary track is the largest absolute throughput in the 33-cycle research effort. Per the AR.md secondary-track classification, MoE wins are valuable but do not substitute for dense progress; the primary running-best line stays anchored on dense 27B.
+The MoE secondary track is the largest absolute throughput in the 33-cycle research effort. Per the P6_AUTORESEARCH.md secondary-track classification, MoE wins are valuable but do not substitute for dense progress; the primary running-best line stays anchored on dense 27B.
 
 The 42.17 baseline is now historical.
 
@@ -119,7 +119,7 @@ B and k cost dimensions multiply. Tree-spec at B=52 b=64 = 10 tok/s aggregate (v
 
 **The right unit of analysis is peak-memory ceiling × B-axis lever, not isolated kernel bandwidth.** The 23-cycle journey showed:
 - Cycles 1-9 spent at fixed B=4 with 0 keeps. Wrong frame.
-- Cycle 10 re-read AR.md's metric definition ("B chosen to maximise aggregate"), pulled the axis-shift lever, +4.60×.
+- Cycle 10 re-read P6_AUTORESEARCH.md's metric definition ("B chosen to maximise aggregate"), pulled the axis-shift lever, +4.60×.
 - Cycles 11-12 produced kernel/state probes that were 0% E2E at fixed B but accumulated as resources.
 - Cycle 13 re-composed cycle-12's 3.5 GB peak save with cycle-10's B-axis lever, +1.04× envelope / +1.18× hardware.
 - Cycle 14 stacked cycle-11's v10 kernel at the new B; +1.027× envelope, +1.010× hardware.
@@ -153,7 +153,7 @@ User authorization granted on 2026-05-04 for:
 
 ### Stop-condition closure
 
-AR.md §"Stop conditions" defines three. After 23 cycles:
+P6_AUTORESEARCH.md §"Stop conditions" defines three. After 23 cycles:
 1. Reproduced ≥60 tok/s aggregate on ≥2 runs with σ-bounded confidence — **CLEARED 3.44× envelope / 3.87× hardware**
 2. Reproduced new running-best ≥3σ above 42.17 with clean lever attribution — **CLEARED at 4.89× / 5.51×; attributed to C10 axis-shift × C12 bf16 peak save × C11 v10 kernel composition**
 3. Measurement-anchored declaration that the open-lever set cannot multiplicatively reach 60 — **N/A** because (1) and (2) already cleared
@@ -176,7 +176,7 @@ After the cycle-23 closure the loop was reopened by user request to (a) verify c
 
 - **Dense 27B primary track is closed at ~232 tok/s** within 48 GB hardware ceiling. Cycle 30's identification of DeltaNet at 88% step share + cycle 31's bandwidth-limit finding + cycle 29's architectural-cliff finding together close the load-bearing kernel-and-allocator levers on this stack. Future dense progress requires mlx 0.32+ async-copy or mx.compile cache rerouting.
 - **MoE secondary track is open and productive.** Cycle 34-35 demonstrate that the cycle-12+13 methodology generalises across architectures within the Qwen3.5 family. The same lever set delivers 791.8 tok/s on MoE 35B-A3B at hardware ceiling vs 232 tok/s on dense 27B at the same ceiling — MoE is the genuinely faster regime when expert sparsity is exploited at high B.
-- **AR.md secondary-track classification holds**: MoE wins on the qwen3.5-moe-35b-a3b-warm-decode-* row family go on the secondary chart; primary dense 27B running-best line stays anchored at 204 envelope / 232 hardware.
+- **P6_AUTORESEARCH.md secondary-track classification holds**: MoE wins on the qwen3.5-moe-35b-a3b-warm-decode-* row family go on the secondary chart; primary dense 27B running-best line stays anchored at 204 envelope / 232 hardware.
 
 ### MoE expert-amortisation note (cycle 35)
 

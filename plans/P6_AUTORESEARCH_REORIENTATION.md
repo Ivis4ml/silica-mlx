@@ -22,7 +22,7 @@ This memo opens an autoresearch loop. Three findings shape the loop:
 
 3. **The verify-k microbench shows the dense decode is compute-bound at k≥4 / B≥4.** P-6.0.5 Unit 7 measured bandwidth utilisation dropping 83% (k=1) → 79% (k=2) → 55% (k=4) → 30% (k=8); Unit 2 measured B=1 → B=4 utilisation drop 79% → 52%. The two regimes cross at the same ~52-55% line, which means the 48% headroom on B=4 weights is **not pure bandwidth idle** — it is bounded by candidate-side compute (16 attention layers × 4 batch + 48 DeltaNet recurrent updates × 4 batch per step + per-step Python and small-op cost). Custom MLX kernels that reduce per-step compute (FlashAttention-style fused SDPA, fused RMSNorm+RoPE, fused gated-delta-update) directly attack this wall and are the single most measurement-anchored open lever today.
 
-The recommended next probe is therefore **a microbench harness on the existing dense Qwen3.5-27B-4bit warm-decode B=4 path that decomposes per-step time into per-layer-kind components via per-layer `mx.eval` timing hooks** (full-attention layers, DeltaNet linear-attention layers, RMSNorm+RoPE small-op chains, logits projection, Python loop / scheduler overhead), on cached weights. The methodology uses **per-layer barriers, not layer-skipping**, because skipping DeltaNet layers in a hybrid model breaks the recurrent-state pipeline that subsequent layers depend on. No download, no commit, no destructive op, fits the autonomous-loop budget. The microbench either identifies a kernel-side gap that justifies opening a custom MLX-native kernel candidate (priority 3 in the AR.md hardware-limit ladder), or it shows the time is dominated by stock MLX ops at their achievable ceilings, in which case the bottleneck moves to the spec-composition leg (priority 2).
+The recommended next probe is therefore **a microbench harness on the existing dense Qwen3.5-27B-4bit warm-decode B=4 path that decomposes per-step time into per-layer-kind components via per-layer `mx.eval` timing hooks** (full-attention layers, DeltaNet linear-attention layers, RMSNorm+RoPE small-op chains, logits projection, Python loop / scheduler overhead), on cached weights. The methodology uses **per-layer barriers, not layer-skipping**, because skipping DeltaNet layers in a hybrid model breaks the recurrent-state pipeline that subsequent layers depend on. No download, no commit, no destructive op, fits the autonomous-loop budget. The microbench either identifies a kernel-side gap that justifies opening a custom MLX-native kernel candidate (priority 3 in the P6_AUTORESEARCH.md hardware-limit ladder), or it shows the time is dominated by stock MLX ops at their achievable ceilings, in which case the bottleneck moves to the spec-composition leg (priority 2).
 
 **The MTP probe path retires for the current production target** (`mlx-community/Qwen3.5-27B-4bit`): `safetensors.index.json` inspection (2026-05-02) found **zero tensor keys matching `mtp|nextn|multi_token|multistep`** in the 2180-key index, even though `config.json:mtp_num_hidden_layers = 1` says the architecture supports MTP. The production checkpoint ships without MTP weights. Re-opening the MTP path requires either downloading the upstream Qwen/Qwen3.5-27B BF16 (~52 GB) and re-converting, or downloading `trevon/Qwen3.5-27B-MLX-MTP` (29.1 GB) — both gated on explicit user authorisation. The QuantSpec and KnapSpec probes (priority 5) and the C.5 γ.1 read-only kernel survey (priority 1 of the existing escalate path) are queued behind the kernel microbench.
 
@@ -167,8 +167,8 @@ Direct evidence from the cached `mlx-community/Qwen3.5-27B-4bit` snapshot at `45
 
 **Don't-re-open conditions:**
 
-- A new C.4-style drafter that does NOT change one of {drafter cost, accept-rate vs 4-bit target, rollback cost, verify-side kernel} fails the AR.md re-open gate by definition.
-- `--quantize-draft` (4-bit-quantising the upstream DFlash drafter) is an open question that addresses (1) drafter cost and possibly (2) accept-rate-vs-4-bit-target. It is in scope for re-opening **only** with explicit user approval per AR.md.
+- A new C.4-style drafter that does NOT change one of {drafter cost, accept-rate vs 4-bit target, rollback cost, verify-side kernel} fails the P6_AUTORESEARCH.md re-open gate by definition.
+- `--quantize-draft` (4-bit-quantising the upstream DFlash drafter) is an open question that addresses (1) drafter cost and possibly (2) accept-rate-vs-4-bit-target. It is in scope for re-opening **only** with explicit user approval per P6_AUTORESEARCH.md.
 - Porting upstream's `verify_qmm` int4 simdgroup-MMA Metal kernel + 2-pass JIT SDPA (the dflash-mlx kernel-reference patterns the kernel-ecosystem survey identified) addresses (4) verify-side kernel. Same gating: explicit user approval required.
 
 ### 2.2 Track B native 3-bit (retired v1.7.21)
@@ -210,7 +210,7 @@ The pattern across all three failed paths: each was a single-lever play against 
 
 ## 3. Bottleneck Model
 
-This section decomposes the dense, MoE, and spec paths into the per-step costs Silica can measure, and refines the hardware-limit envelope against the latest data. **It does not defend the AR.md prompt's prior envelope numbers** — it rebuilds them from the corrected 15.13 GB anchor.
+This section decomposes the dense, MoE, and spec paths into the per-step costs Silica can measure, and refines the hardware-limit envelope against the latest data. **It does not defend the P6_AUTORESEARCH.md prompt's prior envelope numbers** — it rebuilds them from the corrected 15.13 GB anchor.
 
 ### 3.1 Dense Qwen3.5-27B-4bit decompose (B=4 warm-decode hot path)
 
@@ -426,19 +426,19 @@ One card per plausible method. Methods classified `monitor` get an abbreviated c
 - **Runtime requirements:** MLX `mx.fast.metal_kernel` API. JIT-compiled at runtime.
 - **Hardware assumptions:** Apple Silicon Metal GPU; head-dim and KV-len shapes typical of Qwen3.5-27B (head_dim=128 for full-attn, MoE-style heads).
 - **Needs CUDA / Triton / torch / custom kernel?** Custom Metal via mlx.fast.metal_kernel only.
-- **Has MLX code?** Reference patterns exist; Silica re-impl required per AR.md ("kernels are not the default; they are an option opened by measurement, not by external paper claims").
+- **Has MLX code?** Reference patterns exist; Silica re-impl required per P6_AUTORESEARCH.md ("kernels are not the default; they are an option opened by measurement, not by external paper claims").
 - **Has Qwen3.5 / MoE checkpoint?** N/A — checkpoint-independent.
 - **Requires training / finetuning?** No.
 - **Requires new model weights?** No.
-- **Exact / lossless or approximate?** Must be exact-or-tighter than the MLX reference within fp16 noise (per AR.md "Custom kernels must be exact-or-tighter").
-- **Which Silica bottleneck it changes:** kernel cost per layer (priority 3 in AR.md hardware-limit ladder); bandwidth utilisation (priority 1).
+- **Exact / lossless or approximate?** Must be exact-or-tighter than the MLX reference within fp16 noise (per P6_AUTORESEARCH.md "Custom kernels must be exact-or-tighter").
+- **Which Silica bottleneck it changes:** kernel cost per layer (priority 3 in P6_AUTORESEARCH.md hardware-limit ladder); bandwidth utilisation (priority 1).
 - **Minimal local probe:** the **§7 microbench** decomposes per-step time by layer kind. The microbench is the gate to opening any specific kernel candidate.
 - **Kill criteria per kernel:** if the microbench shows the targeted op is below 20% of step time, the kernel is not on the critical path and the candidate is not opened.
-- **Expected implementation cost (per kernel, after microbench):** medium — 200-400 LOC kernel source + 50-100 LOC test harness + correctness gate per AR.md (max-abs / max-rel error vs MLX reference on ≥3 input shapes spanning the production decode profile).
+- **Expected implementation cost (per kernel, after microbench):** medium — 200-400 LOC kernel source + 50-100 LOC test harness + correctness gate per P6_AUTORESEARCH.md (max-abs / max-rel error vs MLX reference on ≥3 input shapes spanning the production decode profile).
 - **Measurement cost:** the §7 microbench fits an autonomous-loop iteration; per-kernel microbenches stay under unit-test cost.
 - **Quality / correctness risk:** low on fused-norm + RoPE (numerical equivalence is straightforward); medium on FlashAttention-style SDPA (online-softmax precision is the classical concern).
 - **Composability:** kernels compose additively with each other and multiplicatively with bandwidth utilisation; they compose multiplicatively with spec amortisation if the kernel work raises the verify-forward util at the spec verify-k step.
-- **Recommendation:** **microbench first** (§7), then per-kernel candidate opening behind explicit user authorisation. Per AR.md: microbench-only is autonomous; integration is not.
+- **Recommendation:** **microbench first** (§7), then per-kernel candidate opening behind explicit user authorisation. Per P6_AUTORESEARCH.md: microbench-only is autonomous; integration is not.
 
 ### 5.5 SSSD (training-free n-gram lookup spec)
 
@@ -489,7 +489,7 @@ One card per plausible method. Methods classified `monitor` get an abbreviated c
 
 ## 6. Ranked Hypotheses
 
-Ranked by AR.md hardware-limit priority order, then by composability score. Each tagged with the lever family it touches.
+Ranked by P6_AUTORESEARCH.md hardware-limit priority order, then by composability score. Each tagged with the lever family it touches.
 
 | Rank | Hypothesis | Lever family | Expected speedup | Cost | Risk | Probe | Kill criteria |
 | ---: | --- | --- | --- | --- | --- | --- | --- |
@@ -504,7 +504,7 @@ Ranked by AR.md hardware-limit priority order, then by composability score. Each
 | 9 | **`mx.compile`-fused sampler chain** (Track A.1 / A.2 in P-6 deliverables) — defer-and-batch sampler sync | scheduler overlap | 1.05-1.15× claimed | medium (touches `silica.core.sampler` + `silica.scheduler.batcher` + `silica.engine`) | low | If (5) shows >5% Python overhead, prototype `mx.compile`-wrapped sampler; measure on B=4 warm-decode | Kill if measured < 1.05× on B=4 |
 | 10 | **Multi-request hybrid spec gate lift** ((c) slice 3) — composes spec with B>1 | scheduler overlap | unknown (depends on what spec-on-B=4 looks like) | high (separate orientation, multi-row dispatch over BatchKVCache) | medium | Out of autoresearch loop scope; surface only if (1)-(8) leave a measurement-anchored case for B>1 spec | n/a — phase deferred |
 
-**Items 1, 3, 4, 5 fit the autonomous-loop budget. Item 2 has been resolved during this orientation (MTP keys absent — see §1.4 OQ-4 closure and §5.1).** Items 7, 8, 9, 10 require explicit user authorisation per AR.md (opening a large implementation track / shipping kernel into hot path / re-opening retired track / etc.). Item 6 is retired.
+**Items 1, 3, 4, 5 fit the autonomous-loop budget. Item 2 has been resolved during this orientation (MTP keys absent — see §1.4 OQ-4 closure and §5.1).** Items 7, 8, 9, 10 require explicit user authorisation per P6_AUTORESEARCH.md (opening a large implementation track / shipping kernel into hot path / re-opening retired track / etc.). Item 6 is retired.
 
 ---
 
@@ -515,14 +515,14 @@ Ranked by AR.md hardware-limit priority order, then by composability score. Each
 ### 7.1 Why this probe
 
 - It directly attacks the §1.4 OQ-1 + OQ-3 measurement gap: where does the 48% bandwidth headroom at B=4 actually go?
-- It is the gate that opens or retires custom-kernel candidates per AR.md's "kernels are not the default; they are an option opened by measurement, not by external paper claims" rule.
+- It is the gate that opens or retires custom-kernel candidates per P6_AUTORESEARCH.md's "kernels are not the default; they are an option opened by measurement, not by external paper claims" rule.
 - It composes with the C.5 escalate decision: kernel-side gains shift the (1b) survival arithmetic; current memo cannot pre-empt the user's retire-vs-γ.1 call without this data.
 - It is the cheapest decisive probe in §6: read-only, no download, no commit, no destructive op, fits the autonomous-loop budget.
 - It produces a comparable artefact (per-component-ms JSONL) that any future kernel candidate can be attributed against on the running-best progress chart.
 
 ### 7.2 Lever-family tag
 
-Primary: **kernel fusion (priority 3 in AR.md hardware-limit ladder)**. Secondary: **bandwidth utilisation (priority 1)** — kernel work that frees compute at B=4 raises utilisation toward the 80%+ ceiling.
+Primary: **kernel fusion (priority 3 in P6_AUTORESEARCH.md hardware-limit ladder)**. Secondary: **bandwidth utilisation (priority 1)** — kernel work that frees compute at B=4 raises utilisation toward the 80%+ ceiling.
 
 ### 7.3 Hypothesis (predeclared)
 
@@ -530,7 +530,7 @@ The dense 27B-4bit B=4 warm-decode step at 95.0 ms is dominated by one or two of
 
 ### 7.4 Pass / fail threshold (predeclared)
 
-This is a **diagnostic** probe (per AR.md `experiment status` taxonomy), not an optimisation. The disposition decision tree:
+This is a **diagnostic** probe (per P6_AUTORESEARCH.md `experiment status` taxonomy), not an optimisation. The disposition decision tree:
 
 - **Largest component ≥ 30% of step time AND below an achievable kernel ceiling** (e.g. attention layers at 30% of step with stock SDPA having a known 1.5× speedup headroom on M5 Pro) → opens a custom-kernel candidate. Status: `diagnostic` (with `keep` if a follow-up kernel proves the gap).
 - **Largest component 15-30% of step time** → microbench that component at higher fidelity in a follow-up iteration.
@@ -587,8 +587,8 @@ Expected wall: ~5 minutes (3 warmup + 20 measurement iters at ~0.1 s/step × mul
 ### 7.8 What this probe does NOT do
 
 - It does not run on MoE. Cross-family attribution is a follow-up after dense disposition lands.
-- It does not write any custom kernel. Kernel work is gated behind explicit user authorisation per AR.md.
-- It does not change PLAN.md. PLAN updates land only after a kernel candidate clears its end-to-end gate (per AR.md Custom kernel authorization).
+- It does not write any custom kernel. Kernel work is gated behind explicit user authorisation per P6_AUTORESEARCH.md.
+- It does not change PLAN.md. PLAN updates land only after a kernel candidate clears its end-to-end gate (per P6_AUTORESEARCH.md Custom kernel authorization).
 - It does not exercise spec. Spec-side decomposition needs a separate microbench harness on `decode_step_multi(k=4)`.
 
 ---
@@ -599,7 +599,7 @@ This memo's deliverables, in order:
 
 1. **This memo** at `plans/P6_AUTORESEARCH_REORIENTATION.md`.
 2. **Experiment ledger** at `plans/P6_AUTORESEARCH_LOG.tsv` — header + initial 6 rows seeded from existing measurements (baseline / C.4 / Track B / C.5 β.1 / C.5 β.2 / verify-k microbench) so the running-best line starts at 42.17 with a populated history.
-3. **Progress summary** at `plans/P6_AUTORESEARCH_PROGRESS.md` — short human-readable index over the TSV. **No .png chart in this commit** — matplotlib is not in `pyproject.toml` deps; per AR.md "do not add new plotting dependencies unless explicitly approved", the chart is queued for the first new keep-or-diagnostic experiment under explicit approval.
+3. **Progress summary** at `plans/P6_AUTORESEARCH_PROGRESS.md` — short human-readable index over the TSV. **No .png chart in this commit** — matplotlib is not in `pyproject.toml` deps; per P6_AUTORESEARCH.md "do not add new plotting dependencies unless explicitly approved", the chart is queued for the first new keep-or-diagnostic experiment under explicit approval.
 
 For the recommended next probe in §7:
 
@@ -613,21 +613,21 @@ For follow-up probes (§6 ranked items 2-5), the same `plans/P6_AUTORESEARCH/` d
 
 ## 9. Approval Requests
 
-Per AR.md "You must ask before:" list, this memo lands without any of the gated actions. Explicit asks for the next iteration:
+Per P6_AUTORESEARCH.md "You must ask before:" list, this memo lands without any of the gated actions. Explicit asks for the next iteration:
 
 | # | Action | Required for | Authorisation status |
 | --- | --- | --- | --- |
 | A1 | **No download / no network call** in the next-probe (§7) — uses the cached `mlx-community/Qwen3.5-27B-4bit` target only. | Probe execution. | **Autonomous-loop scope; no ask needed.** |
-| A2 | **No git commit** as part of this memo / ledger / probe. | Memo + ledger artefact landing. | **Per AR.md "creating any git commit (every commit needs explicit user approval, even when the toolchain is green)"; user must explicitly authorise the commit when ready.** |
+| A2 | **No git commit** as part of this memo / ledger / probe. | Memo + ledger artefact landing. | **Per P6_AUTORESEARCH.md "creating any git commit (every commit needs explicit user approval, even when the toolchain is green)"; user must explicitly authorise the commit when ready.** |
 | A3 | **Long real-model benchmark > 10 min** in any follow-up. | Future probe execution. | Not requested in this memo. |
 | A4 | ~~`safetensors.index.json` inspection~~ | ~~Resolve OQ-4~~ | **DONE 2026-05-02 — RESOLVED NEGATIVE (MTP keys absent; see §1.4 OQ-4 closure and §5.1).** Ledger row `AR_MTP_KEY_INSPECTION`. |
 | A5 | **C.5 γ.1 read-only upstream survey** on `humanrouter/ddtree-mlx` (item 3 in §6, the C.5 REPORT's standing user decision). | Resolve C.5 escalate state. | **Requires user decision per the C.5 REPORT engineering recommendation.** Not pre-empted by this memo. |
-| A6 | **Opening a custom MLX-native kernel candidate** for hot-path integration (any of fused RMSNorm+RoPE, fused gated-delta-update, FlashAttention-style SDPA, paged-KV scatter). | Once §7 microbench identifies a measurable gap. | **Requires explicit user authorisation per AR.md "shipping a custom MLX Metal kernel into the Silica hot path".** |
-| A7 | **MTP path re-opening** via Option A (re-convert upstream Qwen/Qwen3.5-27B BF16, ~52 GB download + conversion) or Option B (download trevon/Qwen3.5-27B-MLX-MTP, 8-bit 29.1 GB). | MTP probe is retired for the current production target (A4 resolved negative); re-opening requires a new checkpoint. | **Requires explicit user authorisation per AR.md "checkpoint downloads" + "opening a large implementation track".** Not requested. |
+| A6 | **Opening a custom MLX-native kernel candidate** for hot-path integration (any of fused RMSNorm+RoPE, fused gated-delta-update, FlashAttention-style SDPA, paged-KV scatter). | Once §7 microbench identifies a measurable gap. | **Requires explicit user authorisation per P6_AUTORESEARCH.md "shipping a custom MLX Metal kernel into the Silica hot path".** |
+| A7 | **MTP path re-opening** via Option A (re-convert upstream Qwen/Qwen3.5-27B BF16, ~52 GB download + conversion) or Option B (download trevon/Qwen3.5-27B-MLX-MTP, 8-bit 29.1 GB). | MTP probe is retired for the current production target (A4 resolved negative); re-opening requires a new checkpoint. | **Requires explicit user authorisation per P6_AUTORESEARCH.md "checkpoint downloads" + "opening a large implementation track".** Not requested. |
 | A8 | **QuantSpec / KnapSpec probe implementation** (touches `silica.kvcache` or new self-spec drafter). | If MTP retires AND microbench leaves spec lever as the path. | **Requires explicit user authorisation.** |
 | A9 | **OptiQ-4bit download (~16 GB) + PPL row** (§5.6). | Quality-floor recovery only — not a current-cycle probe. | **Requires explicit user authorisation.** Not requested. |
-| A10 | **Re-opening C.4 DFlash via `--quantize-draft`** (the (1) drafter-cost finding's only open follow-up). | Only if a new-evidence hypothesis emerges. | **Requires explicit user approval per AR.md "re-opening any retired track".** |
-| A11 | **PLAN.md final-disposition edit** (e.g. closing C.5 step 8, retiring (1b), updating §3.2 kernel non-goal once a kernel ships). | After the relevant decision is empirical. | **Per AR.md "committing final strategic decisions to PLAN" — explicit user authorisation required.** |
+| A10 | **Re-opening C.4 DFlash via `--quantize-draft`** (the (1) drafter-cost finding's only open follow-up). | Only if a new-evidence hypothesis emerges. | **Requires explicit user approval per P6_AUTORESEARCH.md "re-opening any retired track".** |
+| A11 | **PLAN.md final-disposition edit** (e.g. closing C.5 step 8, retiring (1b), updating §3.2 kernel non-goal once a kernel ships). | After the relevant decision is empirical. | **Per P6_AUTORESEARCH.md "committing final strategic decisions to PLAN" — explicit user authorisation required.** |
 
 ---
 
@@ -635,7 +635,7 @@ Per AR.md "You must ask before:" list, this memo lands without any of the gated 
 
 ### 10.1 Ledger
 
-`plans/P6_AUTORESEARCH_LOG.tsv` — machine-readable experiment ledger. Columns per AR.md spec:
+`plans/P6_AUTORESEARCH_LOG.tsv` — machine-readable experiment ledger. Columns per P6_AUTORESEARCH.md spec:
 
 ```
 experiment_id  date  commit  track  hypothesis  metric_name  metric_value  baseline_value  relative_delta  direction  status  artifact_path  notes
@@ -650,13 +650,13 @@ Initial seeded rows (existing measurements, mapped onto the ledger schema):
 - `C5_DDTREE_BETA2_COVERAGE` — coverage@16 = 0.258, status `diagnostic` (escalate disposition; not on tok/s axis).
 - `P605_VERIFY_K` — verify-k cap 2.93× at k=8 perfect, status `diagnostic` (microbench, not optimisation).
 
-The TSV file is written by the main agent only (per AR.md "Ledger ownership"); sub-agents return findings, the main agent appends.
+The TSV file is written by the main agent only (per P6_AUTORESEARCH.md "Ledger ownership"); sub-agents return findings, the main agent appends.
 
 ### 10.2 Charts
 
-Per AR.md "do not add new plotting dependencies unless explicitly approved" and the local check showing matplotlib is not in `pyproject.toml`, **no .png chart in this commit**. The chart generation is queued for the first new keep-or-diagnostic experiment with explicit user approval to either install matplotlib or generate the chart out-of-band (e.g. via a separate venv).
+Per P6_AUTORESEARCH.md "do not add new plotting dependencies unless explicitly approved" and the local check showing matplotlib is not in `pyproject.toml`, **no .png chart in this commit**. The chart generation is queued for the first new keep-or-diagnostic experiment with explicit user approval to either install matplotlib or generate the chart out-of-band (e.g. via a separate venv).
 
-When the chart is generated, the structure follows AR.md spec:
+When the chart is generated, the structure follows P6_AUTORESEARCH.md spec:
 
 - `plans/P6_AUTORESEARCH_PROGRESS_DECODE_TOK_S.png` — primary metric (higher is better); discarded experiments as small gray points; kept improvements as green points; running best as a green step line. Title: "Silica-MLX dense 27B B=4 autoresearch — N experiments, K kept improvements".
 - `plans/P6_AUTORESEARCH_PROGRESS_PPL.png` — quality metric (lower is better) for any compression / codec experiment.
@@ -673,11 +673,11 @@ A breakthrough is labeled on the relevant chart. Diagnostic-only experiments are
 
 ## 11. Custom-Kernel Candidacy Review
 
-Per AR.md section 14 — "list any place where a microbench shows the existing MLX algorithm is on the dense 27B critical path AND clearly below an achievable kernel ceiling. If none, say so explicitly — do not invent candidates."
+Per P6_AUTORESEARCH.md section 14 — "list any place where a microbench shows the existing MLX algorithm is on the dense 27B critical path AND clearly below an achievable kernel ceiling. If none, say so explicitly — do not invent candidates."
 
 **As of this orientation, NO microbench has yet shown that an existing MLX algorithm is below an achievable kernel ceiling on the dense 27B critical path.** The verify-k microbench (P-6.0.5 Unit 7) shows the bandwidth-utilisation regime transition at k=4 but does not attribute it to a specific MLX op. The B=4 warm-decode at 52% utilisation is consistent with compute-bound regime but does not name the bottleneck op.
 
-The §7 recommended probe is precisely the microbench that would close this gap. **No specific kernel candidate is proposed in this memo** — proposing one would invent it, which AR.md forbids.
+The §7 recommended probe is precisely the microbench that would close this gap. **No specific kernel candidate is proposed in this memo** — proposing one would invent it, which P6_AUTORESEARCH.md forbids.
 
 The kernel ecosystem survey (§4.1) identified four reference patterns that would become candidates **if** §7 surfaces a measurable gap. Each pattern's candidacy is constrained by the verified architecture facts in §1.5:
 
@@ -715,7 +715,7 @@ External anchors carried in §4:
 
 ---
 
-## 13. Stop conditions (carried from AR.md, instantiated for this loop)
+## 13. Stop conditions (carried from P6_AUTORESEARCH.md, instantiated for this loop)
 
 The autoresearch loop must surface one of these before declaring success:
 
@@ -731,13 +731,13 @@ The autoresearch loop must surface one of these before declaring success:
 
 | Frame | Value | Source |
 | --- | --- | --- |
-| Primary metric | `decode_tok_s` (higher is better) | AR.md mission statement |
-| Primary row family | `qwen3.5-27b-warm-decode-*` | AR.md hardware-limit map |
+| Primary metric | `decode_tok_s` (higher is better) | P6_AUTORESEARCH.md mission statement |
+| Primary row family | `qwen3.5-27b-warm-decode-*` | P6_AUTORESEARCH.md hardware-limit map |
 | Running best | **42.17 tok/s** | P-6.0.5 Unit 2, B=4, 2-run mean |
 | σ (run-to-run) | 0.21 tok/s | P-6.0.5 Unit 2, 2-run |
 | 3σ floor for keep | 0.63 tok/s (a kept improvement must measure ≥ 42.80 tok/s on ≥2 reproductions) | derived |
 | Stretch milestone | 60 tok/s ((1b)) | PLAN.md §6 (1b) |
-| Hypothetical envelope (composed multi-lever) | 80-170 tok/s | AR.md prompt — to be refined by measurement |
+| Hypothetical envelope (composed multi-lever) | 80-170 tok/s | P6_AUTORESEARCH.md prompt — to be refined by measurement |
 | Refined envelope (this memo) | 60-100 tok/s mid-band, with kernel + spec composition | §3.1 of this memo |
 | Hard cap on spec-only (linear k=8 perfect) | 2.93× × 16.05 ≈ 47 tok/s | P-6.0.5 Unit 7 |
 

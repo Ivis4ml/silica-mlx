@@ -161,7 +161,7 @@ was the necessary step before cycle-14's stack KEEP.
    the dominant cost at B=64).
 2. **Speculative decoding** (D-021 framework available; B=64 + spec gives
    multi-token-per-step which side-steps the 232 ceiling). Gated on the
-   C.5 γ.1 read-only survey decision per AR.md.
+   C.5 γ.1 read-only survey decision per P6_AUTORESEARCH.md.
 3. **Profile mlx's actual memory behavior past 40 GB peak** to understand
    the cliff cause architecturally, not empirically. Knowing whether it's
    SLC, allocator, or VM tells us if the cliff can be moved with a

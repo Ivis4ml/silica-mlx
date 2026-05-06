@@ -20,7 +20,7 @@
 | Within strict 36 GB envelope | 42.17 ± 0.21 tok/s (B=4) | **204.5 ± ~1.5 tok/s (B=52, bf16 state)** | **4.85×** |
 | Within 48 GB hardware ceiling | n/a | **~230 tok/s (B=64, bf16 state) — pending re-measurement** | ~5.45× |
 | (1b) ≥60 tok/s milestone | not cleared | **CLEARED 3.41× (envelope)** | — |
-| Stop conditions per AR.md §"Stop conditions" | none cleared | **2 of 3 cleared** | — |
+| Stop conditions per P6_AUTORESEARCH.md §"Stop conditions" | none cleared | **2 of 3 cleared** | — |
 
 **Pre-correction claim (from cycle 14, attribution defective):** 206.2 ±
 0.5 tok/s at B=52 with "v10+bf16 stack". Cycle 27 revealed v10 FA-decode
@@ -68,7 +68,7 @@ Cycle-1 decomposition at B=4: 48 DeltaNet layers = 74.2% of step;
 ### Cycle 10: BREAKTHROUGH via axis-shift (42.17 → 193.9 tok/s)
 
 **The cycle-1 framing assumed B=4 was the cap because "B=8 is infeasible
-on 48 GB without aggressive tricks."** Cycle 10 re-read AR.md's metric
+on 48 GB without aggressive tricks."** Cycle 10 re-read P6_AUTORESEARCH.md's metric
 definition ("aggregate decode_tok_s, B chosen to maximise aggregate
 within 36 GB envelope") and probed the B axis directly.
 
@@ -286,7 +286,7 @@ These are load-bearing for future autoresearch loops on Silica.
 ### 5.1 Read the metric definition carefully
 
 The 9-cycle plateau at 42.17 (cycles 1-9) was caused by solving the
-WRONG problem. The cycle-1 framing locked B=4 as fixed; AR.md actually
+WRONG problem. The cycle-1 framing locked B=4 as fixed; P6_AUTORESEARCH.md actually
 specified "B chosen to maximise aggregate within envelope". **Cycle 10
 fixed this in one cycle by re-reading the metric definition.**
 
@@ -391,9 +391,9 @@ the B-sweep family that anchors cycle-10 / cycle-13 / cycle-14 KEEPs.
 
 ---
 
-## 7. Stop conditions per AR.md §"Stop conditions"
+## 7. Stop conditions per P6_AUTORESEARCH.md §"Stop conditions"
 
-AR.md defines three stop conditions. After 23 cycles:
+P6_AUTORESEARCH.md defines three stop conditions. After 23 cycles:
 
 1. **A reproduced ≥60 tok/s aggregate measurement on dense 27B primary
    row family on ≥2 runs** — **CLEARED** by 3.44× envelope / 3.87× hardware ceiling.
@@ -404,7 +404,7 @@ AR.md defines three stop conditions. After 23 cycles:
    set cannot multiplicatively reach 60** — **N/A** because (1) and (2)
    already cleared.
 
-**The autoresearch loop has reached a legitimate stop per AR.md.**
+**The autoresearch loop has reached a legitimate stop per P6_AUTORESEARCH.md.**
 
 Further work past 232 tok/s is bounded by the open levers TODO-1 through
 TODO-6 above; none of them can be expected to deliver another large
@@ -438,14 +438,14 @@ multiple over the 5.51× already achieved.
 This 23-cycle journey was conducted under user-authorized autonomous
 loop with explicit gates:
 - Custom MLX kernels (cycle 11) — under the 2026-05-02 mandate per
-  AR.md's "Custom kernel authorization" section.
+  P6_AUTORESEARCH.md's "Custom kernel authorization" section.
 - bf16 DeltaNet state (cycles 12-13) — derived from cycle-1 finding,
   shadow-installed via env flag.
 - Spec-decode research thread (cycles 19-23) — under the 2026-05-04
   user authorization for >40% accept rate research.
 
 All commits remain pending user explicit approval per the
-"every commit needs explicit user approval" gate in AR.md.
+"every commit needs explicit user approval" gate in P6_AUTORESEARCH.md.
 
 ---
 

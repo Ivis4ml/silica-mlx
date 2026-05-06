@@ -1,6 +1,6 @@
 """Custom MLX-native Metal kernels for the Silica hot path.
 
-Per AR.md Custom kernel authorization (relaxed 2026-05-02 / mandate
+Per P6_AUTORESEARCH.md Custom kernel authorization (relaxed 2026-05-02 / mandate
 2026-05-03), this package hosts hand-rolled Metal kernels via
 ``mx.fast.metal_kernel``. The public surface is intentionally narrow
 after the v1.7.23 P-6 strategic re-anchor: the running-best dense-27B

@@ -84,6 +84,6 @@ The remaining-known levers are all gated or substantial:
 - **External upgrade to MLX 0.32+ async-copy primitives** (not yet released)
 
 The autoresearch loop has reached the local maximum on the cycle-1-17
-lever set. Per AR.md "Stop conditions" §, both cycle-1 stop conditions
+lever set. Per P6_AUTORESEARCH.md "Stop conditions" §, both cycle-1 stop conditions
 remain cleared by margin; no urgency to push further unless an
 authorisation opens.

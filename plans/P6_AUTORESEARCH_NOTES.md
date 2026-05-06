@@ -8,9 +8,9 @@
 | Branch | `opus` |
 | Hardware | Apple M5 Pro 48 GB unified memory, 307 GB/s peak bandwidth |
 | Targets | Dense Qwen3.5-27B-4bit (primary); MoE Qwen3.5-35B-A3B-4bit (secondary) |
-| Companion files | `AR.md` (directive); `plans/P6_AUTORESEARCH_LOG.tsv` (ledger); `plans/P6_AUTORESEARCH_PROGRESS.md` (index); `plans/P6_AUTORESEARCH/REPORT_KERNEL_CYCLE_*.md` (per-cycle reports); `plans/P6_AUTORESEARCH_PROGRESS_*.png` (charts) |
+| Companion files | `P6_AUTORESEARCH.md` (directive); `plans/P6_AUTORESEARCH_LOG.tsv` (ledger); `plans/P6_AUTORESEARCH_PROGRESS.md` (index); `plans/P6_AUTORESEARCH/REPORT_KERNEL_CYCLE_*.md` (per-cycle reports); `plans/P6_AUTORESEARCH_PROGRESS_*.png` (charts) |
 
-This file is the durable take-home companion to `AR.md`. The mission was to push Silica-MLX as close as possible to the M5 Pro hardware limit on the production checkpoints. The note covers what we measured, what the levers are, what failed, and what's left for the next phase.
+This file is the durable take-home companion to `P6_AUTORESEARCH.md`. The mission was to push Silica-MLX as close as possible to the M5 Pro hardware limit on the production checkpoints. The note covers what we measured, what the levers are, what failed, and what's left for the next phase.
 
 ## TL;DR
 
@@ -23,10 +23,10 @@ This file is the durable take-home companion to `AR.md`. The mission was to push
 
 The (1b) ≥60 tok/s milestone cleared 3.40× within strict envelope and 3.87× at hardware ceiling on the dense primary track. The 791.8 tok/s MoE secondary measurement is the largest absolute throughput observed in the 35-cycle effort.
 
-## Mission framing (from `AR.md`)
+## Mission framing (from `P6_AUTORESEARCH.md`)
 
 - Push the production targets toward the hardware limit, not toward gate compliance. The (1b) milestone is a step on the way, not the ceiling.
-- Decode throughput is the single primary metric. `B` (max batch size) is chosen to maximise aggregate per the AR.md metric definition. Improvements must clear ≥3σ on ≥2 reproductions before they enter the running-best line.
+- Decode throughput is the single primary metric. `B` (max batch size) is chosen to maximise aggregate per the P6_AUTORESEARCH.md metric definition. Improvements must clear ≥3σ on ≥2 reproductions before they enter the running-best line.
 - Karpathy-style autoresearch ledger: every measurement is a TSV row. `plans/P6_AUTORESEARCH_LOG.tsv` is appended only by the main agent; subagents return findings, the main agent merges.
 - Chunked-decode is structurally incompatible with the warm-decode oracle stability gate (cycles 4/5/12/15 — chunk=2 still fails). Do not propose chunked-decode again as a small-B lever.
 
@@ -43,7 +43,7 @@ The (1b) ≥60 tok/s milestone cleared 3.40× within strict envelope and 3.87× 
 | 7 | 2026-05-03 | QMM v3-v6 tuning iterations | Best v6 = 0.83 ms; mlx 0.45 ms still wins. |
 | 8 | 2026-05-03 | QMM v7-v11 (incl. v9 = 0.59 ms BEST silica) | Even silica's best (v9=0.59) loses to mlx 0.45. Cycle 16 confirms mlx qmv_quad already loads 4 uint32 per thread; QMM kernel arm closed. |
 | 9 | 2026-05-03 | QMM v12-v13 final tuning | All discard. QMM kernel arm formally retired. |
-| **10 ⭐** | 2026-05-03 | **BREAKTHROUGH** — re-read AR.md metric definition ("B chosen to maximise aggregate"); pulled the axis-shift lever | 42.17 → 193.9 tok/s at B=48 (4.60×). (1b) milestone cleared 3.23×. |
+| **10 ⭐** | 2026-05-03 | **BREAKTHROUGH** — re-read P6_AUTORESEARCH.md metric definition ("B chosen to maximise aggregate"); pulled the axis-shift lever | 42.17 → 193.9 tok/s at B=48 (4.60×). (1b) milestone cleared 3.23×. |
 | 11 | 2026-05-04 | FA-decode kernel port (`flash_attention_decode_v10.py`): K-axis split + GQA-aware tile sharing + streaming online softmax + half4 vectorised loads + fused sigmoid output gate | Kernel-level beats mlx by 1.25-1.81× across T_kv ∈ {128, 256, 512, 1024}. **0% E2E delta at B=48** because attention is only 22% of step time. Cycle-12 dtype defect introduced here (silently skipped bf16 path). |
 | 12 | 2026-05-04 | bf16 DeltaNet state probe; shadow_install wiring fix in `qwen3_5.py:from_hf_repo` | Greedy-decode token-ID parity verified. Direct E2E save at fixed B=48: 0%. **Indirect save: 3.5 GB peak-memory headroom.** Defect: shadow_install dtype check was `mx.float16` only — discovered 14 cycles later by Codex review. |
 | **13 ⭐** | 2026-05-04 | Re-composed cycle-12's peak save with cycle-10's B-axis lever | **B=52 = 200.8 ± 1.5 envelope KEEP**; B=64 = 229.8 ± 2.0 hardware-ceiling KEEP. 18σ above C10. The "193 wall" was a B=48 cap, not a hardware wall. |
@@ -76,7 +76,7 @@ Stars (⭐) mark cycles that delivered or revised a running-best. Of the 35 cycl
 
 ### 1. The right unit of analysis is *peak-memory ceiling × B-axis lever*, not isolated kernel bandwidth.
 
-Cycles 1-9 spent at fixed B=4 with 0 keeps — wrong frame. Cycle 10 re-read AR.md's "B chosen to maximise aggregate" definition and gained 4.60× by extending B alone. The 23-cycle journey shows kernel/state probes that look flat in isolation (cycles 11/12 = 0% at fixed B=48) can be *resource feeders* that pay off when re-composed at a higher B (cycle 13 = +4.76×).
+Cycles 1-9 spent at fixed B=4 with 0 keeps — wrong frame. Cycle 10 re-read P6_AUTORESEARCH.md's "B chosen to maximise aggregate" definition and gained 4.60× by extending B alone. The 23-cycle journey shows kernel/state probes that look flat in isolation (cycles 11/12 = 0% at fixed B=48) can be *resource feeders* that pay off when re-composed at a higher B (cycle 13 = +4.76×).
 
 ### 2. Project from measured baselines, not extrapolated ones.
 
@@ -196,7 +196,7 @@ For any future re-verification of these numbers:
 
 | File | Role |
 | --- | --- |
-| `AR.md` | The autoresearch directive + 2026-05-04 addendums (cycle-23 closure + cycles-28-35 update). |
+| `P6_AUTORESEARCH.md` | The autoresearch directive + 2026-05-04 addendums (cycle-23 closure + cycles-28-35 update). |
 | `plans/P6_AUTORESEARCH_NOTES.md` | This file — durable take-home companion. |
 | `plans/P6_AUTORESEARCH_FINAL_REPORT.md` | Comprehensive 23-cycle write-up (written at cycle-23 closure; cycles 28-35 documented in this note). |
 | `plans/P6_AUTORESEARCH_PROGRESS.md` | Short index over the ledger; running counts and last cycle. |
@@ -217,6 +217,6 @@ For any future re-verification of these numbers:
 ## Closing notes
 
 - The autoresearch loop reached a legitimate stop on the dense 27B primary track (cycle 28-29) and a legitimate stop on the MoE secondary track (cycle 35).
-- Two of three AR.md "Stop conditions" cleared: (1) ≥60 tok/s milestone cleared 3.40-3.87×; (2) new running-best ≥3σ above 42.17 with clean lever attribution after cycle-27 correction.
+- Two of three P6_AUTORESEARCH.md "Stop conditions" cleared: (1) ≥60 tok/s milestone cleared 3.40-3.87×; (2) new running-best ≥3σ above 42.17 with clean lever attribution after cycle-27 correction.
 - The cycle-12+13 methodology (bf16 DeltaNet state + axis-shift) generalises across architectures within the Qwen3.5 family, demonstrated by cycles 34-35 on MoE 35B-A3B.
 - The next research direction is small-B speed per 2026-05-04 user redirect; B-axis extension and spec-decode threads are closed.

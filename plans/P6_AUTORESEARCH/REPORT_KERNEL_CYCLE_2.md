@@ -112,12 +112,12 @@ Unchanged at **42.17 tok/s** (P-6.0.5 baseline). My e2e baseline is 42.68 ± 0.2
 
 ## Stop conditions surfaced
 
-The autoresearch loop's stop conditions per AR.md require one of:
+The autoresearch loop's stop conditions per P6_AUTORESEARCH.md require one of:
 1. Reproduced ≥60 tok/s on ≥2 runs — **not reached.**
 2. Reproduced new running-best ≥3σ above 42.17 — **not reached.**
 3. Measurement-anchored declaration that the remaining open-lever set cannot multiplicatively reach 60 — **NOT this**: the open levers can still reach 60-100 envelope, they just require multi-day engineering this session cannot complete.
 
-Per AR.md "Continue forever is not a stop condition", but the **scope-bounded** stop is: I have exhausted what's tractable in one session via simple kernel writing. The next iteration is bounded by user authorisation for one of the multi-day engineering directions in §"What would actually close the gap" above.
+Per P6_AUTORESEARCH.md "Continue forever is not a stop condition", but the **scope-bounded** stop is: I have exhausted what's tractable in one session via simple kernel writing. The next iteration is bounded by user authorisation for one of the multi-day engineering directions in §"What would actually close the gap" above.
 
 ## Recommended next-action options
 

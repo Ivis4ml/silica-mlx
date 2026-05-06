@@ -58,7 +58,7 @@ state) and operating-point selection (axis-shift).
 <summary><strong>Two load-bearing levers</strong> — running-best is composition, not a kernel</summary>
 
 - **Cycle 10 — batched-aggregate axis-shift.** Re-reading the
-  AR.md metric definition ("B is chosen to maximise aggregate")
+  P6_AUTORESEARCH.md metric definition ("B is chosen to maximise aggregate")
   moved the operating point from B=4 → B=48 within the 36 GB
   envelope. Pure parameter selection; no kernel change. *4.60× on
   its own.*
@@ -195,7 +195,7 @@ line` and the linked opening document.
 - `plans/P6_AUTORESEARCH_NOTES.md` — durable take-home companion.
 - `plans/P6_AUTORESEARCH_FINAL_REPORT.md` — comprehensive 23-cycle
   final report.
-- `AR.md` — autoresearch directive + addendums.
+- `P6_AUTORESEARCH.md` — autoresearch directive + addendums.
 - `plans/P6_AUTORESEARCH_LOG.tsv` — raw 110-row Karpathy-style
   ledger.
 - `plans/P6_AUTORESEARCH/` — per-cycle reports, JSONL artefacts,

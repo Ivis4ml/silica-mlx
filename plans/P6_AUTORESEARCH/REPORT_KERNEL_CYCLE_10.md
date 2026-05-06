@@ -12,7 +12,7 @@
 
 **The running-best on `qwen3.5-27b-warm-decode-*` row family jumps from 42.17 to 193.9 tok/s — 4.60× the baseline, 3.23× the (1b) ≥60 milestone.**
 
-The cycle-1 P-6.0.5 framing said "B=4 is the headroom limit, B=8 infeasible on 48 GB." Cycle 10 empirically refutes this. AR.md says "B is chosen to maximise aggregate while respecting the 36 GB peak-memory ceiling" — running the warm-decode oracle at B={8,12,16,24,32,40,44,48} reveals the aggregate climbs cleanly with B, peak memory stays under 36 GB through B=48, and the warm-decode oracle's stability + memory gates pass at every step.
+The cycle-1 P-6.0.5 framing said "B=4 is the headroom limit, B=8 infeasible on 48 GB." Cycle 10 empirically refutes this. P6_AUTORESEARCH.md says "B is chosen to maximise aggregate while respecting the 36 GB peak-memory ceiling" — running the warm-decode oracle at B={8,12,16,24,32,40,44,48} reveals the aggregate climbs cleanly with B, peak memory stays under 36 GB through B=48, and the warm-decode oracle's stability + memory gates pass at every step.
 
 | Scenario | Status | decode_tok_s | Reproductions | Peak (GB) | × baseline |
 | --- | --- | ---: | --- | ---: | ---: |
@@ -30,13 +30,13 @@ All runs pass the warm-decode oracle's per-step rate-stability check + peak-memo
 
 ## What changed and why
 
-The AR.md mission scoreboard names the primary metric as "aggregate decode_tok_s on the qwen3.5-27b-warm-decode-* row family. **B is chosen to maximise aggregate while respecting the 36 GB peak-memory ceiling.**" The cycle-1 orientation memo, written from the P-6.0.5 baseline that only measured B=1/2/4, declared:
+The P6_AUTORESEARCH.md mission scoreboard names the primary metric as "aggregate decode_tok_s on the qwen3.5-27b-warm-decode-* row family. **B is chosen to maximise aggregate while respecting the 36 GB peak-memory ceiling.**" The cycle-1 orientation memo, written from the P-6.0.5 baseline that only measured B=1/2/4, declared:
 
 > Linear extrapolation from B=1 predicted B=4 = 64.2 tok/s; measured 42.17 ± 0.21 leaves a 17.83 tok/s residual gap. **B=8 is infeasible on 48 GB without aggressive tricks.**
 
 This was wrong. The "infeasible" claim came from the v1.7.13 P-6.0 13.5 GB weight footprint anchor and a worst-case-padding model. With the corrected 15.13 GB anchor and actual measurement, B=8 fits comfortably (peak 18.7 GB). Continuing up: B=48 fits at 33.95 GB.
 
-The cycle-1 framing locked B=4 in as the running-best frame and 9 cycles of kernel work tried to optimize that fixed shape. **Cycle 10 reframes the question from "make B=4 faster" to "find the optimal B" — which is what AR.md actually asked for.**
+The cycle-1 framing locked B=4 in as the running-best frame and 9 cycles of kernel work tried to optimize that fixed shape. **Cycle 10 reframes the question from "make B=4 faster" to "find the optimal B" — which is what P6_AUTORESEARCH.md actually asked for.**
 
 The aggregate scaling is highly sublinear per row but enormous in aggregate:
 
@@ -104,14 +104,14 @@ The (1b) survival rule from v1.7.18 Decision Gate 1 is comfortably satisfied. Th
 
 ## Reflection on cycles 1-9
 
-The kernel work in cycles 1-9 was not wasted, but it was solving the WRONG problem. The cycle-1 orientation memo locked B=4 in as the frame and 13 custom Metal kernels tried to make B=4 faster. None worked — mlx's tuned QMM was the floor. Meanwhile the actual running-best frame (per AR.md exact wording) was free to choose ANY B that maximises aggregate.
+The kernel work in cycles 1-9 was not wasted, but it was solving the WRONG problem. The cycle-1 orientation memo locked B=4 in as the frame and 13 custom Metal kernels tried to make B=4 faster. None worked — mlx's tuned QMM was the floor. Meanwhile the actual running-best frame (per P6_AUTORESEARCH.md exact wording) was free to choose ANY B that maximises aggregate.
 
 The kernel work is still valuable foundation:
 - v9 simdgroup_matrix QMM is correctness-validated and 1.27× from mlx parity (close enough that 1-2 more iterations might match)
 - 13 kernels in `silica/kernels/` provide microbench scaffolding for future custom-kernel work
 - Shadow-install + correctness-gate patterns are reusable
 
-But the cycle-10 lesson is: **read the metric definition carefully and probe the variable axes the metric defines.** AR.md said "B is chosen to maximise aggregate" and 9 cycles missed that for "make B=4 faster".
+But the cycle-10 lesson is: **read the metric definition carefully and probe the variable axes the metric defines.** P6_AUTORESEARCH.md said "B is chosen to maximise aggregate" and 9 cycles missed that for "make B=4 faster".
 
 ## What's next
 
@@ -130,6 +130,6 @@ The autoresearch loop has reached a legitimate stop. Further work would be:
 1. **Push B=52+** — but peak memory at B=48 is 33.95 GB; B=52 likely OOMs.
 2. **Apply the v9 simdgroup_matrix QMM kernel at higher B** — could compose with the batched-aggregate win for additional speedup if v9 catches mlx (and would only matter if integration is net-positive at higher B, which depends on per-call time vs amortisation).
 3. **Try B=48 + speculative decoding** — compose batched-aggregate with the spec lever the verify-k cap permits. C.5 γ.1 survey still pending user decision.
-4. **Find the next axis** — what other parameter would AR.md's metric definition allow varying? E.g., prompt length, decode length, KV codec.
+4. **Find the next axis** — what other parameter would P6_AUTORESEARCH.md's metric definition allow varying? E.g., prompt length, decode length, KV codec.
 
 For the user's stated milestone "we must make it > 50 tok/s firstly" — **mission accomplished, by 3.88×.**

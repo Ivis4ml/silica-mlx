@@ -63,8 +63,8 @@ The 4.60× cycle-1 → cycle-10 jump (axis-shift to B=48) and the 1.07×
 cycle-10 → cycle-14 lift (composition of v10 + bf16 + axis-extension)
 came from **structural moves at the right level of abstraction**:
 
-- **Cycle 10**: re-read AR.md's metric definition; pulled the axis-shift
-  lever AR.md actually specified ("B chosen to maximise aggregate within
+- **Cycle 10**: re-read P6_AUTORESEARCH.md's metric definition; pulled the axis-shift
+  lever P6_AUTORESEARCH.md actually specified ("B chosen to maximise aggregate within
   envelope"). The cycle-1-9 kernel work was solving the wrong frame.
 - **Cycles 11-12**: discovered new resources (FA-decode kernel, bf16-state
   correctness, peak-memory headroom, shadow-install wiring) that looked

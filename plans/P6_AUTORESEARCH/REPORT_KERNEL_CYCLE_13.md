@@ -27,7 +27,7 @@ cycle-10 / B=48 / 33.95 GB cap.
 
 The within-envelope lift is **+6.9 tok/s (3.6%) at 4.3σ above cycle-10
 baseline** — clears the 3σ keep threshold; B=52 is the formal new
-running-best for the AR.md-policy strict frame.
+running-best for the P6_AUTORESEARCH.md-policy strict frame.
 
 The demonstrated ceiling beyond strict envelope is **B=64 = 229.8 ± 2.0 tok/s,
 +18.5% / 18σ above cycle-10 baseline**, peak 40 GB (within 48 GB system limit).
@@ -82,9 +82,9 @@ Pooled σ ≈ 1.6. Δ = 6.9 tok/s = 4.3σ. **CLEARS 3σ keep threshold.**
 | 3 | 228.0 | 40.01 | 145.6 |
 | **mean ± std** | **229.8 ± 2.0** | 40.01 | — |
 
-Δ vs cycle-10 baseline = 35.9 tok/s = 18σ. Outside the strict 36 GB AR.md
+Δ vs cycle-10 baseline = 35.9 tok/s = 18σ. Outside the strict 36 GB P6_AUTORESEARCH.md
 envelope; well within the 48 GB hardware ceiling. Listed as "demonstrated
-capability" rather than running-best per AR.md envelope policy.
+capability" rather than running-best per P6_AUTORESEARCH.md envelope policy.
 
 ## Where the wall is now
 
@@ -150,7 +150,7 @@ bf16 state's peak-memory headroom was the resource that unlocked the B-axis.
 
 The autoresearch loop's pattern across cycles 10-13:
 
-1. **Cycle 10**: read AR.md's metric definition correctly → axis-shift to
+1. **Cycle 10**: read P6_AUTORESEARCH.md's metric definition correctly → axis-shift to
    higher B → +4.60× (42.17 → 193.9 tok/s)
 2. **Cycles 11+12**: kernel/state-bandwidth probes appeared "wasted" at
    fixed B=48

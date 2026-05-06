@@ -142,7 +142,7 @@ attribution-corrupt. The honest replacement:
 re-measurement under the corrected v10 path. Likely revises down by
 ~1-3 tok/s based on the B=52 pattern.
 
-**Stop conditions** per AR.md "Stop conditions" still cleared:
+**Stop conditions** per P6_AUTORESEARCH.md "Stop conditions" still cleared:
 - (1b) ≥60 milestone CLEARED 3.41× (envelope) — still passes by margin
 - New running-best ≥3σ above 42.17 with clean attribution: **YES, but
   the lever attribution is C10 axis-shift × C12 bf16 peak-save, NOT
@@ -194,7 +194,7 @@ Specific cycle-28 work:
    the demonstrated-ceiling attribution
 2. Run B=52 across multiple sessions (cold start vs warm) to characterize
    the between-session variance
-3. Update `plans/P6_AUTORESEARCH_FINAL_REPORT.md` and AR.md with the
+3. Update `plans/P6_AUTORESEARCH_FINAL_REPORT.md` and P6_AUTORESEARCH.md with the
    corrected running-best line
 4. Re-render charts with the corrected numbers
 

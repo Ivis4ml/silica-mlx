@@ -138,7 +138,7 @@ attention or QMM kernel.
 <summary><strong>Two load-bearing levers</strong> — running-best is composition, not a kernel</summary>
 
 - **Cycle 10 — batched-aggregate axis-shift.** Re-reading the
-  AR.md metric definition ("B is chosen to maximise aggregate")
+  P6_AUTORESEARCH.md metric definition ("B is chosen to maximise aggregate")
   moved the operating point from B=4 → B=48 within the 36 GB
   envelope. Pure parameter selection; no kernel change. *4.60× on
   its own.*
@@ -242,7 +242,7 @@ environment with proper warm cache.
 
 [`P6_AUTORESEARCH_NOTES.md`](plans/P6_AUTORESEARCH_NOTES.md) ·
 [`P6_AUTORESEARCH_FINAL_REPORT.md`](plans/P6_AUTORESEARCH_FINAL_REPORT.md) ·
-[`AR.md`](AR.md) ·
+[`P6_AUTORESEARCH.md`](P6_AUTORESEARCH.md) ·
 [`P6_AUTORESEARCH_LOG.tsv`](plans/P6_AUTORESEARCH_LOG.tsv) (110-row ledger) ·
 [`P6_AUTORESEARCH/`](plans/P6_AUTORESEARCH/) (35 per-cycle reports) ·
 [`P6_SMALL_B_OPENING.md`](plans/P6_SMALL_B_OPENING.md) (D-022 next line)

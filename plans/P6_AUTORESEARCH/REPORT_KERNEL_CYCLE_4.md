@@ -17,7 +17,7 @@ This cycle pursued **execution-pattern levers** (the only remaining single-sessi
 1. **The +7% applies to raw forward_batched, not the production warm-decode-b4 oracle path.** The B=4 production bench uses `Engine.generate_batch` → `ContinuousBatcher`, which has its own per-step `.item()` syncs in `_decode_phase` (e.g., `silica/scheduler/batcher.py:1922`). My change in `Engine._drive` only affects single-request `Engine.generate` (B=1 path).
 2. **At B=1 (where the change applies), gain is +1.1% (16.55 vs 16.37 within same run, well under 3σ=0.63).** AND chunk=2..32 ALL fail the warm-decode oracle's per-step stability check (chunked path has spiky per-step timing — bursts of near-zero ms during lazy chunks, then big sync spike — which the oracle reads as decode-rate instability and rejects with `warm_decode_row_0_warmup_did_not_stabilize`).
 
-The lever is **real but unconverted into a running-best gain in this session**. Translating it requires either (a) ContinuousBatcher chunked-decode integration (multi-day, risky given the batcher's admission/stop-token/streaming logic), or (b) a warm-decode oracle adaptation that accepts chunk-aggregated stability rather than per-step (oracle-policy change, requires user authorization per AR.md "changing gates or acceptance criteria").
+The lever is **real but unconverted into a running-best gain in this session**. Translating it requires either (a) ContinuousBatcher chunked-decode integration (multi-day, risky given the batcher's admission/stop-token/streaming logic), or (b) a warm-decode oracle adaptation that accepts chunk-aggregated stability rather than per-step (oracle-policy change, requires user authorization per P6_AUTORESEARCH.md "changing gates or acceptance criteria").
 
 ## What was attempted
 
@@ -129,7 +129,7 @@ Unchanged at **42.17 tok/s**. Cycle 4 produced the first signal of a real lever 
 
 The session-tractable lever set is empirically exhausted on the dense 27B B=4 path. The next iteration legitimately needs **one of three multi-day or external-authorization paths**:
 
-1. **ContinuousBatcher chunked-decode integration** + warm-decode oracle adaptation (3-5d). Lifts the cycle-4 lever to the production B=4 path; would unlock +5-7 tok/s = ~47-49 tok/s. Requires user approval for the oracle change ("changing gates or acceptance criteria" per AR.md).
+1. **ContinuousBatcher chunked-decode integration** + warm-decode oracle adaptation (3-5d). Lifts the cycle-4 lever to the production B=4 path; would unlock +5-7 tok/s = ~47-49 tok/s. Requires user approval for the oracle change ("changing gates or acceptance criteria" per P6_AUTORESEARCH.md).
 2. **Custom simdgroup_matrix QMM kernel** (3-7d). Would unlock the bandwidth-utilisation lever from 52% toward the demonstrated 82.7%; estimated +5-10 tok/s lift = ~47-52 tok/s.
 3. **C.5 γ.1 read-only kernel survey** (1d). The C.5 escalate state's only remaining branch — still pending since 2026-05-02. Could re-open the spec lever if the upstream `humanrouter/ddtree-mlx` ships a no-torch tree-attention kernel with sub-linear T=32 verify cost.
 

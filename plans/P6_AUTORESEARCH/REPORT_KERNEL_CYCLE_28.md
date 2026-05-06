@@ -116,7 +116,7 @@ Per cycle 27 plan + Codex recommendation:
    look for workloads (longer T_kv, higher attn fraction) where the
    kernel-level wins translate.
 
-## Stop conditions per AR.md (status check)
+## Stop conditions per P6_AUTORESEARCH.md (status check)
 
 1. ≥60 tok/s on ≥2 runs — CLEARED 3.41× / 3.86×
 2. New running-best ≥3σ above 42.17 with clean attribution — **CLEARED

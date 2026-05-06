@@ -93,7 +93,7 @@ the same B/kernel/state lever set are below 3σ noise. To break 207
 tok/s within strict envelope or 233 within hardware ceiling, a different
 class of lever is needed — not more local kernel/state tuning.
 
-Per AR.md "Stop conditions" §, both cycle-1 stop conditions remain
+Per P6_AUTORESEARCH.md "Stop conditions" §, both cycle-1 stop conditions remain
 cleared by margin. The autoresearch loop is in a healthy stable state
 with two compositional KEEPs landing in the last 2 cycles. No
 deliverable urgency to push further unless authorised lever (spec

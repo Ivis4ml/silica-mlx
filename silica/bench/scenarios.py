@@ -2154,7 +2154,7 @@ _QWEN3_5_27B_WARM_DECODE_B4 = Scenario(
 
 def _warm_decode_b_scenario(b: int) -> "Scenario":
     """2026-05-03 cycle 10: higher-B warm-decode rows for the dense 27B
-    running-best frame. AR.md §"Hardware-limit map": "B is chosen to
+    running-best frame. P6_AUTORESEARCH.md §"Hardware-limit map": "B is chosen to
     maximise aggregate while respecting the 36 GB peak-memory ceiling."
     Cycle 10 microbench probe found that aggregate tok/s climbs cleanly
     through B=12 (>60), B=24 (>105), B=32 (>135) without OOM and well
@@ -2214,7 +2214,7 @@ _QWEN3_5_27B_WARM_DECODE_B44 = _warm_decode_b_scenario(44)
 _QWEN3_5_27B_WARM_DECODE_B48 = _warm_decode_b_scenario(48)
 # 2026-05-04 cycle 13: B>48 reach scenarios for the bf16-state-headroom probe.
 # bf16 DeltaNet state saves ~3.5 GB peak vs fp32, opening room above the
-# cycle-10 B=48 / 33.95 GB cap toward the 36 GB AR.md envelope.
+# cycle-10 B=48 / 33.95 GB cap toward the 36 GB P6_AUTORESEARCH.md envelope.
 _QWEN3_5_27B_WARM_DECODE_B52 = _warm_decode_b_scenario(52)
 _QWEN3_5_27B_WARM_DECODE_B53 = _warm_decode_b_scenario(53)
 _QWEN3_5_27B_WARM_DECODE_B56 = _warm_decode_b_scenario(56)

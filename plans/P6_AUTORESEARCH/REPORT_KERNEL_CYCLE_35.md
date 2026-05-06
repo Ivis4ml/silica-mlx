@@ -62,7 +62,7 @@ sidesteps it because only 8/256 experts are active per token.
 
 ## Within-envelope vs hardware-ceiling running-bests
 
-Per AR.md "B is chosen to maximise aggregate while respecting the 36 GB
+Per P6_AUTORESEARCH.md "B is chosen to maximise aggregate while respecting the 36 GB
 peak-memory ceiling":
 
 | Frame | Value | Note |
@@ -70,7 +70,7 @@ peak-memory ceiling":
 | MoE within strict 36 GB envelope | **464.1 ± 0.7 tok/s at B=64** (peak 33.8) | 2.46× MoE C1 baseline |
 | MoE within 48 GB hardware ceiling | **791.8 ± 5.2 tok/s at B=128** (peak 47.96) | 4.20× MoE C1 baseline |
 
-Both are KEEP on secondary track. AR.md does say MoE secondary, so this
+Both are KEEP on secondary track. P6_AUTORESEARCH.md does say MoE secondary, so this
 doesn't replace dense 27B primary. But within the MoE workload class
 both numbers are real.
 
@@ -106,7 +106,7 @@ peak memory tracked precisely (33.8 / 47.96 GB).
   MoE baseline. Per-row throughput 6.18 tok/s at B=128 vs 7.25 at B=64
   vs 4.87 at B=96 — non-monotonic curve reflects expert routing
   utilisation crossing a threshold near B=128. Reproductions: 785.8 /
-  794.5 / 795.0 across 3 runs. AR.md MoE secondary-track classification
+  794.5 / 795.0 across 3 runs. P6_AUTORESEARCH.md MoE secondary-track classification
   applies.
 
 ## What this opens

@@ -110,7 +110,7 @@ Substituting the witness measurements into the composed-lever framework:
 | **L0** Current best | B=4 stock kernels at 52% util | 1.00× (baseline) | **42.17** |
 | **L1 (kernel)** Recover witness-2 utilisation at B=4 | Custom MLX kernels (fused gated SDPA, fused gated-delta-update, fused RMSNorm+RoPE) reduce per-step compute, freeing bandwidth | **1.59×** (52% → 82.7%) | **67.12** |
 | **L2 (kernel ceiling)** Approach witness-3 utilisation at B=4 | Pushing kernel work toward MoE-style 92% util | up to **1.77×** (52% → 92%) | up to **74.67** |
-| **L3 (spec on top of L1)** Sustainable α on either KnapSpec or QuantSpec | Per AR.md hardware-limit priority order: spec composes with L1 since L1 raises verify-forward util | **×1.5** (mid-band sustainable) | **~100** |
+| **L3 (spec on top of L1)** Sustainable α on either KnapSpec or QuantSpec | Per P6_AUTORESEARCH.md hardware-limit priority order: spec composes with L1 since L1 raises verify-forward util | **×1.5** (mid-band sustainable) | **~100** |
 
 **The composed envelope is 67-100 tok/s.** The (1b) 60 tok/s milestone is mid-band, not stretch. The hardware ceiling for this checkpoint × this chip × MLX-native runtime sits around 75-100 tok/s; what fraction of that envelope is actually reached is an empirical question the autoresearch loop's job is to answer.
 

@@ -6,7 +6,7 @@
 | Branch | `opus` |
 | Status | **NEW running-best on MoE secondary track**: 464.4 tok/s at B=64 with bf16 DeltaNet state — 2.46× cycle-1 MoE B=4 baseline of 188.5. The cycle-12 bf16 state lever + cycle-13 axis-shift transfer cleanly to the MoE 35B-A3B variant. MoE has same DeltaNet structure (Hk=16, Hv=32, Dk=Dv=128) so shadow_install bf16 path applies via the inherited Qwen3_5MoeAdapter. |
 | User authorization | "let us try next step for improvement" |
-| Companion docs | cycle 12 (bf16 state); cycle 13 (axis-shift); cycle 28 (corrected ceiling); AR.md MoE secondary track |
+| Companion docs | cycle 12 (bf16 state); cycle 13 (axis-shift); cycle 28 (corrected ceiling); P6_AUTORESEARCH.md MoE secondary track |
 
 ## TL;DR
 
@@ -25,7 +25,7 @@ The MoE 35B-A3B SECONDARY-TRACK running-best lifts from 188.5 → 464.4
 tok/s **(+146%)** with the same lever set that produced cycles 13/14
 on dense 27B.
 
-Per AR.md: "Wins on this row are valuable but do not substitute for
+Per P6_AUTORESEARCH.md: "Wins on this row are valuable but do not substitute for
 dense progress; they go on a secondary chart, not the primary running-
 best line." This is a portability validation, not a replacement of the
 dense 27B = 204 / 232 line.
@@ -76,7 +76,7 @@ But the absolute throughput is much higher on MoE: 464.4 vs 232
   464.4 tok/s (peak 33.8 GB, within 36 GB envelope). 2.46× cycle-1
   MoE B=4 baseline of 188.5. Cycles 12+13 levers transfer cleanly to
   the MoE variant via the inherited Qwen3_5MoeAdapter + shared
-  gated_delta module shadow patch. AR.md classifies this as secondary-
+  gated_delta module shadow patch. P6_AUTORESEARCH.md classifies this as secondary-
   track; primary dense 27B running-best (204 envelope / 232 hardware)
   unchanged. Validates lever portability across the Qwen3.5 family.
 

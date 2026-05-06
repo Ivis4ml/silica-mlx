@@ -135,7 +135,7 @@ verify, tree-walk accept. Measure accept rate at b=64. Time: ~6-8 hours.
 
 **Option B — Pull upstream `humanrouter/ddtree-mlx`** (read-only survey
 + adapter): cheaper integration, but needs license / no-torch
-attestation per AR.md. Time: ~2-3 hours survey + ~3-4 hours adapter.
+attestation per P6_AUTORESEARCH.md. Time: ~2-3 hours survey + ~3-4 hours adapter.
 
 **Option C — Pivot to drafter-side improvements**: skip tree-spec
 entirely; train a quantization-aware drafter on the 4-bit target's

@@ -64,7 +64,7 @@ The kernel `silica.kernels.fused_gated_output(x, g)` fuses `x * sigmoid(g)` into
 
 3. **Fused gated-delta-update + conv1d** (DeltaNet path). The 2026-Q2 survey identified this as the largest still-unfused DeltaNet opportunity. mlx-lm ships `gated_delta_update` as a Metal kernel, but conv1d (kernel_dim=4) is a separate dispatch. Fusing conv1d into the recurrence kernel (per ZMLX v0.10.0 prototype) closes the gap on the 48 DeltaNet layers that own 74% of step time. Engineering scope: substantial (interacts with DeltaNet recurrent state semantics; mlx-lm reference kernel needs extension). References: ZMLX deltanet pattern + mlx-lm `gated_delta.py`.
 
-Per the AR.md custom-kernel mandate, these candidates open under autonomous scope at microbench + correctness + shadow-mode level, with explicit user approval required for hot-path replacement. Items 1 and 3 are larger work; item 2 sits between.
+Per the P6_AUTORESEARCH.md custom-kernel mandate, these candidates open under autonomous scope at microbench + correctness + shadow-mode level, with explicit user approval required for hot-path replacement. Items 1 and 3 are larger work; item 2 sits between.
 
 ## Aggregate position vs the 42.17 baseline
 
@@ -76,7 +76,7 @@ This cycle did NOT improve T₄. The kernel work delivered:
 
 Running best on `decode_tok_s` is **unchanged at 42.17 ± 0.21 tok/s**.
 
-The cycle is a **diagnostic** in the AR.md status taxonomy:
+The cycle is a **diagnostic** in the P6_AUTORESEARCH.md status taxonomy:
 - Decisively narrows where to spend the next kernel cycle (74% vs 22% leverage);
 - Establishes that the simple end of fusion (two-op elementwise) is not enough;
 - Leaves a working harness and a working trivial kernel as the foundation for the larger candidates.
