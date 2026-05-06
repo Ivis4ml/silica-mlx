@@ -216,10 +216,10 @@ const App = () => {
       <Nav />
       <Hero tweaks={tweaks} />
       <Comparison />
+      <Performance />
       <Architecture />
       <SchedulerAnim />
       <Highlights />
-      <Performance />
       <Codec />
       <ChatRepl />
       <CodeSnippets />

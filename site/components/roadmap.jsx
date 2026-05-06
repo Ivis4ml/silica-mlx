@@ -9,8 +9,8 @@ const Roadmap = () => {
     { id: "P-4", name: "Unified bench harness — runner · oracles · 15 scenarios · vqbench xcheck", state: "done" },
     { id: "P-4.5", name: "Chunked-prefill minimal + VectorCodec runtime spike", state: "done" },
     { id: "P-5", name: "VQ KV compression — BlockTQ · RaBitQ · ExtRaBitQ · per-head Haar", state: "done" },
-    { id: "P-6", name: "Performance phase — measurement gate · Decision Gate 1 · spec foundation closed v1.7.19 · Tracks A / B / C.4-C.5 / D queued", state: "active" },
-    { id: "P-7", name: "Speculative decoding — DraftTarget foundation closed v1.7.19; ≥1.2× rolls into P-6 Track C.4 / C.5", state: "active" },
+    { id: "P-6", name: "Performance phase — every acceptance gate cleared 3.4-5.5× via the 35-cycle autoresearch (v1.7.23); Track B retired v1.7.21, Track C settled with negatives v1.7.20-22, Track A reframed as small-B dispatch lead; D-022 small-B interactive QoE is the next active line (v1.7.24)", state: "active" },
+    { id: "P-7", name: "Speculative decoding — DraftTarget foundation shipped v1.7.19; ≥1.2× decode-throughput payoff settled with measurement-anchored negative on this stack (cycle 23 verify-cost closure)", state: "done" },
     { id: "P-8", name: "OpenAI-compatible HTTP server + session layer", state: "plan" },
   ];
 
@@ -25,8 +25,8 @@ const Roadmap = () => {
       <div className="container">
         <div className="section-head">
           <div className="section-eyebrow">Roadmap</div>
-          <h2>Seven phases shipped. Two in progress. One on deck.</h2>
-          <p>The engine main loop already carries stub implementations behind frozen interfaces. P-6 (performance phase) and P-7 (speculative decoding) are actively landing — the v1.7.19 spec foundation closure ships <span className="mono">DraftTargetEngine</span> + three rollback paths + spec-metrics into the bench harness; the ≥1.2× decode acceptance bullet rolls into Track C.4 / C.5. Planned phases progressively replace remaining stubs without changing call sites.</p>
+          <h2>Eight phases shipped. One in progress. One on deck.</h2>
+          <p>The engine main loop already carries stub implementations behind frozen interfaces. P-6 (performance phase) closed at v1.7.23 with every acceptance gate cleared 3.4-5.5× over the cycle-1 baseline via the 35-cycle autoresearch loop — see <a href="#performance">Performance</a>. The next active research line is <span className="mono">D-022</span> small-B interactive QoE (v1.7.24). P-7 speculative decoding shipped its foundation at v1.7.19; the production payoff was settled with a measurement-anchored negative on this hardware/model stack. Planned phases progressively replace remaining stubs without changing call sites.</p>
         </div>
 
         <div className="rm-progress">
