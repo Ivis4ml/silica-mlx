@@ -365,20 +365,22 @@ read in-editor while iterating.
   **Pairing + feasibility caveat at the top.** The advertised MTP pair
   is target `mlx-community/gemma-4-31B-it-bf16` (~62.5 GB BF16,
   exceeds M5 Pro 48 GB unified memory) + drafter
-  `mlx-community/gemma-4-31B-it-assistant-bf16` (~939 MB BF16). The
-  cached `mlx-community/gemma-4-31b-4bit` (17 GB) is the non-IT 4-bit
-  variant and is **not the supported MTP target**. Whether D-023 can
-  run on this hardware depends on a supported-pairing verification
-  (does an MTP-supported 4-bit IT target variant exist? does mlx-vlm
-  support mixed precision?) — the load-bearing pre-spike step in §3
-  with four outcomes A/B/C/D.
+  `mlx-community/gemma-4-31B-it-assistant-bf16` (~939 MB BF16), so the
+  spike is not runnable as-advertised on this hardware. Gate (i) is now
+  resolved as outcome A\*: `mlx-community/gemma-4-31b-it-4bit` exists as
+  the 4-bit IT target and pairs with the BF16 assistant drafter for a
+  hardware-feasible but mixed-precision / undocumented spike. The cached
+  `mlx-community/gemma-4-31b-4bit` (17 GB) is the non-IT 4-bit variant
+  and remains **not used**. The precision mismatch is empirical and must
+  be carried into the verdict.
 
   Sections in the spike doc: provenance (D-023 vs C.3 reopen with
   narrowed Qwen3.5 production-target framing), license-verify (待核查
   — official Apache-2.0 vs `mlx-community` conversion-metadata
   `License: gemma`, reuse decision deferred), supported-pairing +
   hardware-feasibility verification (the load-bearing gate; outcomes
-  A/B/C/D), runtime deps (`mlx-vlm` dev-only via `uv add --dev`; pin
+  A/A\*/B/C/D; gate (i) resolved A\* on 2026-05-06), runtime deps
+  (`mlx-vlm` dev-only via `uv add --dev`; pin
   status against the `mlx==0.31.1 / mlx-lm==0.31.2 / mlx-metal==0.31.1`
   toolchain), HF cache check (cached non-IT 4-bit base is not the
   supported target; advertised BF16 pair not cached and exceeds 48 GB

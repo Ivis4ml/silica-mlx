@@ -3,7 +3,7 @@
 | Field        | Value                                                              |
 | ------------ | ------------------------------------------------------------------ |
 | Decision ID  | D-023                                                              |
-| Status       | Opening — pending pairing / hardware-feasibility / runtime / license stop-and-ask gates |
+| Status       | Opening — gate (i) pairing/feasibility verified 2026-05-06 (outcome A\*); pending gate (ii) downloads / gate (iii) `uv add --dev mlx-vlm` / gate (iv) license reconciliation |
 | Created      | 2026-05-06                                                         |
 | Origin       | External evidence: Google's Gemma 4 multi-token-prediction release |
 | Frame        | Track C reopen probe; not D-022 reopen, not C.3 continuation        |
@@ -27,9 +27,13 @@ document exists for intuition only and never enters the verdict.
 **Feasibility caveat at the top.** The advertised MTP pair on the HF /
 mlx-vlm side is target `mlx-community/gemma-4-31B-it-bf16` (~62.5 GB) +
 drafter `mlx-community/gemma-4-31B-it-assistant-bf16` (~939 MB). The
-BF16 target exceeds the M5 Pro 48 GB unified-memory ceiling. Whether
-the spike can run at all on this hardware depends on the supported-pairing
-question in §3 — it is not given.
+BF16 target exceeds the M5 Pro 48 GB unified-memory ceiling, so the
+spike is not runnable as-advertised on this hardware. Gate (i) resolved
+to outcome A\*: use the 4-bit IT target
+`mlx-community/gemma-4-31b-it-4bit` plus the BF16 assistant drafter.
+That pairing is hardware-feasible but mixed-precision / undocumented;
+accept-rate and parity remain empirical, and the verdict must carry the
+precision-mismatch caveat.
 
 ---
 
@@ -148,7 +152,18 @@ The verification is a primary-source read (HF model search, mlx-vlm
 README, drafter card) plus a brief check that any downloads stay in
 range. The outcome is one of:
 
-- **A** — 4-bit IT pair exists → pull both, ~18 GB total, run spike.
+- **A** — 4-bit IT target exists with a precision-matched (4-bit) drafter,
+  the documented pair is genuinely 4-bit on both sides → pull both,
+  ~18 GB total, run spike with no caveat.
+- **A\*** (hybrid mixed precision, no precision-matched drafter exists) —
+  4-bit IT target exists but only bf16 drafter exists, and the bf16
+  drafter is the documented partner of the bf16 IT target → pull the
+  4-bit IT target + bf16 drafter, accept the precision-mismatch as a
+  documented unsupported pairing in the verdict, run spike with the
+  caveat that accept-rate is empirical (drafter was trained against
+  bf16 IT hidden states; loading 4-bit IT instead changes the layer
+  geometry by precision only, not by training data, so accept-rate
+  is plausibly close to the documented baseline but not vendor-warranted).
 - **B** — only BF16 pair exists, mixed-precision unsupported → close
   this M5-Pro external spike with hardware-feasibility negative
   (gate row PAIR-INFEASIBLE below). The broader Gemma 4 MTP question
@@ -162,6 +177,32 @@ range. The outcome is one of:
 - **D** — BF16 pair only and explicit user authorization to use a
   remote box / cloud GPU for the spike → out of scope for "half-day
   external probe on M5 Pro" framing; defer.
+
+### §3.5 Verification result (2026-05-06)
+
+Performed via `https://huggingface.co/api/models?search=gemma-4-31B-it&author=mlx-community`,
+the drafter card at `https://huggingface.co/mlx-community/gemma-4-31B-it-assistant-bf16`,
+and the `mlx-vlm` README at `https://github.com/Blaizzy/mlx-vlm`.
+
+Findings:
+
+- `mlx-community/gemma-4-31b-it-4bit` exists on HF (most-downloaded
+  variant of the family at 56,661 downloads as of the verification
+  date). 4-bit IT target solves the M5 Pro 48 GB ceiling.
+- No precision-matched (4-bit) drafter exists. The only drafter on HF
+  is `mlx-community/gemma-4-31B-it-assistant-bf16` (939 MB bf16). The
+  drafter card recommends `mlx-community/gemma-4-31B-it-bf16` as the
+  documented target (precision-matched bf16 pair).
+- mlx-vlm README does not document mixed-precision pairings. Examples
+  show matching precision only.
+
+Resolution: **outcome A\*** (hybrid mixed precision). User authorized
+2026-05-06: pull `mlx-community/gemma-4-31b-it-4bit` (~17-19 GB est.) +
+`mlx-community/gemma-4-31B-it-assistant-bf16` (~939 MB), run spike with
+the precision-mismatch caveat documented in the verdict. The
+hardware-feasibility hard block (PAIR-INFEASIBLE) is therefore not
+fired; the spike proceeds to gate (ii) download authorization, gate
+(iii) `uv add --dev mlx-vlm`, and gate (iv) license reconciliation.
 
 ---
 
@@ -211,11 +252,11 @@ as of 2026-05-06:
 
 | Repo                                                     | Cached? | Local size | Role for D-023                                            |
 | -------------------------------------------------------- | ------- | ---------- | --------------------------------------------------------- |
-| `mlx-community/gemma-4-31b-4bit` (non-IT)                | ✅      | 17 GB      | **Not the supported MTP target**; usable only under §3.4 outcome C |
+| `mlx-community/gemma-4-31b-4bit` (non-IT)                | ✅      | 17 GB      | **Not the supported MTP target**; not used under outcome A\* |
 | `mlx-community/gemma-4-26b-a4b-4bit` (MoE non-IT)        | ✅      | 15 GB      | Out of scope for D-023 (MTP drafter is dense-paired)       |
-| `mlx-community/gemma-4-31B-it-bf16` (advertised target)  | ❌      | (~62.5 GB) | Cannot fit on 48 GB unified memory; outcome B blocks        |
-| `mlx-community/gemma-4-31B-it-assistant-bf16` (drafter)  | ❌      | (~939 MB)  | Always required for spike; download authorized only after §3 verification |
-| `mlx-community/gemma-4-31B-it-4bit` (hypothesised)       | ❌      | (~17-19 GB est.) | If exists, the supported-pairing answer is outcome A |
+| `mlx-community/gemma-4-31b-it-4bit` (4-bit IT target)    | ❌      | (~17-19 GB est.) | **Outcome A\* target.** Authorized for download 2026-05-06; pending gate (ii) |
+| `mlx-community/gemma-4-31B-it-bf16` (advertised target)  | ❌      | (~62.5 GB) | Cannot fit on 48 GB unified memory; not used under outcome A\* |
+| `mlx-community/gemma-4-31B-it-assistant-bf16` (drafter)  | ❌      | (~939 MB)  | **Outcome A\* drafter** (only drafter HF publishes for this family); authorized 2026-05-06; pending gate (ii) |
 
 The non-IT 4-bit target snapshot has 4 safetensors shards plus
 tokenizer + `processor_config.json` (multimodal-capable processor; the
@@ -227,7 +268,7 @@ spike before any download fires.
 
 ## §6 Measurement plan
 
-Applies only when §3 resolves to outcome A or outcome C.
+Applies only when §3 resolves to outcome A, outcome A\*, or outcome C.
 
 All measurements run through `mlx_vlm` external runtime; no `silica.*`
 imports.
@@ -463,9 +504,10 @@ Toolchain
   mx.metal device : <device name + memory>
 
 Pairing
-  outcome (§3.4)        : <A | B | C | D>
+  outcome (§3.4)        : <A | A* | B | C | D>     (A* hybrid mixed precision per §3.5)
   target  : <repo>      (snapshot <hash>)
   drafter : <repo>      (snapshot <hash>)
+  precision mismatch?   : <NO | YES — record caveat in disposition>
   license reuse decision : <PENDING | RECONCILED-APACHE-2 | RESTRICTED-NO-REUSE>
 
 Greedy parity (temperature=0)
