@@ -1,46 +1,265 @@
 // Performance — visual showcase of the P-6 autoresearch results.
 //
-// Visual-first composition: a tabbed chart panel as the centrepiece
-// (Karpathy-style ledger plots), a row of click-to-expand cycle-
-// highlight cards beneath the chart, a compact acceptance-gates
-// row, and a small gallery of secondary charts. Long-form text
-// (load-bearing levers, honest closures, methodology) lives behind
-// click-to-expand details rather than as a wall of paragraphs.
+// The Karpathy-style ledger plots are redrawn as native SVG so they
+// pick up the site's CSS variables (accent, ink, bg, fonts) and
+// adapt to the active theme. Dots are coloured by status (keep /
+// diagnostic / discard / retracted). The running-best ladder steps
+// through every measurement that improved on the previous best,
+// honest-attribution-style: the cycle-14 retracted KEEPs appear as
+// dashed open circles and do *not* contribute to the running-best;
+// the line resumes at cycle 28's reverify.
 
-const PerfChartTabs = [
-  {
-    id: "dense",
-    label: "Dense 27B",
-    sub: "Karpathy ledger · 38 experiments · 9 kept",
-    img: "uploads/p6-decode-dense.png",
-    caption: "Running-best line: 42.17 tok/s @ B=4 (cycle 1) → 232 tok/s @ B=64 (cycle 28). Each dot is a measurement; the ladder is the running-best.",
-    head: "Dense Qwen3.5-27B-4bit · running best 232.2 tok/s",
-  },
-  {
-    id: "moe",
-    label: "MoE 35B-A3B",
-    sub: "Karpathy ledger · 11 experiments · 2 kept",
-    img: "uploads/p6-decode-moe.png",
-    caption: "Running-best line: 188.5 tok/s @ B=4 (cycle 1) → 791.8 tok/s @ B=128 (cycle 35). The 791.8 measurement is the largest absolute throughput observed across the full 35-cycle effort.",
-    head: "MoE Qwen3.5-35B-A3B-4bit · running best 791.8 tok/s",
-  },
-  {
-    id: "cycles",
-    label: "Cycle deliverables",
-    sub: "35 cycles · per-cycle outcomes",
-    img: "uploads/p6-cycles.png",
-    caption: "What each cycle produced: kept (running-best moved), discard (no improvement vs prior best), or correction (cycle 27 retraction).",
-    head: "Cycle ledger · 35 cycles, 5 lasting load-bearing changes",
-  },
-  {
-    id: "summary",
-    label: "Summary",
-    sub: "Multi-panel summary chart",
-    img: "uploads/p6-summary.png",
-    caption: "Multi-panel summary covering both tracks, kernel ablations, and the cycle-27 corrected attribution.",
-    head: "Multi-panel summary",
-  },
+const PerfDensePoints = [
+  // [seq, tok_s, status, cycle?, label?]
+  // status: 'keep' | 'diag' | 'discard' | 'retracted'
+  [1, 42.17, "keep", "C1", "baseline 42.17"],
+  [2, 6.54, "discard"],
+  [3, 7.74, "discard"],
+  [4, 17.10, "discard"],
+  [5, 39.99, "diag"],
+  [6, 41.00, "discard"],
+  [7, 42.39, "discard"],
+  [8, 42.53, "discard"],
+  [9, 42.68, "diag"],
+  [10, 43.0, "diag"],
+  [11, 63.1, "keep"],
+  [12, 81.1, "diag"],
+  [13, 112.8, "diag"],
+  [14, 150.6, "keep"],
+  [15, 171.6, "keep"],
+  [16, 183.3, "keep"],
+  [17, 193.9, "keep", "C10", "axis-shift @ B=48"],
+  [18, 193.3, "diag"],
+  [19, 192.5, "diag"],
+  [20, 200.8, "keep", "C13", "envelope @ B=52"],
+  [21, 212.2, "diag"],
+  [22, 219.1, "diag"],
+  [23, 229.8, "keep"],
+  [24, 166.8, "discard"],
+  [25, 169.1, "discard"],
+  [26, 173.2, "discard"],
+  [27, 206.2, "retracted"],
+  [28, 232.2, "retracted"],
+  [29, 197.05, "diag"],
+  [30, 200.14, "diag"],
+  [31, 185.30, "diag"],
+  [32, 231.9, "keep", "C28", "ceiling @ B=64"],
+  [33, 204.0, "keep"],
 ];
+
+const PerfMoePoints = [
+  [1, 188.5, "keep", "C1", "baseline 188.5"],
+  [2, 181.4, "diag"],
+  [3, 242.0, "diag"],
+  [4, 306.3, "diag"],
+  [5, 384.8, "diag"],
+  [6, 434.3, "diag"],
+  [7, 464.4, "keep", "C34", "envelope @ B=64"],
+  [8, 447.9, "discard"],
+  [9, 444.5, "discard"],
+  [10, 467.1, "diag"],
+  [11, 791.8, "keep", "C35", "ceiling @ B=128"],
+];
+
+const PerfTracks = {
+  dense: {
+    label: "Dense Qwen3.5-27B-4bit",
+    sub: "38 measurements · 9 KEEPs · running best 232 tok/s",
+    points: PerfDensePoints,
+    yMax: 260,
+    yTicks: [0, 50, 100, 150, 200, 250],
+    baseline: 42.17,
+    baselineLabel: "cycle-1 baseline 42.17",
+    caption: "Each dot is a measurement; the ladder line is the running best honest-attributed (cycles 27/28 retraction respected). The two dashed circles at the top right are cycle 14's retracted KEEPs — published as part of the research record.",
+  },
+  moe: {
+    label: "MoE Qwen3.5-35B-A3B-4bit",
+    sub: "11 measurements · 2 KEEPs · running best 791.8 tok/s",
+    points: PerfMoePoints,
+    yMax: 850,
+    yTicks: [0, 200, 400, 600, 800],
+    baseline: 188.5,
+    baselineLabel: "cycle-1 baseline 188.5",
+    caption: "Same C10×C12 lever stack ported via the shared gated_delta shadow patch (cycles 34-35). Per-row throughput is non-monotonic; the cycle-35 hardware ceiling at B=128 is the largest absolute throughput observed across the full effort.",
+  },
+};
+
+const PerfLedger = ({ trackKey }) => {
+  const t = PerfTracks[trackKey];
+  const data = t.points;
+  const W = 1100;
+  const H = 360;
+  const padL = 64;
+  const padR = 36;
+  const padT = 30;
+  const padB = 44;
+  const innerW = W - padL - padR;
+  const innerH = H - padT - padB;
+  const xAt = i => padL + (i / Math.max(1, data.length - 1)) * innerW;
+  const yAt = v => padT + (1 - v / t.yMax) * innerH;
+
+  // Honest running-best: skip retracted points, treat all measurements
+  // (keep + diag + discard) as candidates for "best so far".
+  let best = 0;
+  const bestSeries = data.map(p => {
+    const status = p[2];
+    const tok = p[1];
+    if (status !== "retracted" && tok > best) best = tok;
+    return best;
+  });
+
+  // Build a step-style polyline that hugs the dot positions and
+  // steps up at each new best.
+  const stepPoints = [];
+  bestSeries.forEach((b, i) => {
+    if (i === 0) {
+      stepPoints.push([xAt(i), yAt(b)]);
+    } else {
+      stepPoints.push([xAt(i), yAt(bestSeries[i - 1])]);
+      stepPoints.push([xAt(i), yAt(b)]);
+    }
+  });
+
+  return (
+    <svg
+      viewBox={`0 0 ${W} ${H}`}
+      preserveAspectRatio="xMidYMid meet"
+      className="perf-svg"
+      role="img"
+      aria-label={`${t.label} — Karpathy-style autoresearch ledger`}
+    >
+      {/* gridlines */}
+      {t.yTicks.map(g => (
+        <g key={`grid-${g}`}>
+          <line
+            x1={padL}
+            x2={W - padR}
+            y1={yAt(g)}
+            y2={yAt(g)}
+            className="perf-svg-grid"
+          />
+          <text
+            x={padL - 14}
+            y={yAt(g) + 4}
+            className="perf-svg-tick mono"
+            textAnchor="end"
+          >
+            {g}
+          </text>
+        </g>
+      ))}
+
+      {/* axis labels */}
+      <text
+        x={padL - 14}
+        y={padT - 12}
+        className="perf-svg-axis-title mono"
+        textAnchor="end"
+      >
+        tok/s
+      </text>
+      <text
+        x={W / 2}
+        y={H - 10}
+        className="perf-svg-axis-title mono"
+        textAnchor="middle"
+      >
+        experiment index · cycles 1 → 35
+      </text>
+
+      {/* baseline reference line */}
+      <line
+        x1={padL}
+        x2={W - padR}
+        y1={yAt(t.baseline)}
+        y2={yAt(t.baseline)}
+        className="perf-svg-baseline"
+      />
+      <text
+        x={W - padR - 6}
+        y={yAt(t.baseline) - 6}
+        className="perf-svg-baseline-label mono"
+        textAnchor="end"
+      >
+        {t.baselineLabel}
+      </text>
+
+      {/* running-best step polyline */}
+      <polyline
+        points={stepPoints.map(p => `${p[0].toFixed(2)},${p[1].toFixed(2)}`).join(" ")}
+        className="perf-svg-best"
+      />
+
+      {/* dots */}
+      {data.map((p, i) => {
+        const [seq, tok, status, cycle, label] = p;
+        const cx = xAt(i);
+        const cy = yAt(tok);
+        const isKeep = status === "keep";
+        const isRetracted = status === "retracted";
+        return (
+          <g key={`d-${i}`}>
+            {isRetracted ? (
+              <circle
+                cx={cx}
+                cy={cy}
+                r={6}
+                className="perf-svg-dot perf-svg-dot-retracted"
+              />
+            ) : (
+              <circle
+                cx={cx}
+                cy={cy}
+                r={isKeep ? 5.5 : 3.4}
+                className={`perf-svg-dot perf-svg-dot-${status}`}
+              />
+            )}
+            <title>{`#${seq}${cycle ? " " + cycle : ""}: ${tok} tok/s (${status})`}</title>
+          </g>
+        );
+      })}
+
+      {/* milestone annotations */}
+      {data.map((p, i) => {
+        const [_, tok, status, cycle, label] = p;
+        if (!cycle || !label) return null;
+        const cx = xAt(i);
+        const cy = yAt(tok);
+        // place label above for low values, below for high values
+        const above = cy > padT + innerH * 0.4;
+        const yLine1 = above ? cy - 30 : cy + 22;
+        const yLine2 = above ? cy - 16 : cy + 34;
+        return (
+          <g key={`anno-${i}`}>
+            <line
+              x1={cx}
+              x2={cx}
+              y1={cy}
+              y2={above ? cy - 12 : cy + 12}
+              className="perf-svg-anno-tick"
+            />
+            <text
+              x={cx}
+              y={yLine1}
+              textAnchor="middle"
+              className="perf-svg-anno-cycle mono"
+            >
+              {cycle}
+            </text>
+            <text
+              x={cx}
+              y={yLine2}
+              textAnchor="middle"
+              className="perf-svg-anno-label mono"
+            >
+              {label}
+            </text>
+          </g>
+        );
+      })}
+    </svg>
+  );
+};
 
 const PerfCycleHighlights = [
   {
@@ -49,7 +268,7 @@ const PerfCycleHighlights = [
     headline: "Baseline",
     tok: "42.17 tok/s",
     blurb: "Dense 27B B=4 warm decode at 52% bandwidth utilisation. Per-step decomposition: DeltaNet 74% / full-attn 22% / overhead 4%.",
-    detail: "Cycle 1 anchored P-6.0.5's measurement frame and proved 42.17 tok/s was not the chip ceiling. This baseline is the denominator for every later uplift number; preserving it as a 4.60-5.50× anchor takes work because run-to-run variance has to stay under control through every later cycle.",
+    detail: "Cycle 1 anchored P-6.0.5's measurement frame and proved 42.17 tok/s was not the chip ceiling. This baseline is the denominator for every later uplift number.",
   },
   {
     n: 2,
@@ -57,7 +276,7 @@ const PerfCycleHighlights = [
     headline: "Axis-shift breakthrough",
     tok: "+4.60× alone",
     blurb: "Re-reading the AR.md metric definition (\"B is chosen to maximise aggregate\") moved the operating point B=4 → B=48. Pure parameter selection; no kernel change.",
-    detail: "Nine cycles of QMM kernel work at fixed B=4 produced zero KEEPs. Cycle 10 did not write any new code — it moved the operating point along the axis the metric definition pointed at. This is the single biggest leverage event in the loop, and it's why kernel work alone is the wrong frame for the M5 Pro envelope.",
+    detail: "Nine cycles of QMM kernel work at fixed B=4 produced zero KEEPs. Cycle 10 did not write any new code — it moved the operating point along the axis the metric definition pointed at. The single biggest leverage event in the loop.",
   },
   {
     n: 3,
@@ -65,7 +284,7 @@ const PerfCycleHighlights = [
     headline: "Composition KEEP",
     tok: "204 tok/s @ B=52",
     blurb: "Cycle-12's bf16 DeltaNet state save (3.5 GB peak) composed with cycle-10's B-axis lever. Within the 36 GB envelope; 18σ above C10.",
-    detail: "C12 alone was 0% E2E at fixed B=48 — it produced peak-memory headroom but no direct speedup. C10 alone was capped at B=48 by the fp32 state's memory footprint. Composing the two pushed B from 48 to 52 within the envelope and 64 at the hardware ceiling. The 193 tok/s wall observed earlier was a B=48 cap, not a hardware wall.",
+    detail: "C12 alone was 0% E2E at fixed B=48 — peak-memory headroom but no direct speedup. C10 alone was capped at B=48 by fp32 state's memory footprint. Composition pushed B from 48 → 52 within envelope and 64 at hardware ceiling.",
   },
   {
     n: 4,
@@ -73,7 +292,7 @@ const PerfCycleHighlights = [
     headline: "Codex retraction",
     tok: "−5.4 tok/s revised away",
     blurb: "Codex cross-review on opus-codex caught a 14-cycle dtype defect: shadow_install checked for fp16 but the production path is bf16. v10's claimed C14 KEEP was attribution error.",
-    detail: "After the bf16-native v10 fix and 8-rep reverify, v10's E2E contribution measured +0.5 tok/s @ B=52 / -1.7 tok/s @ B=64 — both within noise. The honest running-best is C10+C12 composition alone. Publishing the retracted KEEP (rather than quietly editing it out) is part of the research record; the take-home note for cross-reviews is to check small-n σ against between-session variance.",
+    detail: "After the bf16-native v10 fix and 8-rep reverify, v10's E2E contribution measured +0.5 tok/s @ B=52 / -1.7 tok/s @ B=64 — both within noise. The honest running-best is C10+C12 alone. Publishing the retracted KEEP rather than quietly editing it out is part of the research record.",
   },
   {
     n: 5,
@@ -81,7 +300,7 @@ const PerfCycleHighlights = [
     headline: "Hardware ceiling",
     tok: "231.9 ± 0.3 tok/s",
     blurb: "Re-measured at B=64 with the corrected v10 path. v10 contribution within noise; bf16-only is the load-bearing piece.",
-    detail: "At B=66 throughput drops 26% (40 GB peak boundary). Cycle 29 confirmed three allocator-hint probes (mx.metal.set_cache_limit / set_memory_limit / set_wired_limit) leave the cliff in place — architectural, not allocator policy. Dense 27B B-axis extension is closed at this ceiling.",
+    detail: "At B=66 throughput drops 26% (40 GB peak boundary). Cycle 29 confirmed three allocator-hint probes leave the cliff in place — architectural, not allocator policy. Dense 27B B-axis extension is closed at this ceiling.",
   },
   {
     n: 6,
@@ -89,7 +308,7 @@ const PerfCycleHighlights = [
     headline: "MoE ceiling",
     tok: "791.8 ± 5.2 tok/s @ B=128",
     blurb: "MoE 35B-A3B at the 48 GB hardware ceiling. Same C10×C12 lever stack, transferred via the shared gated_delta shadow patch.",
-    detail: "MoE does not have the dense 27B's 40 GB cliff because expert sparsity (8 of 256 experts active per token) bypasses dense activation pressure. Per-row throughput is non-monotonic — amortisation crosses the threshold near B=128 where each expert sees ~4 activations per step vs 2 at B=64.",
+    detail: "MoE does not have the dense 27B's 40 GB cliff because expert sparsity (8 of 256 experts active per token) bypasses dense activation pressure. Per-row throughput non-monotonic — amortisation crosses the threshold near B=128.",
   },
 ];
 
@@ -114,7 +333,7 @@ const PerfDetails = [
           <li><strong>Cycle 13 — composition.</strong> Cycle-12's peak save composed with cycle-10's B-axis lever produces the running-best line. The two levers are independent; together they dominate every later atomic probe.</li>
         </ul>
         <p className="perf-callout">
-          <strong>17 custom Metal kernel attempts closed without a load-bearing E2E win.</strong> Cycle-30 explained why: at B=64 with the v10+bf16 stack, DeltaNet owns 88% of step time, full-attn 12.5%, dispatch 0.3% — and mlx's existing <span className="mono">gated_delta</span> kernel is already at HBM-bandwidth limit (cycle-31 silica <span className="mono">gated_delta_v2</span> = 1.001× vs mlx). Source-string Metal kernels in mlx 0.31.x do not pay back on dense 27B.
+          <strong>17 custom Metal kernel attempts closed without a load-bearing E2E win.</strong> Cycle 30 explained why: at B=64 with the v10+bf16 stack, DeltaNet owns 88% of step time, full-attn 12.5%, dispatch 0.3% — and mlx's existing <span className="mono">gated_delta</span> kernel is already at HBM-bandwidth limit (cycle-31 silica <span className="mono">gated_delta_v2</span> = 1.001× vs mlx). Source-string Metal kernels in mlx 0.31.x do not pay back on dense 27B.
         </p>
       </>
     ),
@@ -128,7 +347,7 @@ const PerfDetails = [
         <ul>
           <li><strong>Spec-decode at production B — closed with measurement-anchored negative.</strong> Cycle 23 measured the B × k verify-cost matrix: B=52 k=64 = 8105 ms vs same-B plain decode ~252 ms / step. Tree-spec recomputes to ~10 tok/s aggregate, a 20× regression vs plain. Track C settles: C.4 retired (η.1 = 0.482×), C.5 retired (cycle-23 closure), C.1/C.2/C.3/C.6 deprioritised.</li>
           <li><strong>Dense B-axis past 64 — closed at the architectural cliff.</strong> Cycles 28-29 measured a 26% drop at B=64 → B=66 (40 GB peak boundary). Three allocator-hint probes leave the cliff in place — architectural, not allocator policy.</li>
-          <li><strong>Cycle 14's claimed v10 KEEP — retracted via codex review.</strong> A 14-cycle dtype-defect in <span className="mono">shadow_install</span> silently skipped the bf16 production path. After the fix, cycles 27/28 measured v10's E2E at +0.5 tok/s @ B=52 / −1.7 tok/s @ B=64 — both within noise. The retraction is published as part of the research record.</li>
+          <li><strong>Cycle 14's claimed v10 KEEP — retracted via codex review.</strong> A 14-cycle dtype-defect in <span className="mono">shadow_install</span> silently skipped the bf16 production path. After the fix, cycles 27/28 measured v10's E2E at +0.5 tok/s @ B=52 / −1.7 tok/s @ B=64 — both within noise. The retraction is published as part of the research record (the two dashed circles in the chart).</li>
         </ul>
       </>
     ),
@@ -150,19 +369,36 @@ const PerfDetails = [
   },
 ];
 
-const PerfGallery = [
-  { src: "uploads/p6-fa-kernel.png", title: "FA-decode kernel ablation", note: "Cycle 11 · v10 vs mlx SDPA across T_kv ∈ {128, 256, 512, 1024}." },
-  { src: "uploads/p6-fa-bf16.png", title: "FA bf16 microbench", note: "Cycle 26 · post-codex bf16-native v10 microbench at T=512." },
-  { src: "uploads/p6-qmm-kernel.png", title: "QMM kernel tuning", note: "Cycles 7-9 · 13 silica QMM versions vs mlx qmv_quad. mlx wins at the bandwidth limit." },
-];
+const PerfLegend = () => (
+  <div className="perf-legend mono">
+    <span className="perf-legend-item">
+      <span className="perf-legend-dot perf-svg-dot-keep"></span>
+      KEEP
+    </span>
+    <span className="perf-legend-item">
+      <span className="perf-legend-dot perf-svg-dot-diag"></span>
+      diagnostic
+    </span>
+    <span className="perf-legend-item">
+      <span className="perf-legend-dot perf-svg-dot-discard"></span>
+      discard
+    </span>
+    <span className="perf-legend-item">
+      <span className="perf-legend-dot perf-svg-dot-retracted"></span>
+      retracted (cycle 27)
+    </span>
+    <span className="perf-legend-item">
+      <span className="perf-legend-line"></span>
+      running best
+    </span>
+  </div>
+);
 
 const Performance = () => {
   const [activeTab, setActiveTab] = React.useState("dense");
   const [expandedCycle, setExpandedCycle] = React.useState(null);
   const [openDetail, setOpenDetail] = React.useState(null);
-  const [galleryOpen, setGalleryOpen] = React.useState(null);
-
-  const tab = PerfChartTabs.find(t => t.id === activeTab) || PerfChartTabs[0];
+  const t = PerfTracks[activeTab];
 
   return (
     <section className="block" id="performance">
@@ -171,31 +407,31 @@ const Performance = () => {
           <div className="section-eyebrow">P-6 autoresearch · v1.7.23</div>
           <h2>35 cycles. Two levers. Every gate cleared 3.4-5.5×.</h2>
           <p>
-            The opus autoresearch loop pushed Qwen3.5-27B-4bit warm decode 5.50× over the cycle-1 baseline on M5 Pro 48 GB, and Qwen3.5-35B-A3B-4bit MoE to 791.8 tok/s at the 48 GB hardware ceiling. The chart below is the Karpathy-style ledger that drove every decision — each dot a measurement, the ladder line the running best.
+            The opus autoresearch loop pushed Qwen3.5-27B-4bit warm decode 5.50× over the cycle-1 baseline on M5 Pro 48 GB, and Qwen3.5-35B-A3B-4bit MoE to 791.8 tok/s at the 48 GB hardware ceiling. Below is the Karpathy-style ledger that drove every decision — each dot a measurement, the ladder line the running best, the dashed circles cycle 14's retracted KEEPs.
           </p>
         </div>
 
         {/* Hero chart panel */}
         <div className="perf-chart-panel">
           <div className="perf-tabs" role="tablist">
-            {PerfChartTabs.map(t => (
+            {Object.entries(PerfTracks).map(([key, track]) => (
               <button
-                key={t.id}
+                key={key}
                 type="button"
                 role="tab"
-                aria-selected={activeTab === t.id}
-                className={"perf-tab" + (activeTab === t.id ? " perf-tab-active" : "")}
-                onClick={() => setActiveTab(t.id)}
+                aria-selected={activeTab === key}
+                className={"perf-tab" + (activeTab === key ? " perf-tab-active" : "")}
+                onClick={() => setActiveTab(key)}
               >
-                <span className="perf-tab-label">{t.label}</span>
-                <span className="perf-tab-sub mono">{t.sub}</span>
+                <span className="perf-tab-label">{track.label}</span>
+                <span className="perf-tab-sub mono">{track.sub}</span>
               </button>
             ))}
           </div>
           <div className="perf-chart-frame">
-            <div className="perf-chart-head mono">{tab.head}</div>
-            <img src={tab.img} alt={tab.head} className="perf-chart-img" />
-            <div className="perf-chart-cap">{tab.caption}</div>
+            <PerfLedger trackKey={activeTab} />
+            <PerfLegend />
+            <div className="perf-chart-cap">{t.caption}</div>
           </div>
         </div>
 
@@ -271,47 +507,6 @@ const Performance = () => {
           </div>
         </div>
 
-        {/* Secondary chart gallery */}
-        <div className="perf-section">
-          <div className="perf-subhead">Secondary charts · click to enlarge</div>
-          <div className="perf-gallery">
-            {PerfGallery.map((g, i) => (
-              <button
-                key={i}
-                type="button"
-                className="perf-thumb"
-                onClick={() => setGalleryOpen(galleryOpen === i ? null : i)}
-                aria-expanded={galleryOpen === i}
-              >
-                <img src={g.src} alt={g.title} className="perf-thumb-img" />
-                <div className="perf-thumb-meta">
-                  <div className="perf-thumb-title">{g.title}</div>
-                  <div className="perf-thumb-note">{g.note}</div>
-                </div>
-              </button>
-            ))}
-          </div>
-          {galleryOpen !== null && (
-            <div className="perf-gallery-modal" onClick={() => setGalleryOpen(null)}>
-              <div className="perf-gallery-modal-inner" onClick={(e) => e.stopPropagation()}>
-                <button
-                  type="button"
-                  className="perf-gallery-close"
-                  onClick={() => setGalleryOpen(null)}
-                  aria-label="close"
-                >
-                  ×
-                </button>
-                <img src={PerfGallery[galleryOpen].src} alt={PerfGallery[galleryOpen].title} className="perf-gallery-modal-img" />
-                <div className="perf-gallery-modal-meta">
-                  <div className="perf-gallery-modal-title">{PerfGallery[galleryOpen].title}</div>
-                  <div className="perf-gallery-modal-note">{PerfGallery[galleryOpen].note}</div>
-                </div>
-              </div>
-            </div>
-          )}
-        </div>
-
         <div className="perf-foot">
           <div className="perf-foot-cta">
             <a className="btn btn-ghost" href="https://github.com/Ivis4ml/silica-mlx/blob/sonnet/plans/P6_AUTORESEARCH_NOTES.md" target="_blank" rel="noreferrer">Take-home notes</a>
@@ -325,9 +520,7 @@ const Performance = () => {
 
       <style>{`
         /* Tabs */
-        .perf-chart-panel {
-          margin-bottom: 56px;
-        }
+        .perf-chart-panel { margin-bottom: 56px; }
         .perf-tabs {
           display: flex;
           gap: 1px;
@@ -337,71 +530,150 @@ const Performance = () => {
           border-radius: var(--radius) var(--radius) 0 0;
           overflow: hidden;
         }
-        @media (max-width: 720px) {
-          .perf-tabs { flex-wrap: wrap; }
-        }
+        @media (max-width: 720px) { .perf-tabs { flex-direction: column; } }
         .perf-tab {
           flex: 1;
           background: var(--bg-elev);
           border: none;
-          padding: 14px 18px;
+          padding: 16px 20px;
           text-align: left;
           cursor: pointer;
           display: flex;
           flex-direction: column;
-          gap: 3px;
+          gap: 4px;
           color: var(--ink-3);
           transition: color 120ms, background 120ms;
-          min-width: 160px;
+          min-width: 200px;
         }
-        .perf-tab:hover {
-          background: var(--bg-sunken);
-          color: var(--ink);
-        }
+        .perf-tab:hover { background: var(--bg-sunken); color: var(--ink); }
         .perf-tab-active {
           background: var(--bg-elev);
           color: var(--ink);
           box-shadow: inset 0 -2px 0 var(--accent);
         }
-        .perf-tab-label {
-          font-size: 14px;
-          font-weight: 600;
-        }
-        .perf-tab-sub {
-          font-size: 11px;
-          color: var(--ink-3);
-        }
+        .perf-tab-label { font-size: 14px; font-weight: 600; }
+        .perf-tab-sub { font-size: 11px; color: var(--ink-3); }
         .perf-tab-active .perf-tab-sub { color: var(--ink-2); }
 
         .perf-chart-frame {
           background: var(--bg-elev);
           border: 1px solid var(--rule);
           border-radius: 0 0 var(--radius) var(--radius);
-          padding: 0;
-          overflow: hidden;
+          padding: 24px 24px 0;
         }
-        .perf-chart-head {
-          font-size: 12px;
-          color: var(--accent);
-          padding: 14px 20px 0;
-          letter-spacing: 0.04em;
-          text-transform: uppercase;
-          font-weight: 600;
-        }
-        .perf-chart-img {
-          display: block;
+
+        /* SVG ledger */
+        .perf-svg {
           width: 100%;
           height: auto;
-          padding: 12px 20px 4px;
+          display: block;
+          font-family: var(--font-sans);
+          overflow: visible;
         }
+        .perf-svg-grid {
+          stroke: var(--rule-2);
+          stroke-width: 1;
+        }
+        .perf-svg-tick {
+          fill: var(--ink-3);
+          font-size: 11px;
+        }
+        .perf-svg-axis-title {
+          fill: var(--ink-3);
+          font-size: 11px;
+          letter-spacing: 0.04em;
+          text-transform: uppercase;
+        }
+        .perf-svg-baseline {
+          stroke: var(--ink-4);
+          stroke-width: 1;
+          stroke-dasharray: 4 5;
+          opacity: 0.5;
+        }
+        .perf-svg-baseline-label {
+          fill: var(--ink-3);
+          font-size: 10px;
+        }
+        .perf-svg-best {
+          fill: none;
+          stroke: var(--accent);
+          stroke-width: 2.4;
+          stroke-linejoin: round;
+          stroke-linecap: round;
+        }
+        .perf-svg-dot {
+          transition: r 120ms;
+          cursor: pointer;
+        }
+        .perf-svg-dot-keep { fill: var(--accent); }
+        .perf-svg-dot-diag { fill: var(--ink-3); opacity: 0.55; }
+        .perf-svg-dot-discard { fill: var(--ink-4); opacity: 0.35; }
+        .perf-svg-dot-retracted {
+          fill: var(--bg-elev);
+          stroke: var(--ink-3);
+          stroke-width: 1.6;
+          stroke-dasharray: 2.5 2;
+        }
+        .perf-svg-anno-tick {
+          stroke: var(--accent);
+          stroke-width: 1;
+          opacity: 0.55;
+        }
+        .perf-svg-anno-cycle {
+          fill: var(--accent);
+          font-size: 11px;
+          font-weight: 700;
+          letter-spacing: 0.02em;
+        }
+        .perf-svg-anno-label {
+          fill: var(--ink-2);
+          font-size: 10px;
+          letter-spacing: 0.01em;
+        }
+
+        /* Legend */
+        .perf-legend {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 18px;
+          padding: 14px 0 12px;
+          font-size: 11px;
+          color: var(--ink-3);
+          border-top: 1px solid var(--rule-2);
+          margin-top: 8px;
+        }
+        .perf-legend-item {
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+        }
+        .perf-legend-dot {
+          width: 10px;
+          height: 10px;
+          border-radius: 50%;
+          display: inline-block;
+        }
+        .perf-legend-dot.perf-svg-dot-keep { background: var(--accent); }
+        .perf-legend-dot.perf-svg-dot-diag { background: var(--ink-3); opacity: 0.55; }
+        .perf-legend-dot.perf-svg-dot-discard { background: var(--ink-4); opacity: 0.6; }
+        .perf-legend-dot.perf-svg-dot-retracted {
+          background: var(--bg-elev);
+          border: 1.6px dashed var(--ink-3);
+        }
+        .perf-legend-line {
+          width: 18px;
+          height: 2px;
+          background: var(--accent);
+          border-radius: 2px;
+        }
+
         .perf-chart-cap {
           font-size: 13px;
           color: var(--ink-2);
-          line-height: 1.55;
-          padding: 4px 24px 22px;
+          line-height: 1.6;
+          padding: 14px 0 22px;
           border-top: 1px solid var(--rule-2);
-          margin-top: 8px;
-          padding-top: 16px;
+          margin-top: 0;
         }
 
         /* Sections */
@@ -531,9 +803,7 @@ const Performance = () => {
           overflow: hidden;
           border: 1px solid var(--rule);
         }
-        .perf-detail {
-          background: var(--bg-elev);
-        }
+        .perf-detail { background: var(--bg-elev); }
         .perf-detail-head {
           all: unset;
           width: 100%;
@@ -588,108 +858,6 @@ const Performance = () => {
           .perf-detail-head { grid-template-columns: 100px 1fr 20px; }
         }
 
-        /* Gallery */
-        .perf-gallery {
-          display: grid;
-          grid-template-columns: repeat(3, 1fr);
-          gap: 12px;
-        }
-        @media (max-width: 720px) { .perf-gallery { grid-template-columns: 1fr; } }
-        .perf-thumb {
-          all: unset;
-          background: var(--bg-elev);
-          border: 1px solid var(--rule);
-          border-radius: var(--radius-sm);
-          padding: 10px;
-          cursor: pointer;
-          transition: border-color 120ms, transform 120ms;
-          display: flex;
-          flex-direction: column;
-          gap: 8px;
-        }
-        .perf-thumb:hover {
-          border-color: var(--accent);
-          transform: translateY(-1px);
-        }
-        .perf-thumb-img {
-          display: block;
-          width: 100%;
-          height: 140px;
-          object-fit: contain;
-          background: var(--bg-sunken);
-          border-radius: var(--radius-sm);
-        }
-        .perf-thumb-meta { padding: 4px 4px 8px; }
-        .perf-thumb-title {
-          font-size: 13px;
-          font-weight: 600;
-          color: var(--ink);
-          margin-bottom: 4px;
-        }
-        .perf-thumb-note {
-          font-size: 12px;
-          color: var(--ink-3);
-          line-height: 1.45;
-        }
-
-        .perf-gallery-modal {
-          position: fixed;
-          inset: 0;
-          background: rgba(0, 0, 0, 0.72);
-          z-index: 200;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          padding: 24px;
-          cursor: zoom-out;
-        }
-        .perf-gallery-modal-inner {
-          background: var(--bg-elev);
-          border: 1px solid var(--rule);
-          border-radius: var(--radius);
-          max-width: 1100px;
-          max-height: 90vh;
-          width: 100%;
-          overflow: auto;
-          position: relative;
-          cursor: default;
-        }
-        .perf-gallery-close {
-          all: unset;
-          position: absolute;
-          top: 12px;
-          right: 16px;
-          font-size: 28px;
-          color: var(--ink-3);
-          cursor: pointer;
-          line-height: 1;
-          width: 32px;
-          height: 32px;
-          text-align: center;
-        }
-        .perf-gallery-close:hover { color: var(--ink); }
-        .perf-gallery-modal-img {
-          display: block;
-          width: 100%;
-          height: auto;
-          padding: 24px 24px 8px;
-        }
-        .perf-gallery-modal-meta {
-          padding: 16px 24px 24px;
-          border-top: 1px solid var(--rule-2);
-        }
-        .perf-gallery-modal-title {
-          font-size: 15px;
-          font-weight: 600;
-          color: var(--ink);
-          margin-bottom: 4px;
-        }
-        .perf-gallery-modal-note {
-          font-size: 13px;
-          color: var(--ink-3);
-          line-height: 1.5;
-        }
-
         /* Foot */
         .perf-foot {
           margin-top: 36px;
@@ -698,9 +866,7 @@ const Performance = () => {
           border-radius: var(--radius);
           border: 1px solid var(--rule);
         }
-        .perf-foot-cta {
-          display: flex; flex-wrap: wrap; gap: 8px;
-        }
+        .perf-foot-cta { display: flex; flex-wrap: wrap; gap: 8px; }
         .perf-foot-cta .btn { padding: 6px 12px; font-size: 12px; }
       `}</style>
     </section>
