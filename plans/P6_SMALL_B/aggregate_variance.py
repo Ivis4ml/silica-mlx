@@ -273,54 +273,159 @@ def render_report(warm: dict[str, WarmDecodeStats], attribution: dict[str, list[
     lines.extend(verdicts)
     lines.append("")
 
-    # Attribution microbench summaries
-    lines.append("## Attribution-microbench summaries (per session)")
+    # Decode-step attribution (B=4) — per-session step-share table
+    lines.append("## Decode-step attribution (B=4) — per-session bucket distribution")
     lines.append("")
-    any_attribution = False
-    for key, summaries in attribution.items():
-        if not summaries:
-            continue
-        any_attribution = True
-        lines.append(f"### `{key}`")
+    decode_step_summaries = attribution.get("decode_step_attr_b4", [])
+    if decode_step_summaries:
+        lines.append(
+            _format_table_row(
+                "session", "step_total median (ms)",
+                "DeltaNet (linear) %", "Full-attn %", "Overhead %",
+                "DeltaNet (ms)", "Full-attn (ms)",
+            )
+        )
+        lines.append(
+            _format_table_row(
+                "---", "---:", "---:", "---:", "---:", "---:", "---:",
+            )
+        )
+        for s in decode_step_summaries:
+            step = s.get("step_total_ms") or {}
+            linear = s.get("linear_layers_total_ms") or {}
+            full = s.get("full_layers_total_ms") or {}
+            lines.append(
+                _format_table_row(
+                    s.get("_session", "—"),
+                    _fmt_float(step.get("median_ms", float("nan")), digits=2),
+                    _fmt_float((s.get("linear_pct_of_step") or 0) * 100, digits=1),
+                    _fmt_float((s.get("full_pct_of_step") or 0) * 100, digits=1),
+                    _fmt_float((s.get("overhead_pct_of_step") or 0) * 100, digits=1),
+                    _fmt_float(linear.get("median_ms", float("nan")), digits=2),
+                    _fmt_float(full.get("median_ms", float("nan")), digits=2),
+                )
+            )
         lines.append("")
-        keys = sorted({k for s in summaries for k in s.keys() if not k.startswith("_")})
-        keys = [k for k in keys if k != "kind"]
-        head = _format_table_row("session", *keys)
-        sep = _format_table_row("---", *(["---:"] * len(keys)))
-        lines.append(head)
-        lines.append(sep)
-        for s in summaries:
-            row_cells = [s.get("_session", "—")]
-            for k in keys:
-                v = s.get(k)
-                if isinstance(v, float):
-                    row_cells.append(_fmt_float(v, digits=3))
-                elif v is None:
-                    row_cells.append("—")
+    else:
+        lines.append("> _No decode-step attribution summaries captured yet._")
+        lines.append("")
+
+    # Layer-internal attribution (B=4) — per-component median + pct
+    lines.append("## Layer-internal attribution (B=4) — per-component step-share")
+    lines.append("")
+    layer_internal_summaries = attribution.get("layer_internal_attr_b4", [])
+    if layer_internal_summaries:
+        # Discover all components across sessions
+        all_components: set[str] = set()
+        for s in layer_internal_summaries:
+            comps = s.get("components") or {}
+            all_components.update(comps.keys())
+        ordered_components = sorted(all_components)
+
+        sessions_in_order = [s.get("_session", "—") for s in layer_internal_summaries]
+        head_cells = ["component"] + [f"{ses} %" for ses in sessions_in_order] + ["mean %"]
+        sep_cells = ["---"] + (["---:"] * (len(sessions_in_order) + 1))
+        lines.append(_format_table_row(*head_cells))
+        lines.append(_format_table_row(*sep_cells))
+
+        for comp in ordered_components:
+            row = [f"`{comp}`"]
+            pct_values: list[float] = []
+            for s in layer_internal_summaries:
+                comp_dict = (s.get("components") or {}).get(comp) or {}
+                pct = comp_dict.get("pct_of_step")
+                if pct is None:
+                    row.append("—")
                 else:
-                    row_cells.append(str(v))
-            lines.append(_format_table_row(*row_cells))
+                    pct_pct = pct * 100
+                    pct_values.append(pct_pct)
+                    row.append(_fmt_float(pct_pct, digits=2))
+            mean_pct = sum(pct_values) / len(pct_values) if pct_values else float("nan")
+            row.append(_fmt_float(mean_pct, digits=2))
+            lines.append(_format_table_row(*row))
+        lines.append("")
+    else:
+        lines.append("> _No layer-internal attribution summaries captured yet._")
         lines.append("")
 
-    if not any_attribution:
-        lines.append("> _No attribution-microbench summaries captured yet._")
-        lines.append("")
+    # Sub-unit β / γ / δ gate verdict (driven by attribution data)
+    lines.append("## Sub-unit β / γ / δ gate verdict")
+    lines.append("")
+    lines.append(
+        "Per `plans/P6_SMALL_B_OPENING.md` §4 open-conditions. Bucket "
+        "percentages are mean across sessions where multiple are present."
+    )
+    lines.append("")
 
-    lines.append("## How α opens β / γ / δ")
-    lines.append("")
-    lines.append(
-        "Per `plans/P6_SMALL_B_OPENING.md` §4, a single attribution session "
-        "is enough to read the bucket distribution. Sub-units open as:"
-    )
-    lines.append("")
-    lines.append("- β (attention `mx.compile` + cache reroute) — full-attn ≥ 15% of step time.")
-    lines.append("- γ (`mx.compile` on `Qwen3NextMLP`) — MLP-attributable share ≥ 5%.")
-    lines.append("- δ (`mx.eval` cadence / per-layer loop sync) — overhead bucket ≥ 3%.")
-    lines.append(
-        "- **Close the line** if DeltaNet ≥ 95% (no reachable lever; cycle-31 "
-        "confirmed mlx `gated_delta` at HBM-bandwidth limit)."
-    )
-    lines.append("")
+    if decode_step_summaries:
+        full_pcts = [(s.get("full_pct_of_step") or 0) * 100 for s in decode_step_summaries]
+        linear_pcts = [(s.get("linear_pct_of_step") or 0) * 100 for s in decode_step_summaries]
+        overhead_pcts = [(s.get("overhead_pct_of_step") or 0) * 100 for s in decode_step_summaries]
+
+        full_mean = sum(full_pcts) / len(full_pcts)
+        linear_mean = sum(linear_pcts) / len(linear_pcts)
+        overhead_mean = sum(overhead_pcts) / len(overhead_pcts)
+
+        beta_open = full_mean >= 15.0
+        delta_open = overhead_mean >= 3.0
+        line_close = linear_mean >= 95.0
+
+        # γ: MLP attribution from layer-internal summaries (sum of linear.mlp + full.mlp)
+        mlp_pcts: list[float] = []
+        for s in layer_internal_summaries:
+            comps = s.get("components") or {}
+            lin_mlp = (comps.get("linear.mlp") or {}).get("pct_of_step", 0) or 0
+            full_mlp = (comps.get("full.mlp") or {}).get("pct_of_step", 0) or 0
+            mlp_pcts.append((lin_mlp + full_mlp) * 100)
+        mlp_mean = sum(mlp_pcts) / len(mlp_pcts) if mlp_pcts else float("nan")
+        gamma_open = (not math.isnan(mlp_mean)) and mlp_mean >= 5.0
+
+        verdict_status = "OPEN" if not line_close else "CLOSE"
+
+        def _gate(name: str, value: float, threshold: float, op: str) -> str:
+            return f"{value:.1f}% {op} {threshold:.0f}%"
+
+        lines.append(
+            f"- **β (attention `mx.compile` + cache reroute)**: "
+            f"full-attn = {_gate('full', full_mean, 15.0, '≥' if beta_open else '<')} "
+            f"→ {'**OPEN**' if beta_open else 'closed'}"
+        )
+        lines.append(
+            f"- **γ (`mx.compile` on `Qwen3NextMLP`)**: "
+            f"MLP attribution = {_gate('mlp', mlp_mean, 5.0, '≥' if gamma_open else '<')} "
+            f"→ {'**OPEN**' if gamma_open else 'closed'}"
+        )
+        lines.append(
+            f"- **δ (`mx.eval` cadence / per-layer loop sync)**: "
+            f"overhead = {_gate('overhead', overhead_mean, 3.0, '≥' if delta_open else '<')} "
+            f"→ {'**OPEN**' if delta_open else 'closed'}"
+        )
+        lines.append(
+            f"- **Line-close check**: DeltaNet = "
+            f"{linear_mean:.1f}% {'≥' if line_close else '<'} 95% "
+            f"→ {'**CLOSE the small-B line** (no reachable lever)' if line_close else 'continue'}"
+        )
+        lines.append("")
+        lines.append(f"**Overall α verdict: {verdict_status}**")
+        lines.append("")
+        if not line_close:
+            opens = [name for name, ok in [("β", beta_open), ("γ", gamma_open), ("δ", delta_open)] if ok]
+            if opens:
+                lines.append(
+                    f"Sub-units {' / '.join(opens)} unlocked. "
+                    f"ε remains waitlist (mlx 0.32+ async-copy)."
+                )
+            else:
+                lines.append(
+                    "No sub-unit threshold met. Investigate before opening any of β / γ / δ."
+                )
+            lines.append("")
+    else:
+        lines.append(
+            "> _No attribution data captured. Sub-unit decisions blocked until "
+            "decode_step_attr_b4 and layer_internal_attr_b4 are run._"
+        )
+        lines.append("")
 
     return "\n".join(lines)
 
