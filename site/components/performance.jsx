@@ -196,9 +196,47 @@ const PerfLedger = ({ trackKey, animateKey, onSelect, activeIdx }) => {
     }
   });
 
+  // Closed area path under the running-best line, from each step point
+  // down to the cycle-1 baseline. Used as a soft fill behind the line.
+  const areaCmds = [];
+  if (stepPoints.length > 0) {
+    areaCmds.push(`M ${stepPoints[0][0].toFixed(2)},${yAt(t.baseline).toFixed(2)}`);
+    stepPoints.forEach(p => {
+      areaCmds.push(`L ${p[0].toFixed(2)},${p[1].toFixed(2)}`);
+    });
+    const lastX = stepPoints[stepPoints.length - 1][0];
+    areaCmds.push(`L ${lastX.toFixed(2)},${yAt(t.baseline).toFixed(2)}`);
+    areaCmds.push("Z");
+  }
+  const areaPath = areaCmds.join(" ");
+
+  // Honest-vs-false retraction connector (dense only). When cycle 14's
+  // claimed KEEPs at indices 26-27 are taken at face value, the running
+  // best would have jumped to 232.2 at index 27 and stayed flat through
+  // cycle 28's honest 231.9 reverify. The dashed connector visualises
+  // that "missed shortcut" — the ladder bumps up over the retracted
+  // points and drops back to the honest line.
+  const retractionPath = (() => {
+    if (trackKey !== "dense") return null;
+    const lastHonestIdx = 22; // cycle-13 hardware ceiling at 229.8
+    const falsePeakIdx = 27; // higher of the two retracted (232.2)
+    const honestResumeIdx = 31; // cycle-28 honest KEEP at 231.9
+    const lastHonest = bestSeries[lastHonestIdx]; // 229.8
+    const falsePeakVal = data[falsePeakIdx][1]; // 232.2
+    const honestResumeVal = data[honestResumeIdx][1]; // 231.9
+    return [
+      `M ${xAt(lastHonestIdx).toFixed(2)},${yAt(lastHonest).toFixed(2)}`,
+      `L ${xAt(falsePeakIdx).toFixed(2)},${yAt(lastHonest).toFixed(2)}`,
+      `L ${xAt(falsePeakIdx).toFixed(2)},${yAt(falsePeakVal).toFixed(2)}`,
+      `L ${xAt(honestResumeIdx).toFixed(2)},${yAt(falsePeakVal).toFixed(2)}`,
+      `L ${xAt(honestResumeIdx).toFixed(2)},${yAt(honestResumeVal).toFixed(2)}`,
+    ].join(" ");
+  })();
+
   // Draw progress: stroke-dashoffset interpolation reveals the line
   // from left to right.
   const dashOffset = lineLength * (1 - progress);
+  const gradientId = `perf-area-${trackKey}`;
 
   return (
     <svg
@@ -208,6 +246,24 @@ const PerfLedger = ({ trackKey, animateKey, onSelect, activeIdx }) => {
       role="img"
       aria-label={`${t.label} — Karpathy autoresearch ledger`}
     >
+      <defs>
+        <linearGradient id={gradientId} x1="0%" y1="0%" x2="0%" y2="100%">
+          <stop offset="0%" stopColor="var(--accent)" stopOpacity="0.18" />
+          <stop offset="60%" stopColor="var(--accent)" stopOpacity="0.05" />
+          <stop offset="100%" stopColor="var(--accent)" stopOpacity="0" />
+        </linearGradient>
+      </defs>
+
+      {/* area fill under the running-best line — soft accent gradient */}
+      <path
+        d={areaPath}
+        fill={`url(#${gradientId})`}
+        className="perf-svg-area"
+        style={lineLength ? {
+          opacity: 0.95 * progress,
+        } : { opacity: 0 }}
+      />
+
       {/* gridlines */}
       {t.yTicks.map(g => (
         <g key={`grid-${g}`}>
@@ -274,6 +330,16 @@ const PerfLedger = ({ trackKey, animateKey, onSelect, activeIdx }) => {
           strokeDashoffset: dashOffset,
         } : { opacity: 0 }}
       />
+
+      {/* retraction connector — the "missed shortcut" if cycle-14
+          KEEPs had not been retracted; fades in after main line draws */}
+      {retractionPath && (
+        <path
+          d={retractionPath}
+          className="perf-svg-retract"
+          style={{ opacity: progress > 0.85 ? Math.min(1, (progress - 0.85) / 0.15) : 0 }}
+        />
+      )}
 
       {/* dots — fade in based on progress */}
       {data.map((p, i) => {
@@ -500,9 +566,25 @@ const Performance = () => {
   const [animateKey, setAnimateKey] = React.useState(0);
   const [hasAnimated, setHasAnimated] = React.useState(false);
   const sectionRef = React.useRef(null);
+  const panelRef = React.useRef(null);
 
   const t = PerfTracks[activeTab];
   const point = activeIdx != null ? t.points[activeIdx] : null;
+
+  // Smooth-scroll the detail panel into view when a dot is clicked,
+  // so a click on a dot near the top of a tall SVG does not feel
+  // unresponsive on a tall viewport.
+  React.useEffect(() => {
+    if (activeIdx == null) return;
+    const el = panelRef.current;
+    if (el && typeof el.scrollIntoView === "function") {
+      try {
+        el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      } catch (_) {
+        /* older browsers ignore the option object — no-op fallback */
+      }
+    }
+  }, [activeIdx]);
 
   // Trigger animation on first scroll into view.
   React.useEffect(() => {
@@ -591,6 +673,22 @@ const Performance = () => {
             </button>
           </div>
           <div className="perf-chart-frame" onClick={(e) => e.stopPropagation()}>
+            <div className="perf-chart-title">
+              <div className="perf-chart-title-left">
+                <div className="perf-chart-title-eyebrow mono">{t.label}</div>
+                <div className="perf-chart-title-line">
+                  <span className="perf-chart-title-best mono">running best</span>
+                  <span className="perf-chart-title-num mono">{activeTab === "dense" ? "232" : "791.8"}</span>
+                  <span className="perf-chart-title-unit">tok/s</span>
+                </div>
+              </div>
+              <div className="perf-chart-title-right">
+                <div className="perf-chart-title-vs">
+                  <span className="perf-chart-title-vs-label">vs starting point</span>
+                  <span className="perf-chart-title-vs-num mono">{activeTab === "dense" ? "5.50×" : "4.20×"}</span>
+                </div>
+              </div>
+            </div>
             <PerfLedger
               trackKey={activeTab}
               animateKey={animateKey}
@@ -598,7 +696,9 @@ const Performance = () => {
               onSelect={(i) => setActiveIdx(i === activeIdx ? null : i)}
             />
             <PerfLegend />
-            <PerfDetailPanel point={point} trackKey={activeTab} onClose={() => setActiveIdx(null)} />
+            <div ref={panelRef}>
+              <PerfDetailPanel point={point} trackKey={activeTab} onClose={() => setActiveIdx(null)} />
+            </div>
           </div>
         </div>
 
@@ -653,7 +753,7 @@ const Performance = () => {
             <a className="btn btn-ghost" href="https://github.com/Ivis4ml/silica-mlx/blob/sonnet/plans/P6_AUTORESEARCH_NOTES.md" target="_blank" rel="noreferrer">What we learned</a>
             <a className="btn btn-ghost" href="https://github.com/Ivis4ml/silica-mlx/blob/sonnet/plans/P6_AUTORESEARCH_FINAL_REPORT.md" target="_blank" rel="noreferrer">Full write-up</a>
             <a className="btn btn-ghost" href="https://github.com/Ivis4ml/silica-mlx/blob/sonnet/plans/P6_AUTORESEARCH_LOG.tsv" target="_blank" rel="noreferrer">Every measurement (raw data)</a>
-            <a className="btn btn-ghost" href="https://github.com/Ivis4ml/silica-mlx/blob/sonnet/AR.md" target="_blank" rel="noreferrer">The original brief</a>
+            <a className="btn btn-ghost" href="https://github.com/Ivis4ml/silica-mlx/blob/sonnet/P6_AUTORESEARCH.md" target="_blank" rel="noreferrer">The original brief</a>
             <a className="btn btn-ghost" href="https://github.com/Ivis4ml/silica-mlx/blob/sonnet/plans/P6_SMALL_B_OPENING.md" target="_blank" rel="noreferrer">What we work on next</a>
           </div>
         </div>
@@ -751,10 +851,85 @@ const Performance = () => {
         .perf-replay svg { display: block; }
 
         .perf-chart-frame {
-          background: var(--bg-elev);
+          background:
+            radial-gradient(120% 80% at 50% -10%, color-mix(in srgb, var(--accent-soft) 65%, transparent) 0%, transparent 60%),
+            linear-gradient(180deg, var(--bg-elev) 0%, color-mix(in srgb, var(--bg-sunken) 30%, var(--bg-elev)) 100%);
           border: 1px solid var(--rule);
           border-radius: 0 0 var(--radius) var(--radius);
-          padding: 24px 24px 0;
+          padding: 4px 28px 0;
+          box-shadow: var(--shadow-sm);
+        }
+
+        /* Chart title strip */
+        .perf-chart-title {
+          display: flex;
+          align-items: flex-end;
+          justify-content: space-between;
+          gap: 24px;
+          padding: 24px 4px 18px;
+          border-bottom: 1px solid var(--rule-2);
+          margin-bottom: 8px;
+        }
+        .perf-chart-title-eyebrow {
+          font-size: 10px;
+          color: var(--ink-3);
+          text-transform: uppercase;
+          letter-spacing: 0.12em;
+          font-weight: 600;
+          margin-bottom: 8px;
+        }
+        .perf-chart-title-line {
+          display: flex;
+          align-items: baseline;
+          gap: 10px;
+          font-feature-settings: "tnum" 1, "ss01" 1;
+        }
+        .perf-chart-title-best {
+          font-size: 11px;
+          color: var(--ink-4);
+          text-transform: uppercase;
+          letter-spacing: 0.1em;
+          font-weight: 600;
+        }
+        .perf-chart-title-num {
+          font-size: 38px;
+          font-weight: 700;
+          color: var(--ink);
+          letter-spacing: -0.03em;
+          line-height: 1;
+          font-feature-settings: "tnum" 1, "ss01" 1;
+        }
+        .perf-chart-title-unit {
+          font-size: 16px;
+          color: var(--ink-3);
+          font-weight: 500;
+          letter-spacing: -0.01em;
+        }
+        .perf-chart-title-vs {
+          display: flex;
+          flex-direction: column;
+          align-items: flex-end;
+          gap: 4px;
+        }
+        .perf-chart-title-vs-label {
+          font-size: 10px;
+          color: var(--ink-4);
+          text-transform: uppercase;
+          letter-spacing: 0.1em;
+          font-weight: 600;
+        }
+        .perf-chart-title-vs-num {
+          font-size: 22px;
+          font-weight: 700;
+          color: var(--ok);
+          letter-spacing: -0.02em;
+          font-feature-settings: "tnum" 1;
+        }
+        @media (max-width: 720px) {
+          .perf-chart-title { flex-direction: column; align-items: flex-start; gap: 8px; }
+          .perf-chart-title-vs { align-items: flex-start; }
+          .perf-chart-title-num { font-size: 30px; }
+          .perf-chart-title-vs-num { font-size: 18px; }
         }
 
         /* SVG */
@@ -766,7 +941,12 @@ const Performance = () => {
           overflow: visible;
         }
         .perf-svg-grid { stroke: var(--rule-2); stroke-width: 0.75; opacity: 0.7; }
-        .perf-svg-tick { fill: var(--ink-3); font-size: 11px; font-weight: 500; }
+        .perf-svg-tick {
+          fill: var(--ink-3);
+          font-size: 11px;
+          font-weight: 500;
+          font-feature-settings: "tnum" 1;
+        }
         .perf-svg-axis-title {
           fill: var(--ink-4);
           font-size: 10px;
@@ -788,7 +968,20 @@ const Performance = () => {
           stroke-linejoin: round;
           stroke-linecap: round;
           transition: stroke-dashoffset 60ms linear;
-          filter: drop-shadow(0 0.5px 1px var(--accent-soft));
+          filter: drop-shadow(0 0.5px 1.5px color-mix(in srgb, var(--accent) 22%, transparent));
+        }
+        .perf-svg-area {
+          transition: opacity 320ms ease-out;
+        }
+        .perf-svg-retract {
+          fill: none;
+          stroke: var(--ink-3);
+          stroke-width: 1;
+          stroke-dasharray: 3 3;
+          stroke-linejoin: round;
+          stroke-linecap: round;
+          opacity: 0.45;
+          transition: opacity 360ms ease-out;
         }
         .perf-svg-dot-g {
           opacity: 0;
@@ -951,12 +1144,13 @@ const Performance = () => {
           border: 1px dashed var(--warn);
         }
         .perf-detail-panel-tok {
-          font-size: 30px;
+          font-size: 32px;
           font-weight: 700;
           color: var(--ink);
-          letter-spacing: -0.02em;
-          line-height: 1.1;
+          letter-spacing: -0.028em;
+          line-height: 1.05;
           margin-bottom: 6px;
+          font-feature-settings: "tnum" 1, "ss01" 1;
         }
         .perf-detail-panel-unit {
           font-size: 14px;
@@ -1013,6 +1207,7 @@ const Performance = () => {
         .perf-gate-mult {
           font-size: 22px; font-weight: 700; color: var(--ok);
           letter-spacing: -0.02em;
+          font-feature-settings: "tnum" 1;
         }
         .perf-gate-cleared {
           font-size: 16px; font-weight: 600; color: var(--ink);
@@ -1063,6 +1258,7 @@ const Performance = () => {
           color: var(--accent);
           letter-spacing: -0.02em;
           line-height: 1;
+          font-feature-settings: "tnum" 1;
         }
         .perf-card-tag {
           font-size: 10px;
