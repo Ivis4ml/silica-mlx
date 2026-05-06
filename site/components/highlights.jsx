@@ -40,9 +40,9 @@ const Highlights = () => {
     },
     {
       tag: "P-6 · v1.7.23",
-      title: "Performance phase cleared.",
-      body: "Every P-6 acceptance gate cleared 3.4-5.5× over the cycle-1 baseline across a 35-cycle autoresearch loop. Dense Qwen3.5-27B-4bit hits 232 tok/s at the 48 GB hardware ceiling; MoE 35B-A3B hits 791.8 tok/s. Two parameter changes (no kernels) carry the result; the spec-decode foundation shipped at v1.7.19 was the substrate but its production payoff was settled with a measurement-anchored negative.",
-      detail: ["232 tok/s dense", "791.8 tok/s MoE", "35-cycle ledger"],
+      title: "Server-throughput phase cleared.",
+      body: "Every P-6 server-aggregate acceptance gate cleared 3.4-5.5× over the cycle-1 baseline across a 35-cycle autoresearch loop. Dense Qwen3.5-27B-4bit hits 232 tok/s at B=64; MoE 35B-A3B hits 791.8 tok/s at B=128. Per-row (single-user) speed moves the opposite way: ~20 tok/s at B=1, bandwidth-capped, unchanged by this phase. D-022 (in progress) attacks single-user latency directly.",
+      detail: ["232 tok/s aggregate", "~20 tok/s B=1", "D-022 next"],
     },
   ];
 

@@ -33,7 +33,7 @@ const Hero = ({ tweaks }) => {
     return (
       <section className="hero">
         <div className="container">
-          <div className="hero-eyebrow"><span className="dot"></span>Status v1.7.24: P-6 acceptance gates cleared 3.4-5.5× · D-022 small-B line opens</div>
+          <div className="hero-eyebrow"><span className="dot"></span>Status v1.7.24: P-6 server-throughput gates cleared 3.4-5.5× · D-022 single-user line opens</div>
           <h1>
             Continuous-batching<br/>
             LLM serving,<br/>
@@ -42,9 +42,10 @@ const Hero = ({ tweaks }) => {
           <p className="hero-sub">
             silica-mlx ports the vLLM scheduler core — continuous batching, memory-budget admission,
             preempt+replay, radix prefix cache — onto MLX's unified-memory model. The 35-cycle P-6
-            autoresearch loop closed in May 2026 with all four acceptance gates cleared 3.4-5.5×
-            over the cycle-1 baseline: 232 tok/s on dense Qwen3.5-27B-4bit at the 48 GB hardware
-            ceiling, 791.8 tok/s on MoE Qwen3.5-35B-A3B-4bit at B=128.
+            autoresearch loop closed in May 2026 with every <em>server-throughput</em> acceptance
+            gate cleared 3.4-5.5× over the cycle-1 baseline: 232 tok/s on dense Qwen3.5-27B-4bit
+            at B=64, 791.8 tok/s on MoE Qwen3.5-35B-A3B-4bit at B=128. Single-user latency at B=1
+            sits ~20 tok/s, bandwidth-capped — that's the D-022 research line, in progress.
           </p>
           <div className="hero-ctas">
             <a className="btn btn-primary" href="#quickstart">Quickstart<Icon name="arrow" size={14} className="arrow" /></a>
@@ -58,10 +59,10 @@ const Hero = ({ tweaks }) => {
   return (
     <section className="hero">
       <div className="container">
-        <div className="hero-eyebrow"><span className="dot"></span>Status v1.7.24: P-6 acceptance gates cleared 3.4-5.5× · D-022 small-B line opens</div>
+        <div className="hero-eyebrow"><span className="dot"></span>Status v1.7.24: P-6 server-throughput gates cleared 3.4-5.5× · D-022 single-user line opens</div>
         <h1>Continuous-batching LLM serving, <em>native to Apple Silicon.</em></h1>
         <p className="hero-sub">
-          The vLLM scheduler core, the radix prefix cache, and the memory-budget admission ladder — ported to MLX's unified-memory model on M5 Pro 48 GB. The 35-cycle P-6 autoresearch loop closed in May 2026 with every acceptance gate cleared 3.4-5.5× over the cycle-1 baseline: 232 tok/s on dense Qwen3.5-27B-4bit at the 48 GB hardware ceiling, 791.8 tok/s on MoE Qwen3.5-35B-A3B-4bit at B=128. Two load-bearing levers (axis-shift × bf16 DeltaNet state); 17 custom-kernel attempts closed without a load-bearing E2E win.
+          The vLLM scheduler core, the radix prefix cache, and the memory-budget admission ladder — ported to MLX's unified-memory model on M5 Pro 48 GB. The 35-cycle P-6 autoresearch loop closed in May 2026 with every <em>server-throughput</em> acceptance gate cleared 3.4-5.5× over the cycle-1 baseline: 232 tok/s on dense Qwen3.5-27B-4bit at B=64 (48 GB ceiling), 791.8 tok/s on MoE Qwen3.5-35B-A3B-4bit at B=128. <strong>Single-user latency at B=1 is ~20 tok/s, bandwidth-capped and unchanged by this phase</strong> — that's D-022, the next research line. Two parameter changes carried the result; 17 custom-kernel attempts closed without a load-bearing E2E win.
         </p>
         <div className="hero-ctas">
           <a className="btn btn-primary" href="#performance">Performance<Icon name="arrow" size={14} className="arrow" /></a>
@@ -81,9 +82,9 @@ const Hero = ({ tweaks }) => {
             <div className="hero-meta-sub">Qwen3.5-35B-A3B-4bit · B=128</div>
           </div>
           <div className="hero-meta-item">
-            <div className="hero-meta-label">Dense uplift</div>
-            <div className="hero-meta-value">5.50<span className="unit">×</span></div>
-            <div className="hero-meta-sub">vs cycle-1 baseline 42.17 tok/s</div>
+            <div className="hero-meta-label">Single-user · B=1</div>
+            <div className="hero-meta-value">~20<span className="unit">tok/s</span></div>
+            <div className="hero-meta-sub">Bandwidth-capped · D-022 in progress</div>
           </div>
           <div className="hero-meta-item">
             <div className="hero-meta-label">Autoresearch</div>
@@ -133,7 +134,7 @@ const Footer = () => (
       </div>
       <div className="foot-bottom">
         <div>Apache-2.0 · Target hardware: M5 Pro 48 GB</div>
-        <div className="mono">v1.7.24 · P-6 acceptance gates cleared 3.4-5.5× · D-022 small-B line opens</div>
+        <div className="mono">v1.7.24 · P-6 server-throughput cleared 3.4-5.5× · D-022 single-user line opens</div>
       </div>
     </div>
   </footer>

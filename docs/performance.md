@@ -1,4 +1,4 @@
-# Performance — P-6 autoresearch closed at v1.7.23
+# Performance — P-6 server-throughput phase closed at v1.7.23
 
 ```{image} _static/p6/decode-dense.png
 :alt: Dense Qwen3.5-27B-4bit decode running-best across 35 cycles
@@ -21,17 +21,39 @@ tok/s @ B=4 (cycle 1) → 232 tok/s @ B=64 (cycle 28).*
 @ B=128 (cycle 35) — the largest absolute throughput observed
 across the full effort.*
 
-The 35-cycle opus autoresearch loop pushed Qwen3.5-27B-4bit warm
-decode 5.50× over the cycle-1 baseline on M5 Pro 48 GB. Two
-load-bearing levers — `cycle-10` batched-aggregate axis-shift
-(B=4 → B=52) and `cycle-12` bf16 DeltaNet recurrent state
-(3.5 GB peak save opens B≥48 within the 36 GB envelope) —
-composed to clear all four P-6 acceptance gates 3.4-5.5× over
-baseline. **17 custom Metal kernel attempts closed without a
-load-bearing E2E win**; the unlock came from data layout (bf16
-state) and operating-point selection (axis-shift).
+:::{admonition} Single-user reality
+:class: warning
 
-## Acceptance gates — every P-6 gate cleared
+P-6 is a *server-throughput* phase. All gains route through
+batch size: per-row throughput moves the *opposite* way —
+10.5 tok/s/row at B=4, 3.92 tok/s/row at B=52, 3.62 tok/s/row at
+B=64. **Single-user (B=1) latency on M5 Pro is bandwidth-capped
+near 20 tok/s and unchanged by this phase.** Closing per-step
+time at small batch is the **D-022** research line, in progress
+at v1.7.24.
+:::
+
+| Configuration | Aggregate | Per row | Frame |
+| --- | ---: | ---: | --- |
+| B=1 (single user) | ~20 tok/s | ~20 tok/s | bandwidth ceiling, derived |
+| B=4 (cycle-1 baseline) | 42.17 tok/s | 10.54 tok/s | 52% bandwidth utilisation |
+| B=52 (best within 36 GB) | 204 tok/s | 3.92 tok/s | strict envelope |
+| B=64 (48 GB ceiling) | 232 tok/s | 3.62 tok/s | hardware cap |
+
+The 35-cycle opus autoresearch loop pushed Qwen3.5-27B-4bit warm
+decode 5.50× over the cycle-1 baseline on M5 Pro 48 GB **at the
+server-aggregate level**. Two load-bearing levers — `cycle-10`
+batched-aggregate axis-shift (B=4 → B=52) and `cycle-12` bf16
+DeltaNet recurrent state (3.5 GB peak save opens B≥48 within the
+36 GB envelope) — composed to clear all four P-6 acceptance gates
+3.4-5.5× over baseline. **17 custom Metal kernel attempts closed
+without a load-bearing E2E win**; the unlock came from data layout
+(bf16 state) and operating-point selection (axis-shift). None of
+these levers move B=1 single-user latency, which sits at the
+chip's weights-only bandwidth ceiling on this stack — that is the
+explicit motivation for the D-022 small-B research line.
+
+## Acceptance gates — every server-throughput P-6 gate cleared
 
 | Gate | Target | Cleared | Multiplier | Frame |
 | --- | --- | --- | ---: | --- |

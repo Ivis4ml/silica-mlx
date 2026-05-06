@@ -624,9 +624,12 @@ const Performance = () => {
       <div className="container">
         <div className="section-head">
           <div className="section-eyebrow">Throughput Autoresearch</div>
-          <h2>35 cycles. Two levers. Every gate cleared 3.4-5.5×.</h2>
+          <h2>35 cycles. Server throughput 5.5×. Single-user, untouched.</h2>
           <p>
-            We pushed Qwen3.5-27B-4bit decoding from 42 to 232 tokens per second on M5 Pro 48 GB across 35 experiments. The chart below is our lab notebook: each dot is one experiment, the rising line is the best result so far, the dashed circles are a claim we later retracted (visible on the chart so the correction stays public). Click any dot to read what that experiment tried.
+            We pushed Qwen3.5-27B-4bit <em>server-aggregate</em> decoding from 42 to 232 tokens per second on M5 Pro 48 GB across 35 experiments. The unlock was running more prompts in parallel, not faster decoding per prompt &mdash; per-row throughput moves the opposite way (10.5 tok/s/row at batch 4, 3.9 tok/s/row at batch 52, ~20 tok/s the bandwidth ceiling at batch 1). P-6 was a server-throughput phase; <strong>single-user interactive latency was not its goal</strong> &mdash; that's <span className="mono">D-022</span>, the next research line.
+          </p>
+          <p>
+            The chart below is our lab notebook: each dot is one experiment, the rising line is the best result so far, the dashed circles are a claim we later retracted (visible on the chart so the correction stays public). Click any dot to read what that experiment tried.
           </p>
           <div className="perf-primer">
             <div className="perf-primer-card">
@@ -702,9 +705,61 @@ const Performance = () => {
           </div>
         </div>
 
+        {/* Single-user reality — per-row math */}
+        <div className="perf-section perf-perrow-section">
+          <div className="perf-perrow-card">
+            <div className="perf-perrow-eyebrow mono">Single-user reality</div>
+            <h3 className="perf-perrow-title">All gains route through batch size. Per-row speed moves the opposite way.</h3>
+            <p className="perf-perrow-body">
+              Total throughput rises with batch because the per-step weight read amortises across more in-flight prompts. The flip side: each individual prompt receives a smaller share of the chip's bandwidth, so single-prompt speed <em>decreases</em> as batch grows. P-6 optimised aggregate, not single-user.
+            </p>
+            <div className="perf-perrow-table-wrap">
+              <table className="perf-perrow-table mono">
+                <thead>
+                  <tr>
+                    <th>Configuration</th>
+                    <th className="num">Aggregate</th>
+                    <th className="num">Per row</th>
+                    <th>Frame</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>batch 1 (single user)</td>
+                    <td className="num">~20 tok/s</td>
+                    <td className="num">~20 tok/s</td>
+                    <td>bandwidth ceiling, derived</td>
+                  </tr>
+                  <tr>
+                    <td>batch 4 (cycle-1 baseline)</td>
+                    <td className="num">42.17 tok/s</td>
+                    <td className="num">10.54 tok/s</td>
+                    <td>52% bandwidth utilisation</td>
+                  </tr>
+                  <tr className="perf-perrow-row-best">
+                    <td>batch 52 (best within 36 GB)</td>
+                    <td className="num">204 tok/s</td>
+                    <td className="num">3.92 tok/s</td>
+                    <td>strict envelope</td>
+                  </tr>
+                  <tr className="perf-perrow-row-best">
+                    <td>batch 64 (48 GB ceiling)</td>
+                    <td className="num">232 tok/s</td>
+                    <td className="num">3.62 tok/s</td>
+                    <td>hardware cap</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <p className="perf-perrow-foot">
+              P-6 was a <em>server-throughput</em> phase: more parallel users on the same chip. Single-user interactive latency &mdash; the silica-chat experience for one person sitting in front of an M5 Pro &mdash; was not its goal. <strong>D-022</strong> (in progress, v1.7.24) is the research line that attacks single-user latency directly: closing dispatch overhead and per-step time at batch &isin; <span className="mono">{"{1, 2, 4, 8, 12}"}</span>.
+            </p>
+          </div>
+        </div>
+
         {/* Acceptance gates */}
         <div className="perf-section">
-          <div className="perf-subhead">The four targets we set · all cleared</div>
+          <div className="perf-subhead">The four targets we set &middot; all cleared <span className="perf-subhead-qual">(server-aggregate)</span></div>
           <div className="perf-gates">
             {PerfGates.map((g, i) => (
               <div key={i} className="perf-gate">
@@ -719,7 +774,7 @@ const Performance = () => {
             ))}
           </div>
           <div className="perf-gates-note">
-            All four cleared by the same composition: a bigger batch size (lever 1) made possible by storing recurrent state in 16-bit floats (lever 2, which by itself doesn't speed anything up but frees ~3.5 GB so the bigger batch fits). The exact same combination ports cleanly to the MoE model. See card 01 below for the mechanics.
+            All four cleared by the same composition: a bigger batch size (lever 1) made possible by storing recurrent state in 16-bit floats (lever 2, which by itself doesn't speed anything up but frees ~3.5 GB so the bigger batch fits). The exact same combination ports cleanly to the MoE model. These targets are <strong>batch-aggregate throughput</strong>; per-row decreases with batch &mdash; see the Single-user reality table above. See card 01 below for the mechanics.
           </div>
         </div>
 
@@ -1180,6 +1235,103 @@ const Performance = () => {
           letter-spacing: 0.08em;
           font-weight: 600;
           margin-bottom: 18px;
+        }
+        .perf-subhead-qual {
+          font-family: var(--font-mono);
+          font-size: 10.5px;
+          color: var(--ink-3);
+          font-weight: 500;
+          letter-spacing: 0.02em;
+          text-transform: none;
+          margin-left: 6px;
+        }
+
+        /* Single-user reality callout */
+        .perf-perrow-section { margin-top: 16px; }
+        .perf-perrow-card {
+          background: var(--bg-elev);
+          border: 1px solid var(--rule);
+          border-radius: var(--radius);
+          padding: 28px 30px 26px;
+          position: relative;
+          overflow: hidden;
+        }
+        .perf-perrow-card::before {
+          content: "";
+          position: absolute; left: 0; top: 0; bottom: 0;
+          width: 3px;
+          background: linear-gradient(180deg, var(--warn, #b58a00), color-mix(in srgb, var(--warn, #b58a00) 40%, transparent));
+          opacity: 0.85;
+        }
+        .perf-perrow-eyebrow {
+          font-size: 11px;
+          color: var(--warn, #b58a00);
+          text-transform: uppercase;
+          letter-spacing: 0.08em;
+          font-weight: 600;
+          margin-bottom: 8px;
+        }
+        .perf-perrow-title {
+          font-size: 19px;
+          letter-spacing: -0.018em;
+          font-weight: 600;
+          line-height: 1.3;
+          color: var(--ink);
+          margin: 0 0 12px;
+        }
+        .perf-perrow-body {
+          font-size: 14px;
+          color: var(--ink-2);
+          line-height: 1.6;
+          margin: 0 0 18px;
+        }
+        .perf-perrow-table-wrap { overflow-x: auto; }
+        .perf-perrow-table {
+          width: 100%;
+          border-collapse: collapse;
+          font-size: 13px;
+          font-feature-settings: "tnum" 1, "ss01" 1;
+        }
+        .perf-perrow-table th,
+        .perf-perrow-table td {
+          padding: 11px 14px;
+          border-bottom: 1px solid var(--rule);
+          text-align: left;
+          color: var(--ink-2);
+          font-weight: 400;
+        }
+        .perf-perrow-table th {
+          font-size: 11px;
+          color: var(--ink-3);
+          text-transform: uppercase;
+          letter-spacing: 0.06em;
+          font-weight: 600;
+          border-bottom: 1px solid var(--rule);
+        }
+        .perf-perrow-table th.num,
+        .perf-perrow-table td.num {
+          text-align: right;
+          color: var(--ink);
+          font-weight: 500;
+        }
+        .perf-perrow-table tbody tr:last-child td { border-bottom: none; }
+        .perf-perrow-row-best td { color: var(--ink); }
+        .perf-perrow-row-best td.num { color: var(--accent); font-weight: 600; }
+        .perf-perrow-foot {
+          margin: 18px 0 0;
+          padding: 14px 16px;
+          background: var(--bg-sunken);
+          border: 1px solid var(--rule);
+          border-radius: var(--radius-sm);
+          font-size: 13px;
+          color: var(--ink-2);
+          line-height: 1.6;
+        }
+        @media (max-width: 720px) {
+          .perf-perrow-card { padding: 22px 20px 20px; }
+          .perf-perrow-title { font-size: 17px; }
+          .perf-perrow-table th,
+          .perf-perrow-table td { padding: 10px 8px; font-size: 12px; }
         }
 
         /* Gates */

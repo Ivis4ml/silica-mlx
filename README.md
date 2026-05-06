@@ -32,14 +32,19 @@ Qwen3.5-35B-A3B MoE, gemma-4-26B-A4B MoE.
 > (`DraftTargetEngine` + three rollback paths + spec-metrics
 > emission + `--speculative` bench switch — D-021 step 5) are
 > shipped. **The 35-cycle P-6 autoresearch loop closed in May 2026
-> with all four acceptance gates cleared 3.4-5.5× over the cycle-1
-> baseline** — 232 tok/s on dense Qwen3.5-27B-4bit at the 48 GB
-> hardware ceiling, 791.8 tok/s on MoE Qwen3.5-35B-A3B-4bit at
-> B=128. Two load-bearing levers: batched-aggregate axis-shift
-> (cycle 10) × bf16 DeltaNet recurrent state (cycle 12); 17 custom
-> Metal kernel attempts closed without a load-bearing E2E win on
-> mlx 0.31.x (see § Performance). D-022 small-B interactive QoE is
-> the next active research line. OpenAI HTTP server and weight
+> with every server-throughput acceptance gate cleared 3.4-5.5×
+> over the cycle-1 baseline** — 232 tok/s on dense Qwen3.5-27B-4bit
+> at B=64 (48 GB hardware ceiling), 791.8 tok/s on MoE
+> Qwen3.5-35B-A3B-4bit at B=128. **These are server-aggregate
+> numbers; per-row throughput moves the opposite way (10.5 tok/s
+> at B=4, 3.9 tok/s at B=52), and B=1 single-user latency sits at
+> the ~20 tok/s bandwidth ceiling, unchanged by this phase.** Two
+> load-bearing levers carried the aggregate result: batched-aggregate
+> axis-shift (cycle 10) × bf16 DeltaNet recurrent state (cycle 12);
+> 17 custom Metal kernel attempts closed without a load-bearing
+> E2E win on mlx 0.31.x (see § Performance). **D-022 small-B
+> interactive QoE is the next active research line, attacking
+> single-user latency directly.** OpenAI HTTP server and weight
 > streaming for MoE residency remain stubs behind frozen
 > interfaces.
 
@@ -89,7 +94,7 @@ either yet — see "What's planned" below for the gap.
 
 ---
 
-## Performance — P-6 autoresearch closed at v1.7.23
+## Performance — P-6 server-throughput phase closed at v1.7.23
 
 <table>
 <tr>
@@ -100,18 +105,36 @@ either yet — see "What's planned" below for the gap.
 
 <sub>Karpathy-style autoresearch ledgers — each dot is a measurement, the ladder is the running best. <strong>Left:</strong> dense Qwen3.5-27B-4bit, 38 experiments, 9 KEEPs, baseline 42.17 tok/s @ B=4 (cycle 1) → 232 tok/s @ B=64 (cycle 28). <strong>Right:</strong> MoE Qwen3.5-35B-A3B-4bit, 11 experiments, 2 KEEPs, baseline 188.5 tok/s @ B=4 → 791.8 tok/s @ B=128 (cycle 35) — the largest absolute throughput observed across the full effort.</sub>
 
-The 35-cycle opus autoresearch loop pushed Qwen3.5-27B-4bit warm
-decode 5.50× over the cycle-1 baseline on M5 Pro 48 GB. Two
-load-bearing levers — `cycle-10` batched-aggregate axis-shift
-(B=4 → B=52) and `cycle-12` bf16 DeltaNet recurrent state (3.5 GB
-peak save opens B≥48 within the 36 GB envelope) — composed to
-clear all four P-6 acceptance gates 3.4-5.5× over baseline.
-**17 custom Metal kernel attempts closed without a load-bearing
-E2E win**; the unlock came from data layout (bf16 state) and
-operating-point selection (axis-shift), not from a custom
-attention or QMM kernel.
+> **Single-user reality.** P-6 is a *server-throughput* phase. All
+> gains route through batch size: per-row throughput moves the
+> *opposite* way — 10.5 tok/s/row at B=4, 3.92 tok/s/row at B=52,
+> 3.62 tok/s/row at B=64. **Single-user (B=1) latency on M5 Pro is
+> bandwidth-capped near 20 tok/s and unchanged by this phase.**
+> Closing per-step time at small batch is the **D-022** research
+> line, in progress at v1.7.24.
 
-### Acceptance gates — every P-6 gate cleared
+| Configuration | Aggregate | Per row | Frame |
+| --- | ---: | ---: | --- |
+| B=1 (single user) | ~20 tok/s | ~20 tok/s | bandwidth ceiling, derived |
+| B=4 (cycle-1 baseline) | 42.17 tok/s | 10.54 tok/s | 52% bandwidth utilisation |
+| B=52 (best within 36 GB) | 204 tok/s | 3.92 tok/s | strict envelope |
+| B=64 (48 GB ceiling) | 232 tok/s | 3.62 tok/s | hardware cap |
+
+The 35-cycle opus autoresearch loop pushed Qwen3.5-27B-4bit warm
+decode 5.50× over the cycle-1 baseline on M5 Pro 48 GB **at the
+server-aggregate level**. Two load-bearing levers — `cycle-10`
+batched-aggregate axis-shift (B=4 → B=52) and `cycle-12` bf16
+DeltaNet recurrent state (3.5 GB peak save opens B≥48 within the
+36 GB envelope) — composed to clear all four P-6 acceptance gates
+3.4-5.5× over baseline. **17 custom Metal kernel attempts closed
+without a load-bearing E2E win**; the unlock came from data layout
+(bf16 state) and operating-point selection (axis-shift), not from
+a custom attention or QMM kernel. None of these levers move B=1
+single-user latency, which sits at the chip's weights-only
+bandwidth ceiling on this stack — that is the explicit motivation
+for the D-022 small-B research line.
+
+### Acceptance gates — every server-throughput P-6 gate cleared
 
 | Gate | Target | Cleared | Multiplier | Frame |
 | --- | --- | --- | ---: | --- |
@@ -335,7 +358,7 @@ variable-length SDPA kernel.
 | P-4 | Unified bench harness — runner, oracles, 15 scenarios, JSONL + Markdown reports, vqbench subprocess PPL | ✅ complete |
 | P-4.5 | P-4 exit bridge — chunked-prefill minimal + VectorCodec runtime integration spike | ✅ complete (v1.6.9) |
 | P-5 | VQ KV compression (BlockTQ / RaBitQ) | ✅ complete (v1.7.4 — Acceptance (1)–(4) closed; P-5-F production routing closed at v1.7.6; (b-static) Qwen3.5-4B baseline closed at v1.7.7; per-head opt-in + measurements at v1.7.8 / v1.7.10 / v1.7.11) |
-| P-6 | Performance phase (dense Qwen3.5-27B-4bit ≥40 tok/s primary, ≥60 stretch; MoE 35B-A3B ≥100 anchor cleared, ≥175 aggregate stretch) | ✅ acceptance gates cleared at v1.7.23 — (1a)/(1b)/(2b) all cleared 3.4-5.5× over the cycle-1 baseline via the 35-cycle opus autoresearch loop (axis-shift × bf16 DeltaNet state composition; see § Performance). D-021 step 5 spec foundation closed at v1.7.19. Track B 3-bit retired at v1.7.21 (B.2 PPL gate FAIL). Track C.4 retired at v1.7.20 (η.1 = 0.482×). Track C.5 retired at v1.7.22 (production-B verify-cost wall). D-022 small-B interactive QoE (B ∈ {1, 2, 4, 8, 12}) opened at v1.7.24 as the next active research line; Track A reframes from "ships after spec foundation" to next-research lead. Dense layer-streaming deferred to v0.2 per D-018. |
+| P-6 | Performance phase (dense Qwen3.5-27B-4bit ≥40 tok/s primary, ≥60 stretch; MoE 35B-A3B ≥100 anchor cleared, ≥175 aggregate stretch) | ✅ **server-throughput acceptance gates** cleared at v1.7.23 — (1a)/(1b)/(2b) all cleared 3.4-5.5× over the cycle-1 baseline via the 35-cycle opus autoresearch loop (axis-shift × bf16 DeltaNet state composition; see § Performance). All gains route through batch size; **B=1 single-user latency is unchanged from baseline (~20 tok/s, bandwidth-capped)** — that is the explicit motivation for D-022. D-021 step 5 spec foundation closed at v1.7.19. Track B 3-bit retired at v1.7.21 (B.2 PPL gate FAIL). Track C.4 retired at v1.7.20 (η.1 = 0.482×). Track C.5 retired at v1.7.22 (production-B verify-cost wall). D-022 small-B interactive QoE (B ∈ {1, 2, 4, 8, 12}) opened at v1.7.24 as the next active research line attacking single-user latency directly; Track A reframes from "ships after spec foundation" to next-research lead. Dense layer-streaming deferred to v0.2 per D-018. |
 | P-7 | Speculative decoding (DraftTarget / EAGLE / Medusa) | Promoted to T1 at v1.7.13; `DraftEngine` interface frozen. Foundation deliverables (`DraftTargetEngine` + engine integration + spec-metrics + bench switch) closed at D-021 step 5 (v1.7.19). ≥1.2× decode-throughput acceptance has now been settled with a measurement-anchored negative: opus cycle 23 measured the B × k verify-cost matrix on dense Qwen3.5-27B-4bit (B=52 k=64 = 8105 ms vs same-B plain decode ~252 ms / step) — tree-spec recomputes to ~10 tok/s aggregate, a net regression by 20× vs plain decode, with no B regime in {1, 4, 16, 52} where any spec variant beats plain. Track C.4 / C.5 both retired with negatives in P-6. Re-opening requires a fundamentally different verifier with measured sub-linear cost at production batch. EAGLE / Medusa stay v0.2. |
 | P-8 | OpenAI-compatible HTTP server + session layer | ⏳ planned (T1 tail, after P-5) |
 
