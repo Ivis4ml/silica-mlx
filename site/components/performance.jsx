@@ -402,50 +402,63 @@ const PerfGates = [
 const PerfDetails = [
   {
     id: "levers",
-    title: "Two load-bearing levers",
-    tag: "How",
-    body: (
-      <>
-        <p>The running-best is composition, not a custom kernel.</p>
-        <ul>
-          <li><strong>Cycle 10 — batched-aggregate axis-shift.</strong> Re-reading the AR.md metric definition moved the operating point B=4 → B=48 within the 36 GB envelope. Pure parameter selection. <em>4.60× on its own.</em></li>
-          <li><strong>Cycle 12 — bf16 DeltaNet recurrent state.</strong> State shape <span className="mono">[B, Hv=48, Dv=128, Dk=128]</span> is 144 MB at fp32 per layer, 72 MB at bf16. ~3.5 GB peak save. Opens B≥48 within envelope, B=64 at ceiling.</li>
-          <li><strong>Cycle 13 — composition.</strong> Cycle-12's peak save composed with cycle-10's B-axis lever produces the running-best line. The two levers are independent; together they dominate every later atomic probe.</li>
-        </ul>
-        <p className="perf-callout">
-          <strong>17 custom Metal kernel attempts closed without a load-bearing E2E win.</strong> Cycle 30 explained why: at B=64 with the v10+bf16 stack, DeltaNet owns 88% of step time, full-attn 12.5%, dispatch 0.3% — and mlx's existing <span className="mono">gated_delta</span> kernel is already at HBM-bandwidth limit (cycle-31 silica <span className="mono">gated_delta_v2</span> = 1.001× vs mlx). Source-string Metal kernels in mlx 0.31.x do not pay back on dense 27B.
-        </p>
-      </>
-    ),
+    num: "01",
+    tag: "How it worked",
+    title: "Two parameter changes; zero kernels.",
+    points: [
+      {
+        head: "Lever 1 · re-read the goal.",
+        body: "We were optimizing per-prompt speed; the metric we actually wanted was total throughput across the batch. Sweeping batch size 4 → 48 within the 36 GB memory budget gave 4.6× the starting throughput, with no code change.",
+      },
+      {
+        head: "Lever 2 · 16-bit recurrent state.",
+        body: "Storing one piece of model state in 16-bit floats instead of 32-bit frees ~3.5 GB of memory. By itself: no speedup. Combined with Lever 1: the batch can climb past 48 to 52 (envelope KEEP) and 64 (ceiling KEEP).",
+      },
+      {
+        head: "The lesson.",
+        body: "17 custom GPU kernel attempts produced zero wins. The unlock was operating-point selection, not kernel hacking — because mlx's existing kernels are already at the chip's memory-bandwidth limit and the dominant cost is data movement, not compute.",
+      },
+    ],
   },
   {
     id: "honest",
-    title: "Honest record — closures and a retraction",
+    num: "02",
     tag: "What didn't work",
-    body: (
-      <>
-        <ul>
-          <li><strong>Spec-decode at production B — closed with measurement-anchored negative.</strong> Cycle 23 measured the B × k verify-cost matrix: B=52 k=64 = 8105 ms vs same-B plain decode ~252 ms / step. Tree-spec recomputes to ~10 tok/s aggregate, a 20× regression vs plain. Track C settles: C.4 retired (η.1 = 0.482×), C.5 retired (cycle-23 closure), C.1/C.2/C.3/C.6 deprioritised.</li>
-          <li><strong>Dense B-axis past 64 — closed at the architectural cliff.</strong> Cycles 28-29 measured a 26% drop at B=64 → B=66 (40 GB peak boundary). Three allocator-hint probes leave the cliff in place — architectural, not allocator policy.</li>
-          <li><strong>Cycle 14's claimed v10 KEEP — retracted via codex review.</strong> A 14-cycle dtype-defect in <span className="mono">shadow_install</span> silently skipped the bf16 production path. After the fix, cycles 27/28 measured v10's E2E at +0.5 tok/s @ B=52 / −1.7 tok/s @ B=64 — both within noise. The retracted KEEPs are the dashed circles in the chart; click them to read the full story.</li>
-        </ul>
-      </>
-    ),
+    title: "Three roads we walked before turning around.",
+    points: [
+      {
+        head: "Speculative decoding — closed with a negative.",
+        body: "Verify-cost grows roughly linearly with batch size. At B=52 the verifier alone takes 8 seconds per step, vs 0.25 s for plain decoding. Tree-spec produces ~10 tok/s, a 20× regression. No batch size in {1, 4, 16, 52} where any spec variant beats plain decode.",
+      },
+      {
+        head: "Bigger batches past 64 — hardware cliff.",
+        body: "B=64 → B=66 throughput drops 26% at a 40 GB memory boundary. Three allocator-tuning probes leave the cliff in place. The cliff is in the chip itself (likely SLC threshold or memory-bandwidth contention near the 48 GB cap), not in our code.",
+      },
+      {
+        head: "Cycle 14's retracted kernel claim.",
+        body: "Code review found a typo in a dtype check that silently skipped a custom GPU kernel for 14 cycles. Honest re-measure: the kernel adds about 0.5 tok/s, indistinguishable from noise. Both retracted KEEPs stay on the chart as dashed circles — public retraction.",
+      },
+    ],
   },
   {
     id: "method",
-    title: "Methodology",
+    num: "03",
     tag: "How we measured",
-    body: (
-      <>
-        <p>
-          Karpathy-style autoresearch ledger (one TSV row per measurement; the main agent appends, sub-agents return findings). Variance discipline: ≥3 reps per session, ≥2 sessions, combined σ check before declaring a KEEP. Cycle 33's combined σ at B=52 across 2 sessions tightened to 0.83 tok/s on n=6 — the protocol standard, not the exception.
-        </p>
-        <p>
-          Toolchain pin: <span className="mono">mlx==0.31.1</span>, <span className="mono">mlx-lm==0.31.2</span>, <span className="mono">mlx-metal==0.31.1</span>. Determinism gate: <span className="mono">tests/test_p2_preload_parity.py</span> (3/3 pass). The cycle-27 retraction reinforced a process rule: small-n within-session σ underestimates run-to-run variance, so an n=3 KEEP is provisional until a second session confirms it.
-        </p>
-      </>
-    ),
+    title: "Karpathy-style ledger with variance discipline.",
+    points: [
+      {
+        head: "One row per measurement.",
+        body: "Main agent appends to the TSV ledger; sub-agents return findings rather than editing the ledger directly. 110 rows across the 35-cycle effort. Every dot on the chart is one row.",
+      },
+      {
+        head: "Three reps × two sessions before declaring a win.",
+        body: "Within-session error underestimates run-to-run variance — that's how cycle 14 published a result that needed retraction. The standard now: ≥3 reps per session, ≥2 sessions, combined error ≤ 1.5 tok/s before any KEEP is recorded.",
+      },
+      {
+        head: "Toolchain pinned and gated.",
+        body: "mlx 0.31.1 / mlx-lm 0.31.2 / mlx-metal 0.31.1. A determinism test (3/3 must pass) catches drift before any new measurement gets compared to the running best.",
+      },
+    ],
   },
 ];
 
@@ -477,7 +490,6 @@ const PerfLegend = () => (
 const Performance = () => {
   const [activeTab, setActiveTab] = React.useState("dense");
   const [activeIdx, setActiveIdx] = React.useState(null);
-  const [openDetail, setOpenDetail] = React.useState(null);
   const [animateKey, setAnimateKey] = React.useState(0);
   const [hasAnimated, setHasAnimated] = React.useState(false);
   const sectionRef = React.useRef(null);
@@ -601,28 +613,27 @@ const Performance = () => {
           </div>
         </div>
 
-        {/* Click-to-expand details */}
+        {/* Behind the numbers — 3 cards, always visible */}
         <div className="perf-section">
-          <div className="perf-subhead">Behind the numbers · click to expand</div>
-          <div className="perf-details">
-            {PerfDetails.map(d => {
-              const open = openDetail === d.id;
-              return (
-                <div key={d.id} className={"perf-detail" + (open ? " perf-detail-open" : "")}>
-                  <button
-                    type="button"
-                    className="perf-detail-head"
-                    onClick={() => setOpenDetail(open ? null : d.id)}
-                    aria-expanded={open}
-                  >
-                    <span className="perf-detail-tag mono">{d.tag}</span>
-                    <span className="perf-detail-title">{d.title}</span>
-                    <span className="perf-detail-chev mono">{open ? "−" : "+"}</span>
-                  </button>
-                  {open && <div className="perf-detail-body">{d.body}</div>}
+          <div className="perf-subhead">Behind the numbers</div>
+          <div className="perf-cards">
+            {PerfDetails.map(d => (
+              <div key={d.id} className="perf-card">
+                <div className="perf-card-head">
+                  <span className="perf-card-num mono">{d.num}</span>
+                  <span className="perf-card-tag mono">{d.tag}</span>
                 </div>
-              );
-            })}
+                <h3 className="perf-card-title">{d.title}</h3>
+                <div className="perf-card-points">
+                  {d.points.map((pt, idx) => (
+                    <div key={idx} className="perf-card-point">
+                      <div className="perf-card-point-head">{pt.head}</div>
+                      <div className="perf-card-point-body">{pt.body}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
           </div>
         </div>
 
@@ -998,69 +1009,80 @@ const Performance = () => {
         }
         .perf-gate-frame { font-size: 12px; color: var(--ink-3); line-height: 1.5; }
 
-        /* Details accordion */
-        .perf-details {
+        /* Behind-the-numbers cards */
+        .perf-cards {
+          display: grid;
+          grid-template-columns: repeat(3, 1fr);
+          gap: 16px;
+        }
+        @media (max-width: 920px) { .perf-cards { grid-template-columns: 1fr; } }
+        .perf-card {
+          background: var(--bg-elev);
+          border: 1px solid var(--rule);
+          border-radius: var(--radius);
+          padding: 26px 24px 28px;
           display: flex;
           flex-direction: column;
-          gap: 1px;
-          background: var(--rule);
-          border-radius: var(--radius);
-          overflow: hidden;
-          border: 1px solid var(--rule);
+          transition: border-color 160ms ease, transform 160ms ease, box-shadow 160ms ease;
         }
-        .perf-detail { background: var(--bg-elev); }
-        .perf-detail-head {
-          all: unset;
-          width: 100%;
-          padding: 18px 22px;
-          cursor: pointer;
-          display: grid;
-          grid-template-columns: 130px 1fr 24px;
-          gap: 14px;
-          align-items: center;
-          transition: background 120ms;
+        .perf-card:hover {
+          border-color: var(--rule);
+          transform: translateY(-1px);
+          box-shadow: 0 1px 3px rgba(0,0,0,0.04), 0 8px 24px -12px rgba(0,0,0,0.08), 0 0 0 1px var(--rule);
         }
-        .perf-detail-head:hover { background: var(--bg-sunken); }
-        .perf-detail-tag {
-          font-size: 11px;
+        .perf-card-head {
+          display: flex;
+          align-items: baseline;
+          gap: 12px;
+          margin-bottom: 14px;
+        }
+        .perf-card-num {
+          font-size: 22px;
+          font-weight: 600;
           color: var(--accent);
+          letter-spacing: -0.02em;
+          line-height: 1;
+        }
+        .perf-card-tag {
+          font-size: 10px;
+          color: var(--ink-4);
           text-transform: uppercase;
-          letter-spacing: 0.06em;
+          letter-spacing: 0.1em;
           font-weight: 600;
         }
-        .perf-detail-title {
-          font-size: 15px;
+        .perf-card-title {
+          font-size: 17px;
           font-weight: 600;
           color: var(--ink);
+          letter-spacing: -0.012em;
+          line-height: 1.3;
+          margin: 0 0 18px;
         }
-        .perf-detail-chev {
-          font-size: 18px;
-          color: var(--ink-3);
+        .perf-card-points {
+          display: flex;
+          flex-direction: column;
+          gap: 14px;
+          flex: 1;
+        }
+        .perf-card-point {
+          padding-top: 14px;
+          border-top: 1px solid var(--rule-2);
+        }
+        .perf-card-point:first-child {
+          padding-top: 0;
+          border-top: none;
+        }
+        .perf-card-point-head {
+          font-size: 12px;
           font-weight: 600;
-          text-align: right;
+          color: var(--ink);
+          margin-bottom: 6px;
+          letter-spacing: -0.005em;
         }
-        .perf-detail-body {
-          padding: 0 22px 22px;
+        .perf-card-point-body {
           font-size: 13px;
           color: var(--ink-2);
-          line-height: 1.65;
-        }
-        .perf-detail-body p { margin: 0 0 12px; }
-        .perf-detail-body ul { margin: 0; padding-left: 22px; }
-        .perf-detail-body li { margin-bottom: 8px; }
-        .perf-detail-body strong { color: var(--ink); font-weight: 600; }
-        .perf-detail-body em { color: var(--accent); font-style: normal; font-weight: 600; }
-        .perf-callout {
-          margin-top: 14px !important;
-          padding: 14px 18px;
-          background: var(--bg-sunken);
-          border-radius: var(--radius-sm);
-          border: 1px solid var(--rule);
-          font-size: 13px;
-          color: var(--ink-2);
-        }
-        @media (max-width: 720px) {
-          .perf-detail-head { grid-template-columns: 100px 1fr 20px; }
+          line-height: 1.6;
         }
 
         /* Foot */
