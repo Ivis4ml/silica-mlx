@@ -3,7 +3,7 @@
 | Field        | Value                                                              |
 | ------------ | ------------------------------------------------------------------ |
 | Decision ID  | D-023                                                              |
-| Status       | Opening — gate (i) pairing/feasibility verified 2026-05-06 (outcome A\*); pending gate (ii) downloads / gate (iii) `uv add --dev mlx-vlm` / gate (iv) license reconciliation |
+| Status       | Opening — gate (i) verified 2026-05-06 (outcome A\*); gate (ii) downloads done 2026-05-06 (target `dcb78c3` 17 GB + drafter `28e9227` 926 MB); gate (iii) reframed 2026-05-06 — install via isolated venv, NOT project dev-deps (mlx-vlm 0.5.0 requires `mlx>=0.31.2 / mlx-lm>=0.31.3` which would force-bump the v1.7.21 determinism anchor); gate (iv) license reconciliation deferred — spike does not bundle weights |
 | Created      | 2026-05-06                                                         |
 | Origin       | External evidence: Google's Gemma 4 multi-token-prediction release |
 | Frame        | Track C reopen probe; not D-022 reopen, not C.3 continuation        |
@@ -202,11 +202,12 @@ Resolution: **outcome A\*** (hybrid mixed precision). User authorized
 the precision-mismatch caveat documented in the verdict. The
 hardware-feasibility hard block (PAIR-INFEASIBLE) is therefore not
 fired; the spike proceeds to gate (ii) download authorization, gate
-(iii) `uv add --dev mlx-vlm`, and gate (iv) license reconciliation.
+(iii) isolated-venv setup for `mlx-vlm 0.5.0`, and gate (iv) license
+reconciliation.
 
 ---
 
-## §4 Runtime dependencies — `mlx-vlm` dev-only
+## §4 Runtime dependencies — isolated venv fork
 
 The spike runs through Google's published `mlx_vlm` runtime. The
 canonical CLI command form per the HF / mlx-vlm README is:
@@ -225,23 +226,47 @@ A Python `batch_generate` API exists for B > 1 measurement; the
 exact entry-point is `mlx_vlm.utils.batch_generate` (verify exact
 import path against the installed version before scripting the spike).
 
-Required dependency state:
+### §4.1 Why an isolated venv, not project dev-deps
 
-| Item         | Current state                              | Action gate                            |
-| ------------ | ------------------------------------------ | -------------------------------------- |
-| `mlx`        | 0.31.1 (pinned in pyproject.toml)          | No change — drafter must run on pin    |
-| `mlx-lm`     | 0.31.2 (pinned)                            | No change                               |
-| `mlx-metal`  | 0.31.1 (pinned, darwin only)               | No change                               |
-| `mlx-vlm`    | **not installed**                          | **STOP-GATE A** — `uv add --dev`        |
+`mlx-vlm 0.5.0` (the version with Gemma 4 MTP CLI) requires
+`mlx>=0.31.2 / mlx-lm>=0.31.3 / transformers>=5.5.0`. Silica's project
+pin is `mlx==0.31.1 / mlx-lm==0.31.2 / mlx-metal==0.31.1` per the
+v1.7.21 anchor in `tests/test_p2_preload_parity.py` (the cycle-11
+2026-05-04 upgrade attempt produced a deterministic argmax flip at
+greedy-decode index 5; bisect across the three packages was deferred).
 
-The `mlx-vlm` install must use `uv add --dev` so the dependency lands
-under `[dependency-groups].dev`, not under `[project].dependencies` —
-this is an external runtime probe and `silica.*` mainline must stay
-slim. After install, re-run `uv pip list | grep mlx` to confirm the
-`mlx==0.31.1 / mlx-lm==0.31.2 / mlx-metal==0.31.1` pin is intact; if
-`mlx-vlm` force-bumps the pin, the spike pauses for re-evaluation
-(the v1.7.21 pin is anchored in `tests/test_p2_preload_parity.py`
-determinism).
+`uv add --dev mlx-vlm` would therefore either fail at the resolver
+step or force-bump the pin and break the determinism anchor.
+
+Decision recorded 2026-05-06: **install `mlx-vlm 0.5.0` into a
+project-external isolated venv; do NOT touch `pyproject.toml` or
+`uv.lock`.** This decouples the spike from the pin-bump decision
+entirely. The spike's verdict will record the runtime-stack divergence
+explicitly (see §10).
+
+### §4.2 Isolated venv install plan
+
+| Item                  | Path / version                                                    |
+| --------------------- | ----------------------------------------------------------------- |
+| venv root             | `~/.cache/silica-d023-mtp/.venv`                                  |
+| Python                | match silica's `>=3.12`                                           |
+| `mlx-vlm`             | `==0.5.0` (Gemma 4 MTP CLI; 2026-05-06 release)                   |
+| transitively pinned   | `mlx>=0.31.2`, `mlx-lm>=0.31.3`, `transformers>=5.5.0`, `Pillow`, etc. |
+| silica `pyproject.toml` | **untouched** at `mlx==0.31.1 / mlx-lm==0.31.2 / mlx-metal==0.31.1` |
+
+After install, the spike scripts run via
+`~/.cache/silica-d023-mtp/.venv/bin/python -m mlx_vlm.generate ...`,
+keeping the command path explicit to avoid accidental shadowing by
+the project venv on `$PATH`.
+
+### §4.3 Pin-divergence ledger (records what changed during the spike)
+
+The verdict template (§10) records the exact installed versions of
+`mlx`, `mlx-lm`, and `mlx-vlm` inside the isolated venv at spike
+runtime. Future-self consults that block to know precisely what
+runtime stack produced the measurements; the silica project pin is
+separately anchored by the still-untouched
+`tests/test_p2_preload_parity.py` determinism gate.
 
 ---
 
@@ -254,15 +279,14 @@ as of 2026-05-06:
 | -------------------------------------------------------- | ------- | ---------- | --------------------------------------------------------- |
 | `mlx-community/gemma-4-31b-4bit` (non-IT)                | ✅      | 17 GB      | **Not the supported MTP target**; not used under outcome A\* |
 | `mlx-community/gemma-4-26b-a4b-4bit` (MoE non-IT)        | ✅      | 15 GB      | Out of scope for D-023 (MTP drafter is dense-paired)       |
-| `mlx-community/gemma-4-31b-it-4bit` (4-bit IT target)    | ❌      | (~17-19 GB est.) | **Outcome A\* target.** Authorized for download 2026-05-06; pending gate (ii) |
+| `mlx-community/gemma-4-31b-it-4bit` (4-bit IT target)    | ✅      | 17 GB      | **Outcome A\* target.** Downloaded 2026-05-06 (snapshot `dcb78c3`)        |
 | `mlx-community/gemma-4-31B-it-bf16` (advertised target)  | ❌      | (~62.5 GB) | Cannot fit on 48 GB unified memory; not used under outcome A\* |
-| `mlx-community/gemma-4-31B-it-assistant-bf16` (drafter)  | ❌      | (~939 MB)  | **Outcome A\* drafter** (only drafter HF publishes for this family); authorized 2026-05-06; pending gate (ii) |
+| `mlx-community/gemma-4-31B-it-assistant-bf16` (drafter)  | ✅      | 926 MB     | **Outcome A\* drafter.** Downloaded 2026-05-06 (snapshot `28e9227`)        |
 
-The non-IT 4-bit target snapshot has 4 safetensors shards plus
-tokenizer + `processor_config.json` (multimodal-capable processor; the
-spike runs text-only, mirroring D-014). Any download requires explicit
-user approval per the locked startup sequence; outcome B closes the
-spike before any download fires.
+Both outcome A* models cached locally. The non-IT 4-bit target snapshot
+has 4 safetensors shards plus tokenizer + `processor_config.json`
+(multimodal-capable processor; the spike runs text-only, mirroring
+D-014).
 
 ---
 
@@ -497,11 +521,18 @@ B = 4 k = 8, so the optimistic claim is at the edge of physics.
 ```
 === D-023 verdict (date: YYYY-MM-DD) ===
 
-Toolchain
-  mlx           : <pin status>
-  mlx-lm        : <pin status>
-  mlx-vlm       : <version installed>
-  mx.metal device : <device name + memory>
+Toolchain — **MUST record runtime-stack divergence** (§4.3)
+  isolated venv path  : <e.g., ~/.cache/silica-d023-mtp/.venv>
+  mlx (in venv)       : <e.g., 0.31.2>
+  mlx-lm (in venv)    : <e.g., 0.31.3>
+  mlx-vlm (in venv)   : <e.g., 0.5.0>
+  silica project pin  : mlx==0.31.1 / mlx-lm==0.31.2 / mlx-metal==0.31.1 (untouched)
+  divergence note     : "External spike stack != silica pinned stack;
+                         spike result informs D-023 decision only and
+                         does NOT constitute a silica runtime
+                         attestation. tests/test_p2_preload_parity.py
+                         remains anchored on the silica project pin."
+  mx.metal device     : <device name + memory>
 
 Pairing
   outcome (§3.4)        : <A | A* | B | C | D>     (A* hybrid mixed precision per §3.5)

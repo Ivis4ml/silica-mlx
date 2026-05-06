@@ -380,11 +380,14 @@ read in-editor while iterating.
   `License: gemma`, reuse decision deferred), supported-pairing +
   hardware-feasibility verification (the load-bearing gate; outcomes
   A/A\*/B/C/D; gate (i) resolved A\* on 2026-05-06), runtime deps
-  (`mlx-vlm` dev-only via `uv add --dev`; pin
-  status against the `mlx==0.31.1 / mlx-lm==0.31.2 / mlx-metal==0.31.1`
-  toolchain), HF cache check (cached non-IT 4-bit base is not the
-  supported target; advertised BF16 pair not cached and exceeds 48 GB
-  ceiling), measurement plan (`draft_block_size ∈ {2, 3, 6, 9}` ×
+  (`mlx-vlm 0.5.0` requires `mlx>=0.31.2 / mlx-lm>=0.31.3` and would
+  force-bump the v1.7.21 determinism anchor, so install lands in an
+  isolated venv at `~/.cache/silica-d023-mtp/.venv`; silica project
+  pin `mlx==0.31.1 / mlx-lm==0.31.2 / mlx-metal==0.31.1` stays
+  untouched), HF cache check (outcome A\* target snapshot `dcb78c3`
+  and drafter snapshot `28e9227` cached; cached non-IT 4-bit base is
+  not used; advertised BF16 target exceeds the 48 GB ceiling),
+  measurement plan (`draft_block_size ∈ {2, 3, 6, 9}` ×
   `B ∈ {1, 4}`, `k_candidates = block_size − 1`; `block_size = 6` is
   the card's single-request recommendation, `block_size = 3` the
   batched recommendation, `block_size = 2` is the verify-cost-floor
