@@ -13,7 +13,7 @@
 const PerfDensePoints = [
   // [seq, tok_s, status, cycle?, label?, description?]
   [1, 42.17, "keep", "C1", "starting point",
-    "Where we begin. Generating tokens for 4 simultaneous requests on Qwen3.5-27B (a 27-billion-parameter model) reaches 42 tokens per second per request — about 52% of what the M5 Pro chip's memory bandwidth ought to allow. Every later number is compared against this one."],
+    "Where we begin. Decoding 4 prompts in parallel (B=4) on Qwen3.5-27B reaches 42 tokens per second total throughput. The chip's memory bandwidth could in principle support more — we're using about 52% of it. Every later number is compared against this 42."],
   [2, 6.54, "discard", null, null,
     "First speculative-decoding probe — a small companion model guesses tokens, the big model verifies. Slower than plain decoding (about 40% the speed). Retired."],
   [3, 7.74, "discard", null, null,
@@ -31,78 +31,78 @@ const PerfDensePoints = [
   [9, 42.68, "diag", null, null,
     "Re-baselined at production attention shape. Within noise of cycle 1."],
   [10, 43.0, "diag", null, null,
-    "First step of the batch sweep: 8 simultaneous requests. Just above baseline."],
+    "First step of the batch sweep: 8 prompts in parallel (B=8). Just above baseline because B=4 → B=8 doesn't yet pay off enough to dominate per-step overhead."],
   [11, 63.1, "keep", null, null,
-    "First win: 12 requests at once = 63 tok/s. The first time we crossed the 60 tok/s stretch goal — without writing any new code. Just a different batch size."],
+    "First win: 12 prompts in parallel (B=12) = 63 tok/s. The first time we crossed the 60 tok/s stretch goal — without writing any new code. Just a different batch size: 12 prompts share the same per-step weight read instead of doing 12 sequential reads."],
   [12, 81.1, "diag", null, null,
-    "16 requests at once. Throughput keeps climbing cleanly."],
+    "B=16. Throughput keeps climbing cleanly — the per-step weight read amortizes across more in-flight tokens."],
   [13, 112.8, "diag", null, null,
-    "24 requests at once — about 2.7× the starting point already."],
+    "B=24. About 2.7× the starting point already, just from packing more prompts into the same step."],
   [14, 150.6, "keep", null, null,
-    "32 requests: 150 tok/s, 3.6× the start. Memory peak ~26 GB, well within budget."],
+    "B=32: 150 tok/s, 3.6× the start. Memory peak ~26 GB, well within the 36 GB budget."],
   [15, 171.6, "keep", null, null,
-    "40 requests: 172 tok/s. About 4× the start."],
+    "B=40: 172 tok/s. About 4× the start."],
   [16, 183.3, "keep", null, null,
-    "44 requests: 183 tok/s. Approaching the strict 36 GB memory budget."],
+    "B=44: 183 tok/s. Approaching the strict 36 GB memory budget."],
   [17, 193.9, "keep", "C10", "axis-shift @ B=48",
-    "The breakthrough. Batching 48 requests together = 4.6× the starting throughput, with no kernel change at all. The trick was just re-reading our own goal: \"maximize total tokens per second across the batch\", not per individual request. Memory peak 34 GB, still inside the 36 GB budget. Nine prior cycles of GPU-kernel hacking had moved nothing — this single parameter choice did."],
+    "The breakthrough. Decoding 48 prompts in parallel (B=48) = 4.6× the starting throughput, with no kernel change at all. The trick was just re-reading our own goal — \"maximize total tokens per second across the batch\", not per individual prompt — and then sweeping B until we hit a memory boundary. Memory peak 34 GB, still inside the 36 GB budget. Nine prior cycles of GPU-kernel hacking had moved nothing; this single parameter choice did."],
   [18, 193.3, "diag", null, null,
-    "Tested a custom GPU attention kernel at this batch size. Wins on a microbenchmark, but flat at the system level — attention is only a small slice of total step time at high batch."],
+    "Tested a custom GPU attention kernel at B=48. Wins on a small microbenchmark, but flat at the whole-system level — attention is only a small slice of total step time at high batch."],
   [19, 192.5, "diag", null, null,
-    "Tried storing the recurrent state in 16-bit floats instead of 32-bit. Same speed at this batch, but frees ~3.5 GB of memory — the seed for the next breakthrough."],
+    "Tried storing one piece of state — the model's recurrent memory — in 16-bit floats instead of 32-bit. Same speed at B=48, but frees about 3.5 GB of memory. That free headroom is the seed for the next breakthrough."],
   [20, 200.8, "keep", "C13", "the composition win",
-    "Composition. The 16-bit memory save from cycle 12 doesn't speed anything up by itself, but it frees enough headroom to push from 48 to 52 requests in batch — and that bump pushes throughput past 200 tok/s, still inside the 36 GB budget. Two cheap parameter changes beat every kernel attempt."],
+    "Composition. The 16-bit memory save from cycle 12 doesn't speed anything up by itself, but it frees enough headroom to bump batch size from 48 to 52 (B=52) — and that bump pushes throughput past 200 tok/s, still inside the 36 GB budget. Two cheap parameter changes beat every kernel attempt."],
   [21, 212.2, "diag", null, null,
-    "56 requests at once. Past the strict 36 GB budget but inside the 48 GB chip-memory cap."],
+    "B=56. Past the strict 36 GB budget but still inside the 48 GB chip-memory cap."],
   [22, 219.1, "diag", null, null,
-    "60 requests."],
+    "B=60."],
   [23, 229.8, "keep", null, null,
-    "64 requests: 230 tok/s. About 5.5× the starting point — pushing right against the 48 GB chip memory limit."],
+    "B=64: 230 tok/s. About 5.5× the starting point — pushing right against the 48 GB chip memory limit."],
   [24, 166.8, "discard", null, null,
-    "Tried 66 requests. Throughput collapsed 26%. We hit a hardware cliff at the 40 GB memory peak — beyond it, the chip stops scaling. Three allocator settings tried; the cliff is in the chip itself, not our code."],
+    "Tried B=66. Throughput collapsed 26%. We hit a hardware cliff at the 40 GB memory peak — beyond it, the chip stops scaling. Three allocator settings tried; the cliff is in the chip itself, not in our code."],
   [25, 169.1, "discard", null, null,
-    "68 requests — also past the cliff."],
+    "B=68 — also past the cliff."],
   [26, 173.2, "discard", null, null,
-    "72 requests — confirming the pattern. Dense 27B can't benefit from larger batches on this chip."],
+    "B=72 — confirming the pattern. Dense 27B can't benefit from larger batches on this chip."],
   [27, 206.2, "retracted", "C14→C27", "retracted",
-    "A retracted result. Cycle 14 claimed a 5-tok/s gain at batch=52 from a custom GPU attention kernel. Two weeks later a code review caught a bug — the code checked for the wrong floating-point format and the kernel was silently being skipped on the production model. After the fix, the kernel's real contribution measured to within noise (~0.5 tok/s, statistically zero). The honest credit goes to cycles 10 and 12; we kept this dot on the chart so the retraction stays visible."],
+    "A retracted result. Cycle 14 claimed a 5-tok/s gain at B=52 from a custom GPU attention kernel. Two weeks later a code review caught a bug — the code checked for the wrong floating-point format and the kernel was silently being skipped on the production model. After the fix, the kernel's real contribution measured to within noise (about 0.5 tok/s, statistically zero). The honest credit goes to cycles 10 and 12; we kept this dot on the chart so the retraction stays visible."],
   [28, 232.2, "retracted", "C14→C27", "retracted",
-    "Same retracted experiment at batch=64. Cycle 14 reported 232 tok/s with the custom kernel; the code-review fix showed it was actually slightly slower than the simpler version (still within noise). The real ceiling result comes two indices later, at 231.9."],
+    "Same retracted experiment at B=64. Cycle 14 reported 232 tok/s with the custom kernel; the code-review fix showed it was actually slightly slower than the simpler version (still within noise). The real ceiling result comes two indices later, at 231.9."],
   [29, 197.05, "diag", null, null,
-    "First re-check after the code-review fix. Within the cycle-13 range; no new claim."],
+    "First re-check at B=52 after the code-review fix. Within the cycle-13 range; no new claim."],
   [30, 200.14, "diag", null, null,
-    "Re-check under one Python environment — back near cycle-13."],
+    "Re-check at B=52 under one Python environment — back near cycle-13."],
   [31, 185.30, "diag", null, null,
-    "Re-check under a different Python environment — about 10% lower. Identified as between-environment drift, not a regression."],
+    "Re-check at B=52 under a different Python environment — about 10% lower. Identified as between-environment drift, not a regression."],
   [32, 231.9, "keep", "C28", "honest ceiling",
-    "The honest hardware-ceiling result: 232 tok/s at batch=64, measured 3 times with tight agreement (±0.3 tok/s). About 5.5× the starting point, just inside the 48 GB chip memory limit. This number replaces the cycle-14 retracted claim."],
+    "The honest hardware-ceiling result. B=64 → 232 tok/s, measured 3 times with tight agreement (±0.3 tok/s). About 5.5× the starting point, just inside the 48 GB chip memory limit. This number replaces the cycle-14 retracted claim."],
   [33, 204.0, "keep", "C33", "tightened envelope",
-    "Final tighten. Re-measured at batch=52 across 6 runs in two sessions: 204 ± 1 tok/s. This is the running-best within the strict 36 GB memory budget. The variance protocol used here (multiple sessions, combined error check) is now the standard for any future claim."],
+    "Final tighten. Re-measured at B=52 across 6 runs in two sessions: 204 ± 1 tok/s. This is the best result within the strict 36 GB memory budget. The variance protocol used here (multiple sessions, combined error check) is now the standard for any future claim."],
 ];
 
 const PerfMoePoints = [
   [1, 188.5, "keep", "C1", "starting point",
-    "Same starting line for the mixture-of-experts version. 188 tok/s for 4 simultaneous requests on Qwen3.5-35B-A3B (a 35-billion-parameter MoE model — larger total weights but only 8 of 256 experts active per token). The original ≥100 tok/s goal was already satisfied here at the baseline."],
+    "Same starting line, this time for the mixture-of-experts version. 188 tok/s for 4 prompts in parallel (B=4) on Qwen3.5-35B-A3B — a 35-billion-parameter MoE model where only 8 of 256 experts are active per token, so each token's active-weight footprint is much smaller than dense 27B's. The original ≥100 tok/s goal was already satisfied here at the baseline."],
   [2, 181.4, "diag", null, null,
-    "Tried the 16-bit recurrent state on MoE at 4 requests. Slightly below baseline — 4 requests amortizes poorly on this architecture."],
+    "Tried the 16-bit recurrent state on MoE at B=4. Slightly below baseline — B=4 amortizes poorly on this architecture."],
   [3, 242.0, "diag", null, null,
-    "8 requests. Climbing."],
+    "B=8. Climbing."],
   [4, 306.3, "diag", null, null,
-    "16 requests."],
+    "B=16."],
   [5, 384.8, "diag", null, null,
-    "32 requests."],
+    "B=32."],
   [6, 434.3, "diag", null, null,
-    "48 requests."],
+    "B=48."],
   [7, 464.4, "keep", "C34", "envelope KEEP @ B=64",
-    "MoE win within the strict memory budget. 464 tok/s at 64 simultaneous requests, peak 33.8 GB. Same parameter changes from cycles 10 and 12 ported over to MoE via a shared memory hook. About 2.5× the MoE starting point."],
+    "MoE win within the strict memory budget. B=64 → 464 tok/s, peak memory 33.8 GB (inside the 36 GB budget). Same parameter changes from cycles 10 and 12 ported over to MoE via a shared memory hook. About 2.5× the MoE starting point."],
   [8, 447.9, "discard", null, null,
-    "80 requests — past the strict budget, throughput dips."],
+    "B=80 — past the strict budget, throughput dips."],
   [9, 444.5, "discard", null, null,
-    "72 requests."],
+    "B=72."],
   [10, 467.1, "diag", null, null,
-    "96 requests — climbing again as we sweep toward the chip-memory limit."],
+    "B=96 — climbing again as we sweep toward the chip-memory limit."],
   [11, 791.8, "keep", "C35", "the biggest result",
-    "The biggest result of the entire 35-cycle effort. 792 tok/s at 128 simultaneous requests on the MoE model, sitting almost exactly at the 48 GB chip memory limit (peak 47.96 GB), measured 3 times. About 4.2× the MoE starting point. Unlike dense 27B, the MoE architecture doesn't hit a memory cliff at this size — only 8 of 256 experts are active per token, so each token's active-weight footprint is much smaller."],
+    "The biggest result of the entire 35-cycle effort. B=128 → 792 tok/s on the MoE model, sitting almost exactly at the 48 GB chip memory limit (peak 47.96 GB), measured 3 times. About 4.2× the MoE starting point. Unlike dense 27B, the MoE architecture doesn't hit a memory cliff at this size — because only 8 of 256 experts are active per token, the active-weight footprint per prompt is much smaller, leaving room for more parallel prompts before the chip caps out."],
 ];
 
 const PerfTracks = {
@@ -525,8 +525,21 @@ const Performance = () => {
           <div className="section-eyebrow">P-6 autoresearch · v1.7.23</div>
           <h2>35 cycles. Two levers. Every gate cleared 3.4-5.5×.</h2>
           <p>
-            The opus autoresearch loop pushed Qwen3.5-27B-4bit warm decode 5.50× over the cycle-1 baseline on M5 Pro 48 GB; MoE Qwen3.5-35B-A3B-4bit hit 791.8 tok/s at the 48 GB hardware ceiling. The chart below replays the ledger — each dot a measurement, the ladder the running best, the dashed circles cycle 14's retracted KEEPs. Click any dot to read its experiment record.
+            We pushed Qwen3.5-27B-4bit decoding from 42 to 232 tokens per second on M5 Pro 48 GB across 35 experiments. The chart below is our lab notebook: each dot is one experiment, the rising line is the best result so far, the dashed circles are a claim we later retracted (visible on the chart so the correction stays public). Click any dot to read what that experiment tried.
           </p>
+          <div className="perf-primer">
+            <div className="perf-primer-card">
+              <div className="perf-primer-tag mono">how to read</div>
+              <div className="perf-primer-body">
+                <p>
+                  <strong>Throughput vs batch size.</strong> Every decode step loads the model's weights from memory once — and that one read can serve any number of in-flight prompts in parallel. Decoding 12 prompts at once produces about 12× the tokens per second of decoding one at a time, until either memory fills up or compute saturates. So the question "how fast is this?" depends critically on how many prompts you're running together; "batch size" (B in the chart) is the answer.
+                </p>
+                <p>
+                  <strong>Two memory budgets.</strong> The 36 GB envelope is our strict working budget (leaves room for OS + browser); 48 GB is the M5 Pro chip's hard ceiling. Bigger batches eat more memory, so throughput climbs along the batch axis until one of these caps stops us.
+                </p>
+              </div>
+            </div>
+          </div>
         </div>
 
         {/* Animated chart panel */}
@@ -625,6 +638,44 @@ const Performance = () => {
       </div>
 
       <style>{`
+        /* "How to read" primer */
+        .perf-primer {
+          margin-top: 28px;
+          margin-bottom: 8px;
+        }
+        .perf-primer-card {
+          background: var(--bg-sunken);
+          border: 1px solid var(--rule);
+          border-radius: var(--radius);
+          padding: 20px 24px;
+          display: grid;
+          grid-template-columns: 110px 1fr;
+          gap: 16px;
+          align-items: start;
+        }
+        @media (max-width: 720px) {
+          .perf-primer-card {
+            grid-template-columns: 1fr;
+            gap: 8px;
+          }
+        }
+        .perf-primer-tag {
+          font-size: 10px;
+          color: var(--accent);
+          text-transform: uppercase;
+          letter-spacing: 0.08em;
+          font-weight: 600;
+          padding-top: 2px;
+        }
+        .perf-primer-body {
+          font-size: 13px;
+          color: var(--ink-2);
+          line-height: 1.6;
+        }
+        .perf-primer-body p { margin: 0 0 10px; }
+        .perf-primer-body p:last-child { margin-bottom: 0; }
+        .perf-primer-body strong { color: var(--ink); font-weight: 600; }
+
         /* Tabs + chart frame */
         .perf-chart-panel { margin-bottom: 56px; }
         .perf-tabs {
