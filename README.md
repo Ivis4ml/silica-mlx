@@ -91,25 +91,25 @@ either yet — see "What's planned" below for the gap.
 
 ## Performance — P-6 autoresearch closed at v1.7.23
 
+<table>
+<tr>
+<td width="50%"><img src="plans/P6_AUTORESEARCH_PROGRESS_DECODE_TOK_S.png" alt="Dense Qwen3.5-27B-4bit decode running-best line across 35 cycles" /></td>
+<td width="50%"><img src="plans/P6_AUTORESEARCH_PROGRESS_MOE_DECODE_TOK_S.png" alt="MoE Qwen3.5-35B-A3B-4bit decode running-best line across cycles 34-35" /></td>
+</tr>
+</table>
+
+<sub>Karpathy-style autoresearch ledgers — each dot is a measurement, the ladder is the running best. <strong>Left:</strong> dense Qwen3.5-27B-4bit, 38 experiments, 9 KEEPs, baseline 42.17 tok/s @ B=4 (cycle 1) → 232 tok/s @ B=64 (cycle 28). <strong>Right:</strong> MoE Qwen3.5-35B-A3B-4bit, 11 experiments, 2 KEEPs, baseline 188.5 tok/s @ B=4 → 791.8 tok/s @ B=128 (cycle 35) — the largest absolute throughput observed across the full effort.</sub>
+
 The 35-cycle opus autoresearch loop pushed Qwen3.5-27B-4bit warm
-decode 5.50× over the cycle-1 baseline on M5 Pro 48 GB. The two
+decode 5.50× over the cycle-1 baseline on M5 Pro 48 GB. Two
 load-bearing levers — `cycle-10` batched-aggregate axis-shift
 (B=4 → B=52) and `cycle-12` bf16 DeltaNet recurrent state (3.5 GB
 peak save opens B≥48 within the 36 GB envelope) — composed to
-clear all four P-6 acceptance gates 3.4-5.5× over baseline. The
-MoE secondary track at B=128 = 791.8 tok/s is the largest
-absolute throughput observed across the full effort.
-
-### Headline numbers
-
-| Metric | Value | Frame |
-| --- | ---: | --- |
-| Dense 27B decode (envelope) | **204 ± 1 tok/s** | `mlx-community/Qwen3.5-27B-4bit` · B=52 · 36 GB · n=6 across 2 sessions |
-| Dense 27B decode (hardware ceiling) | **231.9 ± 0.3 tok/s** | B=64 · 48 GB · n=3 |
-| MoE 35B-A3B decode (envelope) | **464.1 ± 0.7 tok/s** | `mlx-community/Qwen3.5-35B-A3B-4bit` · B=64 · 33.8 GB · n=3 |
-| MoE 35B-A3B decode (hardware ceiling) | **791.8 ± 5.2 tok/s** | B=128 · 47.96 GB · n=3 |
-| Dense uplift from cycle-1 baseline (42.17 tok/s @ B=4) | **5.50×** at B=64 / **4.85×** at B=52 | — |
-| MoE uplift from cycle-1 baseline (188.5 tok/s @ B=4) | **4.20×** at B=128 / **2.46×** at B=64 | — |
+clear all four P-6 acceptance gates 3.4-5.5× over baseline.
+**17 custom Metal kernel attempts closed without a load-bearing
+E2E win**; the unlock came from data layout (bf16 state) and
+operating-point selection (axis-shift), not from a custom
+attention or QMM kernel.
 
 ### Acceptance gates — every P-6 gate cleared
 
@@ -120,62 +120,80 @@ absolute throughput observed across the full effort.
 | (2a) MoE anchor | ≥100 tok/s | 120.93 tok/s (preserved) | — | MoE B=2 · v1.7.13 baseline |
 | (2b) MoE stretch | ≥175 tok/s | 791.8 ± 5.2 tok/s | **4.52×** | MoE B=128 · 48 GB hardware ceiling |
 
-### Two load-bearing levers (running-best is composition, not a custom kernel)
+<details>
+<summary><strong>Headline numbers</strong> — full table with envelope vs hardware-ceiling framing</summary>
 
-- **Cycle 10 — batched-aggregate axis-shift.** Re-reading the AR.md
-  metric definition ("B is chosen to maximise aggregate") moved the
-  operating point from B=4 → B=48 within the 36 GB envelope. Pure
-  parameter selection; no kernel change. 4.60× on its own.
+| Metric | Value | Frame |
+| --- | ---: | --- |
+| Dense 27B decode (envelope) | **204 ± 1 tok/s** | `mlx-community/Qwen3.5-27B-4bit` · B=52 · 36 GB · n=6 across 2 sessions |
+| Dense 27B decode (hardware ceiling) | **231.9 ± 0.3 tok/s** | B=64 · 48 GB · n=3 |
+| MoE 35B-A3B decode (envelope) | **464.1 ± 0.7 tok/s** | `mlx-community/Qwen3.5-35B-A3B-4bit` · B=64 · 33.8 GB · n=3 |
+| MoE 35B-A3B decode (hardware ceiling) | **791.8 ± 5.2 tok/s** | B=128 · 47.96 GB · n=3 |
+| Dense uplift from cycle-1 baseline (42.17 tok/s @ B=4) | **5.50×** at B=64 / **4.85×** at B=52 | — |
+| MoE uplift from cycle-1 baseline (188.5 tok/s @ B=4) | **4.20×** at B=128 / **2.46×** at B=64 | — |
+
+</details>
+
+<details>
+<summary><strong>Two load-bearing levers</strong> — running-best is composition, not a kernel</summary>
+
+- **Cycle 10 — batched-aggregate axis-shift.** Re-reading the
+  AR.md metric definition ("B is chosen to maximise aggregate")
+  moved the operating point from B=4 → B=48 within the 36 GB
+  envelope. Pure parameter selection; no kernel change. *4.60× on
+  its own.*
 - **Cycle 12 — bf16 DeltaNet recurrent state.** State shape
-  `[B, Hv=48, Dv=128, Dk=128]` = 144 MB at fp32 per layer,
-  72 MB at bf16. Across 48 DeltaNet layers, peak-memory save
-  is ~3.5 GB — opens B≥48 within the 36 GB envelope and unlocks
-  B=64 within the 48 GB hardware ceiling.
-- **Cycle 13 — composition.** Cycle-12's peak-memory save composed
-  with cycle-10's B-axis lever produces the running-best line. The
-  two levers are independent; together they dominate every later
-  atomic probe in the loop.
+  `[B, Hv=48, Dv=128, Dk=128]` is 144 MB at fp32 per layer,
+  72 MB at bf16. Across 48 DeltaNet layers the peak-memory save
+  is ~3.5 GB — opens B≥48 within envelope and unlocks B=64 at
+  hardware ceiling.
+- **Cycle 13 — composition.** Cycle-12's peak save composed with
+  cycle-10's B-axis lever produces the running-best line. The two
+  levers are independent; together they dominate every later
+  atomic probe.
 
-17 custom Metal kernel attempts (13 QMM versions + 7 FA-decode
-versions + DeltaNet vectorisation + 3 fused-op kernels) closed
-without a load-bearing E2E win. Cycle-30 explained why: at B=64
-with the v10+bf16 stack, DeltaNet owns 88% of step time,
-full-attention 12.5%, dispatch 0.3% — and mlx's existing
-`gated_delta` kernel is already at HBM-bandwidth limit (cycle-31
-silica `gated_delta_v2` = 1.001× vs mlx). Source-string Metal
-kernels in mlx 0.31.x do not pay back on dense 27B; the unlock came
-from data layout (bf16 state) and operating-point selection
-(axis-shift).
+Cycle 30 explained why kernel work didn't pay back: at B=64 with
+the v10+bf16 stack, DeltaNet owns 88% of step time, full-attn
+12.5%, dispatch 0.3% — and mlx's existing `gated_delta` kernel
+is already at HBM-bandwidth limit (cycle-31 silica
+`gated_delta_v2` = 1.001× vs mlx). Source-string Metal kernels in
+mlx 0.31.x do not pay back on dense 27B.
 
-### Honest record — what closed with a negative, what was retracted
+</details>
+
+<details>
+<summary><strong>Honest record</strong> — closures and a retraction</summary>
 
 - **Spec-decode at production B — closed with measurement-anchored
   negative.** Cycle 23 measured the `B × k` verify-cost matrix:
   B=52 k=64 = **8105 ms** vs same-B plain-decode ~252 ms / step.
-  Tree-spec at b=64 recomputes to ~10 tok/s aggregate, a net
-  regression by 20× vs plain decode. No B regime in {1, 4, 16, 52}
-  where spec-decode beats plain on this stack. Track C settles:
-  C.4 retired (η.1 = 0.482×), C.5 retired (cycle-23 closure),
+  Tree-spec at b=64 recomputes to ~10 tok/s aggregate, a 20×
+  regression vs plain decode. No B regime in {1, 4, 16, 52} where
+  spec-decode beats plain on this stack. Track C settles: C.4
+  retired (η.1 = 0.482×), C.5 retired (cycle-23 closure),
   C.1 / C.2 / C.3 / C.6 deprioritised since (1b) no longer needs
   them.
 - **Dense B-axis past 64 — closed at the architectural cliff.**
   Cycles 28-29 measured a 26% throughput drop at the B=64 → B=66
   transition (40 GB peak boundary). Three allocator-hint probes
-  (`mx.metal.set_cache_limit / set_memory_limit / set_wired_limit`)
-  leave the cliff in place. The cliff is architectural — likely
-  M5 Pro SLC threshold or unified-memory bandwidth contention near
-  the 48 GB cap — not allocator policy.
+  (`mx.metal.set_cache_limit / set_memory_limit /
+  set_wired_limit`) leave the cliff in place — architectural,
+  likely M5 Pro SLC threshold or unified-memory bandwidth
+  contention near the 48 GB cap, not allocator policy.
 - **Cycle 14's claimed v10 KEEP — retracted via codex review.** A
   codex cross-review on the `opus-codex` branch caught a 14-cycle
   dtype-defect in `silica.kernels.shadow_install`
   (`queries.dtype == mx.float16` silently skipped the bf16
   production path). After the fix, an 8-rep reverify (cycles
   27 / 28) measured v10's E2E contribution at +0.5 tok/s @ B=52 /
-  -1.7 tok/s @ B=64 — both within noise. The honest running-best
+  −1.7 tok/s @ B=64 — both within noise. The honest running-best
   is C10 axis-shift × C12 bf16 DeltaNet state composition alone;
   the retracted KEEP is published as part of the research record.
 
-### Methodology
+</details>
+
+<details>
+<summary><strong>Methodology</strong> — Karpathy-style ledger and variance discipline</summary>
 
 Karpathy-style autoresearch ledger (one TSV row per measurement;
 the main agent appends, sub-agents return findings). Variance
@@ -186,7 +204,10 @@ standard, not the exception. Toolchain pin: `mlx==0.31.1`,
 `mlx-lm==0.31.2`, `mlx-metal==0.31.1`. Determinism gate:
 `tests/test_p2_preload_parity.py` (3/3 pass).
 
-### Reproducibility
+</details>
+
+<details>
+<summary><strong>Reproducibility</strong> — three commands</summary>
 
 ```bash
 # Dense 27B within 36 GB envelope (running-best 204 tok/s)
@@ -211,20 +232,20 @@ SILICA_USE_BF16_DELTANET_STATE=1 \
         --out /tmp/repro_moe_b128.jsonl
 ```
 
+n=3 reps recommended per scenario. Combined σ is typically
+~1 tok/s on dense B=52 and ~5 tok/s on MoE B=128 in the same
+environment with proper warm cache.
+
+</details>
+
 ### Read more
 
-- [`plans/P6_AUTORESEARCH_NOTES.md`](plans/P6_AUTORESEARCH_NOTES.md)
-  — durable take-home companion (cycle log, lessons, levers,
-  reproducibility recipes).
-- [`plans/P6_AUTORESEARCH_FINAL_REPORT.md`](plans/P6_AUTORESEARCH_FINAL_REPORT.md)
-  — comprehensive 23-cycle final report.
-- [`AR.md`](AR.md) — autoresearch directive + addendums.
-- [`plans/P6_AUTORESEARCH_LOG.tsv`](plans/P6_AUTORESEARCH_LOG.tsv)
-  — raw 110-row Karpathy-style ledger.
-- [`plans/P6_AUTORESEARCH/`](plans/P6_AUTORESEARCH/) — per-cycle
-  reports + JSONL artefacts + progress charts.
-- [`plans/P6_SMALL_B_OPENING.md`](plans/P6_SMALL_B_OPENING.md) —
-  D-022 small-B interactive QoE line (next research direction).
+[`P6_AUTORESEARCH_NOTES.md`](plans/P6_AUTORESEARCH_NOTES.md) ·
+[`P6_AUTORESEARCH_FINAL_REPORT.md`](plans/P6_AUTORESEARCH_FINAL_REPORT.md) ·
+[`AR.md`](AR.md) ·
+[`P6_AUTORESEARCH_LOG.tsv`](plans/P6_AUTORESEARCH_LOG.tsv) (110-row ledger) ·
+[`P6_AUTORESEARCH/`](plans/P6_AUTORESEARCH/) (35 per-cycle reports) ·
+[`P6_SMALL_B_OPENING.md`](plans/P6_SMALL_B_OPENING.md) (D-022 next line)
 
 ---
 
