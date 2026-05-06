@@ -623,7 +623,7 @@ const Performance = () => {
     <section className="block" id="performance" ref={sectionRef}>
       <div className="container">
         <div className="section-head">
-          <div className="section-eyebrow">P-6 autoresearch · v1.7.23</div>
+          <div className="section-eyebrow">Throughput Autoresearch</div>
           <h2>35 cycles. Two levers. Every gate cleared 3.4-5.5×.</h2>
           <p>
             We pushed Qwen3.5-27B-4bit decoding from 42 to 232 tokens per second on M5 Pro 48 GB across 35 experiments. The chart below is our lab notebook: each dot is one experiment, the rising line is the best result so far, the dashed circles are a claim we later retracted (visible on the chart so the correction stays public). Click any dot to read what that experiment tried.
