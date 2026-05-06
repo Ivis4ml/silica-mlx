@@ -624,9 +624,9 @@ const Performance = () => {
       <div className="container">
         <div className="section-head">
           <div className="section-eyebrow">Throughput Autoresearch</div>
-          <h2>35 cycles. Server throughput 5.5×. Single-user, untouched.</h2>
+          <h2>35 cycles. Server throughput 5.5×. Single-user line settled.</h2>
           <p>
-            We pushed Qwen3.5-27B-4bit <em>server-aggregate</em> decoding from 42 to 232 tokens per second on M5 Pro 48 GB across 35 experiments. The unlock was running more prompts in parallel, not faster decoding per prompt &mdash; per-row throughput moves the opposite way (10.5 tok/s/row at batch 4, 3.9 tok/s/row at batch 52, ~20 tok/s the bandwidth ceiling at batch 1). P-6 was a server-throughput phase; <strong>single-user interactive latency was not its goal</strong> &mdash; that's <span className="mono">D-022</span>, the next research line.
+            We pushed Qwen3.5-27B-4bit <em>server-aggregate</em> decoding from 42 to 232 tokens per second on M5 Pro 48 GB across 35 experiments. The unlock was running more prompts in parallel, not faster decoding per prompt &mdash; per-row throughput moves the opposite way (10.5 tok/s/row at batch 4, 3.9 tok/s/row at batch 52, ~20 tok/s the bandwidth ceiling at batch 1). P-6 was a server-throughput phase; D-022 then tested the small-B single-user line and closed it with β/γ/δ measurement-anchored negatives.
           </p>
           <p>
             The chart below is our lab notebook: each dot is one experiment, the rising line is the best result so far, the dashed circles are a claim we later retracted (visible on the chart so the correction stays public). Click any dot to read what that experiment tried.
@@ -752,7 +752,7 @@ const Performance = () => {
               </table>
             </div>
             <p className="perf-perrow-foot">
-              P-6 was a <em>server-throughput</em> phase: more parallel users on the same chip. Single-user interactive latency &mdash; the silica-chat experience for one person sitting in front of an M5 Pro &mdash; was not its goal. <strong>D-022</strong> (in progress, v1.7.24) is the research line that attacks single-user latency directly: closing dispatch overhead and per-step time at batch &isin; <span className="mono">{"{1, 2, 4, 8, 12}"}</span>.
+              P-6 was a <em>server-throughput</em> phase: more parallel users on the same chip. Single-user interactive latency &mdash; the silica-chat experience for one person sitting in front of an M5 Pro &mdash; was tested separately by <strong>D-022</strong>, which closed at v1.7.28. β found attention compile scope too narrow, γ found MLP compile gain too small, and δ found ≤0.6% recoverable Python-hygiene headroom.
             </p>
           </div>
         </div>
@@ -809,7 +809,7 @@ const Performance = () => {
             <a className="btn btn-ghost" href="https://github.com/Ivis4ml/silica-mlx/blob/sonnet/plans/P6_AUTORESEARCH_FINAL_REPORT.md" target="_blank" rel="noreferrer">Full write-up</a>
             <a className="btn btn-ghost" href="https://github.com/Ivis4ml/silica-mlx/blob/sonnet/plans/P6_AUTORESEARCH_LOG.tsv" target="_blank" rel="noreferrer">Every measurement (raw data)</a>
             <a className="btn btn-ghost" href="https://github.com/Ivis4ml/silica-mlx/blob/sonnet/P6_AUTORESEARCH.md" target="_blank" rel="noreferrer">The original brief</a>
-            <a className="btn btn-ghost" href="https://github.com/Ivis4ml/silica-mlx/blob/sonnet/plans/P6_SMALL_B_OPENING.md" target="_blank" rel="noreferrer">What we work on next</a>
+            <a className="btn btn-ghost" href="https://github.com/Ivis4ml/silica-mlx/blob/sonnet/plans/P6_SMALL_B/DELTA/PRE_PROJECTION.md" target="_blank" rel="noreferrer">D-022 closure audit</a>
           </div>
         </div>
       </div>

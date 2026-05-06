@@ -307,24 +307,24 @@ read in-editor while iterating.
   (β.2 probe + tests), `309af8c` (β.1 / β.2 measurement bundle),
   then this closure sync.
 
-### D-022 — P-6 small-B dispatch / latency line (opened at v1.7.24)
+### D-022 — P-6 small-B dispatch / latency line (closed at v1.7.28)
 
 - [`P6_SMALL_B_OPENING.md`](../plans/P6_SMALL_B_OPENING.md) —
   actionable opening for the small-B latency / dispatch attack
   declared as next P-6 research direction at v1.7.24, recorded
   formally as D-022 in `PLAN.md` §9. Replaces "next direction
   hint" with sub-unit-level commands, gates, and stop conditions.
+- [`P6_SMALL_B/DELTA/PRE_PROJECTION.md`](../plans/P6_SMALL_B/DELTA/PRE_PROJECTION.md) —
+  final closure audit for δ and the D-022 line.
 
-  Five sub-units (α–ε): α sonnet-side baseline refresh
-  (unconditional; B=4/B=8/B=12 warm-decode + decode-step + layer-
-  internal attribution; cycle-27 variance discipline as gate);
-  β attention `mx.compile` graph-trace with cache reroute
-  (conditional, targets the ~22% full-attn bucket per cycle-1
-  B=4 step-share); γ MLP `mx.compile` close (low priority,
-  negative-confirmation reverify of cycle 17); δ `mx.eval`
-  cadence / per-layer loop sync hygiene (Python-side, bounded by
-  the 4% overhead ceiling); ε mlx 0.32+ async-copy upstream
-  waitlist (do not open).
+  Five sub-units (α–ε) reached terminal state: α completed the
+  sonnet baseline refresh at v1.7.25; β closed negative at v1.7.26
+  because post-cache attention compile had too little reachable
+  scope; γ closed negative at v1.7.27 because `Qwen3NextMLP`
+  compile had only 1.011× per-call gain; δ closed negative-on-audit
+  at v1.7.28 because the 3.6% overhead bucket was mostly real
+  compute, with ≤0.6% recoverable Python-hygiene headroom. ε remains
+  an upstream mlx async-copy waitlist trigger, not an open sub-unit.
 
   Goal framing: interactive single-row latency / TTFT, **not**
   throughput parity (per-row at B=4 already exceeds per-row at
@@ -342,7 +342,10 @@ read in-editor while iterating.
   `SILICA_USE_BF16_DELTANET_STATE` / `SILICA_USE_FA_DECODE_V10`
   flags, and the `mlx==0.31.1 / mlx-lm==0.31.2 / mlx-metal==0.31.1`
   pin attested by `tests/test_p2_preload_parity.py`. No tool
-  debt blocks the first measurement.
+  debt blocked the first measurement. D-022's closure artefacts live
+  under `plans/P6_SMALL_B/{BETA,GAMMA,DELTA}/`; re-opening requires
+  new evidence such as mlx async-copy primitives, a different kernel
+  path, or a different model architecture.
 
 ## Side track: chat CLI redesign
 

@@ -39,10 +39,10 @@ const Highlights = () => {
       detail: ["JSONL + Markdown", "--all-kv-codecs sweep"],
     },
     {
-      tag: "P-6 · v1.7.23",
-      title: "Server-throughput phase cleared.",
-      body: "Every P-6 server-aggregate acceptance gate cleared 3.4-5.5× over the cycle-1 baseline across a 35-cycle autoresearch loop. Dense Qwen3.5-27B-4bit hits 232 tok/s at B=64; MoE 35B-A3B hits 791.8 tok/s at B=128. Per-row (single-user) speed moves the opposite way: ~20 tok/s at B=1, bandwidth-capped, unchanged by this phase. D-022 (in progress) attacks single-user latency directly.",
-      detail: ["232 tok/s aggregate", "~20 tok/s B=1", "D-022 next"],
+      tag: "P-6 · v1.7.28",
+      title: "Performance phase closed (D-022 closed).",
+      body: "Every P-6 server-aggregate acceptance gate cleared 3.4-5.5× over the cycle-1 baseline across a 35-cycle autoresearch loop. Dense Qwen3.5-27B-4bit hits 232 tok/s at B=64; MoE 35B-A3B hits 791.8 tok/s at B=128. Per-row speed still sits near ~20 tok/s at B=1, bandwidth-capped. D-022 closed with β narrow-scope, γ tiny-gain, and δ real-compute-overhead negatives.",
+      detail: ["232 tok/s aggregate", "~20 tok/s B=1", "D-022 closed"],
     },
   ];
 

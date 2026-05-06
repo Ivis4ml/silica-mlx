@@ -9,7 +9,7 @@ const Roadmap = () => {
     { id: "P-4", name: "Unified bench harness — runner · oracles · 15 scenarios · vqbench xcheck", state: "done" },
     { id: "P-4.5", name: "Chunked-prefill minimal + VectorCodec runtime spike", state: "done" },
     { id: "P-5", name: "VQ KV compression — BlockTQ · RaBitQ · ExtRaBitQ · per-head Haar", state: "done" },
-    { id: "P-6", name: "Performance phase — server-throughput acceptance gates cleared 3.4-5.5× via the 35-cycle autoresearch (v1.7.23). Per-row throughput at small batch was not optimised: B=1 single-user latency sits at the ~20 tok/s bandwidth ceiling, unchanged. Track B retired v1.7.21, Track C settled with negatives v1.7.20-22, Track A reframed as small-B dispatch lead; D-022 small-B interactive QoE is the next active line attacking single-user latency directly (v1.7.24)", state: "active" },
+    { id: "P-6", name: "Performance phase — server-throughput acceptance gates cleared 3.4-5.5× via the 35-cycle autoresearch; D-022 small-B interactive QoE closed at v1.7.28 with β/γ/δ measurement-anchored negatives. B=1 single-user latency remains ~20 tok/s, bandwidth-capped; ε stays an upstream mlx async-copy waitlist trigger.", state: "done" },
     { id: "P-7", name: "Speculative decoding — DraftTarget foundation shipped v1.7.19; ≥1.2× decode-throughput payoff settled with measurement-anchored negative on this stack (cycle 23 verify-cost closure)", state: "done" },
     { id: "P-8", name: "OpenAI-compatible HTTP server + session layer", state: "plan" },
   ];
@@ -25,8 +25,8 @@ const Roadmap = () => {
       <div className="container">
         <div className="section-head">
           <div className="section-eyebrow">Roadmap</div>
-          <h2>Eight phases shipped. One in progress. One on deck.</h2>
-          <p>The engine main loop already carries stub implementations behind frozen interfaces. P-6 (server-throughput phase) closed at v1.7.23 with every aggregate acceptance gate cleared 3.4-5.5× over the cycle-1 baseline via the 35-cycle autoresearch loop — see <a href="#performance">Performance</a>. <strong>The phase did not optimise single-user latency</strong>; per-row throughput at small batch was a non-goal, and B=1 stays at the ~20 tok/s bandwidth ceiling. The next active research line is <span className="mono">D-022</span> small-B interactive QoE (v1.7.24), which attacks single-user latency directly. P-7 speculative decoding shipped its foundation at v1.7.19; the production payoff was settled with a measurement-anchored negative on this hardware/model stack. Planned phases progressively replace remaining stubs without changing call sites.</p>
+          <h2>Nine phases shipped. One on deck.</h2>
+          <p>The engine main loop already carries stub implementations behind frozen interfaces. P-6 is a closed performance research phase: server-throughput gates cleared 3.4-5.5× over the cycle-1 baseline, and D-022 later settled the small-B single-user line with measurement-anchored negatives — see <a href="#performance">Performance</a>. <strong>Single-user latency remains bandwidth-capped near 20 tok/s</strong>; the next active project work is P-8, the OpenAI-compatible HTTP server and session layer. P-7 speculative decoding shipped its foundation at v1.7.19; the production payoff was settled with a measurement-anchored negative on this hardware/model stack. Planned phases progressively replace remaining stubs without changing call sites.</p>
         </div>
 
         <div className="rm-progress">

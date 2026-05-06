@@ -6,16 +6,17 @@ with a vLLM-style continuous batcher, a radix prefix cache, and a
 pluggable KV codec stack (BlockTQ + RaBitQ) wired into the prefix
 store.
 
-The 35-cycle P-6 autoresearch loop closed in May 2026 with every
-*server-throughput* acceptance gate cleared 3.4-5.5× over the cycle-1
-baseline: **232 tok/s on dense Qwen3.5-27B-4bit at B=64 (48 GB ceiling)**,
-**791.8 tok/s on MoE Qwen3.5-35B-A3B-4bit at B=128**. These are
-server-aggregate numbers; **single-user (B=1) latency on M5 Pro is
-bandwidth-capped near 20 tok/s and unchanged by this phase**. Closing
-per-step time at small batch is the **D-022** research line, in
-progress at v1.7.24. See {doc}`performance` for the full record
-(headline numbers, the two load-bearing levers, the per-row math,
-and the honest closures + cycle-27 retraction).
+The P-6 performance phase is closed. The 35-cycle autoresearch loop
+cleared every *server-throughput* acceptance gate 3.4-5.5× over the
+cycle-1 baseline: **232 tok/s on dense Qwen3.5-27B-4bit at B=64
+(48 GB ceiling)**, **791.8 tok/s on MoE Qwen3.5-35B-A3B-4bit at
+B=128**. These are server-aggregate numbers; **single-user (B=1)
+latency on M5 Pro is bandwidth-capped near 20 tok/s and unchanged by
+this phase**. D-022 then closed the small-B single-user research line
+at v1.7.28 with β/γ/δ measurement-anchored negatives and ≤0.6%
+recoverable Python-hygiene headroom. See {doc}`performance` for the
+full record (headline numbers, the two load-bearing levers, the
+per-row math, D-022 closure, and the honest retraction record).
 
 This site bundles five kinds of material:
 

@@ -1,4 +1,4 @@
-# Performance — P-6 server-throughput phase closed at v1.7.23
+# Performance — P-6 performance phase closed at v1.7.28
 
 ```{image} _static/p6/decode-dense.png
 :alt: Dense Qwen3.5-27B-4bit decode running-best across 35 cycles
@@ -28,9 +28,10 @@ P-6 is a *server-throughput* phase. All gains route through
 batch size: per-row throughput moves the *opposite* way —
 10.5 tok/s/row at B=4, 3.92 tok/s/row at B=52, 3.62 tok/s/row at
 B=64. **Single-user (B=1) latency on M5 Pro is bandwidth-capped
-near 20 tok/s and unchanged by this phase.** Closing per-step
-time at small batch is the **D-022** research line, in progress
-at v1.7.24.
+near 20 tok/s and unchanged by this phase.** D-022 then tested
+the small-B single-user line and closed at v1.7.28: B=4 stayed at
+10.29 tok/s/row, β/γ/δ all reached measurement-anchored negatives,
+and the remaining Python-hygiene headroom projected ≤0.6% E2E.
 :::
 
 | Configuration | Aggregate | Per row | Frame |
@@ -50,8 +51,10 @@ DeltaNet recurrent state (3.5 GB peak save opens B≥48 within the
 without a load-bearing E2E win**; the unlock came from data layout
 (bf16 state) and operating-point selection (axis-shift). None of
 these levers move B=1 single-user latency, which sits at the
-chip's weights-only bandwidth ceiling on this stack — that is the
-explicit motivation for the D-022 small-B research line.
+chip's weights-only bandwidth ceiling on this stack. D-022 followed
+that motivation and closed the small-B line with measurement-anchored
+negatives: β had too little reachable scope, γ had too little per-call
+gain, and δ found the apparent overhead bucket was mostly real compute.
 
 ## Acceptance gates — every server-throughput P-6 gate cleared
 
@@ -192,25 +195,29 @@ retraction). Five cycles produced lasting load-bearing changes:
 C10 (axis-shift), C13 (composition KEEP), C27 (correction), C34
 (MoE portability), C35 (MoE hardware ceiling).*
 
-## What's next — D-022 small-B interactive QoE
+## D-022 small-B interactive QoE — closed at v1.7.28
 
-The cleared (1a) / (1b) / (2b) gates were aggregate-throughput
-at high B; per-step latency at small B (B ∈ {1, 2, 4, 8, 12}) is
-the next user-facing dimension. Cycle-1 B=4 step-share
-decomposition names two reachable buckets: full-attention (~22%)
-via `mx.compile` graph-trace with cache reroute, and dispatch
-overhead (~4%) via `mx.compile` MLP plus `mx.eval` cadence
-cleanup. DeltaNet (74%) remains bandwidth-saturated on
-mlx 0.31.x and is out of scope.
+The cleared P-6 gates were aggregate-throughput at high B, so D-022
+tested whether per-step latency at small B (B ∈ {1, 2, 4, 8, 12})
+had any load-bearing lever left on mlx 0.31.x. It did not. The line
+closed with one diagnostic baseline and three measurement-anchored
+negative conclusions:
 
-Goal framing: interactive single-row latency / TTFT, **not**
-throughput parity. Per-row throughput at B=4
-(~10.5 tok/s/row from the cycle-1 baseline) already exceeds
-per-row at B=52 (~3.92 tok/s/row); the throughput-parity frame
+| Sub-unit | Terminal state | Physical close reason | E2E vs gate |
+| --- | --- | --- | --- |
+| α | complete (v1.7.25) | sonnet baseline + bucket decomposition | diagnostic |
+| β | NEGATIVE (v1.7.26) | compile-reachable scope too narrow (~3-4% step) | 0.25-0.41% / 3% |
+| γ | NEGATIVE (v1.7.27) | per-call `mx.compile` gain too small (1.011×) | 0.51% / 3% |
+| δ | NEGATIVE-on-audit (v1.7.28) | 3.6% overhead bucket is 70-90% real compute | ≤0.6% / 2% |
+| ε | upstream waitlist | mlx 0.32+ async-copy re-open trigger | n/a |
+
+Goal framing stayed interactive single-row latency / TTFT, **not**
+throughput parity. Per-row throughput at B=4 (~10.5 tok/s/row from
+the cycle-1 baseline, 10.29 tok/s/row in the sonnet refresh) already
+exceeds per-row at B=52 (~3.92 tok/s/row); the throughput-parity frame
 is structurally inverted.
 
-See {doc}`plans-index` for `D-022 — P-6 small-B dispatch / latency
-line` and the linked opening document.
+See {doc}`plans-index` for the D-022 opening and closure artefacts.
 
 ## Read more
 
@@ -222,5 +229,6 @@ line` and the linked opening document.
   ledger.
 - `plans/P6_AUTORESEARCH/` — per-cycle reports, JSONL artefacts,
   and progress charts.
-- `plans/P6_SMALL_B_OPENING.md` — D-022 small-B interactive QoE
-  line.
+- `plans/P6_SMALL_B_OPENING.md` and
+  `plans/P6_SMALL_B/DELTA/PRE_PROJECTION.md` — D-022 small-B
+  opening and closure audit.
