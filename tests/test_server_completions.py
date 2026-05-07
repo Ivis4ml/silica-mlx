@@ -231,7 +231,7 @@ def test_completions_404_when_model_id_does_not_match() -> None:
         )
 
     assert response.status_code == 404
-    detail = response.json()["detail"]
+    detail = response.json()["error"]["message"]
     assert "other/model" in detail
     assert "stub/model" in detail
 
@@ -255,7 +255,7 @@ def test_completions_503_when_runtime_closed() -> None:
         )
 
     assert response.status_code == 503
-    assert response.json() == {"detail": "engine not ready"}
+    assert response.json() == {"error": {"message": "engine not ready", "type": "server_error"}}
 
 
 # ---------------------------------------------------------------------------

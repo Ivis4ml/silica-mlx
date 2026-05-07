@@ -33,11 +33,12 @@ acceptance row:
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 from fastapi import FastAPI, HTTPException, Request
+from starlette.responses import Response
 
 from silica.core.logger import get_logger
 from silica.server.runtime import Runtime
@@ -60,10 +61,21 @@ class ServerConfig:
       stub runtime (for example over :class:`StubModelAdapter` +
       :class:`NullKVManager`) so the smoke path stays off the
       HuggingFace network.
+
+    Hardening knobs (sub-unit (h)):
+
+    - :attr:`api_key`: bearer token enforced on ``/v1/...`` routes.
+      ``None`` (default) disables auth — every request is accepted.
+      Production deployments set ``SILICA_API_KEY`` env var or pass
+      ``--api-key`` to ``silica serve``.
+    - :attr:`rate_limit_rpm`: per-key requests-per-minute cap.
+      ``None`` (default) or ``<= 0`` disables rate limiting.
     """
 
     model_repo: str | None = None
     runtime_factory: Callable[[], Runtime] | None = None
+    api_key: str | None = None
+    rate_limit_rpm: int | None = None
 
     def __post_init__(self) -> None:
         if (self.model_repo is None) == (self.runtime_factory is None):
@@ -126,6 +138,15 @@ app = FastAPI(
     lifespan=_lifespan,
 )
 
+# OpenAI-shaped error envelope (sub-unit (h)). Installed before the
+# routers so any HTTPException raised by the route layer (404s, 501s,
+# 503s) and any pydantic validation error during request parsing
+# surfaces to the client as ``{"error": {"message": ..., "type":
+# ...}}`` instead of FastAPI's default ``{"detail": ...}``.
+from silica.server.errors import install_exception_handlers  # noqa: E402
+
+install_exception_handlers(app)
+
 # Route registration: each routes/* module exports an APIRouter that
 # gets mounted here. Module imports are cheap (no model load); the
 # heavy work happens inside route handlers under the lifespan-built
@@ -137,6 +158,45 @@ from silica.server.routes import models as _models  # noqa: E402
 app.include_router(_chat_completions.router)
 app.include_router(_completions.router)
 app.include_router(_models.router)
+
+# Hardening middleware (sub-unit (h)). One inline middleware
+# consults :data:`_config` at every dispatch so the test seam
+# (``configure`` re-binding between TestClient runs) and a future
+# hot-reload both work without re-installing middleware. Order:
+# **rate-limit (outer) → auth (inner) → app**. Rate-limit runs
+# first so a flood of unauthenticated requests decrements the
+# offending IP's bucket — otherwise an attacker could spam
+# ``/v1/...`` past the bucket cap and pay only the 401 round trip.
+#
+# Both gates short-circuit when their config knob is unset
+# (``api_key=None`` / ``rate_limit_rpm`` is None or <= 0) so the
+# dev-default (no auth, no rate limit) preserves the (a)–(g) test
+# surface byte-for-byte.
+from silica.server.auth import check_bearer_auth  # noqa: E402
+from silica.server.ratelimit import (  # noqa: E402
+    consume_rate_limit_token,
+)
+
+
+@app.middleware("http")
+async def _hardening_chain(
+    request: Request,
+    call_next: Callable[[Request], Awaitable[Response]],
+) -> Response:
+    cfg = _config
+    rl_response = consume_rate_limit_token(
+        request,
+        rpm=cfg.rate_limit_rpm if cfg is not None else None,
+    )
+    if rl_response is not None:
+        return rl_response
+    auth_response = check_bearer_auth(
+        request,
+        api_key=cfg.api_key if cfg is not None else None,
+    )
+    if auth_response is not None:
+        return auth_response
+    return await call_next(request)
 
 
 @app.get("/healthz")

@@ -111,4 +111,4 @@ def test_healthz_returns_503_when_runtime_closed_mid_lifespan() -> None:
         runtime.close()
         response = client.get("/healthz")
         assert response.status_code == 503
-        assert response.json() == {"detail": "engine not ready"}
+        assert response.json() == {"error": {"message": "engine not ready", "type": "server_error"}}

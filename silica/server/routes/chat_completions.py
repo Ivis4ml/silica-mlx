@@ -356,6 +356,24 @@ def _validate_unsupported(req: ChatCompletionRequest) -> None:
             )
 
     if req.response_format is not None and req.response_format.type != "text":
+        # Sub-unit (h): structured-output slot. The grammar / JSON-
+        # schema engine is post-announce, but logging the requested
+        # format here gives the future implementer visibility into
+        # which schemas downstream callers actually need (the
+        # ``response_format`` field is otherwise rejected before any
+        # generate runs). Logged at INFO so the production server's
+        # default level captures it; sensitive content stays out of
+        # the log because we only print the type / schema-name, not
+        # the schema body.
+        log.info(
+            "structured_output.requested type=%s json_schema_name=%s",
+            req.response_format.type,
+            (
+                (req.response_format.json_schema or {}).get("name")
+                if req.response_format.json_schema
+                else None
+            ),
+        )
         raise HTTPException(
             status_code=501,
             detail=(

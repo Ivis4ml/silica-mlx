@@ -1,5 +1,15 @@
 """silica.server.cli — command-line driver.
 
+Hardening flags (sub-unit (h)):
+
+- ``--api-key`` / ``SILICA_API_KEY`` env var: when set, every request
+  to ``/v1/...`` must carry a matching ``Authorization: Bearer <key>``
+  header. ``/healthz`` is exempt. CLI flag takes precedence over the
+  env var.
+- ``--rate-limit-rpm``: per-key requests-per-minute cap. ``None``
+  (default) disables rate limiting.
+
+
 Invocation:
 
     silica run --model Qwen/Qwen3.5-0.8B --prompt "The capital of France is"
@@ -42,6 +52,7 @@ the two invocation forms.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from collections.abc import Sequence
 from typing import Any
@@ -161,6 +172,27 @@ def build_parser() -> argparse.ArgumentParser:
             "configure() state"
         ),
     )
+    serve.add_argument(
+        "--api-key",
+        default=None,
+        help=(
+            "bearer token enforced on /v1/... routes; falls back to "
+            "the SILICA_API_KEY env var when not passed. None / "
+            "unset disables auth (development default; matches the "
+            "v0.1 single-user-localhost framing)."
+        ),
+    )
+    serve.add_argument(
+        "--rate-limit-rpm",
+        type=int,
+        default=None,
+        help=(
+            "per-key requests-per-minute cap (token bucket). None "
+            "or <= 0 disables rate limiting (the v0.1 default). "
+            "Per-key isolation: Authorization header value when "
+            "auth is configured, else client IP."
+        ),
+    )
     return root
 
 
@@ -263,7 +295,20 @@ def _serve(args: argparse.Namespace) -> int:
 
     from silica.server import openai_api
 
-    openai_api.configure(openai_api.ServerConfig(model_repo=args.model))
+    # Auth: --api-key wins over SILICA_API_KEY env. Either is
+    # opt-in; absent both leaves auth disabled (the v0.1
+    # single-user-localhost dev default).
+    api_key = args.api_key
+    if api_key is None:
+        api_key = os.environ.get("SILICA_API_KEY") or None
+
+    openai_api.configure(
+        openai_api.ServerConfig(
+            model_repo=args.model,
+            api_key=api_key,
+            rate_limit_rpm=args.rate_limit_rpm,
+        )
+    )
 
     import uvicorn
 

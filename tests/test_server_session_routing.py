@@ -392,11 +392,11 @@ def test_extension_session_id_plus_thinking_mode_returns_501(
         )
 
     assert response.status_code == 501
-    assert "thinking_mode" in response.json()["detail"]
+    assert "thinking_mode" in response.json()["error"]["message"]
     # session_id is honoured, so it must NOT appear in the rejection
     # list — guards against a regression where the route lumps it
     # back in with the unsupported set.
-    assert "session_id" not in response.json()["detail"]
+    assert "session_id" not in response.json()["error"]["message"]
 
 
 def test_session_id_returns_501_for_sliding_window_adapter() -> None:
@@ -447,7 +447,7 @@ def test_session_id_returns_501_for_sliding_window_adapter() -> None:
             headers={"X-Silica-Session-ID": "any-sid"},
         )
         assert rejected.status_code == 501
-        detail = rejected.json()["detail"]
+        detail = rejected.json()["error"]["message"]
         assert "SLIDING" in detail or "sliding" in detail
         assert "session_id" in detail
 

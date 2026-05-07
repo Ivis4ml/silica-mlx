@@ -409,7 +409,7 @@ def test_chat_completions_501_on_string_sequence_stop(
         )
 
     assert response.status_code == 501
-    assert "string-sequence 'stop'" in response.json()["detail"]
+    assert "string-sequence 'stop'" in response.json()["error"]["message"]
 
 
 # ---------------------------------------------------------------------------
@@ -452,7 +452,7 @@ def test_chat_completions_400_on_out_of_range_sampling_param(
         response = client.post("/v1/chat/completions", json=payload)
 
     assert response.status_code == 400, response.json()
-    assert expected_substring in response.json()["detail"]
+    assert expected_substring in response.json()["error"]["message"]
 
 
 # ---------------------------------------------------------------------------
@@ -496,7 +496,7 @@ def test_chat_completions_501_on_non_empty_extension(
         )
 
     assert response.status_code == 501
-    assert expected_substring in response.json()["detail"]
+    assert expected_substring in response.json()["error"]["message"]
 
 
 def test_chat_completions_accepts_empty_extension(
@@ -550,7 +550,7 @@ def test_chat_completions_400_on_non_leading_system_message(
         )
 
     assert response.status_code == 400
-    assert "system messages must precede" in response.json()["detail"]
+    assert "system messages must precede" in response.json()["error"]["message"]
 
 
 # ---------------------------------------------------------------------------
@@ -577,7 +577,7 @@ def test_chat_completions_404_on_model_mismatch(
         )
 
     assert response.status_code == 404
-    detail = response.json()["detail"]
+    detail = response.json()["error"]["message"]
     assert "gpt-4o" in detail
     assert "stub/model" in detail
 
@@ -633,7 +633,7 @@ def test_chat_completions_rejects_empty_messages(
         )
 
     assert response.status_code == 400
-    assert "must not be empty" in response.json()["detail"]
+    assert "must not be empty" in response.json()["error"]["message"]
 
 
 def test_chat_completions_rejects_non_user_last_message(
@@ -655,7 +655,7 @@ def test_chat_completions_rejects_non_user_last_message(
         )
 
     assert response.status_code == 400
-    assert "role='user'" in response.json()["detail"]
+    assert "role='user'" in response.json()["error"]["message"]
 
 
 def test_chat_completions_rejects_max_tokens_conflict(
@@ -676,7 +676,7 @@ def test_chat_completions_rejects_max_tokens_conflict(
         )
 
     assert response.status_code == 400
-    assert "max_tokens" in response.json()["detail"]
+    assert "max_tokens" in response.json()["error"]["message"]
 
 
 def test_chat_completions_accepts_matching_max_tokens_pair(
@@ -739,7 +739,7 @@ def test_chat_completions_501_unsupported_fields(
         response = client.post("/v1/chat/completions", json=payload)
 
     assert response.status_code == 501
-    assert expected_substring in response.json()["detail"]
+    assert expected_substring in response.json()["error"]["message"]
 
 
 def test_chat_completions_501_multimodal_user_content(
@@ -763,7 +763,7 @@ def test_chat_completions_501_multimodal_user_content(
         )
 
     assert response.status_code == 501
-    assert "multimodal" in response.json()["detail"]
+    assert "multimodal" in response.json()["error"]["message"]
 
 
 def test_chat_completions_501_developer_role(
@@ -785,7 +785,7 @@ def test_chat_completions_501_developer_role(
         )
 
     assert response.status_code == 501
-    assert "role='developer'" in response.json()["detail"]
+    assert "role='developer'" in response.json()["error"]["message"]
 
 
 # ---------------------------------------------------------------------------
@@ -821,4 +821,4 @@ def test_chat_completions_503_when_runtime_closed_mid_request(
         )
 
     assert response.status_code == 503
-    assert response.json() == {"detail": "engine not ready"}
+    assert response.json() == {"error": {"message": "engine not ready", "type": "server_error"}}

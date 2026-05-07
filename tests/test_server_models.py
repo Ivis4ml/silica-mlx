@@ -110,7 +110,7 @@ def test_list_models_503_when_runtime_closed() -> None:
         response = client.get("/v1/models")
 
     assert response.status_code == 503
-    assert response.json() == {"detail": "engine not ready"}
+    assert response.json() == {"error": {"message": "engine not ready", "type": "server_error"}}
 
 
 def test_list_models_503_when_runtime_unset() -> None:
@@ -128,4 +128,4 @@ def test_list_models_503_when_runtime_unset() -> None:
         response = client.get("/v1/models")
 
     assert response.status_code == 503
-    assert response.json() == {"detail": "engine not ready"}
+    assert response.json() == {"error": {"message": "engine not ready", "type": "server_error"}}
