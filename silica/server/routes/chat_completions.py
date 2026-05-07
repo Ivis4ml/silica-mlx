@@ -1,8 +1,13 @@
 """silica.server.routes.chat_completions — POST /v1/chat/completions
-non-streaming branch (P-8 sub-unit (c)).
+non-streaming + streaming branches (P-8 sub-units (c) and (d)).
 
-Synchronous chat-turn handler driven by
-:meth:`silica.chat.session.ChatSession.chat` with ``stream_to=None``.
+Non-streaming (``stream=False``) is driven by
+:meth:`silica.chat.session.ChatSession.chat` with ``stream_to=None``;
+streaming (``stream=True``) drives the same call with a
+:func:`_on_delta` callback that bridges MLX-thread token deltas onto
+an asyncio queue, which the SSE :class:`StreamingResponse` generator
+drains and re-frames as OpenAI ``chat.completion.chunk`` events.
+
 One conversation per HTTP request; v0.1 has no cross-request session
 reuse (sub-unit (f) lands ``SessionManager``).
 
@@ -14,12 +19,13 @@ Pipeline
    one model; echoing a wrong id would mislead OpenAI clients).
 2. :func:`_validate_unsupported` — return 501 for fields that
    change output semantics or are not yet wired
-   (``stream=True``, string-sequence ``stop``, non-empty
-   ``extension`` envelope, ``n>1``, ``tools``, ``tool_choice``,
-   ``logprobs``, ``top_logprobs``, ``logit_bias``,
-   ``presence_penalty != 0``, ``frequency_penalty != 0``,
-   ``response_format.type != 'text'``, multimodal content,
-   non-{system, user, assistant} roles).
+   (string-sequence ``stop``, non-empty ``extension`` envelope,
+   ``n>1``, ``tools``, ``tool_choice``, ``logprobs``,
+   ``top_logprobs``, ``logit_bias``, ``presence_penalty != 0``,
+   ``frequency_penalty != 0``, ``response_format.type != 'text'``,
+   multimodal content, non-{system, user, assistant} roles).
+   ``stream=True`` was rejected here in (c) but is honoured by the
+   streaming branch added in (d).
 3. :func:`_validate_sampling_bounds` — return 400 for sampling
    parameters outside their accepted range (temperature, top_p,
    max_tokens, max_completion_tokens). Without this the pydantic
@@ -53,12 +59,15 @@ nothing; treat as a stop).
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse
 
 from silica.chat.session import ChatSession, TurnMetrics
 from silica.core.logger import get_logger
@@ -67,6 +76,9 @@ from silica.server.runtime import Runtime
 from silica.server.schemas import (
     AssistantMessage,
     ChatCompletionChoice,
+    ChatCompletionChunk,
+    ChatCompletionChunkChoice,
+    ChatCompletionChunkDelta,
     ChatCompletionRequest,
     ChatCompletionResponse,
     Usage,
@@ -75,6 +87,36 @@ from silica.server.schemas import (
 log = get_logger(__name__)
 
 router = APIRouter()
+
+
+# Streaming-specific bridge constants. The bounded queue depth provides
+# G-3 backpressure (OPENING §6.1.2): when a slow consumer fails to
+# drain, ``run_coroutine_threadsafe(queue.put(item), loop).result()``
+# blocks the worker thread on a full queue, which is what we want —
+# slow client → slow MLX decode → no token drop. Hard-coded in v0.1
+# per the (d) review; tunable via env / CLI flag is deferred to (h).
+_STREAM_QUEUE_MAXSIZE = 64
+
+
+# Sentinel placed on the queue when the worker noticed a client
+# disconnect (via :class:`_ClientDisconnected`). The generator drains
+# this and exits cleanly without emitting ``[DONE]`` (the client is
+# already gone; SSE framing on a disconnected socket is moot).
+_DISCONNECTED = object()
+
+
+class _ClientDisconnected(Exception):
+    """Raised inside the worker-thread :func:`_on_delta` callback when
+    the SSE generator's cleanup path has set the abort event after a
+    client disconnect. Caught by the worker loop so ``ChatSession.chat``
+    unwinds cleanly at the next streamed-delta boundary instead of
+    running to completion against a dead consumer.
+
+    Caveat per OPENING G-3: an in-flight MLX decode step can NOT be
+    interrupted; abort takes effect at the next ``stream_to`` invocation.
+    Acceptable v0.1 trade-off (the alternative requires a per-step
+    cancellation hook on ``Engine.generate``, deferred to (h) hardening).
+    """
 
 
 _ALLOWED_ROLES = frozenset({"system", "user", "assistant"})
@@ -155,15 +197,6 @@ def _validate_unsupported(req: ChatCompletionRequest) -> None:
     ``extra='allow'``; this is the route-level rejection per (b)
     review's "parse != supported" rule.
     """
-    if req.stream:
-        # /v1/chat/completions accepts both stream=True and stream=False;
-        # (c) is the non-streaming branch. (d) lands the SSE branch and
-        # will replace this 501.
-        raise HTTPException(
-            status_code=501,
-            detail="streaming not yet implemented (P-8 sub-unit (d))",
-        )
-
     # silica.engine.Engine v0.1 only honours stop_token_ids (set from
     # the tokenizer's EOS set); string-sequence ``stop`` is a P-2
     # concern per silica/engine/__init__.py:17. Accepting the field
@@ -467,17 +500,413 @@ def _build_response(
 
 
 # ---------------------------------------------------------------------------
+# Streaming bridge primitives (sub-unit (d)).
+# ---------------------------------------------------------------------------
+
+
+def _abortable_put(
+    queue: asyncio.Queue[Any],
+    item: Any,
+    loop: asyncio.AbstractEventLoop,
+    abort_event: threading.Event,
+    *,
+    poll_interval: float = 0.1,
+) -> None:
+    """Thread-to-loop transfer that can abort while the queue is full.
+
+    The plain pattern
+    ``run_coroutine_threadsafe(queue.put(item), loop).result()`` blocks
+    the worker thread indefinitely if the queue is full and the
+    consumer has gone away — the generator's ``finally`` block would
+    then time out, swallow the exception, and release
+    ``runtime.engine_lock`` while the worker is still alive. That
+    breaks G-1 (single active decode under engine_lock).
+
+    This helper instead polls the future on ``poll_interval`` ticks
+    and re-checks ``abort_event`` between polls. When the event fires
+    mid-wait it cancels the in-flight ``queue.put`` coroutine and
+    raises :class:`_ClientDisconnected`, which the worker catches to
+    unwind ``ChatSession.chat`` cleanly.
+    """
+    if abort_event.is_set():
+        raise _ClientDisconnected()
+    future = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
+    while True:
+        try:
+            future.result(timeout=poll_interval)
+            return
+        except concurrent.futures.TimeoutError:
+            if abort_event.is_set():
+                future.cancel()
+                raise _ClientDisconnected() from None
+
+
+# ---------------------------------------------------------------------------
+# SSE chunk formatting (sub-unit (d)).
+# ---------------------------------------------------------------------------
+
+
+def _format_sse(chunk: ChatCompletionChunk) -> bytes:
+    """Serialize a chunk to the OpenAI SSE wire frame
+    ``data: {...}\\n\\n``. Pydantic's ``model_dump_json`` with
+    ``exclude_none=True`` drops the ``usage=None`` field on token
+    chunks (only the terminal usage chunk emits it)."""
+    payload = chunk.model_dump_json(exclude_none=True)
+    return f"data: {payload}\n\n".encode()
+
+
+def _make_role_chunk(
+    *, request_id: str, model: str, created: int
+) -> ChatCompletionChunk:
+    """First SSE chunk: declares ``role='assistant'`` and an empty
+    content delta. The OpenAI SDK uses this to assemble the
+    streaming reply object before any tokens arrive."""
+    return ChatCompletionChunk(
+        id=request_id,
+        created=created,
+        model=model,
+        choices=[
+            ChatCompletionChunkChoice(
+                index=0,
+                delta=ChatCompletionChunkDelta(role="assistant"),
+            )
+        ],
+    )
+
+
+def _make_delta_chunk(
+    *, request_id: str, model: str, created: int, content: str
+) -> ChatCompletionChunk:
+    """Token chunk: empty role, ``delta.content`` carries the
+    text-delta string verbatim from
+    :func:`ChatSession._on_token`'s already-UTF-8-corrected output."""
+    return ChatCompletionChunk(
+        id=request_id,
+        created=created,
+        model=model,
+        choices=[
+            ChatCompletionChunkChoice(
+                index=0,
+                delta=ChatCompletionChunkDelta(content=content),
+            )
+        ],
+    )
+
+
+def _make_finish_chunk(
+    *,
+    request_id: str,
+    model: str,
+    created: int,
+    finish_reason: str,
+) -> ChatCompletionChunk:
+    """Terminal token-side chunk: empty delta, populated
+    ``finish_reason``. Followed by an optional usage chunk (when
+    ``stream_options.include_usage=True``) and then ``data: [DONE]``."""
+    return ChatCompletionChunk(
+        id=request_id,
+        created=created,
+        model=model,
+        choices=[
+            ChatCompletionChunkChoice(
+                index=0,
+                delta=ChatCompletionChunkDelta(),
+                finish_reason=finish_reason,  # type: ignore[arg-type]
+            )
+        ],
+    )
+
+
+def _make_usage_chunk(
+    *,
+    request_id: str,
+    model: str,
+    created: int,
+    metrics: TurnMetrics,
+) -> ChatCompletionChunk:
+    """Usage-only chunk emitted before ``[DONE]`` when
+    ``stream_options.include_usage=True``. Reuses the same
+    ``id`` / ``created`` / ``model`` as the token chunks per
+    OpenAI's published wire shape; ``choices`` is empty and
+    ``usage`` carries the totals."""
+    return ChatCompletionChunk(
+        id=request_id,
+        created=created,
+        model=model,
+        choices=[],
+        usage=Usage(
+            prompt_tokens=metrics.prompt_tokens,
+            completion_tokens=metrics.output_tokens,
+            total_tokens=metrics.prompt_tokens + metrics.output_tokens,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Streaming branch.
+# ---------------------------------------------------------------------------
+
+
+def _stream_chat_completion(
+    body: ChatCompletionRequest,
+    runtime: Runtime,
+    session: Any,
+    user_text: str,
+    params: SamplingParams,
+) -> StreamingResponse:
+    """Build the SSE :class:`StreamingResponse` for ``stream=True``.
+
+    Architecture:
+
+    1. A bounded :class:`asyncio.Queue` (size :data:`_STREAM_QUEUE_MAXSIZE`)
+       carries items from the worker thread back to the SSE generator
+       coroutine. Items are tagged by type — ``str`` is a text delta,
+       :class:`TurnMetrics` is success completion, :data:`_DISCONNECTED`
+       signals a client disconnect noticed by the worker, and any
+       :class:`BaseException` is a worker error.
+    2. A :class:`threading.Event` carries the abort signal from the
+       generator's cleanup path back to the worker. The
+       :func:`_on_delta` callback routes through :func:`_abortable_put`,
+       which polls the in-flight ``run_coroutine_threadsafe`` future
+       and re-checks the event between polls so a full queue + late
+       disconnect raises :class:`_ClientDisconnected` instead of
+       blocking the worker. ``ChatSession.chat`` then unwinds at the
+       next streamed-delta boundary.
+    3. The generator holds ``runtime.engine_lock`` for the **whole
+       lifetime of the worker** (per OPENING G-1: single active
+       decode). The ``finally`` block keeps draining the queue until
+       ``worker.done()`` so the worker's in-flight ``queue.put`` can
+       always complete, then surfaces any worker exception via
+       :meth:`asyncio.Task.exception` synchronously (no
+       ``await worker`` — that would tight-loop on a pending outer
+       ``CancelledError``). This ensures G-1 is preserved even when
+       the client disconnects mid-stream with the bounded queue
+       full.
+    4. Terminal items use no-drop transfers: the success-path
+       metrics push and the failure-path exception push both go
+       through :func:`_abortable_put` so a slow consumer never
+       loses the finish/[DONE] sequence. Only the
+       :data:`_DISCONNECTED` sentinel (where the consumer is
+       already gone by definition) uses a bounded best-effort put.
+    5. Every thread → loop transfer goes through
+       :func:`asyncio.run_coroutine_threadsafe` per the (a1)
+       lock+thread contract — never :meth:`asyncio.Queue.put_nowait`
+       from the worker thread, which is not thread-safe and would
+       drop tokens on a full queue.
+    """
+    request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    created = int(time.time())
+    include_usage = bool(
+        body.stream_options is not None
+        and body.stream_options.include_usage
+    )
+
+    queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=_STREAM_QUEUE_MAXSIZE)
+    abort_event = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def _on_delta(delta_text: str) -> None:
+        # Per-token thread-to-loop transfer. Goes through
+        # :func:`_abortable_put` so a full queue + late client
+        # disconnect raises :class:`_ClientDisconnected` instead of
+        # blocking the worker forever.
+        _abortable_put(queue, delta_text, loop, abort_event)
+
+    def _run_worker() -> None:
+        try:
+            metrics = session.chat(
+                user_text,
+                sampling_params=params,
+                stream_to=_on_delta,
+            )
+        except _ClientDisconnected:
+            # Consumer already gone — best-effort sentinel push. The
+            # cleanup loop is draining and may not even need the
+            # sentinel (it exits on ``worker.done()``), but emitting
+            # it lets the generator's main loop close cleanly if it
+            # is still active in the disconnect race window. Bounded
+            # at 10 s because the consumer is by definition gone;
+            # losing the sentinel is harmless.
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    queue.put(_DISCONNECTED), loop
+                ).result(timeout=10.0)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "chat.completions stream disconnect sentinel "
+                    "dropped (reason=%r)",
+                    exc,
+                )
+            return
+        except Exception as exc:
+            # Always log at the worker site so a downstream queue.put
+            # failure cannot lose the diagnostic.
+            log.exception(
+                "chat.completions stream worker session.chat failed"
+            )
+            # Surface the exception to the generator. Use abortable
+            # put — must not drop on timeout (the generator still
+            # needs the item to log + close) but a late client
+            # disconnect should still unwind us through
+            # :class:`_ClientDisconnected`.
+            try:
+                _abortable_put(queue, exc, loop, abort_event)
+            except _ClientDisconnected:
+                # Cleanup beat the exception push. Already logged
+                # above; nothing more to do.
+                pass
+            return
+
+        # Success path: the generator is blocked on this terminal
+        # metrics item to emit the finish chunk + optional usage +
+        # ``[DONE]``. MUST NOT drop on timeout — that would hang the
+        # generator forever on the next ``queue.get()``. Use
+        # ``_abortable_put`` so a slow consumer eventually unblocks
+        # (the cleanup loop also drains, so a disconnect race
+        # resolves through ``abort_event``).
+        try:
+            _abortable_put(queue, metrics, loop, abort_event)
+        except _ClientDisconnected:
+            # Client disconnected during the success-push window.
+            # The generator already returned; nothing to push to.
+            pass
+
+    async def _generator() -> AsyncIterator[bytes]:
+        async with runtime.engine_lock:
+            worker = asyncio.create_task(asyncio.to_thread(_run_worker))
+            try:
+                yield _format_sse(
+                    _make_role_chunk(
+                        request_id=request_id,
+                        model=body.model,
+                        created=created,
+                    )
+                )
+
+                while True:
+                    item = await queue.get()
+                    if isinstance(item, str):
+                        yield _format_sse(
+                            _make_delta_chunk(
+                                request_id=request_id,
+                                model=body.model,
+                                created=created,
+                                content=item,
+                            )
+                        )
+                    elif isinstance(item, TurnMetrics):
+                        finish = _FINISH_REASON_MAP.get(
+                            item.finish_reason, "stop"
+                        )
+                        yield _format_sse(
+                            _make_finish_chunk(
+                                request_id=request_id,
+                                model=body.model,
+                                created=created,
+                                finish_reason=finish,
+                            )
+                        )
+                        if include_usage:
+                            yield _format_sse(
+                                _make_usage_chunk(
+                                    request_id=request_id,
+                                    model=body.model,
+                                    created=created,
+                                    metrics=item,
+                                )
+                            )
+                        yield b"data: [DONE]\n\n"
+                        return
+                    elif item is _DISCONNECTED:
+                        # Client gone before completion. No [DONE] —
+                        # the consumer is no longer reading.
+                        return
+                    elif isinstance(item, BaseException):
+                        log.error(
+                            "chat.completions stream worker failed: %r",
+                            item,
+                        )
+                        # SSE stream is mid-flight; closing the socket
+                        # without [DONE] is the canonical "error
+                        # mid-stream" signal in OpenAI-SSE land.
+                        return
+            finally:
+                # G-1: hold ``runtime.engine_lock`` until the worker
+                # truly exits. The worker may be stalled inside
+                # ``_abortable_put`` waiting for queue room; we drain
+                # the queue continuously so the next ``put`` (or the
+                # in-flight one) can complete and the worker observes
+                # ``abort_event`` on its next ``stream_to`` boundary.
+                #
+                # Cancellation handling: if Starlette propagates a
+                # second cancellation (or a ``GeneratorExit`` chain
+                # surfaces ``CancelledError`` at our awaits) during
+                # cleanup, we absorb it and keep draining. Releasing
+                # the lock before the worker exits would re-introduce
+                # the G-1 violation that this drain-during-cleanup
+                # design is here to prevent.
+                abort_event.set()
+                while not worker.done():
+                    try:
+                        await asyncio.wait_for(queue.get(), timeout=0.1)
+                    except asyncio.TimeoutError:
+                        # Queue empty; loop and re-check ``worker.done()``.
+                        # The worker either finished between checks or
+                        # is still running through MLX compute; either
+                        # way another short wait is the right move.
+                        pass
+                    except asyncio.CancelledError:
+                        # Outer cancellation during cleanup — keep
+                        # draining. The worker is still alive and we
+                        # must hold engine_lock until it exits per
+                        # OPENING G-1.
+                        pass
+                # Worker is done. Surface its outcome via sync
+                # accessors instead of ``await worker``: an await on
+                # an already-done task can still raise
+                # ``CancelledError`` if our coroutine has a pending
+                # cancellation, which would tight-loop a retry; and
+                # we never want outer cancellation to reach the
+                # worker task itself (sync access does neither).
+                if not worker.cancelled():
+                    exc = worker.exception()
+                    if exc is not None:
+                        log.error(
+                            "chat.completions stream worker exit "
+                            "error: %r",
+                            exc,
+                        )
+
+    return StreamingResponse(
+        _generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            # Disable proxy buffering (nginx, etc.) so chunks arrive
+            # without a buffer flush delay. OpenAI's docs use this
+            # header for the same reason.
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # Route.
 # ---------------------------------------------------------------------------
 
 
-@router.post(
-    "/v1/chat/completions",
-    response_model=ChatCompletionResponse,
-)
+@router.post("/v1/chat/completions")
 async def chat_completions(
     body: ChatCompletionRequest, request: Request
-) -> ChatCompletionResponse:
+) -> Any:
+    """POST /v1/chat/completions dispatcher.
+
+    Returns either a :class:`ChatCompletionResponse` (when
+    ``body.stream`` is falsy) or a :class:`StreamingResponse` of SSE
+    chunks (when ``body.stream`` is truthy). Pre-dispatch validation
+    is identical for both branches.
+    """
     runtime = _get_runtime(request)
 
     # Single-process server (OPENING §6.1.2 G-1) — silica.serve loads
@@ -512,13 +941,19 @@ async def chat_completions(
     )
 
     log.info(
-        "chat.completions request model=%s history_turns=%d "
+        "chat.completions request model=%s stream=%s history_turns=%d "
         "user_text_len=%d max_tokens=%s",
         body.model,
+        bool(body.stream),
         len(history),
         len(user_text),
         params.max_tokens,
     )
+
+    if body.stream:
+        return _stream_chat_completion(
+            body, runtime, session, user_text, params
+        )
 
     async with runtime.engine_lock:
         metrics: TurnMetrics = await asyncio.to_thread(

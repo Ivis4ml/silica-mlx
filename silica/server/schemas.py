@@ -107,6 +107,26 @@ class Usage(BaseModel):
     total_tokens: int
 
 
+class StreamOptions(BaseModel):
+    """``stream_options`` request field — applies only when
+    ``stream=True``.
+
+    Uses ``extra="allow"`` because ``stream_options`` is an
+    OpenAI-owned surface (not a silica-owned envelope like
+    :class:`Extension`); future SDK additions must not 422 the
+    endpoint. v0.1 honours :attr:`include_usage`; unknown fields
+    parse through here and are ignored by the route, with the
+    parse-but-not-support trade-off matching the request-level
+    ``extra="allow"`` policy at the top of this module. (h) hardening
+    can promote specific known-but-unsupported fields to route-level
+    501.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    include_usage: bool | None = None
+
+
 class ResponseFormat(BaseModel):
     """``response_format`` request field.
 
@@ -196,7 +216,7 @@ class ChatCompletionRequest(BaseModel):
 
     # Streaming.
     stream: bool | None = None
-    stream_options: dict[str, Any] | None = None
+    stream_options: StreamOptions | None = None
 
     # Reserved interface slot — v0.1 routes 501 unless type == "text".
     response_format: ResponseFormat | None = None
@@ -297,7 +317,7 @@ class CompletionRequest(BaseModel):
     seed: int | None = None
     user: str | None = None
     stream: bool | None = None
-    stream_options: dict[str, Any] | None = None
+    stream_options: StreamOptions | None = None
 
     extension: Extension | None = None
 
@@ -370,5 +390,6 @@ __all__ = [
     "ModelInfo",
     "ModelsListResponse",
     "ResponseFormat",
+    "StreamOptions",
     "Usage",
 ]

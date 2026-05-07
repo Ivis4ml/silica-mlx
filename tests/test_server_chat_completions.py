@@ -704,7 +704,9 @@ def test_chat_completions_accepts_matching_max_tokens_pair(
 @pytest.mark.parametrize(
     "extra_field, expected_substring",
     [
-        ({"stream": True}, "streaming not yet implemented"),
+        # ``stream=True`` is no longer 501 — sub-unit (d) lifted that
+        # gate; the SSE path is exercised in
+        # tests/test_server_chat_completions_streaming.py.
         ({"n": 2}, "n=2 not supported"),
         ({"tools": [{"type": "function"}]}, "tool calling"),
         ({"tool_choice": "auto"}, "tool_choice"),
