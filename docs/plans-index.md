@@ -362,8 +362,9 @@ read in-editor while iterating.
   Verdict PASS-PREPROJECTION rests on cycle-1 parity + B=1 speedup +
   non-degenerate long-run output, **not** on long-run byte identity.
   Native-integration ladder is gated on D-024 (the trigger has fired —
-  pin-bump bisect or silica-native MTP path); P-8 OpenAI HTTP server
-  opens cleanly after D-024 settles.
+  pin-bump bisect or silica-native MTP path), but P-8 does not depend
+  on native MTP; P-8 OPENING landed at v1.7.32 and is now the active
+  phase entry.
 - [`MTP_GEMMA4_PRE_PROJECTION.md`](../plans/MTP_GEMMA4_PRE_PROJECTION.md) —
   half-day external spike against Google's Gemma 4 multi-token-prediction
   (MTP) drafter, opened as D-023 in `PLAN.md` §9 at v1.7.29 and the
@@ -420,9 +421,41 @@ read in-editor while iterating.
   matrix was amended at v1.7.30 to bind GREEDY-PARITY-FAIL (row 2) to
   cycle-1 byte parity, add row 2.5 OUTPUT-QUALITY-FAIL (degeneracy /
   repetition / format collapse), and clarify row 3 DRAFT-VERIFY-WALL
-  ratio measurement is deferred to native integration. P-8 opens
-  cleanly after D-023 settles; the native-integration ladder is gated
-  on D-024.
+  ratio measurement is deferred to native integration. P-8 OPENING
+  landed at v1.7.32 (`plans/P8_OPENING.md`); the native-integration
+  ladder is gated on D-024 (parked as post-announce TODO per
+  v1.7.31).
+
+## Phase 8 — Mini-SGLang layer (OpenAI HTTP server)
+
+- [`P8_OPENING.md`](../plans/P8_OPENING.md) — phase-opening doc
+  landed at v1.7.32. Carries §1 motivation (M-9 acceptance is the
+  silica-mlx 1.0 announce blocker), §2 in-/out-of-scope tiers
+  (PLAN.md §7 P-8 deliverables + acceptance verbatim, plus v0.2
+  deferrals and post-(h) follow-ons), §3 entry-point inventory
+  verified at v1.7.31 (`silica/server/__init__.py` +
+  `silica/llm/__init__.py` empty; `silica/server/cli.py` is the
+  178-line one-shot CLI; `pyproject.toml [serve]` extra already
+  declares FastAPI / Uvicorn / OpenAI), §4 architecture sketch,
+  §5 sub-unit ladder (a)–(h) (FastAPI scaffold → Pydantic schemas
+  → `/v1/chat/completions` non-streaming → SSE streaming →
+  `/v1/completions` + `/v1/models` → `SessionManager` + prefix
+  reuse → `silica.llm.LLM` facade → auth + rate-limit + tests +
+  docs), §6 acceptance gate matrix (G-1 / G-2 / G-3 stop-and-ask
+  gates + R-a..R-h sub-unit acceptance rows + M-9 terminal
+  verdict), §7-§8 sources and cross-references. **§6.1.2 design
+  lock:** v0.1 is positioned as a *local single-user
+  OpenAI-compatible server* — Option A endpoint routing (one
+  active decode turn at a time; concurrent requests serialise on
+  the engine), per-`ChatSession` `RadixPrefixCache` (same-session
+  cross-request reuse only; cross-session shared system-prompt
+  reuse is post-P-8), bounded-queue SSE backpressure with no
+  token drop. Canonical session selector is the
+  `X-Silica-Session-ID` HTTP header (or
+  `extra_body.extension.session_id`); the OpenAI `user` field is
+  **not** consulted as session id. Multi-customer scheduler
+  routing (Options B/C in §6.1.1) is a post-announce follow-on
+  outside the silica-mlx 1.0 scope.
 
 ## Side track: chat CLI redesign
 
