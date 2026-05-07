@@ -1,0 +1,142 @@
+"""silica.server.openai_api — FastAPI app + lifespan + /healthz (P-8 a2).
+
+Module-level :data:`app` is the bare FastAPI instance with the
+``/healthz`` route and a lifespan that builds + tears down a
+:class:`silica.server.runtime.Runtime`. The lifespan reads a
+module-level :data:`_config` set via :func:`configure`. Two intended
+call sites:
+
+- **Production** (wired in sub-unit (a3)): :mod:`silica.server.cli`
+  parses ``silica serve --model ...`` args, calls ``configure(
+  ServerConfig(model_repo="..."))``, then runs uvicorn against
+  ``silica.server.openai_api:app``.
+- **Tests**: a fixture calls ``configure(ServerConfig(
+  runtime_factory=lambda: stub_runtime))`` before driving
+  :class:`fastapi.testclient.TestClient`, so no HuggingFace load
+  happens in CI.
+
+Design constraints from ``plans/P8_OPENING.md`` §6.1.2 and the (a)
+acceptance row:
+
+- Module import must NOT load any model. :func:`configure` also does
+  not load — model construction happens on the lifespan startup hook,
+  on the worker that drives the app.
+- ``/healthz`` is **strict**: returns 200 only AFTER the lifespan
+  startup hook has successfully built the runtime. Returns 503 while
+  the lifespan has not yet run, after a shutdown, or if the runtime
+  has been closed.
+- Concurrent HTTP request handlers (sub-units (c)/(d)/(f)) use
+  :attr:`Runtime.engine_lock` + :func:`asyncio.to_thread` per the
+  Runtime docstring. ``/healthz`` itself never touches MLX so the
+  lock+thread contract does not bite here.
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+
+from fastapi import FastAPI, HTTPException, Request
+
+from silica.core.logger import get_logger
+from silica.server.runtime import Runtime
+
+log = get_logger(__name__)
+
+
+@dataclass
+class ServerConfig:
+    """Configuration consumed by the FastAPI lifespan.
+
+    Exactly one of :attr:`model_repo` / :attr:`runtime_factory` must
+    be set:
+
+    - :attr:`model_repo`: production path. The lifespan invokes
+      :meth:`Runtime.from_repo` which loads weights via
+      :func:`silica.models.factory.adapter_for_repo`.
+    - :attr:`runtime_factory`: a zero-argument callable returning a
+      pre-built :class:`Runtime`. Tests use this seam to inject a
+      stub runtime (for example over :class:`StubModelAdapter` +
+      :class:`NullKVManager`) so the smoke path stays off the
+      HuggingFace network.
+    """
+
+    model_repo: str | None = None
+    runtime_factory: Callable[[], Runtime] | None = None
+
+    def __post_init__(self) -> None:
+        if (self.model_repo is None) == (self.runtime_factory is None):
+            raise ValueError(
+                "ServerConfig requires exactly one of model_repo "
+                "or runtime_factory to be set"
+            )
+
+
+_config: ServerConfig | None = None
+
+
+def configure(config: ServerConfig) -> None:
+    """Register the server configuration consumed by the lifespan.
+
+    Must be called before the app boots — before
+    :class:`fastapi.testclient.TestClient` enters its context, or
+    before ``uvicorn.run`` is invoked. Overwrites any previously
+    registered config; the lifespan reads :data:`_config` once at
+    startup.
+    """
+    global _config
+    _config = config
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    if _config is None:
+        raise RuntimeError(
+            "silica.server.openai_api: lifespan started but no "
+            "ServerConfig was registered. Call configure(...) before "
+            "the app boots; the CLI does this in (a3) and tests must "
+            "do it before TestClient enters its context."
+        )
+
+    log.info("server.startup begin")
+    if _config.runtime_factory is not None:
+        runtime = _config.runtime_factory()
+    else:
+        assert _config.model_repo is not None  # invariant per __post_init__
+        runtime = Runtime.from_repo(_config.model_repo)
+    app.state.runtime = runtime
+    log.info("server.startup ready model=%s", runtime.model_repo)
+
+    try:
+        yield
+    finally:
+        log.info("server.shutdown begin model=%s", runtime.model_repo)
+        runtime.close()
+        app.state.runtime = None
+        log.info("server.shutdown done")
+
+
+app = FastAPI(
+    title="silica-mlx OpenAI-compatible server",
+    description=(
+        "P-8 v0.1 — local single-user OpenAI HTTP server "
+        "(plans/P8_OPENING.md §6.1.2)."
+    ),
+    lifespan=_lifespan,
+)
+
+
+@app.get("/healthz")
+async def healthz(request: Request) -> dict[str, str]:
+    """Strict liveness probe.
+
+    Returns 200 ``{"status": "ok"}`` once the lifespan startup hook
+    has successfully built the runtime. Returns 503 if the runtime
+    has not been registered (lifespan not yet run) or if it has been
+    closed (shutdown in progress or completed).
+    """
+    runtime: Runtime | None = getattr(request.app.state, "runtime", None)
+    if runtime is None or runtime.closed:
+        raise HTTPException(status_code=503, detail="engine not ready")
+    return {"status": "ok"}
