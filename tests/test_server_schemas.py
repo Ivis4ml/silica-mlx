@@ -519,3 +519,162 @@ def test_openai_sdk_extra_body_extension_round_trips() -> None:
     assert request.extension is not None
     assert request.extension.session_id == "sess-openai-sdk"
     assert request.extension.thinking_mode == "off"
+
+
+def _capture_openai_completions_request_body(
+    **create_kwargs: Any,
+) -> dict[str, Any]:
+    """Drive ``openai.OpenAI(...).completions.create(...)`` against a
+    captured :class:`httpx.MockTransport` and return the raw JSON body
+    the SDK would send on the wire. Returns a stub
+    :class:`CompletionResponse` so the SDK does not raise on the
+    response side; the test only inspects what was sent.
+    """
+    captured: dict[str, Any] = {}
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "id": "cmpl-stub",
+                "object": "text_completion",
+                "created": 0,
+                "model": "stub",
+                "choices": [
+                    {
+                        "text": " stub",
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "logprobs": None,
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            },
+        )
+
+    transport = httpx.MockTransport(_handler)
+    client = OpenAI(
+        api_key="dummy",
+        base_url="http://localhost:9999/v1",
+        http_client=httpx.Client(transport=transport),
+    )
+    client.completions.create(**create_kwargs)
+    body: dict[str, Any] = captured["body"]
+    return body
+
+
+@pytest.mark.skipif(
+    not _HAS_OPENAI_SDK,
+    reason="P-8 [serve] extra not installed (openai / httpx missing)",
+)
+def test_openai_sdk_serialises_into_completion_request() -> None:
+    """``client.completions.create(...)`` produces a wire body that
+    :class:`CompletionRequest` accepts. R-e gate parity for the
+    legacy text-completions endpoint."""
+    body = _capture_openai_completions_request_body(
+        model="Qwen/Qwen3.5-0.8B",
+        prompt="The capital of France is",
+        max_tokens=32,
+        temperature=0.7,
+        top_p=0.9,
+        stream=False,
+    )
+
+    assert body["model"] == "Qwen/Qwen3.5-0.8B"
+    assert body["prompt"] == "The capital of France is"
+
+    request = CompletionRequest(**body)
+    assert request.model == "Qwen/Qwen3.5-0.8B"
+    assert request.prompt == "The capital of France is"
+    assert request.max_tokens == 32
+
+
+@pytest.mark.skipif(
+    not _HAS_OPENAI_SDK,
+    reason="P-8 [serve] extra not installed (openai / httpx missing)",
+)
+def test_openai_sdk_parses_completion_response() -> None:
+    """The SDK can deserialise a :class:`CompletionResponse`-shaped
+    payload into its ``Completion`` object. R-e response-side gate.
+    """
+    captured: dict[str, Any] = {}
+
+    response_body = CompletionResponse(
+        id="cmpl-test",
+        created=1_700_000_000,
+        model="Qwen/Qwen3.5-0.8B",
+        choices=[
+            CompletionChoice(text=" Paris.", index=0, finish_reason="stop")
+        ],
+        usage=Usage(prompt_tokens=8, completion_tokens=2, total_tokens=10),
+    ).model_dump()
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        return httpx.Response(200, json=response_body)
+
+    transport = httpx.MockTransport(_handler)
+    client = OpenAI(
+        api_key="dummy",
+        base_url="http://localhost:9999/v1",
+        http_client=httpx.Client(transport=transport),
+    )
+
+    sdk_response = client.completions.create(
+        model="Qwen/Qwen3.5-0.8B",
+        prompt="The capital of France is",
+        max_tokens=8,
+    )
+
+    assert captured["path"] == "/v1/completions"
+    assert sdk_response.id == "cmpl-test"
+    assert sdk_response.choices[0].text == " Paris."
+    assert sdk_response.choices[0].finish_reason == "stop"
+    assert sdk_response.usage is not None
+    assert sdk_response.usage.total_tokens == 10
+
+
+@pytest.mark.skipif(
+    not _HAS_OPENAI_SDK,
+    reason="P-8 [serve] extra not installed (openai / httpx missing)",
+)
+def test_openai_sdk_parses_models_list_response() -> None:
+    """The SDK can deserialise a :class:`ModelsListResponse`-shaped
+    payload into its model list. R-e response-side gate for the
+    metadata endpoint.
+    """
+    captured: dict[str, Any] = {}
+
+    response_body = ModelsListResponse(
+        data=[
+            ModelInfo(id="Qwen/Qwen3.5-0.8B", created=1_700_000_000),
+        ]
+    ).model_dump()
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["method"] = request.method
+        return httpx.Response(200, json=response_body)
+
+    transport = httpx.MockTransport(_handler)
+    client = OpenAI(
+        api_key="dummy",
+        base_url="http://localhost:9999/v1",
+        http_client=httpx.Client(transport=transport),
+    )
+
+    page = client.models.list()
+    models = list(page)
+
+    assert captured["method"] == "GET"
+    assert captured["path"] == "/v1/models"
+    assert len(models) == 1
+    assert models[0].id == "Qwen/Qwen3.5-0.8B"
+    assert models[0].owned_by == "silica"
+    assert models[0].object == "model"
+    assert models[0].created == 1_700_000_000

@@ -131,8 +131,12 @@ app = FastAPI(
 # heavy work happens inside route handlers under the lifespan-built
 # runtime.
 from silica.server.routes import chat_completions as _chat_completions  # noqa: E402
+from silica.server.routes import completions as _completions  # noqa: E402
+from silica.server.routes import models as _models  # noqa: E402
 
 app.include_router(_chat_completions.router)
+app.include_router(_completions.router)
+app.include_router(_models.router)
 
 
 @app.get("/healthz")

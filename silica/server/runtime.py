@@ -32,6 +32,7 @@ without changing the lifespan shape.
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import TYPE_CHECKING
 
 from silica.core.logger import get_logger
@@ -126,6 +127,7 @@ class Runtime:
         *,
         model_repo: str,
         metrics: MetricsRegistry | None = None,
+        created_at: int | None = None,
     ) -> None:
         self._adapter = adapter
         self._kv_manager = kv_manager
@@ -134,6 +136,12 @@ class Runtime:
             adapter=adapter,
             kv_manager=kv_manager,
             metrics=metrics,
+        )
+        # Stamped at construction so /v1/models reports a stable
+        # creation timestamp for the lifetime of this runtime.
+        # Tests inject a fixed value via the keyword.
+        self._created_at = (
+            created_at if created_at is not None else int(time.time())
         )
         self.engine_lock = asyncio.Lock()
         self._closed = False
@@ -168,6 +176,17 @@ class Runtime:
     @property
     def model_repo(self) -> str:
         return self._model_repo
+
+    @property
+    def created_at(self) -> int:
+        """Unix timestamp captured at construction.
+
+        Surfaced by ``GET /v1/models`` as the model entry's ``created``
+        field per OpenAI's wire shape. Stable for the lifetime of this
+        Runtime; a new Runtime (lifespan restart, ``--reload`` etc.)
+        gets a fresh stamp.
+        """
+        return self._created_at
 
     @property
     def closed(self) -> bool:

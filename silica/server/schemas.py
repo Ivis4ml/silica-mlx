@@ -298,11 +298,12 @@ class CompletionRequest(BaseModel):
     """``POST /v1/completions`` request body (legacy, no chat template).
 
     v0.1 supports a single ``str`` prompt; ``list[str]``,
-    ``list[int]``, and ``list[list[int]]`` parse here under
-    ``extra="allow"`` semantics on the union but the route returns
-    400 if anything other than ``str`` is provided (P-8 v0.1 ties
-    completions to a single tokenised prompt; batch / token-id
-    inputs are post-announce).
+    ``list[int]``, and ``list[list[int]]`` parse here under the
+    structural union but the route returns 501 if anything other
+    than ``str`` is provided (P-8 v0.1 ties completions to a single
+    tokenised prompt; batch / token-id inputs are post-announce).
+    Mirrors the chat-completions "parsed but not supported → 501"
+    rule from sub-unit (c).
     """
 
     model_config = ConfigDict(extra="allow", protected_namespaces=())
