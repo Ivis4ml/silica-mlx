@@ -5,8 +5,9 @@ Invocation:
     silica run --model Qwen/Qwen3.5-0.8B --prompt "The capital of France is"
     silica chat --model Qwen/Qwen3-0.6B
     silica chat --model Qwen/Qwen3.5-4B --kv-codec block_tq_b64_b4
+    silica serve --model Qwen/Qwen3.5-0.8B --port 8000
 
-Two subcommands:
+Three subcommands:
 
 - ``run`` — single-shot generation. P-1 acceptance surface: pulls
   EOS from the tokenizer's ``eos_token_ids`` automatically, prints
@@ -20,14 +21,21 @@ Two subcommands:
   knobs are intentionally not CLI flags here — the chat-app default
   is "open and use", power users override mid-session via
   ``/config``.
+- ``serve`` — OpenAI-compatible HTTP server (P-8 sub-unit (a3)).
+  Single-process in v0.1: ``--workers`` must remain 1 and
+  ``--reload`` is unsupported because the FastAPI lifespan reads a
+  module-level configuration slot that does not propagate to child
+  processes spawned by uvicorn's reload / multi-worker modes.
+  Multi-customer scheduler routing is a post-announce follow-on
+  (``plans/P8_OPENING.md`` §6.1.1).
 
 Bare ``silica`` (no subcommand) opens the chat REPL with all
 defaults — claude-style. Implementation: :func:`main` pre-processes
 ``argv`` and prepends ``chat`` when the first positional token is
-not a known subcommand (``run`` / ``chat``) and not a top-level
-flag (``--help`` / ``-h`` / ``--version``). Both ``silica`` and
-``silica chat`` therefore land on the same subparser, so
-``--model`` / ``--system`` / ``--kv-codec`` work uniformly across
+not a known subcommand (``run`` / ``chat`` / ``serve``) and not a
+top-level flag (``--help`` / ``-h`` / ``--version``). Both
+``silica`` and ``silica chat`` therefore land on the same subparser,
+so ``--model`` / ``--system`` / ``--kv-codec`` work uniformly across
 the two invocation forms.
 """
 
@@ -97,6 +105,62 @@ def build_parser() -> argparse.ArgumentParser:
             "design doc §6 for when this is worth opting into."
         ),
     )
+
+    serve = sub.add_parser(
+        "serve",
+        help="run the OpenAI-compatible HTTP server (P-8)",
+        description=(
+            "Run the silica-mlx OpenAI-compatible HTTP server. v0.1 "
+            "is single-process: --workers must remain 1 and --reload "
+            "is unsupported because the FastAPI lifespan reads a "
+            "module-level configuration slot that does not propagate "
+            "to child processes spawned by uvicorn's reload / "
+            "multi-worker modes. Multi-customer scheduler routing is "
+            "a post-announce follow-on (plans/P8_OPENING.md §6.1.1)."
+        ),
+    )
+    serve.add_argument(
+        "--model",
+        required=True,
+        help="HuggingFace repo id (e.g. Qwen/Qwen3.5-0.8B)",
+    )
+    serve.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="bind address (default 127.0.0.1; use 0.0.0.0 for LAN)",
+    )
+    serve.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="listen port (default 8000)",
+    )
+    serve.add_argument(
+        "--log-level",
+        default="info",
+        choices=("critical", "error", "warning", "info", "debug", "trace"),
+        help="uvicorn log level (default info)",
+    )
+    serve.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help=(
+            "must be 1; v0.1 is single-process and rejects "
+            "--workers > 1 because module-level configure() state "
+            "is not inherited by uvicorn worker subprocesses"
+        ),
+    )
+    serve.add_argument(
+        "--reload",
+        action="store_true",
+        default=False,
+        help=(
+            "unsupported in v0.1; the reload supervisor re-imports "
+            "the module fresh in child processes which lose "
+            "configure() state"
+        ),
+    )
     return root
 
 
@@ -136,7 +200,7 @@ def _print_metrics(snapshot: Any) -> None:
         print("[metrics] " + " ".join(parts), file=sys.stderr)
 
 
-_KNOWN_SUBCOMMANDS = frozenset({"run", "chat"})
+_KNOWN_SUBCOMMANDS = frozenset({"run", "chat", "serve"})
 _TOP_LEVEL_FLAGS = frozenset({"--help", "-h", "--version"})
 
 
@@ -160,6 +224,66 @@ def _preprocess_argv(argv: Sequence[str]) -> list[str]:
     return ["chat", *args]
 
 
+def _validate_serve_args(args: argparse.Namespace) -> str | None:
+    """Return an error message if serve flags violate the v0.1 single-process
+    invariant, otherwise ``None``.
+
+    P-8 v0.1 (per ``plans/P8_OPENING.md`` §6.1.2 G-1) is a single-process
+    OpenAI-compatible server. The FastAPI lifespan reads
+    :data:`silica.server.openai_api._config` which is set by
+    :func:`silica.server.openai_api.configure` in the parent process before
+    ``uvicorn.run`` is called. Reload / multi-worker modes spawn child
+    processes that re-import the module fresh, dropping ``_config`` to
+    ``None``; the lifespan would then refuse to start. Both are rejected
+    here with an explicit message rather than silently failing in the
+    worker subprocess.
+    """
+    if args.workers != 1:
+        return (
+            f"--workers={args.workers} is not supported. silica serve is "
+            "single-process in v0.1 because module-level configure() "
+            "state is not inherited by uvicorn worker subprocesses. "
+            "Multi-customer scheduler routing is a post-announce "
+            "follow-on; see plans/P8_OPENING.md §6.1.1."
+        )
+    if args.reload:
+        return (
+            "--reload is not supported. The reload supervisor re-imports "
+            "the module fresh in child processes which lose configure() "
+            "state. Restart the server manually for code changes."
+        )
+    return None
+
+
+def _serve(args: argparse.Namespace) -> int:
+    error = _validate_serve_args(args)
+    if error is not None:
+        print(f"silica serve: error: {error}", file=sys.stderr)
+        return 2
+
+    from silica.server import openai_api
+
+    openai_api.configure(openai_api.ServerConfig(model_repo=args.model))
+
+    import uvicorn
+
+    # Pass the app object directly, not the import-string form
+    # ``"silica.server.openai_api:app"``. The import-string form would
+    # let uvicorn re-import the module in subprocesses (e.g. under
+    # ``--workers > 1`` or ``--reload``), which would lose the
+    # ``configure()`` state set in the parent. ``_validate_serve_args``
+    # already rejects those modes; passing the live app object keeps
+    # the single-process contract enforced even if a future reload
+    # path is added.
+    uvicorn.run(
+        openai_api.app,
+        host=args.host,
+        port=args.port,
+        log_level=args.log_level,
+    )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     raw = sys.argv[1:] if argv is None else list(argv)
     parser = build_parser()
@@ -170,6 +294,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         from silica.chat.cli.app import run_chat
 
         return run_chat(args)
+    if args.cmd == "serve":
+        return _serve(args)
     parser.error(f"unknown command: {args.cmd!r}")
     return 2  # unreachable — parser.error raises SystemExit, kept for mypy
 
