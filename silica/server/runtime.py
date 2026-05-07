@@ -38,6 +38,12 @@ from typing import TYPE_CHECKING
 from silica.core.logger import get_logger
 from silica.core.profiler import MetricsRegistry
 from silica.engine import Engine
+from silica.server.session import (
+    DEFAULT_MAX_SESSIONS,
+    DEFAULT_PREFIX_CACHE_BLOCK_SIZE,
+    DEFAULT_SESSION_TTL_S,
+    SessionManager,
+)
 
 if TYPE_CHECKING:
     from silica.kvcache.manager import KVManager
@@ -128,6 +134,9 @@ class Runtime:
         model_repo: str,
         metrics: MetricsRegistry | None = None,
         created_at: int | None = None,
+        max_sessions: int = DEFAULT_MAX_SESSIONS,
+        session_ttl_s: float = DEFAULT_SESSION_TTL_S,
+        prefix_cache_block_size: int = DEFAULT_PREFIX_CACHE_BLOCK_SIZE,
     ) -> None:
         self._adapter = adapter
         self._kv_manager = kv_manager
@@ -145,6 +154,19 @@ class Runtime:
         )
         self.engine_lock = asyncio.Lock()
         self._closed = False
+        # SessionManager carries the X-Silica-Session-ID → ChatSession
+        # map for cross-request prefix reuse (P-8 sub-unit (f)). One
+        # manager per Runtime; tunables come from constructor kwargs
+        # so tests can size the LRU + TTL down for fast eviction
+        # coverage. (h) hardening exposes these as ``silica serve``
+        # CLI flags.
+        self._session_manager = SessionManager(
+            adapter=adapter,
+            engine=self._engine,
+            max_sessions=max_sessions,
+            session_ttl_s=session_ttl_s,
+            prefix_cache_block_size=prefix_cache_block_size,
+        )
 
     @classmethod
     def from_repo(cls, model_repo: str) -> Runtime:
@@ -189,18 +211,33 @@ class Runtime:
         return self._created_at
 
     @property
+    def session_manager(self) -> SessionManager:
+        """SessionManager owning the X-Silica-Session-ID → ChatSession map.
+
+        Used by :mod:`silica.server.routes.chat_completions` when a
+        request carries a session selector header / extension field.
+        Built in :meth:`__init__`; persists for the Runtime lifetime
+        and is cleared in :meth:`close`.
+        """
+        return self._session_manager
+
+    @property
     def closed(self) -> bool:
         return self._closed
 
     def close(self) -> None:
-        """Release runtime-owned resources. No-op in v0.1.
+        """Release runtime-owned resources.
 
         Called from the FastAPI lifespan shutdown hook. Idempotent —
-        a second call is silently ignored. Future variants land their
-        cleanup here (codec store handles, prefetch worker drain,
+        a second call is silently ignored. Drops every persisted
+        ChatSession via :meth:`SessionManager.close` so the
+        per-session prefix caches and their underlying stores become
+        GC-eligible immediately. Future variants land their cleanup
+        here (codec store handles, prefetch worker drain,
         weight-streaming page table free).
         """
         if self._closed:
             return
         self._closed = True
+        self._session_manager.close()
         log.info("runtime.close model=%s", self._model_repo)

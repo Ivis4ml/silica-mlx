@@ -464,12 +464,11 @@ def test_chat_completions_400_on_out_of_range_sampling_param(
 @pytest.mark.parametrize(
     "extension_payload, expected_substring",
     [
-        ({"session_id": "sess-abc"}, "session_id"),
         ({"thinking_mode": "off"}, "thinking_mode"),
         ({"continue_truncated": True}, "continue_truncated"),
         (
             {"session_id": "s", "thinking_mode": "auto"},
-            "session_id",
+            "thinking_mode",
         ),
     ],
 )
@@ -478,10 +477,11 @@ def test_chat_completions_501_on_non_empty_extension(
     extension_payload: dict[str, Any],
     expected_substring: str,
 ) -> None:
-    """Accepting non-empty extension would silently fall back to a
-    fresh ChatSession with default thinking, contradicting what the
-    field claims to do. Honouring sites land in (f); v0.1 (c)
-    rejects."""
+    """Accepting non-empty extension would silently fall back to default
+    behaviour, contradicting what the field claims to do. After (f)
+    ``session_id`` is honoured; ``thinking_mode`` and
+    ``continue_truncated`` remain unimplemented and return 501.
+    """
     _configure_runtime()
     _install_stub_session(monkeypatch)
 

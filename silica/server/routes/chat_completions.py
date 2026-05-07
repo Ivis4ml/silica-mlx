@@ -1,5 +1,5 @@
 """silica.server.routes.chat_completions — POST /v1/chat/completions
-non-streaming + streaming branches (P-8 sub-units (c) and (d)).
+non-streaming + streaming branches (P-8 sub-units (c) / (d) / (f)).
 
 Non-streaming (``stream=False``) is driven by
 :meth:`silica.chat.session.ChatSession.chat` with ``stream_to=None``;
@@ -8,8 +8,30 @@ streaming (``stream=True``) drives the same call with a
 an asyncio queue, which the SSE :class:`StreamingResponse` generator
 drains and re-frames as OpenAI ``chat.completion.chunk`` events.
 
-One conversation per HTTP request; v0.1 has no cross-request session
-reuse (sub-unit (f) lands ``SessionManager``).
+Session routing (sub-unit (f), per OPENING §6.1.2 G-1 / G-2)
+============================================================
+
+Each request resolves a session selector: the ``X-Silica-Session-ID``
+HTTP header (preferred) or, if absent, the body-level
+``extension.session_id`` field (provided so SDKs that cannot set
+headers can still address a persistent session). The OpenAI ``user``
+field is **not** consulted — its spec semantics are abuse-monitoring
+identifier, not conversation continuity. When a selector is present
+the route hands off to :class:`silica.server.session.SessionManager`,
+which returns a persistent :class:`ChatSession` carrying its own
+:class:`silica.kvcache.prefix.RadixPrefixCache`. Absent any selector
+the request falls back to a fresh per-call ChatSession (sub-units
+(c)/(d) shape — no cross-request prefix reuse for unsessioned
+calls).
+
+The session resolution call (``runtime.session_manager.get_or_create``
+or :func:`_session_factory`) runs **inside**
+``runtime.engine_lock``: G-1 means at most one decode is active at
+a time, so two concurrent requests with the same session_id queue
+on the lock and only the lock-holding coroutine touches the
+session manager. Without this hoist the second request's
+``replace_messages`` could clobber the first request's history
+between resolution and decode start.
 
 Pipeline
 ========
@@ -191,6 +213,108 @@ def _get_runtime(request: Request) -> Runtime:
     return runtime
 
 
+def _resolve_session_id(
+    request: Request, body: ChatCompletionRequest
+) -> str | None:
+    """Pick the session selector for this request.
+
+    Per OPENING §4.3 / (f), the canonical selector is the
+    ``X-Silica-Session-ID`` HTTP header. If that header is absent
+    (some SDKs cannot set custom headers), the body-level
+    ``extension.session_id`` is the documented fallback. The OpenAI
+    ``user`` field is intentionally **not** consulted — its
+    documented spec semantics are abuse-monitoring identifier, not
+    conversation continuity.
+
+    The header form is checked first; an empty string from either
+    source is treated as absent (a client clearing the field should
+    not be billed as a fresh persistent session).
+    """
+    header_value = request.headers.get("x-silica-session-id")
+    if header_value:
+        return header_value
+    if body.extension is not None and body.extension.session_id:
+        return body.extension.session_id
+    return None
+
+
+def _validate_session_id_supported(
+    runtime: Runtime, session_id: str | None
+) -> None:
+    """Reject ``session_id`` for adapters incompatible with prefix reuse.
+
+    :class:`silica.server.session.SessionManager` always builds a
+    :class:`RadixPrefixCache` for each persistent session, but
+    :class:`ContinuousBatcher` rejects that combination when the
+    adapter's attention pattern includes
+    :attr:`AttentionKind.SLIDING` (Gemma4 31B today). Driving
+    :meth:`Engine.generate_batch` with the cache attached would
+    raise ``NotImplementedError`` deep in the scheduler — the
+    non-streaming path surfaces it as a 500, the streaming path
+    closes the SSE socket without ``[DONE]``. Returning 501 here
+    is the actionable shape: clients learn their model variant
+    cannot host persistent sessions in v0.1, and existing
+    no-session calls keep working through the miss-only single-row
+    ``Engine.generate`` path.
+
+    Lifting this is tied to the P-3-D3 sliding-window-aware seed
+    path (Engine.generate_batch with prefix_cache against
+    sliding-bearing adapters); deferred to a post-P-8 phase.
+    """
+    if session_id is None:
+        return
+    if not runtime.session_manager.supports_prefix_reuse:
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "session_id is not supported for this model. The "
+                "loaded adapter's attention_kinds include "
+                "AttentionKind.SLIDING; persistent sessions require "
+                "a RadixPrefixCache, which ContinuousBatcher rejects "
+                "for sliding-window-bearing adapters in v0.1. Drop "
+                "the X-Silica-Session-ID / extension.session_id "
+                "field to use a fresh per-request session."
+            ),
+        )
+
+
+def _resolve_session(
+    runtime: Runtime,
+    *,
+    session_id: str | None,
+    system_prompt: str | None,
+    history: list[dict[str, str]],
+) -> Any:
+    """Hand back the ChatSession for this request.
+
+    Two branches:
+
+    - ``session_id is None`` — the (c)/(d) shape: build a fresh
+      :class:`ChatSession` for this request via the
+      :data:`_session_factory` seam. No cross-request prefix reuse;
+      the session is dropped at the end of the call.
+    - ``session_id is not None`` — the (f) shape: hand off to
+      :meth:`SessionManager.get_or_create`, which returns a
+      persistent :class:`ChatSession` carrying its own
+      :class:`RadixPrefixCache`. Repeated calls with the same
+      ``session_id`` reuse that cache.
+
+    Must be called **inside** ``runtime.engine_lock``. Touching the
+    SessionManager outside the lock would let two concurrent
+    requests with the same ``session_id`` race on
+    ``replace_messages``; the (c)/(d) path is also placed under
+    the lock for consistency so the test seam is the same in both
+    branches.
+    """
+    if session_id is None:
+        return _session_factory(
+            runtime, system_prompt=system_prompt, history=history
+        )
+    return runtime.session_manager.get_or_create(
+        session_id, system_prompt=system_prompt, history=history
+    )
+
+
 def _validate_unsupported(req: ChatCompletionRequest) -> None:
     """Return 400 or 501 for fields that change output semantics or
     are not wired in v0.1. Schema layer parses everything under
@@ -211,20 +335,23 @@ def _validate_unsupported(req: ChatCompletionRequest) -> None:
             ),
         )
 
-    # silica's Extension envelope is parsed strictly by (b), but the
-    # honouring sites land later: session_id in (f), thinking_mode and
-    # continue_truncated also in (f). Accepting non-empty extension in
-    # (c) would silently fall back to a fresh ChatSession with default
-    # thinking, which contradicts what the field claims to do.
+    # silica's Extension envelope is parsed strictly by (b). After
+    # (f), ``extension.session_id`` is honoured for cross-request
+    # prefix reuse; ``thinking_mode`` and ``continue_truncated`` are
+    # not yet wired and remain 501. Accepting non-honoured extension
+    # fields would silently fall back to default behaviour, which
+    # contradicts what the field claims to do.
     if req.extension is not None:
         ext_fields = req.extension.model_dump(exclude_none=True)
-        if ext_fields:
+        unsupported = sorted(set(ext_fields) - {"session_id"})
+        if unsupported:
             raise HTTPException(
                 status_code=501,
                 detail=(
-                    f"extension fields {sorted(ext_fields.keys())} are "
-                    "not honoured in v0.1 (session_id, thinking_mode, "
-                    "continue_truncated land in P-8 sub-unit (f))"
+                    f"extension fields {unsupported} are not "
+                    "honoured in v0.1 (thinking_mode and "
+                    "continue_truncated remain unimplemented after "
+                    "P-8 sub-unit (f))"
                 ),
             )
 
@@ -650,7 +777,10 @@ def _make_usage_chunk(
 def _stream_chat_completion(
     body: ChatCompletionRequest,
     runtime: Runtime,
-    session: Any,
+    *,
+    session_id: str | None,
+    system_prompt: str | None,
+    history: list[dict[str, str]],
     user_text: str,
     params: SamplingParams,
 ) -> StreamingResponse:
@@ -693,6 +823,13 @@ def _stream_chat_completion(
        lock+thread contract — never :meth:`asyncio.Queue.put_nowait`
        from the worker thread, which is not thread-safe and would
        drop tokens on a full queue.
+    6. Session resolution happens **inside** the engine_lock branch
+       (sub-unit (f)). Two concurrent streams sharing a session_id
+       queue on the lock; the second's
+       :func:`SessionManager.get_or_create` only fires after the
+       first stream's worker has fully unwound, so its
+       ``replace_messages`` cannot clobber an in-flight
+       conversation.
     """
     request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
@@ -712,7 +849,14 @@ def _stream_chat_completion(
         # blocking the worker forever.
         _abortable_put(queue, delta_text, loop, abort_event)
 
+    # Captured by the worker after the SSE generator resolves the
+    # session inside the lock. Worker reads :attr:`_resolved_session`
+    # from the closure.
+    session_holder: dict[str, Any] = {"session": None}
+
     def _run_worker() -> None:
+        session = session_holder["session"]
+        assert session is not None  # set inside the lock before task launch
         try:
             metrics = session.chat(
                 user_text,
@@ -773,6 +917,17 @@ def _stream_chat_completion(
 
     async def _generator() -> AsyncIterator[bytes]:
         async with runtime.engine_lock:
+            # Resolve the session inside the lock (sub-unit (f)
+            # concurrency contract; see :func:`_resolve_session`).
+            # Done first so any factory exception turns into the
+            # generator's ``finally`` cleanup before the worker
+            # task is launched.
+            session_holder["session"] = _resolve_session(
+                runtime,
+                session_id=session_id,
+                system_prompt=system_prompt,
+                history=history,
+            )
             worker = asyncio.create_task(asyncio.to_thread(_run_worker))
             try:
                 yield _format_sse(
@@ -936,26 +1091,44 @@ async def chat_completions(
         body, max_tokens=max_tokens, eos_ids=eos_ids
     )
 
-    session = _session_factory(
-        runtime, system_prompt=system_prompt, history=history
-    )
+    session_id = _resolve_session_id(request, body)
+    _validate_session_id_supported(runtime, session_id)
 
     log.info(
         "chat.completions request model=%s stream=%s history_turns=%d "
-        "user_text_len=%d max_tokens=%s",
+        "user_text_len=%d max_tokens=%s session_id=%s",
         body.model,
         bool(body.stream),
         len(history),
         len(user_text),
         params.max_tokens,
+        session_id,
     )
 
     if body.stream:
         return _stream_chat_completion(
-            body, runtime, session, user_text, params
+            body,
+            runtime,
+            session_id=session_id,
+            system_prompt=system_prompt,
+            history=history,
+            user_text=user_text,
+            params=params,
         )
 
     async with runtime.engine_lock:
+        # Sub-unit (f) concurrency contract: resolve the session
+        # inside the lock so two concurrent requests sharing a
+        # session_id queue here instead of racing on
+        # ``replace_messages``. The fresh-session branch (no
+        # session_id) takes the same path so both branches share
+        # one test seam.
+        session = _resolve_session(
+            runtime,
+            session_id=session_id,
+            system_prompt=system_prompt,
+            history=history,
+        )
         metrics: TurnMetrics = await asyncio.to_thread(
             session.chat,
             user_text,
@@ -964,11 +1137,14 @@ async def chat_completions(
 
     log.info(
         "chat.completions reply model=%s finish_reason=%s "
-        "prompt_tokens=%d output_tokens=%d",
+        "prompt_tokens=%d output_tokens=%d session_id=%s "
+        "prefix_hit_tokens=%s",
         body.model,
         metrics.finish_reason,
         metrics.prompt_tokens,
         metrics.output_tokens,
+        session_id,
+        metrics.prefix_hit_tokens,
     )
 
     return _build_response(metrics, model=body.model)
