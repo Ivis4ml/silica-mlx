@@ -84,8 +84,14 @@ def test_lifespan_starts_runtime_via_factory_and_healthz_returns_ok() -> None:
         assert openai_api.app.state.runtime is runtime
         assert runtime.closed is False
 
-    # Lifespan shutdown ran on context exit.
+    # Lifespan shutdown ran on context exit: runtime closed AND
+    # app.state.runtime explicitly cleared (pinned per the (a2)
+    # review note — the lifespan finally block at
+    # silica/server/openai_api.py is the only writer that clears
+    # this slot, and a regression that drops the clear-step would
+    # leave a stale Runtime reference dangling on the app).
     assert runtime.closed is True
+    assert openai_api.app.state.runtime is None
 
 
 def test_lifespan_without_configure_raises_at_startup() -> None:
