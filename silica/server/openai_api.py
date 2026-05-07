@@ -126,6 +126,14 @@ app = FastAPI(
     lifespan=_lifespan,
 )
 
+# Route registration: each routes/* module exports an APIRouter that
+# gets mounted here. Module imports are cheap (no model load); the
+# heavy work happens inside route handlers under the lifespan-built
+# runtime.
+from silica.server.routes import chat_completions as _chat_completions  # noqa: E402
+
+app.include_router(_chat_completions.router)
+
 
 @app.get("/healthz")
 async def healthz(request: Request) -> dict[str, str]:
