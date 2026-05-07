@@ -172,7 +172,10 @@ app.include_router(_models.router)
 # (``api_key=None`` / ``rate_limit_rpm`` is None or <= 0) so the
 # dev-default (no auth, no rate limit) preserves the (a)–(g) test
 # surface byte-for-byte.
-from silica.server.auth import check_bearer_auth  # noqa: E402
+from silica.server.auth import (  # noqa: E402
+    auth_response_for_state,
+    preview_bearer_auth,
+)
 from silica.server.ratelimit import (  # noqa: E402
     consume_rate_limit_token,
 )
@@ -184,18 +187,29 @@ async def _hardening_chain(
     call_next: Callable[[Request], Awaitable[Response]],
 ) -> Response:
     cfg = _config
+    api_key = cfg.api_key if cfg is not None else None
+    rpm = cfg.rate_limit_rpm if cfg is not None else None
+
+    # Pre-check auth so the rate-limit gate can route invalid /
+    # missing-token requests to the per-IP bucket (per (h)
+    # follow-up: token rotation would otherwise dodge the cap).
+    # The rate-limit response is emitted before the auth response
+    # so an attacker spamming wrong tokens trips the per-IP 429
+    # rather than walking 401s indefinitely.
+    auth_state = preview_bearer_auth(request, api_key=api_key)
+
     rl_response = consume_rate_limit_token(
-        request,
-        rpm=cfg.rate_limit_rpm if cfg is not None else None,
+        request, rpm=rpm, auth_state=auth_state
     )
     if rl_response is not None:
         return rl_response
-    auth_response = check_bearer_auth(
-        request,
-        api_key=cfg.api_key if cfg is not None else None,
+
+    auth_response = auth_response_for_state(
+        auth_state, request_path=request.url.path
     )
     if auth_response is not None:
         return auth_response
+
     return await call_next(request)
 
 

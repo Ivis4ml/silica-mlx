@@ -129,7 +129,18 @@ async def validation_exception_handler(
     """
     assert isinstance(exc, RequestValidationError)
     errors = exc.errors()
-    log.info("request.validation.fail errors=%r", errors)
+    # Pydantic's :class:`ValidationError` entries carry an
+    # ``input`` field that holds the offending request value —
+    # which for the chat-completions route is typically the
+    # full ``messages`` list (i.e. the user's prompt). Logging
+    # that at INFO level would leak user content into the
+    # production server log. Strip the field before logging;
+    # the ``loc`` / ``msg`` / ``type`` triple is enough to
+    # diagnose a validation failure.
+    redacted = [
+        {k: v for k, v in e.items() if k != "input"} for e in errors
+    ]
+    log.info("request.validation.fail errors=%r", redacted)
     if errors:
         first = errors[0]
         loc = ".".join(str(p) for p in first.get("loc", ())) or "<root>"

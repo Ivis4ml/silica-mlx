@@ -1,10 +1,10 @@
 """silica.server.ratelimit — token-bucket rate limiting (P-8 sub-unit (h)).
 
-Per-key token-bucket: each authentication key (or per-IP when auth
-is disabled) gets its own bucket. The bucket starts full at the
-configured RPM cap and refills linearly over time; each request
-deducts one token. Empty bucket → 429 with the OpenAI-shaped
-``rate_limit_error`` envelope.
+Per-key token-bucket: validated callers share an auth-keyed bucket;
+unauthenticated / wrong-key / missing-header callers fall back to a
+per-IP bucket. The bucket starts full at the configured RPM cap and
+refills linearly over time; each request deducts one token. Empty
+bucket → 429 with the OpenAI-shaped ``rate_limit_error`` envelope.
 
 When the configured RPM is ``None`` or ``<= 0``, the helper is a
 pass-through. v0.1 default is unlimited; ``--rate-limit-rpm`` opts
@@ -20,6 +20,24 @@ The token-bucket algorithm is the right shape for chat workloads:
   pattern.
 - Per-key isolation means one noisy client cannot starve the
   others — important once API keys become per-user in v0.2.
+
+Bucket-key choice (sub-unit (h) follow-up)
+==========================================
+
+The naive shape — "key by ``Authorization`` header value if
+present, else by IP" — has a known bypass: an attacker rotating
+wrong bearer tokens (``Bearer wrong-1``, ``Bearer wrong-2``, …)
+gets a fresh bucket per request and never trips the per-IP cap,
+so :mod:`silica.server.openai_api`'s rate-limit-before-auth
+ordering reduces to per-token-spam over 401s. The fix lives at
+this layer: the rate-limit helper consults
+:class:`silica.server.auth.AuthState` to decide which bucket the
+request maps to. Only :attr:`AuthState.VALID` callers get the
+per-token bucket; everyone else (DISABLED / MISSING / MALFORMED /
+INVALID) shares the per-IP bucket. Disabled-auth deployments
+intentionally key on IP — the ``Authorization`` header from a
+disabled-auth caller is untrusted input that an attacker could
+rotate with the same effect.
 
 The implementation is **in-memory** and lost on process restart.
 For a multi-process deployment a shared Redis-backed bucket is
@@ -37,6 +55,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from silica.core.logger import get_logger
+from silica.server.auth import AuthState
 from silica.server.errors import openai_error_payload
 
 log = get_logger(__name__)
@@ -142,7 +161,10 @@ def _reset_limiters() -> None:
 
 
 def consume_rate_limit_token(
-    request: Request, *, rpm: int | None
+    request: Request,
+    *,
+    rpm: int | None,
+    auth_state: AuthState = AuthState.DISABLED,
 ) -> JSONResponse | None:
     """Enforce the configured RPM cap for ``request``.
 
@@ -150,13 +172,17 @@ def consume_rate_limit_token(
     :class:`JSONResponse` (OpenAI envelope, ``Retry-After`` header)
     when the bucket is empty.
 
-    Behaviour:
-
-    - ``rpm`` is ``None`` or ``<= 0`` — rate limit disabled, always
-      allow.
-    - Path is in :data:`_RATELIMIT_EXEMPT_PATHS` — always allow.
-    - Otherwise — consume one token from the per-key bucket; reject
-      with 429 if empty.
+    Parameters
+    ----------
+    rpm:
+        Requests per minute. ``None`` or ``<= 0`` disables the
+        limiter (pass-through).
+    auth_state:
+        Pre-checked auth state from
+        :func:`silica.server.auth.preview_bearer_auth`. Defaults to
+        :attr:`AuthState.DISABLED` for callers that do not run
+        auth (e.g. an admin endpoint that does its own gating); the
+        production middleware always supplies the real state.
     """
     if rpm is None or rpm <= 0:
         return None
@@ -164,15 +190,16 @@ def consume_rate_limit_token(
         return None
 
     limiter = _get_or_make_limiter(rpm)
-    key = _default_key_fn(request)
+    key = _bucket_key(request, auth_state)
     if limiter.consume(key):
         return None
 
     log.info(
-        "ratelimit.deny key=%r path=%s rpm=%d",
+        "ratelimit.deny key=%r path=%s rpm=%d auth=%s",
         _redact_key(key),
         request.url.path,
         rpm,
+        auth_state.value,
     )
     return JSONResponse(
         status_code=429,
@@ -191,22 +218,45 @@ def consume_rate_limit_token(
     )
 
 
-def _default_key_fn(request: Request) -> str:
-    """Pick the bucket key from the request.
+def _bucket_key(request: Request, auth_state: AuthState) -> str:
+    """Pick the bucket key from the request + auth state.
+
+    Only :attr:`AuthState.VALID` requests get the per-token bucket
+    (keyed by the validated ``Authorization`` header value); every
+    other state shares the per-IP bucket. Disabled-auth deployments
+    do **not** trust the ``Authorization`` header — an attacker
+    could rotate it with the same bucket-bypass effect that
+    motivated this routing — so they also key on IP.
+    """
+    if auth_state == AuthState.VALID:
+        auth_header = request.headers.get("authorization")
+        if auth_header:
+            return f"auth:{auth_header}"
+        # Defensive: VALID implies the header was present and
+        # matched. Falling through to IP keying here would only
+        # happen on a Starlette path that drops the header between
+        # the auth pre-check and rate-limit consumption — which
+        # would be a framework bug, not a request shape we want
+        # to accommodate. Log + IP-fall-back as a safety net.
+        log.warning(
+            "ratelimit: AuthState.VALID but Authorization header "
+            "missing at consume time; falling back to IP bucket "
+            "(framework invariant violated)"
+        )
+    return _ip_key(request)
+
+
+def _ip_key(request: Request) -> str:
+    """Resolve the per-IP bucket key.
 
     Preference order:
 
-    1. ``Authorization`` header (entire value, not just the bearer
-       token — keeps shape future-compatible with non-Bearer schemes).
-    2. ``X-Forwarded-For`` first-hop IP if present (typical reverse-
-       proxy deployment).
-    3. Direct ``request.client.host``.
-    4. Literal ``"anonymous"`` if none of the above resolve (only
-       happens in unusual transport configurations).
+    1. ``X-Forwarded-For`` first-hop IP (typical reverse-proxy
+       deployment).
+    2. Direct ``request.client.host``.
+    3. Literal ``"anonymous"`` if neither resolves (only happens
+       in unusual transport configurations).
     """
-    auth = request.headers.get("authorization")
-    if auth:
-        return f"auth:{auth}"
     fwd = request.headers.get("x-forwarded-for")
     if fwd:
         first = fwd.split(",")[0].strip()
@@ -214,7 +264,7 @@ def _default_key_fn(request: Request) -> str:
             return f"ip:{first}"
     if request.client is not None and request.client.host:
         return f"ip:{request.client.host}"
-    return "anonymous"
+    return "ip:anonymous"
 
 
 def _redact_key(key: str) -> str:

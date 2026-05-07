@@ -158,8 +158,10 @@ class Runtime:
         # map for cross-request prefix reuse (P-8 sub-unit (f)). One
         # manager per Runtime; tunables come from constructor kwargs
         # so tests can size the LRU + TTL down for fast eviction
-        # coverage. (h) hardening exposes these as ``silica serve``
-        # CLI flags.
+        # coverage. v0.1 keeps these fixed in the production CLI
+        # (``silica serve`` exposes only ``--api-key`` and
+        # ``--rate-limit-rpm`` from sub-unit (h)); admin endpoints
+        # for the session tunables are post-announce.
         self._session_manager = SessionManager(
             adapter=adapter,
             engine=self._engine,

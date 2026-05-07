@@ -44,8 +44,11 @@ Lifecycle defaults
   chat-CLI bench showed 4 is the right balance between hit
   granularity and radix-tree node count for chat workloads.
 
-These defaults are tunable via constructor kwargs; (h) hardening
-exposes them as ``silica serve`` CLI flags.
+These defaults are **fixed in v0.1**: only :class:`Runtime`'s
+constructor kwargs override them, and tests use that surface.
+``silica serve`` does not expose CLI flags for the session
+tunables — admin endpoints / per-deployment overrides are a
+post-announce follow-on.
 """
 
 from __future__ import annotations

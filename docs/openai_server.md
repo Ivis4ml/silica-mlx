@@ -111,13 +111,28 @@ silica serve --model Qwen/Qwen3.5-0.8B --rate-limit-rpm 60
 ```
 
 The bucket capacity equals the configured RPM, so a fully-refilled
-bucket allows up to one minute's burst. The key is the
-`Authorization` header value (when auth is enabled) or the client
-IP (`X-Forwarded-For` first hop, else `request.client.host`).
+bucket allows up to one minute's burst. Bucket-key choice:
+
+- **Validated callers (auth enabled, correct token)** — keyed by
+  the `Authorization` header value. All correct-token requests
+  share one bucket (v0.1 is single-shared-secret; per-user keys
+  are post-announce).
+- **Everything else** — auth disabled, missing header, malformed
+  header, or wrong token — keyed by the client IP
+  (`X-Forwarded-For` first hop, else `request.client.host`).
+
+Why the IP fallback for the disabled / unvalidated cases: the
+`Authorization` header from a non-validated request is untrusted
+input. An attacker could otherwise rotate header values
+(`Bearer wrong-1`, `Bearer wrong-2`, …) to dodge the per-IP cap
+with the same effect that prompted the rate-limit-before-auth
+ordering below. The unified per-IP fallback closes that gap.
 
 Rate limit runs **before** auth — a flood of unauthenticated
 requests still decrements the offending IP's bucket, instead of
-letting an attacker spam cheap 401s.
+letting an attacker spam cheap 401s. Combined with the IP-keyed
+fallback above, an attacker spamming wrong tokens will hit 429
+once their IP bucket is exhausted, not unlimited 401s.
 
 429 envelope:
 

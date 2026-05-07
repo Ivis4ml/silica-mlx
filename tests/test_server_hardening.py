@@ -267,34 +267,122 @@ def test_rate_limit_429_after_exhausting_bucket(
     assert int(rejected.headers["Retry-After"]) >= 1
 
 
-def test_rate_limit_per_key_isolation_by_authorization_header(
+def test_rate_limit_unauthenticated_traffic_shares_per_ip_bucket(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Two different Authorization headers get distinct buckets, so
-    one client's exhaustion does not starve the other."""
+    """When auth is disabled, the rate limiter MUST key on the
+    client IP — not on the ``Authorization`` header. An attacker
+    could otherwise rotate header values to bypass the cap.
+
+    This is the (h) follow-up fix: with auth disabled, the
+    Authorization header is untrusted input and must not influence
+    bucket selection. The same IP exhausting its bucket triggers
+    429 regardless of header rotation.
+    """
     _configure_with_rpm(1)
     _install_stub_session(monkeypatch)
 
     with TestClient(openai_api.app) as client:
-        a1 = client.post(
+        first = client.post(
             "/v1/chat/completions",
             json=_basic_chat_payload(),
-            headers={"Authorization": "Bearer client-a"},
+            headers={"Authorization": "Bearer rotating-1"},
         )
-        b1 = client.post(
+        # Different header value, same client IP. With the bug the
+        # second request would get a fresh bucket; the fix makes it
+        # share the per-IP bucket and trip 429.
+        second = client.post(
             "/v1/chat/completions",
             json=_basic_chat_payload(),
-            headers={"Authorization": "Bearer client-b"},
-        )
-        a2 = client.post(
-            "/v1/chat/completions",
-            json=_basic_chat_payload(),
-            headers={"Authorization": "Bearer client-a"},
+            headers={"Authorization": "Bearer rotating-2"},
         )
 
-    assert a1.status_code == 200
-    assert b1.status_code == 200
-    assert a2.status_code == 429
+    assert first.status_code == 200
+    assert second.status_code == 429
+
+
+def test_rate_limit_blocks_token_rotation_attack_under_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The (h) follow-up motivating case: with auth ENABLED, an
+    attacker rotating wrong bearer tokens (Bearer wrong-1, Bearer
+    wrong-2, ...) must eventually trip the per-IP rate limit and
+    get 429, not unlimited 401s.
+
+    Without the fix, the rate limiter keyed each wrong token to a
+    fresh bucket and never charged the attacker's IP — so
+    rate-limit-before-auth ordering reduced to per-token-spam over
+    401s.
+    """
+    runtime = _build_runtime()
+    openai_api.configure(
+        openai_api.ServerConfig(
+            runtime_factory=lambda: runtime,
+            api_key="real-secret",
+            rate_limit_rpm=2,
+        )
+    )
+    _install_stub_session(monkeypatch)
+
+    with TestClient(openai_api.app) as client:
+        # Two wrong-token requests fit in the bucket — both 401.
+        first = client.post(
+            "/v1/chat/completions",
+            json=_basic_chat_payload(),
+            headers={"Authorization": "Bearer wrong-1"},
+        )
+        second = client.post(
+            "/v1/chat/completions",
+            json=_basic_chat_payload(),
+            headers={"Authorization": "Bearer wrong-2"},
+        )
+        # Third rotates a fresh wrong token but the per-IP bucket
+        # is empty → 429, not 401.
+        third = client.post(
+            "/v1/chat/completions",
+            json=_basic_chat_payload(),
+            headers={"Authorization": "Bearer wrong-3"},
+        )
+
+    assert first.status_code == 401
+    assert second.status_code == 401
+    assert third.status_code == 429
+
+
+def test_rate_limit_valid_token_isolated_from_bad_traffic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Validated callers share the auth-keyed bucket; bad traffic
+    on the same IP does not starve them. We exhaust the per-IP
+    bucket with wrong tokens, then a request with the correct
+    token still succeeds because it lands on a separate bucket."""
+    runtime = _build_runtime()
+    openai_api.configure(
+        openai_api.ServerConfig(
+            runtime_factory=lambda: runtime,
+            api_key="real-secret",
+            rate_limit_rpm=1,
+        )
+    )
+    _install_stub_session(monkeypatch)
+
+    with TestClient(openai_api.app) as client:
+        # Burn the per-IP bucket with one wrong-token 401.
+        bad = client.post(
+            "/v1/chat/completions",
+            json=_basic_chat_payload(),
+            headers={"Authorization": "Bearer wrong"},
+        )
+        # Validated request: lands on the auth-keyed bucket and
+        # succeeds even though the IP bucket is now empty.
+        good = client.post(
+            "/v1/chat/completions",
+            json=_basic_chat_payload(),
+            headers={"Authorization": "Bearer real-secret"},
+        )
+
+    assert bad.status_code == 401
+    assert good.status_code == 200
 
 
 def test_rate_limit_healthz_exempt(

@@ -17,6 +17,24 @@ to :meth:`generate` / :meth:`chat` runs
 :meth:`unload` clears the loaded fields so the next call re-loads —
 useful for swapping models in interactive sessions.
 
+Streaming shape
+---------------
+
+- :meth:`generate` ``stream=True`` is **real-time**: tokens arrive
+  on the iterator as the engine yields them. The facade consumes
+  :meth:`silica.engine.Engine.generate` directly; each ``next()``
+  on the returned generator advances one decode cycle.
+- :meth:`chat` ``stream=True`` is **buffered** in v0.1. The
+  underlying :meth:`silica.chat.session.ChatSession.chat` runs
+  synchronously to completion, accumulating deltas via the
+  ``stream_to`` callback; the iterator yields them only after the
+  turn finishes. Callers who need real-time chat streaming should
+  drive the HTTP server in :mod:`silica.server.openai_api`
+  (``stream=True`` SSE is real-time end-to-end). A worker-thread +
+  queue bridge for the facade-side path is post-announce — adding
+  it would couple the facade to the asyncio loop the HTTP server
+  already owns.
+
 The facade is **not** thread-safe — concurrent generate calls
 against one :class:`LLM` instance share the underlying
 :class:`Engine` and would race on :class:`KVHandle` lifecycle. The
@@ -203,8 +221,11 @@ class LLM:
         ----------
         stream:
             ``False`` returns the full reply once the turn finishes.
-            ``True`` yields incremental decoded deltas (same shape as
-            the streaming :meth:`generate`).
+            ``True`` yields decoded deltas — but **buffered**: the
+            underlying :class:`ChatSession` runs synchronously to
+            completion before any delta is yielded. See the module
+            docstring for the rationale and the real-time
+            alternative (HTTP SSE).
         """
         self._ensure_loaded()
         params = self._effective_params(sampling_params)
@@ -330,14 +351,15 @@ class LLM:
         user_text: str,
         params: SamplingParams | None,
     ) -> Iterator[str]:
-        # Bridge ChatSession's stream_to callback (called from the
-        # engine's caller thread, which is the user's thread here)
-        # into a generator. The session runs synchronously, so we
-        # accumulate deltas in a list during the call and yield them
-        # afterwards. A more sophisticated bridge (asyncio queue +
-        # worker thread) is the HTTP server's territory; the facade
-        # is single-thread by design (G-1 under runtime.engine_lock
-        # not applicable here — see module docstring).
+        # Buffered streaming: ``ChatSession.chat`` runs
+        # synchronously, accumulating deltas via the ``stream_to``
+        # callback; we yield them only after the turn finishes.
+        # The first ``next()`` on the returned generator therefore
+        # blocks for the full turn duration — documented at the
+        # module level so consumers do not mistake this for
+        # real-time streaming. A worker-thread + queue bridge is
+        # the HTTP server's territory; the facade is single-thread
+        # by design.
         deltas: list[str] = []
         session = self._build_chat_session(system_prompt, history)
         session.chat(
