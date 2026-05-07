@@ -343,7 +343,11 @@ records `k_candidates` alongside it; speedup is reported per
   by the off-spec leg of each measurement).
 - Greedy mode: `temperature=0`, deterministic.
 - Greedy parity: same prompt, same seed, off-spec vs on-spec output
-  must match byte-for-byte.
+  must match byte-for-byte at **`max_tokens=1` (cycle-1)**. Long-run
+  (`max_tokens=N`) divergence is recorded but does not by itself fire
+  the §7 row 2 hard block (see §7 row 2 amendment for the rationale
+  vs the v1.7.19 D-021 step 5 precedent). Output quality (degeneracy
+  / repetition / format collapse) is handled separately by §7 row 2.5.
 
 ### §6.4 Headline metric
 
@@ -402,8 +406,9 @@ pass condition fired against an unstable measurement.
 | order | row name           | outcome / verdict                                                                | trigger                                                                              |
 | ----- | ------------------ | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
 | 1     | PAIR-INFEASIBLE    | hard block — close this M5-Pro external spike with hardware-feasibility negative; no measurement runs; monitor for a future 4-bit IT target conversion or documented mlx-vlm mixed-precision support and re-run verification when either appears | §3 verification resolves to outcome B (only BF16 pair exists, mixed-precision unsupported, BF16 target > 48 GB) |
-| 2     | GREEDY-PARITY-FAIL | hard block — drafter or runtime compatibility issue; investigate before any verdict | measured, `temperature=0`, off-spec output ≠ on-spec output bytewise                  |
-| 3     | DRAFT-VERIFY-WALL  | hard block — replicates DFlash η.1 physics; close D-023                          | measured `draft_cost_ms / verify_cost_ms ≥ 0.5` at the **best decision row** for B=1 AND B=4 (i.e., the ratio is ≥ 0.5 even at the most favourable `draft_block_size`); diagnostic-only `block_size = 2` does not fire this row |
+| 2     | GREEDY-PARITY-FAIL | hard block — drafter or runtime compatibility issue; investigate before any verdict | measured, `temperature=0`, **`max_tokens=1` cycle-1 byte parity** off-spec output ≠ on-spec output (sha256 mismatch). Long-run `max_tokens=N` byte divergence is **not** by itself a fail — it is a diagnostic / native-integration caveat (see row 2.5). This matches the v1.7.19 D-021 step 5 closure precedent: silica's own fp16 path produces `max_tokens=N` divergence from sequential reference under `BatchKVCache`, validated through (h) bench scenarios rather than against a sequential reference. |
+| 2.5   | OUTPUT-QUALITY-FAIL | hard block — drafter introduces quality regression; investigate before any verdict | on-spec output exhibits **degeneracy** (looped repetition, format collapse, partial-token corruption, gibberish). Detected by: (a) repeated n-gram fraction > 25% over the generated tail, OR (b) pre-/post-pairing sentence-level fluency comparison flags clear regression on visual inspection. Distinguishes "different but coherent paraphrase" (acceptable, not a fail) from "broken" (hard block). Triggered separately from row 2 — long-run paraphrase divergence does not fire row 2.5 if outputs remain non-degenerate, well-formed, and topical. |
+| 3     | DRAFT-VERIFY-WALL  | hard block — replicates DFlash η.1 physics; close D-023                          | measured `draft_cost_ms / verify_cost_ms ≥ 0.5` at the **best decision row** for B=1 AND B=4 (i.e., the ratio is ≥ 0.5 even at the most favourable `draft_block_size`); diagnostic-only `block_size = 2` does not fire this row. Note: `mlx_vlm.GenerationResult` does not separately expose `draft_cost_ms` / `verify_cost_ms`, so the external spike cannot directly evaluate this row. The external spike can only record whether a DFlash-like **net regression** is observed in tok/s. Direct ratio measurement is deferred to native integration. |
 | 4     | B=1-PASS           | open D-023 native integration ladder (covers Gemma4 hidden-capture, see §8)      | measured B=1 per-row speedup ≥ 1.3× at the decision row, σ check PASS                 |
 | 5     | B=4-ONLY-PASS      | record "serving / concurrency reopen value" only in §9; **no auto-integration** | measured B=4 per-row speedup ≥ 1.3× at the decision row AND row 4 did not fire        |
 | 6     | NEGATIVE           | close D-023 with measurement-anchored negative; Track C remains closed           | measured B=1 < 1.3× AND B=4 < 1.3× at the respective decision rows                   |
@@ -412,6 +417,25 @@ pass condition fired against an unstable measurement.
 `draft_block_size` whose `on_tok_per_sec` is the highest at each B
 (see §6.5). Failing on `block_size = 2` (the verify-cost floor) is not
 a verdict.
+
+**Row 2 / 2.5 amendment (2026-05-06, applied during D-023 measurement):**
+The original row 2 wording specified "off-spec output ≠ on-spec output
+bytewise" without bounding the comparison to cycle-1. As written, that
+language is stricter than the silica-internal precedent set by v1.7.19
+D-021 step 5 closure, where `DraftTargetEngine` was admitted into the
+spec foundation with documented `max_tokens=N` divergence from the
+sequential fp16 reference under `BatchKVCache` (validated via (h) bench
+scenarios rather than long-run byte equality). Since D-023's purpose
+is to decide whether to open the native-integration ladder, holding an
+external spec drafter to a stricter parity standard than silica
+already accepts internally is logically inconsistent. The amendment
+narrows row 2 to cycle-1 byte parity (the discriminator that proves
+the drafter introduces no logits-level bias) and splits output-quality
+detection into a new row 2.5 (so paraphrase-level long-run divergence
+does not fire when outputs remain non-degenerate). The native
+integration ladder still requires its own cycle-1 parity gate plus
+scenario-level output sanity plus rollback correctness; PASS at this
+spike does **not** transfer that gate to silica-native code.
 
 ---
 
@@ -542,10 +566,14 @@ Pairing
   license reuse decision : <PENDING | RECONCILED-APACHE-2 | RESTRICTED-NO-REUSE>
 
 Greedy parity (temperature=0)
-  prompt token count : <N>
-  off-spec output    : <hash>
-  on-spec output     : <hash>
-  bytewise match     : <PASS | FAIL>
+  prompt token count             : <N>
+  off-spec output (cycle-1)      : <sha256>
+  on-spec  output (cycle-1)      : <sha256>
+  cycle-1 bytewise match         : <PASS | FAIL>   ← drives §7 row 2
+  off-spec output (max_tokens=N) : <sha256>
+  on-spec  output (max_tokens=N) : <sha256>
+  long-run bytewise match        : <PASS | FAIL>   ← caveat only, not row 2
+  output quality (visual)        : <NO-DEGENERACY | DEGENERATE>   ← drives §7 row 2.5
 
 Per-call decomposition (B=1)
                                   block=2  block=3  block=6  block=9
@@ -585,12 +613,13 @@ Variance discipline
   B=1 in [1.2, 1.4] grey band? : <NO | YES — relative σ_ratio ≤ 0.05? PASS|FAIL>
 
 Gate matrix evaluation (top-down, first FIRE wins)
-  Row 1 PAIR-INFEASIBLE         : <FIRE | NO>
-  Row 2 GREEDY-PARITY-FAIL      : <FIRE | NO>
-  Row 3 DRAFT-VERIFY-WALL       : <FIRE | NO>
-  Row 4 B=1-PASS                : <FIRE | NO>
-  Row 5 B=4-ONLY-PASS           : <FIRE | NO>
-  Row 6 NEGATIVE                : <FIRE | NO>
+  Row 1   PAIR-INFEASIBLE        : <FIRE | NO>
+  Row 2   GREEDY-PARITY-FAIL     : <FIRE | NO>   (cycle-1 max_tokens=1 byte parity)
+  Row 2.5 OUTPUT-QUALITY-FAIL    : <FIRE | NO>   (degenerate / format-collapse / repetition)
+  Row 3   DRAFT-VERIFY-WALL      : <FIRE | NOT-EVALUATED>   (external spike lacks direct ratio; native integration must measure)
+  Row 4   B=1-PASS               : <FIRE | NO>
+  Row 5   B=4-ONLY-PASS          : <FIRE | NO>
+  Row 6   NEGATIVE               : <FIRE | NO>
 
 Disposition
   <one paragraph: which row fired, what next, link to PLAN.md §9 D-023 update>
