@@ -347,12 +347,27 @@ read in-editor while iterating.
   new evidence such as mlx async-copy primitives, a different kernel
   path, or a different model architecture.
 
-### D-023 — Gemma 4 MTP drafter pre-projection (Track C external reopen probe)
+### D-023 — Gemma 4 MTP drafter pre-projection (PASS-PREPROJECTION at v1.7.30 with long-run parity caveat)
 
+- [`D023_MTP_GEMMA4/REPORT.md`](../plans/D023_MTP_GEMMA4/REPORT.md) —
+  the fact bundle. Two-session B=1 sweep on `mlx-community/gemma-4-31b-it-4bit`
+  target + `mlx-community/gemma-4-31B-it-assistant-bf16` drafter through
+  the isolated venv (mlx 0.31.2 / mlx-lm 0.31.3 / mlx-vlm 0.5.0; silica
+  project pin `mlx==0.31.1 / mlx-lm==0.31.2 / mlx-metal==0.31.1` stays
+  untouched). Decision-row B=1 speedup 1.339×–1.657× across 4 prompts
+  under cycle-27 variance discipline; sha256-anchored parity audit
+  splits cycle-1 byte parity 4/4 (the v1.7.30 row 2 hard block — PASS)
+  from long-run paraphrase-level divergence 1/4 (recorded as caveat,
+  not a fail; matches v1.7.19 D-021 step 5 closure precedent).
+  Verdict PASS-PREPROJECTION rests on cycle-1 parity + B=1 speedup +
+  non-degenerate long-run output, **not** on long-run byte identity.
+  Native-integration ladder is gated on D-024 (the trigger has fired —
+  pin-bump bisect or silica-native MTP path); P-8 OpenAI HTTP server
+  opens cleanly after D-024 settles.
 - [`MTP_GEMMA4_PRE_PROJECTION.md`](../plans/MTP_GEMMA4_PRE_PROJECTION.md) —
   half-day external spike against Google's Gemma 4 multi-token-prediction
-  (MTP) drafter, opened as D-023 in `PLAN.md` §9 at v1.7.29 and running
-  before P-8 OpenAI HTTP server work begins. External evidence on the
+  (MTP) drafter, opened as D-023 in `PLAN.md` §9 at v1.7.29 and the
+  fact bundle landing at v1.7.30. External evidence on the
   v1.7.20-22 closed Track C line; D-023 is a new entry, not a C.3
   reopen, because the current Silica production target
   `mlx-community/Qwen3.5-27B-4bit` ships no MTP weights and Gemma 4 is
@@ -401,8 +416,13 @@ read in-editor while iterating.
   gate at `silica/bench/runner.py:537` raises `NotImplementedError`;
   native MTP wiring requires extending `decode_step_multi_with_capture`
   + `prefill_with_capture` to `Gemma4Adapter` first), and a verdict
-  template populated only after the spike runs. P-8 opens cleanly
-  after D-023 settles in any direction.
+  template populated only after the spike runs. The spike-doc §7 gate
+  matrix was amended at v1.7.30 to bind GREEDY-PARITY-FAIL (row 2) to
+  cycle-1 byte parity, add row 2.5 OUTPUT-QUALITY-FAIL (degeneracy /
+  repetition / format collapse), and clarify row 3 DRAFT-VERIFY-WALL
+  ratio measurement is deferred to native integration. P-8 opens
+  cleanly after D-023 settles; the native-integration ladder is gated
+  on D-024.
 
 ## Side track: chat CLI redesign
 
