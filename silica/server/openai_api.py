@@ -70,12 +70,26 @@ class ServerConfig:
       ``--api-key`` to ``silica serve``.
     - :attr:`rate_limit_rpm`: per-key requests-per-minute cap.
       ``None`` (default) or ``<= 0`` disables rate limiting.
+    - :attr:`trusted_proxy`: whether the server is deployed behind
+      a reverse proxy whose ``X-Forwarded-For`` / ``X-Real-IP``
+      headers are trustworthy. ``False`` (default) — direct
+      exposure: rate-limit and per-IP buckets key on
+      ``request.client.host`` and ignore client-supplied
+      forwarding headers, which an attacker could otherwise
+      rotate to dodge per-IP buckets the same way they could
+      rotate ``Authorization`` values. ``True`` — production
+      reverse-proxy deployment: honour the first hop of
+      ``X-Forwarded-For`` (or ``X-Real-IP``) so the bucket sees
+      the real client IP, not the proxy's. **Only set this when
+      a proxy you control strips client-supplied forwarding
+      headers and re-emits them itself.**
     """
 
     model_repo: str | None = None
     runtime_factory: Callable[[], Runtime] | None = None
     api_key: str | None = None
     rate_limit_rpm: int | None = None
+    trusted_proxy: bool = False
 
     def __post_init__(self) -> None:
         if (self.model_repo is None) == (self.runtime_factory is None):
@@ -189,6 +203,7 @@ async def _hardening_chain(
     cfg = _config
     api_key = cfg.api_key if cfg is not None else None
     rpm = cfg.rate_limit_rpm if cfg is not None else None
+    trusted_proxy = cfg.trusted_proxy if cfg is not None else False
 
     # Pre-check auth so the rate-limit gate can route invalid /
     # missing-token requests to the per-IP bucket (per (h)
@@ -199,7 +214,10 @@ async def _hardening_chain(
     auth_state = preview_bearer_auth(request, api_key=api_key)
 
     rl_response = consume_rate_limit_token(
-        request, rpm=rpm, auth_state=auth_state
+        request,
+        rpm=rpm,
+        auth_state=auth_state,
+        trusted_proxy=trusted_proxy,
     )
     if rl_response is not None:
         return rl_response

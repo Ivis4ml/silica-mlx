@@ -39,6 +39,23 @@ intentionally key on IP — the ``Authorization`` header from a
 disabled-auth caller is untrusted input that an attacker could
 rotate with the same effect.
 
+The same trust principle gates the **proxy-forwarded IP** lookup.
+The naive ``X-Forwarded-For`` first-hop fallback has the same
+bypass: a directly-exposed server has no real proxy in front, so
+an attacker can supply arbitrary XFF values and get a fresh
+per-IP bucket per request. The fix uses the
+``trusted_proxy`` flag (``ServerConfig.trusted_proxy`` /
+``--trust-proxy-headers``):
+
+- ``trusted_proxy=False`` (default — direct exposure): IP keys on
+  ``request.client.host`` only. ``X-Forwarded-For`` is **ignored**
+  for bucket selection. Same logic — XFF is untrusted input.
+- ``trusted_proxy=True`` (explicit reverse-proxy deployment):
+  honour the first hop of ``X-Forwarded-For`` (or ``X-Real-IP``)
+  so the bucket sees the real client IP, not the proxy's. Only
+  set when a proxy you control strips client-supplied forwarding
+  headers and re-emits them itself.
+
 The implementation is **in-memory** and lost on process restart.
 For a multi-process deployment a shared Redis-backed bucket is
 post-announce; v0.1 is single-process per
@@ -165,6 +182,7 @@ def consume_rate_limit_token(
     *,
     rpm: int | None,
     auth_state: AuthState = AuthState.DISABLED,
+    trusted_proxy: bool = False,
 ) -> JSONResponse | None:
     """Enforce the configured RPM cap for ``request``.
 
@@ -183,6 +201,12 @@ def consume_rate_limit_token(
         :attr:`AuthState.DISABLED` for callers that do not run
         auth (e.g. an admin endpoint that does its own gating); the
         production middleware always supplies the real state.
+    trusted_proxy:
+        Whether ``X-Forwarded-For`` / ``X-Real-IP`` are
+        trustworthy. ``False`` (default) keys IP buckets on
+        ``request.client.host`` only — the safe shape for direct
+        exposure. ``True`` honours the first XFF hop, for
+        deployments behind a controlled reverse proxy.
     """
     if rpm is None or rpm <= 0:
         return None
@@ -190,7 +214,7 @@ def consume_rate_limit_token(
         return None
 
     limiter = _get_or_make_limiter(rpm)
-    key = _bucket_key(request, auth_state)
+    key = _bucket_key(request, auth_state, trusted_proxy=trusted_proxy)
     if limiter.consume(key):
         return None
 
@@ -218,7 +242,12 @@ def consume_rate_limit_token(
     )
 
 
-def _bucket_key(request: Request, auth_state: AuthState) -> str:
+def _bucket_key(
+    request: Request,
+    auth_state: AuthState,
+    *,
+    trusted_proxy: bool,
+) -> str:
     """Pick the bucket key from the request + auth state.
 
     Only :attr:`AuthState.VALID` requests get the per-token bucket
@@ -243,25 +272,45 @@ def _bucket_key(request: Request, auth_state: AuthState) -> str:
             "missing at consume time; falling back to IP bucket "
             "(framework invariant violated)"
         )
-    return _ip_key(request)
+    return _ip_key(request, trusted_proxy=trusted_proxy)
 
 
-def _ip_key(request: Request) -> str:
+def _ip_key(request: Request, *, trusted_proxy: bool) -> str:
     """Resolve the per-IP bucket key.
 
-    Preference order:
+    When ``trusted_proxy`` is ``False`` (the safe direct-exposure
+    default), only :attr:`Request.client.host` is consulted —
+    client-supplied ``X-Forwarded-For`` / ``X-Real-IP`` are
+    ignored because an attacker could rotate them to dodge the
+    per-IP cap. When ``trusted_proxy`` is ``True``, the first hop
+    of XFF (or ``X-Real-IP``) is honoured so a real proxy
+    deployment sees the originating client IP rather than the
+    proxy's.
 
-    1. ``X-Forwarded-For`` first-hop IP (typical reverse-proxy
-       deployment).
-    2. Direct ``request.client.host``.
-    3. Literal ``"anonymous"`` if neither resolves (only happens
-       in unusual transport configurations).
+    Preference order under ``trusted_proxy=True``:
+
+    1. ``X-Forwarded-For`` first hop (comma-separated; the leftmost
+       entry is the original client per the de facto convention).
+    2. ``X-Real-IP``.
+    3. ``request.client.host``.
+
+    Preference order under ``trusted_proxy=False`` (default):
+
+    1. ``request.client.host``.
+    2. Literal ``"ip:anonymous"`` if no client info is available
+       (only in unusual transport configurations).
     """
-    fwd = request.headers.get("x-forwarded-for")
-    if fwd:
-        first = fwd.split(",")[0].strip()
-        if first:
-            return f"ip:{first}"
+    if trusted_proxy:
+        fwd = request.headers.get("x-forwarded-for")
+        if fwd:
+            first = fwd.split(",")[0].strip()
+            if first:
+                return f"ip:{first}"
+        real_ip = request.headers.get("x-real-ip")
+        if real_ip:
+            stripped = real_ip.strip()
+            if stripped:
+                return f"ip:{stripped}"
     if request.client is not None and request.client.host:
         return f"ip:{request.client.host}"
     return "ip:anonymous"

@@ -118,8 +118,7 @@ bucket allows up to one minute's burst. Bucket-key choice:
   share one bucket (v0.1 is single-shared-secret; per-user keys
   are post-announce).
 - **Everything else** — auth disabled, missing header, malformed
-  header, or wrong token — keyed by the client IP
-  (`X-Forwarded-For` first hop, else `request.client.host`).
+  header, or wrong token — keyed by the client IP.
 
 Why the IP fallback for the disabled / unvalidated cases: the
 `Authorization` header from a non-validated request is untrusted
@@ -127,6 +126,41 @@ input. An attacker could otherwise rotate header values
 (`Bearer wrong-1`, `Bearer wrong-2`, …) to dodge the per-IP cap
 with the same effect that prompted the rate-limit-before-auth
 ordering below. The unified per-IP fallback closes that gap.
+
+### `--trust-proxy-headers`
+
+The per-IP key resolves to `request.client.host` by default —
+client-supplied `X-Forwarded-For` and `X-Real-IP` headers are
+**ignored**. Direct exposure (e.g. `silica serve --host 0.0.0.0`
+with no proxy in front) MUST keep this default: an attacker can
+otherwise rotate XFF values (`X-Forwarded-For: 1.1.1.1`,
+`2.2.2.2`, …) to dodge the per-IP cap exactly the way they could
+rotate `Authorization` values without the auth-state-aware
+keying.
+
+Behind a reverse proxy you control (nginx, Cloudflare, ELB),
+pass `--trust-proxy-headers` so the bucket sees the real client
+IP rather than the proxy's:
+
+```bash
+silica serve \
+    --model Qwen/Qwen3.5-0.8B \
+    --rate-limit-rpm 60 \
+    --trust-proxy-headers
+```
+
+Only enable it when the proxy strips client-supplied forwarding
+headers and re-emits them itself. The default is off because the
+"safe path is the obvious path" — silica serve out of the box on
+a developer laptop or directly-exposed VPS does the right thing
+without further configuration.
+
+Preference order under `--trust-proxy-headers`:
+
+1. First hop of `X-Forwarded-For` (leftmost comma-separated
+   entry).
+2. `X-Real-IP`.
+3. `request.client.host`.
 
 Rate limit runs **before** auth — a flood of unauthenticated
 requests still decrements the offending IP's bucket, instead of

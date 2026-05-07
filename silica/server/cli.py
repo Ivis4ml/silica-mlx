@@ -189,8 +189,22 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "per-key requests-per-minute cap (token bucket). None "
             "or <= 0 disables rate limiting (the v0.1 default). "
-            "Per-key isolation: Authorization header value when "
-            "auth is configured, else client IP."
+            "Per-key isolation: validated Authorization header "
+            "value when auth is configured, else client IP."
+        ),
+    )
+    serve.add_argument(
+        "--trust-proxy-headers",
+        action="store_true",
+        default=False,
+        help=(
+            "honour the first hop of X-Forwarded-For / X-Real-IP "
+            "for per-IP rate-limit bucketing. Default OFF (direct "
+            "exposure): client-supplied forwarding headers are "
+            "ignored and the bucket keys on request.client.host "
+            "only — otherwise an attacker could rotate XFF values "
+            "to dodge the per-IP cap. Only enable when behind a "
+            "reverse proxy you control."
         ),
     )
     return root
@@ -307,6 +321,7 @@ def _serve(args: argparse.Namespace) -> int:
             model_repo=args.model,
             api_key=api_key,
             rate_limit_rpm=args.rate_limit_rpm,
+            trusted_proxy=args.trust_proxy_headers,
         )
     )
 

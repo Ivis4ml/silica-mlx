@@ -349,6 +349,147 @@ def test_rate_limit_blocks_token_rotation_attack_under_auth(
     assert third.status_code == 429
 
 
+def test_rate_limit_default_ignores_x_forwarded_for(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Direct exposure (the v0.1 default) MUST NOT trust client-
+    supplied X-Forwarded-For. An attacker can otherwise rotate XFF
+    values to dodge the per-IP cap.
+
+    rpm=1 + auth disabled, two requests with the same TestClient
+    (same request.client.host) but rotating XFF — the second must
+    return 429 because the bucket keyed on client.host alone."""
+    _configure_with_rpm(1)  # trusted_proxy default = False
+    _install_stub_session(monkeypatch)
+
+    with TestClient(openai_api.app) as client:
+        first = client.post(
+            "/v1/chat/completions",
+            json=_basic_chat_payload(),
+            headers={"X-Forwarded-For": "1.1.1.1"},
+        )
+        second = client.post(
+            "/v1/chat/completions",
+            json=_basic_chat_payload(),
+            headers={"X-Forwarded-For": "2.2.2.2"},
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 429
+
+
+def test_rate_limit_default_ignores_x_real_ip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same as the X-Forwarded-For pin but for X-Real-IP — the
+    other forwarding header an attacker could rotate."""
+    _configure_with_rpm(1)
+    _install_stub_session(monkeypatch)
+
+    with TestClient(openai_api.app) as client:
+        first = client.post(
+            "/v1/chat/completions",
+            json=_basic_chat_payload(),
+            headers={"X-Real-IP": "1.1.1.1"},
+        )
+        second = client.post(
+            "/v1/chat/completions",
+            json=_basic_chat_payload(),
+            headers={"X-Real-IP": "2.2.2.2"},
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 429
+
+
+def test_rate_limit_blocks_xff_rotation_attack_under_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Attacker rotation of BOTH Authorization AND X-Forwarded-For
+    must still trip the per-IP cap. The v0.1 default
+    (trusted_proxy=False) keys on request.client.host so neither
+    rotation creates a fresh bucket."""
+    runtime = _build_runtime()
+    openai_api.configure(
+        openai_api.ServerConfig(
+            runtime_factory=lambda: runtime,
+            api_key="real-secret",
+            rate_limit_rpm=2,
+        )
+    )
+    _install_stub_session(monkeypatch)
+
+    with TestClient(openai_api.app) as client:
+        first = client.post(
+            "/v1/chat/completions",
+            json=_basic_chat_payload(),
+            headers={
+                "Authorization": "Bearer wrong-1",
+                "X-Forwarded-For": "1.1.1.1",
+            },
+        )
+        second = client.post(
+            "/v1/chat/completions",
+            json=_basic_chat_payload(),
+            headers={
+                "Authorization": "Bearer wrong-2",
+                "X-Forwarded-For": "2.2.2.2",
+            },
+        )
+        third = client.post(
+            "/v1/chat/completions",
+            json=_basic_chat_payload(),
+            headers={
+                "Authorization": "Bearer wrong-3",
+                "X-Forwarded-For": "3.3.3.3",
+            },
+        )
+
+    assert first.status_code == 401
+    assert second.status_code == 401
+    assert third.status_code == 429
+
+
+def test_rate_limit_trusted_proxy_honours_x_forwarded_for(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Behind a real proxy, ``--trust-proxy-headers`` makes the
+    bucket key on the first XFF hop so legitimate distinct
+    clients get distinct buckets. We pin this so the opt-in path
+    actually does what its docs promise."""
+    runtime = _build_runtime()
+    openai_api.configure(
+        openai_api.ServerConfig(
+            runtime_factory=lambda: runtime,
+            rate_limit_rpm=1,
+            trusted_proxy=True,
+        )
+    )
+    _install_stub_session(monkeypatch)
+
+    with TestClient(openai_api.app) as client:
+        a = client.post(
+            "/v1/chat/completions",
+            json=_basic_chat_payload(),
+            headers={"X-Forwarded-For": "1.1.1.1"},
+        )
+        b = client.post(
+            "/v1/chat/completions",
+            json=_basic_chat_payload(),
+            headers={"X-Forwarded-For": "2.2.2.2"},
+        )
+        a2 = client.post(
+            "/v1/chat/completions",
+            json=_basic_chat_payload(),
+            headers={"X-Forwarded-For": "1.1.1.1"},
+        )
+
+    assert a.status_code == 200
+    assert b.status_code == 200
+    # Same XFF as ``a`` → same bucket → 429.
+    assert a2.status_code == 429
+
+
 def test_rate_limit_valid_token_isolated_from_bad_traffic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
