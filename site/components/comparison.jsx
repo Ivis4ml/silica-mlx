@@ -32,8 +32,8 @@ const Comparison = () => {
       <div className="container">
         <div className="section-head">
           <div className="section-eyebrow">The niche</div>
-          <h2>vLLM-core architecture, native to Apple Silicon.</h2>
-          <p>mlx-lm is single-request and solves a different problem. vLLM and SGLang are CUDA-first and don't run on Apple Silicon. silica-mlx fills the gap with one integrated MLX-native runtime. Speculative decoding shipped at v1.7.19 as a foundation; production payoff settled with a measurement-anchored negative at v1.7.20-22 (see Performance below for cycle-23 verify-cost closure).</p>
+          <h2>vLLM-style architecture, native to Apple Silicon.</h2>
+          <p>mlx-lm is single-request and solves a different problem. vLLM and SGLang are CUDA-first and don't run on Apple Silicon — silica-mlx references their scheduler patterns and reimplements them on MLX, fills the gap with one integrated MLX-native runtime that does not depend on either. Speculative decoding shipped at v1.7.19 as a foundation; production payoff settled with a measurement-anchored negative at v1.7.20-22 (see Performance below for cycle-23 verify-cost closure).</p>
         </div>
 
         <div className="cmp-card">

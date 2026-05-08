@@ -4,7 +4,7 @@ const Highlights = () => {
   const items = [
     {
       tag: "P-2 · shipped",
-      title: "vLLM-core scheduler.",
+      title: "vLLM-style scheduler.",
       body: "Continuous batching with admit → evict → preempt → reject. Single-request and batched share one code path.",
       detail: ["ContinuousBatcher", "MemoryBudgeter", "preempt + replay"],
     },

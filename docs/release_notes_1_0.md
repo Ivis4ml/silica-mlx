@@ -26,8 +26,9 @@ see "Out of scope" below.
 Phases shipped (all per `plans/PLAN.md` §7):
 
 - **P-0..P-2** — frozen `typing.Protocol` seams; `Engine.generate`;
-  vLLM-core scheduler (continuous batching, memory-budget admission
-  ladder, preempt + replay, radix prefix cache).
+  vLLM-style scheduler (continuous batching, memory-budget admission
+  ladder, preempt + replay, radix prefix cache) — reimplemented on
+  MLX, no vLLM runtime dependency.
 - **P-3** — five model families with batched-output parity validated
   against `mlx-lm` references: Qwen3 dense (0.6B – 32B), Qwen3.5
   hybrid DeltaNet (0.8B / 4B / 27B), Gemma 4 31B dense, Qwen3.5

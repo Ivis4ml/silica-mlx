@@ -11,12 +11,14 @@
   <a href="https://www.apple.com/mac/"><img alt="Platform" src="https://img.shields.io/badge/platform-Apple%20Silicon-lightgrey?style=flat-square"/></a>
 </p>
 
-**Continuous-batching LLM serving on Apple Silicon — vLLM-core
-architecture, MLX-native.**
+**Continuous-batching LLM serving on Apple Silicon — vLLM-style
+scheduler, MLX-native.**
 
 The continuous batching, memory-budget admission, preempt/replay, and
-radix prefix cache that production-grade serving frameworks rely on,
-ported to MLX's unified-memory model. Native KV codec compression
+radix prefix cache that production-grade serving frameworks (vLLM,
+SGLang) rely on, reimplemented from scratch on MLX's unified-memory
+model. silica-mlx does not depend on vLLM; vLLM is the architectural
+reference. Native KV codec compression
 (BlockTQ / RaBitQ) shipped. Multi-family adapters with batched-output
 parity validated against a direct mlx-lm batched reference: Qwen3
 dense, Qwen3.5 hybrid DeltaNet, Gemma4-31B dense, Qwen3.5-35B-A3B MoE,
@@ -26,7 +28,7 @@ Target hardware: M5 Pro 48 GB. Runs Qwen3 (0.6B / 4B / 7B / 14B /
 32B), Qwen3.5 hybrid (0.8B / 4B / 27B), Gemma4-31B dense,
 Qwen3.5-35B-A3B MoE, gemma-4-26B-A4B MoE.
 
-> **Status (v1.7.33):** the scheduler core (continuous batching,
+> **Status (v1.7.33):** the scheduler (continuous batching,
 > prefix cache, memory budget), multi-family adapters, KV codec
 > compression, and the speculative-decoding foundation
 > (`DraftTargetEngine` + three rollback paths + spec-metrics
@@ -92,10 +94,12 @@ Qwen3.5-35B-A3B MoE, gemma-4-26B-A4B MoE.
 | Speculative decoding | ✗ | ✅ | ✅ | planned |
 | Per-expert MoE residency | ✗ | limited | ✗ | planned |
 
-**Niche.** silica-mlx is an MLX-native serving framework that combines
-the vLLM scheduler core (continuous batching + memory budget +
-preempt/replay) with a radix prefix cache and a KV codec compression
-layer on a single integrated runtime. mlx-lm is single-request and
+**Niche.** silica-mlx is an MLX-native serving framework that
+reimplements vLLM's scheduler patterns (continuous batching + memory
+budget + preempt/replay) on top of MLX, combines them with a radix
+prefix cache and a KV codec compression layer, and exposes the result
+through one integrated runtime. silica-mlx does not depend on vLLM —
+vLLM is the architectural reference. mlx-lm is single-request and
 solves a different problem; vLLM and SGLang are CUDA-first and don't
 run on Apple Silicon. silica-mlx is not feature-complete relative to
 either yet — see "What's planned" below for the gap.
@@ -286,7 +290,7 @@ environment with proper warm cache.
 
 ## Highlights — what's shipped
 
-- **vLLM-core scheduler.** Continuous batching with a memory-budget
+- **vLLM-style scheduler.** Continuous batching with a memory-budget
   admission ladder (admit → evict → preempt → reject) and
   preempt+replay (save composite prompt, re-enter queue).
   Single-request and batched generation share one code path.
