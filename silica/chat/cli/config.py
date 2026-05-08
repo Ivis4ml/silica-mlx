@@ -20,26 +20,26 @@ value the rest of the chat code expects. Validation errors raise
 dispatcher catches these and surfaces them to the chat log as a
 red error line.
 
-Defaults match ``plans/CHAT_CLI_OPENING.md`` §6 with three v1.7.36
-adjustments: ``max_tokens`` raised from 1024 to **8192** so a
-single turn can comfortably hold reasoning + a long reply
-(Qwen3 / Qwen3.5 / Gemma 4 reasoning models routinely spend
-1-2k tokens inside ``<think>`` before the visible reply
-starts); ``thinking`` flipped from ``auto`` to **``show``**
-so the (now-shorter, see :data:`silica.chat.cli.app.DEFAULT_SYSTEM_PROMPT`)
+Defaults match ``plans/CHAT_CLI_OPENING.md`` §6 with two v1.7.36
+adjustments retained at v1.7.37: ``max_tokens`` raised from 1024
+to **8192** so a single turn can comfortably hold reasoning + a
+long reply (Qwen3 / Qwen3.5 / Gemma 4 reasoning models routinely
+spend 1-2k tokens inside ``<think>`` before the visible reply
+starts); ``thinking`` flipped from ``auto`` to **``show``** so
 reasoning text streams inline as it is generated rather than
-sitting behind a static spinner; and ``thinking_mode`` flipped
-from ``True`` to **``False``** so casual chat does not pay the
-RL-trained "Thinking Process" tax for zero-entropy questions
-(e.g. "I am 50 m from the car wash, drive or walk?"). The
-system prompt alone could not suppress the verbose markdown-
-structured reasoning Qwen3 / Qwen3.5 emit by default; the
-chat-template ``enable_thinking=False`` propagation is the
-actual lever, and surfacing it as the new default brings
-``silica chat`` in line with mainstream chatbot UX (reasoning
-is opt-in via ``/config thinking_mode=on`` for hard problems).
-Sampling defaults are unchanged (temperature 0.7, top_p 0.9,
-top_k off); ``kv_codec`` defaults to None (fp16) per §6.1.
+sitting behind a static spinner. The third v1.7.36 adjustment
+— ``thinking_mode`` ``True → False`` — was **reverted at v1.7.37**:
+the flip produced broken text-completion output on
+Qwen3.5-Next-A3B (model emitted ``<|im_end|>`` literal text and
+hallucinated additional turns) and a degraded version of the
+same failure mode on Gemma 4 (mlx-community/gemma-4-31b-4bit).
+The verbose-reasoning UX issue the v1.7.36 flip aimed to address
+is best handled by the v1.7.38 fixed-height
+:class:`silica.chat.cli.thinking_scroll.ThinkingScrollWindow`
+(displays the last 6 lines of reasoning text in a rolling
+window) rather than by suppressing reasoning entirely. Sampling
+defaults are unchanged (temperature 0.7, top_p 0.9, top_k off);
+``kv_codec`` defaults to None (fp16) per §6.1.
 """
 
 from __future__ import annotations
@@ -251,16 +251,16 @@ CONFIG_SCHEMA: dict[str, ConfigEntry] = {
     ),
     "thinking_mode": ConfigEntry(
         key="thinking_mode",
-        default=False,
+        default=True,
         parse=lambda raw: _parse_bool("thinking_mode", raw),
         summary="propagate enable_thinking through the chat template",
         valid_help=(
-            "off disables Qwen3 reasoning mode (default — the "
-            "model emits an empty <think></think> and goes "
-            "straight to the answer, faster TTFT and shorter "
-            "total tokens); on re-enables reasoning for hard "
-            "problems where the chain of thought materially "
-            "improves the reply"
+            "on enables reasoning (default — Qwen3 / Qwen3.5 / "
+            "Gemma 4 RL-trained reasoning models behave best with "
+            "thinking on; the v1.7.36 default flip to off produced "
+            "broken text-completion output on Qwen3.5 and Gemma 4 "
+            "and was reverted at v1.7.37); off disables for faster "
+            "TTFT and shorter total tokens, opt-in only"
         ),
     ),
     "thinking_history": ConfigEntry(

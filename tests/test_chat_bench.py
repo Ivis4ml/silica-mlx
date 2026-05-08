@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
@@ -22,6 +23,7 @@ import pytest
 from silica.bench.chat_bench import (
     ChatBenchReport,
     TurnRecord,
+    _default_cache_builder,
     default_user_prompts,
     render_json_report,
     render_text_report,
@@ -270,6 +272,74 @@ def test_run_chat_bench_rejects_zero_n_turns() -> None:
             cache_builder=lambda _a, _c: "c",
             session_cls=_session_factory([]),
         )
+
+
+def test_default_cache_builder_returns_none_for_sliding_attention() -> None:
+    """v1.7.37 sliding-gate parity: ``_default_cache_builder``
+    must mirror the chat REPL's ``_build_prefix_cache`` and
+    short-circuit to ``None`` when the adapter declares
+    ``"sliding"`` in its attention_kinds. Without this gate the
+    chat-bench harness would trip the same
+    ``ContinuousBatcher`` rejection as the live REPL on Gemma 4
+    (see ``silica/scheduler/batcher.py`` line 294 and the
+    docstring KEEP-IN-SYNC contract on ``_default_cache_builder``)."""
+
+    @dataclass
+    class _StubLayout:
+        n_kv_heads: int = 4
+        head_dim: int = 64
+        dtype: Any = None
+
+    @dataclass
+    class _StubCaps:
+        attention_kinds: tuple[str, ...] = ("global", "sliding")
+
+    @dataclass
+    class _StubAdapter:
+        layout: _StubLayout = field(default_factory=_StubLayout)
+        caps: _StubCaps = field(default_factory=_StubCaps)
+
+        def kv_layout(self) -> _StubLayout:
+            return self.layout
+
+        def capabilities(self) -> _StubCaps:
+            return self.caps
+
+    cache = _default_cache_builder(_StubAdapter(), codec_id=None)
+    assert cache is None
+
+
+def test_default_cache_builder_returns_cache_for_global_only_attention() -> None:
+    """Negative-side guard for the sliding gate: a pure-global
+    adapter still gets a real ``RadixPrefixCache`` so the harness
+    exercises the cached path on Qwen3 / Qwen3.5 dense / MoE
+    models."""
+
+    @dataclass
+    class _StubLayout:
+        n_kv_heads: int = 4
+        head_dim: int = 64
+        dtype: Any = None
+
+    @dataclass
+    class _StubCaps:
+        attention_kinds: tuple[str, ...] = ("global",)
+
+    @dataclass
+    class _StubAdapter:
+        layout: _StubLayout = field(default_factory=_StubLayout)
+        caps: _StubCaps = field(default_factory=_StubCaps)
+
+        def kv_layout(self) -> _StubLayout:
+            return self.layout
+
+        def capabilities(self) -> _StubCaps:
+            return self.caps
+
+    # Use codec_id=None so the codec factory is not invoked
+    # (which would require a real codec spec).
+    cache = _default_cache_builder(_StubAdapter(), codec_id=None)
+    assert cache is not None
 
 
 def test_run_chat_bench_propagates_codec_id_to_cache_builder() -> None:

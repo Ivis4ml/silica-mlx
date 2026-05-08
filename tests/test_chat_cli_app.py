@@ -61,11 +61,26 @@ class _FakeKVLayout:
 
 
 @dataclass
+class _FakeCapabilities:
+    """Minimal capabilities surface — only ``attention_kinds`` is
+    consulted by ``_build_prefix_cache``. The default ``("global",)``
+    keeps every pre-v1.7.37 cache test on the cache-built path; the
+    sliding-gate test below substitutes ``("global", "sliding")``
+    to exercise the v1.7.37 short-circuit return-None branch."""
+
+    attention_kinds: tuple[str, ...] = ("global",)
+
+
+@dataclass
 class _FakeAdapter:
     layout: _FakeKVLayout = field(default_factory=_FakeKVLayout)
+    caps: _FakeCapabilities = field(default_factory=_FakeCapabilities)
 
     def kv_layout(self) -> _FakeKVLayout:
         return self.layout
+
+    def capabilities(self) -> _FakeCapabilities:
+        return self.caps
 
 
 @dataclass
@@ -196,6 +211,90 @@ def test_build_prefix_cache_resolves_codec_spec_via_injection() -> None:
         cache_cls=_FakeCache,
     )
     assert seen_codec_ids == ["custom_codec"]
+
+
+def test_build_prefix_cache_returns_none_for_sliding_attention() -> None:
+    """v1.7.37 fix: adapters whose ``capabilities().attention_kinds``
+    contain ``"sliding"`` (Gemma 4's interleaved global + sliding
+    stack at the time of writing) cannot accept a
+    ``RadixPrefixCache`` — ``ContinuousBatcher`` rejects the seed
+    path because the window-truncation / offset / rotated semantics
+    of ``BatchRotatingKVCache`` under seeded admission are not
+    validated yet (P-3-D3 follow-up). This pin protects the chat
+    REPL fallback: the helper must short-circuit to ``None`` so the
+    caller threads ``prefix_cache=None`` into ``ChatSession`` and
+    the miss-only path runs.
+
+    Pre-v1.7.37 the helper unconditionally built a cache and the
+    first user turn raised
+    ``NotImplementedError: ContinuousBatcher does not support a
+    RadixPrefixCache on adapters whose attention_kinds include
+    AttentionKind.SLIDING``, taking down ``silica chat
+    --model mlx-community/gemma-4-31b-4bit`` on the very first
+    prompt."""
+    sliding_adapter = _FakeAdapter(
+        caps=_FakeCapabilities(attention_kinds=("global", "sliding"))
+    )
+    spec = _FakeCodecSpec(factory=_spy_codec_factory)
+
+    cache = _build_prefix_cache(
+        sliding_adapter,
+        codec_id=None,
+        get_codec_spec=_make_get_codec_spec(spec),
+        store_cls=_FakeStore,
+        cache_cls=_FakeCache,
+    )
+
+    assert cache is None
+
+
+def test_build_prefix_cache_short_circuits_before_codec_factory() -> None:
+    """For sliding adapters the short-circuit must happen BEFORE
+    the codec factory runs — otherwise we waste mlx allocations on
+    a cache the caller throws away. Use a factory that records
+    invocation and assert it never fired."""
+    factory_called = False
+
+    def _exploding_factory(**_kwargs: Any) -> Any:
+        nonlocal factory_called
+        factory_called = True
+        return "would-have-been-codec"
+
+    sliding_adapter = _FakeAdapter(
+        caps=_FakeCapabilities(attention_kinds=("sliding",))
+    )
+
+    cache = _build_prefix_cache(
+        sliding_adapter,
+        codec_id="any_codec_id",
+        get_codec_spec=_make_get_codec_spec(
+            _FakeCodecSpec(factory=_exploding_factory)
+        ),
+        store_cls=_FakeStore,
+        cache_cls=_FakeCache,
+    )
+
+    assert cache is None
+    assert factory_called is False
+
+
+def test_build_prefix_cache_global_only_adapter_still_builds_cache() -> None:
+    """Smoke pin guarding the negative side of the gate: a pure-
+    global adapter (default ``_FakeCapabilities``) must still
+    construct a real cache. Without this pin a copy-paste regression
+    that flipped the gate's polarity would silently disable prefix
+    caching for every Qwen3 / Qwen3.5 dense / MoE model too."""
+    cache = _build_prefix_cache(
+        _FakeAdapter(),  # default caps = ("global",)
+        codec_id=None,
+        get_codec_spec=_make_get_codec_spec(
+            _FakeCodecSpec(factory=_spy_codec_factory)
+        ),
+        store_cls=_FakeStore,
+        cache_cls=_FakeCache,
+    )
+
+    assert isinstance(cache, _FakeCache)
 
 
 # ---------------------------------------------------------------------------

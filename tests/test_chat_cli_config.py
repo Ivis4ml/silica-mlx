@@ -201,21 +201,25 @@ def test_thinking_mode_garbage_rejected() -> None:
         parse_config_assignment("thinking_mode=maybe")
 
 
-def test_thinking_mode_default_is_false() -> None:
-    """v1.7.36 default flip: ``thinking_mode`` defaults to
-    ``False`` so casual chat does not pay the RL-trained
-    "Thinking Process" tax for zero-entropy questions. The
-    system prompt cannot reliably suppress the verbose markdown-
-    structured reasoning Qwen3 / Qwen3.5 emit by default; the
-    chat-template ``enable_thinking=False`` propagation is the
-    actual lever, and surfacing it as the new default brings
-    ``silica chat`` in line with mainstream chatbot UX. Power
-    users opt back in via ``/config thinking_mode=on`` for
-    hard problems where the chain of thought materially improves
-    the reply."""
+def test_thinking_mode_default_is_true() -> None:
+    """v1.7.37 revert (after the v1.7.36 flip to ``False``):
+    ``thinking_mode`` defaults to ``True`` again. The v1.7.36
+    flip aimed to suppress verbose markdown-structured reasoning
+    on simple questions, but live testing showed
+    ``enable_thinking=False`` produced broken text-completion
+    output on Qwen3.5-Next-A3B (model emitted ``<|im_end|>``
+    literal text and hallucinated additional turns) and a
+    degraded version of the same failure mode on Gemma 4
+    (mlx-community/gemma-4-31b-4bit). The verbose-reasoning UX
+    is being addressed by the v1.7.38 fixed-height
+    :class:`silica.chat.cli.thinking_scroll.ThinkingScrollWindow`
+    instead — show the last 6 lines of reasoning in a rolling
+    window rather than disabling reasoning entirely. Power users
+    who want thinking off on a model that handles it cleanly
+    can flip via ``/config thinking_mode=off``."""
     from silica.chat.cli.config import CONFIG_SCHEMA
 
-    assert CONFIG_SCHEMA["thinking_mode"].default is False
+    assert CONFIG_SCHEMA["thinking_mode"].default is True
 
 
 # ---------------------------------------------------------------------------

@@ -268,10 +268,26 @@ def _default_cache_builder(
     the test fakes can drop in without re-implementing the
     REPL's injection contract. If ``_PREFIX_CACHE_BLOCK_SIZE``
     changes in the REPL, update the literal below to match.
+
+    v1.7.37 sliding-gate parity: returns ``None`` for adapters
+    whose ``capabilities().attention_kinds`` contain ``"sliding"``
+    (Gemma 4) so the harness mirrors the REPL's miss-only
+    fallback rather than tripping the
+    ``ContinuousBatcher`` / ``RadixPrefixCache`` rejection at
+    first prefill (see ``silica/chat/cli/app.py:_build_prefix_cache``
+    and ``silica/scheduler/batcher.py`` line 294).
     """
     from silica.bench.codec_registry import get_codec_spec
     from silica.kvcache.prefix import RadixPrefixCache
     from silica.kvcache.store import SyntheticPrefixBlockStore
+
+    caps = adapter.capabilities()
+    attention_values = {
+        getattr(kind, "value", str(kind))
+        for kind in caps.attention_kinds
+    }
+    if "sliding" in attention_values:
+        return None
 
     block_size = 4
     layout = adapter.kv_layout()

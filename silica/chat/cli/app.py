@@ -447,6 +447,21 @@ def run_chat(args: argparse.Namespace) -> int:
         store_cls=SyntheticPrefixBlockStore,
         cache_cls=RadixPrefixCache,
     )
+    if prefix_cache is None:
+        # v1.7.37: sliding-attention adapters (Gemma 4) run without
+        # the RadixPrefixCache. Surface the consequence so the user
+        # is not surprised when multi-turn turns re-prefill the full
+        # history each time. Reset / load / model-swap paths print
+        # nothing — the user already heard it once for this model.
+        print(
+            palette.colorize(
+                "[note: sliding-attention model; multi-turn prefix "
+                "caching disabled]",
+                "grey",
+                dim=True,
+            )
+        )
+        sys.stdout.flush()
 
     # mypy variance limitation: ChatSession's _EngineLike Protocol
     # treats kv_manager as a settable attribute, while Engine
@@ -782,7 +797,7 @@ def run_chat(args: argparse.Namespace) -> int:
         # first ``</think>`` correctly transitions out instead of
         # leaking the entire reasoning block as a ReplyChunk.
         implicit_thinking = (
-            bool(state.config.get("thinking_mode", False))
+            bool(state.config.get("thinking_mode", True))
             and _model_supports_implicit_thinking(state.model_name)
         )
         # CHAT-CLI-RESPONSE-POLICY RP-2: for /continue, the parser's
@@ -1501,12 +1516,35 @@ def _build_prefix_cache(
     adapter's KV layout and installed on a
     :class:`SyntheticPrefixBlockStore`.
 
+    Sliding-attention adapters (Gemma 4's interleaved global +
+    sliding stack at the time of writing) cannot accept a
+    ``RadixPrefixCache``: ``ContinuousBatcher`` rejects the seed
+    path because the window-truncation / offset / rotated semantics
+    of ``BatchRotatingKVCache`` under seeded admission are not
+    validated yet (see ``silica/scheduler/batcher.py`` line 294
+    and the P-3-D3 follow-up). For those adapters this builder
+    returns ``None`` so the caller falls through to the
+    miss-only path (``ChatSession`` with ``prefix_cache=None``);
+    multi-turn re-prefills the full history each turn but the
+    REPL works.
+
     Helper-injected arguments mirror the imports inside
     :func:`run_chat` so this builder stays pure-Python and can be
     unit-tested without the heavy MLX / engine warm-up — see
-    ``tests/test_chat_cli_app.py`` for the fp16 / codec / injection
-    coverage (HARDENING-8).
+    ``tests/test_chat_cli_app.py`` for the fp16 / codec / sliding
+    gate / injection coverage (HARDENING-8 + v1.7.37 fix).
     """
+    # AttentionKind is a ``(str, Enum)`` so the value comparison
+    # below is exact without importing the enum here (importing
+    # ``silica.models.adapter`` at module load is the very thing the
+    # deferred-import comment at the top of ``run_chat`` avoids).
+    caps = adapter.capabilities()
+    attention_values = {
+        getattr(kind, "value", str(kind))
+        for kind in caps.attention_kinds
+    }
+    if "sliding" in attention_values:
+        return None
     layout = adapter.kv_layout()
     codec: Any = None
     if codec_id is not None:
