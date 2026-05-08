@@ -1,0 +1,63 @@
+
+=== M-9 R-h smoke: silica serve --model Qwen/Qwen3.5-0.8B ===
+timestamp: 2026-05-07T23:25:17Z
+
+=== /healthz ===
+status: 200
+body: {"status":"ok"}
+
+=== /v1/models (raw) ===
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "Qwen/Qwen3.5-0.8B",
+      "object": "model",
+      "created": 1778196287,
+      "owned_by": "silica"
+    }
+  ]
+}
+
+=== openai SDK: list models ===
+model ids: ['Qwen/Qwen3.5-0.8B']
+
+=== openai SDK: non-streaming chat (M-9.1 part A) ===
+wall: 283ms
+reply: 'Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Question: "Capital of France? One word."\n    *   Constraint'
+finish_reason: length
+usage: {'completion_tokens': 32, 'prompt_tokens': 26, 'total_tokens': 58, 'completion_tokens_details': None, 'prompt_tokens_details': None}
+
+=== openai SDK: streaming chat (M-9.1 part B) ===
+ttft: 2ms; total: 71ms; n_chunks: 8
+reply: 'Thinking Process:\n\n1.  **'
+usage: {'completion_tokens': 8, 'prompt_tokens': 16, 'total_tokens': 24, 'completion_tokens_details': None, 'prompt_tokens_details': None}
+
+=== legacy /v1/completions ===
+reply: ' Paris.\n2.  The user'
+finish_reason: length
+usage: {'completion_tokens': 8, 'prompt_tokens': 5, 'total_tokens': 13, 'completion_tokens_details': None, 'prompt_tokens_details': None}
+
+=== X-Silica-Session-ID prefix reuse demo (M-9.2) ===
+turn-of-len-1: status=200 wall=285ms
+  reply: 'The user is asking about a list comprehension, which is a fundamental concept in Python'
+  usage.prompt_tokens: 27
+turn-of-len-3: status=200 wall=251ms
+  reply: 'The user is asking about dict comprehension, which is a common Python data structure comprehension'
+  usage.prompt_tokens: 48
+turn-of-len-5: status=200 wall=297ms
+  reply: 'Thinking Process:\n\n1.  **Analyze the Request:**\n    *'
+  usage.prompt_tokens: 73
+
+=== M-9 acceptance summary (Qwen3.5-0.8B sanity, 2026-05-07) ===
+endpoints driven on this run: /healthz, /v1/models, /v1/chat/completions (non-streaming + streaming), /v1/completions, /v1/chat/completions with X-Silica-Session-ID (3-turn shared-prefix demo)
+observations:
+  - all openai SDK round-trips returned well-formed client objects with no validation errors
+  - 3-turn shared-prefix session: usage.prompt_tokens grew 27 -> 48 -> 73, consistent with cache reuse across turns
+caveats / what this run does NOT attest:
+  - the route's "prefix_hit_tokens=..." INFO line is NOT present in this log: silica serve does not call silica.core.logger.setup_logging, so the silica.* logger has no handler attached at runtime, and --log-level info configures only uvicorn's loggers. The prompt_tokens growth above is supportive of cache reuse but not direct evidence of a cache hit.
+  - load-bearing M-9.2 attestation is the deterministic R-f unit test tests/test_server_session_routing.py::test_three_turn_shared_prefix_demo_logs_prefix_hits_after_turn_one (pins prefix_hit_tokens > 0 on turns 2 + 3 through a near-real engine); see plans/P8_OPENING.md §6.3 / §9.3
+M-9 row roll-up:
+  M-9.1 (chat-completions stream): PASS via R-c + R-d unit tests + this run's openai SDK round-trips
+  M-9.2 (cross-request prefix reuse): PASS via the R-f deterministic test (load-bearing); this run is supportive evidence only
+  M-9.3 (locally behaves like a small serving engine): PASS on Qwen3.5-0.8B — endpoints listed above all green via openai SDK

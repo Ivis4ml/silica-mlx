@@ -1,0 +1,41 @@
+
+=== M-9 R-h smoke: silica serve --model mlx-community/Qwen3.5-27B-4bit (production-target) ===
+timestamp: 2026-05-07T23:26:00Z
+
+=== /healthz ===
+status: 200 {"status":"ok"}
+
+=== openai SDK: non-streaming chat ===
+wall: 1737ms
+reply: 'Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Question: "What is 2'
+finish_reason: length
+usage: {'completion_tokens': 24, 'prompt_tokens': 29, 'total_tokens': 53, 'completion_tokens_details': None, 'prompt_tokens_details': None}
+effective decode tok/s ~= 13.8
+
+=== openai SDK: streaming chat ===
+ttft: 3ms; total: 596ms; n_chunks: 8
+reply: 'Thinking Process:\n\n1.  **'
+
+=== /v1/completions ===
+reply: ' 4.\n'
+
+=== Cross-request prefix reuse on session_id ===
+turn-of-len-1: status=200 wall=1697ms prompt_tokens=24
+  reply: 'Thinking Process:\n\n1.  **Analyze the Request:**\n    *'
+turn-of-len-3: status=200 wall=1832ms prompt_tokens=48
+  reply: 'Thinking Process:\n\n1.  **Analyze the Request:**\n    *'
+
+=== M-9 acceptance summary (Qwen3.5-27B-4bit production-target, 2026-05-07) ===
+endpoints driven on this run: /healthz, /v1/chat/completions (non-streaming + streaming), /v1/completions, /v1/chat/completions with X-Silica-Session-ID (2-turn shared-prefix demo)
+NOT driven on this run: /v1/models (single-model registry — functionally identical to the 0.8B run; pinned by R-e unit tests on every commit)
+observations:
+  - openai SDK non-streaming chat: 1737 ms wall, ~13.8 tok/s effective decode at production scale on 48 GB M5 Pro
+  - openai SDK streaming chat: TTFT 3 ms / total 596 ms / 8 chunks; chunks parsed cleanly via the openai client
+  - 2-turn X-Silica-Session-ID shared-prefix session: usage.prompt_tokens grew 24 -> 48 between turns, consistent with cache reuse
+caveats / what this run does NOT attest:
+  - the route's "prefix_hit_tokens=..." INFO line is NOT in this log (same root cause as the 0.8B sanity run: silica serve does not configure the silica.* logger handler at runtime). The prompt_tokens growth above is supportive of cache reuse but not direct evidence of a hit.
+  - load-bearing M-9.2 attestation lives in the deterministic R-f unit test (see qwen3_5_0_8b.log notes / plans/P8_OPENING.md §9.3)
+M-9 row roll-up:
+  M-9.1 (chat-completions stream): PASS via R-c + R-d unit tests + this run's openai SDK round-trips
+  M-9.2 (cross-request prefix reuse): PASS via the R-f deterministic test; this run is supportive evidence only (2-turn session, prompt_tokens growth observed)
+  M-9.3 (locally behaves like a small serving engine): PASS on Qwen3.5-27B-4bit — the endpoints driven above are all green via openai SDK; /v1/models is pinned by unit tests rather than by this manual run

@@ -26,7 +26,7 @@ Target hardware: M5 Pro 48 GB. Runs Qwen3 (0.6B / 4B / 7B / 14B /
 32B), Qwen3.5 hybrid (0.8B / 4B / 27B), Gemma4-31B dense,
 Qwen3.5-35B-A3B MoE, gemma-4-26B-A4B MoE.
 
-> **Status (v1.7.28):** the scheduler core (continuous batching,
+> **Status (v1.7.33):** the scheduler core (continuous batching,
 > prefix cache, memory budget), multi-family adapters, KV codec
 > compression, and the speculative-decoding foundation
 > (`DraftTargetEngine` + three rollback paths + spec-metrics
@@ -45,8 +45,15 @@ Qwen3.5-35B-A3B MoE, gemma-4-26B-A4B MoE.
 > E2E win on mlx 0.31.x (see § Performance). **D-022 then closed
 > the small-B single-user research line at v1.7.28: β/γ/δ all
 > reached measurement-anchored negatives, with ≤0.6% recoverable
-> Python-hygiene headroom.** OpenAI HTTP server and weight
-> streaming for MoE residency remain stubs behind frozen
+> Python-hygiene headroom.** **P-8 OpenAI HTTP server shipped at
+> v1.7.33: `silica serve` boots a single-process FastAPI server
+> with the full openai-client surface (`/v1/chat/completions`
+> streaming + non-streaming, `/v1/completions`, `/v1/models`),
+> `X-Silica-Session-ID` cross-request prefix reuse, bearer auth,
+> token-bucket rate limit, OpenAI-shaped error envelope, and a
+> `silica.llm.LLM` Python facade — see
+> [`docs/openai_server.md`](docs/openai_server.md).** Weight
+> streaming for MoE residency remains a stub behind frozen
 > interfaces.
 
 > **Website.** Project homepage at
@@ -81,7 +88,7 @@ Qwen3.5-35B-A3B MoE, gemma-4-26B-A4B MoE.
 | Native KV codec compression | ✗ | limited (FP8 / INT8) | limited | ✅ (BlockTQ + RaBitQ family) |
 | Hybrid DeltaNet (Qwen3.5) — batched | limited (single-request) | ✗ | ✗ | ✅ |
 | MoE batched dispatch | limited (single-request) | ✅ | ✅ | ✅ |
-| OpenAI-compatible HTTP server | ✗ | ✅ | ✅ | planned |
+| OpenAI-compatible HTTP server | ✗ | ✅ | ✅ | ✅ (`silica serve`) |
 | Speculative decoding | ✗ | ✅ | ✅ | planned |
 | Per-expert MoE residency | ✗ | limited | ✗ | planned |
 
@@ -316,6 +323,19 @@ environment with proper warm cache.
   plus `Engine.generate` / `Engine.generate_batch` and
   `ChatSession.chat` / `ChatSession.continue_last` for direct
   embedding.
+- **OpenAI-compatible HTTP server (P-8, v1.7.33).** `silica serve
+  --model ...` boots a single-process FastAPI server with
+  `/v1/chat/completions` (streaming + non-streaming),
+  `/v1/completions`, `/v1/models`, `/healthz`. Bearer-token auth
+  via `--api-key` / `SILICA_API_KEY`; per-key token-bucket rate
+  limit via `--rate-limit-rpm`; `--trust-proxy-headers` opt-in
+  for reverse-proxy deployments. `X-Silica-Session-ID` selects
+  a persisted `ChatSession` with its own `RadixPrefixCache` so
+  cross-request prefix reuse lights up across turns. Concurrent
+  requests serialise on the engine — single-customer routing per
+  the v0.1 design lock. The `silica.llm.LLM(model="...")` Python
+  facade gives mlx-lm-style ergonomics over the same engine. See
+  [`docs/openai_server.md`](docs/openai_server.md).
 
 ---
 
@@ -342,11 +362,6 @@ stubs without changing call sites.
   batched-spec is deferred (`(c)` slice 3, non-blocking for
   foundation correctness). EAGLE / Medusa style schemes are out of
   scope for v0.1.
-- **OpenAI-compatible HTTP server.** `silica-server` binary with
-  OpenAI-compatible chat / completions endpoints, plus a session
-  layer for per-conversation prefix caching across HTTP requests.
-  This is the SGLang-style outer layer of the framework.
-
 Paged-attention codec integration is deferred until MLX exposes a
 variable-length SDPA kernel.
 
@@ -365,7 +380,7 @@ variable-length SDPA kernel.
 | P-5 | VQ KV compression (BlockTQ / RaBitQ) | ✅ complete (v1.7.4 — Acceptance (1)–(4) closed; P-5-F production routing closed at v1.7.6; (b-static) Qwen3.5-4B baseline closed at v1.7.7; per-head opt-in + measurements at v1.7.8 / v1.7.10 / v1.7.11) |
 | P-6 | Performance phase (dense Qwen3.5-27B-4bit ≥40 tok/s primary, ≥60 stretch; MoE 35B-A3B ≥100 anchor cleared, ≥175 aggregate stretch) | ✅ **performance research phase closed at v1.7.28** — server-throughput gates cleared at v1.7.23 ((1a)/(1b)/(2b) 3.4-5.5× over cycle-1 via axis-shift × bf16 DeltaNet state composition), then D-022 small-B interactive QoE closed at v1.7.28. **B=1 single-user latency remains unchanged from baseline (~20 tok/s, bandwidth-capped)**; β/γ/δ all reached measurement-anchored negatives, so the single-user research line is settled rather than active. Track B 3-bit retired at v1.7.21, Track C.4/C.5 retired at v1.7.20-22, and dense layer-streaming stays deferred to v0.2 per D-018. |
 | P-7 | Speculative decoding (DraftTarget / EAGLE / Medusa) | Promoted to T1 at v1.7.13; `DraftEngine` interface frozen. Foundation deliverables (`DraftTargetEngine` + engine integration + spec-metrics + bench switch) closed at D-021 step 5 (v1.7.19). ≥1.2× decode-throughput acceptance has now been settled with a measurement-anchored negative: opus cycle 23 measured the B × k verify-cost matrix on dense Qwen3.5-27B-4bit (B=52 k=64 = 8105 ms vs same-B plain decode ~252 ms / step) — tree-spec recomputes to ~10 tok/s aggregate, a net regression by 20× vs plain decode, with no B regime in {1, 4, 16, 52} where any spec variant beats plain. Track C.4 / C.5 both retired with negatives in P-6. Re-opening requires a fundamentally different verifier with measured sub-linear cost at production batch. EAGLE / Medusa stay v0.2. |
-| P-8 | OpenAI-compatible HTTP server + session layer | ⏳ planned — next active phase after P-6 closure |
+| P-8 | OpenAI-compatible HTTP server + session layer | ✅ complete (v1.7.33 — sub-units (a)–(h) across thirteen commits; M-9.1 + M-9.3 attested by manual openai-SDK end-to-end on Qwen3.5-0.8B sanity and Qwen3.5-27B-4bit production-target, factbundle in `plans/P8_R_H_SMOKE/`; M-9.2 attested by the R-f deterministic test pinning `prefix_hit_tokens > 0` in `tests/test_server_session_routing.py`) |
 
 Legend: ✅ shipped · Stub = wired as the baseline implementation
 behind the frozen interface, swappable in P-6 / P-7 · ⏳ = not started.
@@ -394,7 +409,7 @@ Requires Python 3.12+ and an Apple Silicon Mac. Managed via
 uv pip install -e .
 # chat REPL extras (prompt_toolkit + pygments)
 uv pip install -e '.[chat]'
-# optional extras for the planned HTTP serve path (P-8, not yet wired)
+# optional extras for the OpenAI-compatible HTTP serve path (P-8 — silica serve)
 uv pip install -e '.[serve]'
 # documentation tooling (Sphinx + MyST + Furo theme)
 uv pip install -e '.[docs]'
@@ -784,10 +799,19 @@ the structural picture only.
   acceptance bullet rolled into P-6 Track C.4 / C.5 per Decision
   Gate 1 and closed with measurement-anchored negatives. EAGLE /
   Medusa-style full ports stay deferred to v0.2 per D-020.
-- **P-8** *(planned)* — OpenAI-compatible HTTP server + session
-  layer wrapping `ChatSession` with routing, auth, streaming SSE /
-  WebSocket. Leaning T1 tail per Q-002, sequenced so the HTTP
-  product face ships with VQ compression live.
+- **P-8** *(complete at v1.7.33)* — OpenAI-compatible HTTP server +
+  session layer wrapping `ChatSession`. Sub-units (a)–(h) landed:
+  `silica serve` boots a single-process FastAPI server,
+  `/v1/chat/completions` (streaming + non-streaming), `/v1/completions`,
+  `/v1/models`, `X-Silica-Session-ID` cross-request prefix reuse,
+  bearer-token auth + per-key token-bucket rate limit,
+  `--trust-proxy-headers` opt-in for reverse-proxy deployments,
+  OpenAI-shaped error envelope, `silica.llm.LLM` Python facade.
+  M-9 cleared (M-9.2 attested by the R-f deterministic test
+  pinning `prefix_hit_tokens > 0`; M-9.1 + M-9.3 by openai-SDK
+  end-to-end on Qwen3.5-0.8B sanity + Qwen3.5-27B-4bit
+  production-target — factbundle: `plans/P8_R_H_SMOKE/`); user-facing
+  surface in [`docs/openai_server.md`](docs/openai_server.md).
 
 ---
 

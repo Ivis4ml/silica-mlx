@@ -429,25 +429,33 @@ read in-editor while iterating.
 ## Phase 8 — Mini-SGLang layer (OpenAI HTTP server)
 
 - [`P8_OPENING.md`](../plans/P8_OPENING.md) — phase-opening doc
-  landed at v1.7.32. Carries §1 motivation (M-9 acceptance is the
-  silica-mlx 1.0 announce blocker), §2 in-/out-of-scope tiers
+  landed at v1.7.32; **DISPOSITION at v1.7.33 — P-8 done; M-9
+  cleared (M-9.2 attested by the R-f deterministic test, with
+  manual smoke as supportive evidence on Qwen3.5-0.8B sanity +
+  Qwen3.5-27B-4bit production-target).** Carries §1 motivation
+  (M-9 acceptance is
+  the silica-mlx 1.0 announce blocker), §2 in-/out-of-scope tiers
   (PLAN.md §7 P-8 deliverables + acceptance verbatim, plus v0.2
   deferrals and post-(h) follow-ons), §3 entry-point inventory
   verified at v1.7.31 (`silica/server/__init__.py` +
-  `silica/llm/__init__.py` empty; `silica/server/cli.py` is the
-  178-line one-shot CLI; `pyproject.toml [serve]` extra already
-  declares FastAPI / Uvicorn / OpenAI), §4 architecture sketch,
-  §5 sub-unit ladder (a)–(h) (FastAPI scaffold → Pydantic schemas
-  → `/v1/chat/completions` non-streaming → SSE streaming →
-  `/v1/completions` + `/v1/models` → `SessionManager` + prefix
+  `silica/llm/__init__.py` empty pre-(a); `silica/server/cli.py`
+  was the 178-line one-shot CLI; `pyproject.toml [serve]` extra
+  already declared FastAPI / Uvicorn / OpenAI), §4 architecture
+  sketch, §5 sub-unit ladder (a)–(h) (FastAPI scaffold → Pydantic
+  schemas → `/v1/chat/completions` non-streaming → SSE streaming
+  → `/v1/completions` + `/v1/models` → `SessionManager` + prefix
   reuse → `silica.llm.LLM` facade → auth + rate-limit + tests +
   docs), §6 acceptance gate matrix (G-1 / G-2 / G-3 stop-and-ask
   gates + R-a..R-h sub-unit acceptance rows + M-9 terminal
-  verdict), §7-§8 sources and cross-references. **§6.1.2 design
-  lock:** v0.1 is positioned as a *local single-user
-  OpenAI-compatible server* — Option A endpoint routing (one
-  active decode turn at a time; concurrent requests serialise on
-  the engine), per-`ChatSession` `RadixPrefixCache` (same-session
+  verdict — all rows MET at v1.7.33), §7-§8 sources and
+  cross-references, **§9 disposition (2026-05-07, v1.7.33)** —
+  commit ladder (13 commits), R-h smoke factbundle pointers, M-9
+  per-row attestation, out-of-scope reaffirmation. **§6.1.2
+  design lock (held verbatim through disposition):** v0.1 is
+  positioned as a *local single-user OpenAI-compatible server* —
+  Option A endpoint routing (one active decode turn at a time;
+  concurrent requests serialise on the engine),
+  per-`ChatSession` `RadixPrefixCache` (same-session
   cross-request reuse only; cross-session shared system-prompt
   reuse is post-P-8), bounded-queue SSE backpressure with no
   token drop. Canonical session selector is the
@@ -456,6 +464,28 @@ read in-editor while iterating.
   **not** consulted as session id. Multi-customer scheduler
   routing (Options B/C in §6.1.1) is a post-announce follow-on
   outside the silica-mlx 1.0 scope.
+- [`P8_R_H_SMOKE/qwen3_5_0_8b.log`](../plans/P8_R_H_SMOKE/qwen3_5_0_8b.log),
+  [`P8_R_H_SMOKE/qwen3_5_27b_4bit.log`](../plans/P8_R_H_SMOKE/qwen3_5_27b_4bit.log)
+  — R-h smoke factbundle (2026-05-07). Each log records the
+  endpoints actually driven on the run; the 0.8B sanity run
+  exercises `/healthz` + `/v1/models` + chat (streaming +
+  non-streaming) + `/v1/completions` + a 3-turn
+  `X-Silica-Session-ID` shared-prefix session, and the 27B-4bit
+  production-target run exercises the same surface minus
+  `/v1/models` (pinned by R-e unit tests) with a 2-turn session
+  instead of 3. M-9.1 + M-9.3 are attested by these openai-SDK
+  round-trips together with R-c / R-d / R-h unit tests; M-9.2 is
+  attested by the deterministic R-f unit test
+  `tests/test_server_session_routing.py::test_three_turn_shared_prefix_demo_logs_prefix_hits_after_turn_one`,
+  with the smoke logs' `prompt_tokens` growth as supportive
+  evidence only (the route's `prefix_hit_tokens` INFO line is
+  not in either log because `silica serve` does not configure
+  the silica.* logger handler — recorded as a (h) follow-up #3
+  in `plans/P8_OPENING.md` §9.4).
+- [`docs/openai_server.md`](openai_server.md) — user-facing
+  surface (boot, auth, rate-limit, `--trust-proxy-headers`,
+  routes, X-Silica-Session-ID, error envelope, structured-output
+  reservation slot, observability, limitations summary).
 
 ## Side track: chat CLI redesign
 
