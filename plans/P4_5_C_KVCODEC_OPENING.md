@@ -5,7 +5,7 @@
 | Version      | v1.0.0                                                             |
 | Last updated | 2026-04-21                                                         |
 | Status       | opening doc — B.1 complete, implementation (C.1) not yet started   |
-| Maintainer   | Xin Zhou                                                           |
+| Maintainer   | xxzhou                                                           |
 | Scope        | decide the single v0.1 integration point for `KVCodec` on the      |
 |              | runtime forward path; pin its granularity, resident-bytes          |
 |              | accounting, and acceptance tests; amend stale PLAN §7 P-5 text     |

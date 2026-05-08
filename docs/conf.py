@@ -17,8 +17,8 @@ sys.path.insert(0, str(_REPO_ROOT))
 # ---------------------------------------------------------------------------
 
 project = "silica-mlx"
-author = "Xin Zhou"
-copyright = "2026, Xin Zhou"
+author = "xxzhou"
+copyright = "2026, xxzhou"
 
 # Pull version from the package itself when possible; fall back to the
 # pyproject.toml string. Keeping the import lazy avoids hard-failing the

@@ -5,7 +5,7 @@
 | Version      | v1.0.0 (draft)                                                     |
 | Last updated | 2026-04-21                                                         |
 | Status       | opening doc — P-4.5 closed 2026-04-21 (v1.6.9), P-5 not yet started |
-| Maintainer   | Xin Zhou                                                           |
+| Maintainer   | xxzhou                                                           |
 | Scope        | pin the MLX-native VQ codec platform: a `VectorCodec[P]` interface |
 |              | under which `vqbench`'s three main families (TurboQuantMSE,        |
 |              | BlockTurboQuantMSE, RaBitQ / ExtRaBitQ) land as the first four     |

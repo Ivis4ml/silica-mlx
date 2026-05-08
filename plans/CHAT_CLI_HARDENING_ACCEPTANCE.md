@@ -5,7 +5,7 @@
 | Status | **draft / pending manual run** |
 | Side track | `plans/CHAT_CLI_HARDENING.md` (HARDENING-1 .. HARDENING-9) |
 | Sub-unit | HARDENING-9 |
-| Author | Xin Zhou |
+| Author | xxzhou |
 | Last updated | 2026-04-28 |
 | GA decision | **Pending** — gated on a completed run + sign-off below |
 

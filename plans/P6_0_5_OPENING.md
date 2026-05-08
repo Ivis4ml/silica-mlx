@@ -5,7 +5,7 @@
 | Phase         | P-6 (Performance Phase) sub-step 0.5; D-021 step 3                                                           |
 | Status        | drafted; pending user review                                                                                 |
 | Last updated  | 2026-04-28                                                                                                   |
-| Scope owner   | Xin Zhou                                                                                                     |
+| Scope owner   | xxzhou                                                                                                     |
 | Predecessors  | P-5 complete; P-6.0 measurement gate landed at v1.7.13; P5.9 hardening complete at v1.7.15                   |
 | Successors    | D-021 step 4 (Decision Gate 1) — fixes (1a)/(1b) dense gate framing and the MoE stretch shape                |
 

@@ -5,7 +5,7 @@
 | Phase        | P-5-C.2 (codec-backed PPL oracle + bench rows)        |
 | Status       | Step 3a + step 3b landed                              |
 | Depends on   | C.2 step 1 (oracle, commit `e25893a`), step 2 (loader, commit `72c686f`) |
-| Maintainer   | Xin Zhou                                              |
+| Maintainer   | xxzhou                                              |
 | Opened       | 2026-04-23                                            |
 
 ---

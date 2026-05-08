@@ -5,7 +5,7 @@
 | Phase         | P-6 (Performance Phase) — D-021 step 7                                                                  |
 | Status        | orientation drafted; no code on disk; awaits user review before B.1 begins                              |
 | Last updated  | 2026-05-01                                                                                              |
-| Scope owner   | Xin Zhou                                                                                                |
+| Scope owner   | xxzhou                                                                                                |
 | Predecessors  | D-021 step 6 closed at v1.7.20 with C.4 retired (gate FAILED at 0.482×; see `plans/P6_C4_DFLASH/REPORT.md` (η.1)) |
 | Successors    | D-021 step 8 (C.5 tree-shape spike — **NOT auto-queued; product decision pending after Track B lands**) |
 

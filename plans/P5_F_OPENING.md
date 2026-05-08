@@ -5,7 +5,7 @@
 | Version      | v1.0.0 (draft)                                                     |
 | Last updated | 2026-04-26                                                         |
 | Status       | opening doc — implementation not yet started                       |
-| Maintainer   | Xin Zhou                                                           |
+| Maintainer   | xxzhou                                                           |
 | Parent unit  | P-5 (KV-codec) post-P-5 follow-up                                  |
 | Parent docs  | `plans/PLAN.md` §7 P-5 Notes ("Production `prefix_store_post_rope`  |
 |              | prefix-cache quality cost — post-P-5 required follow-up");        |

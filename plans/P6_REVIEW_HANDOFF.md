@@ -6,7 +6,7 @@
 | Project | silica-mlx — MLX-native LLM serving framework |
 | Status | P-1 .. P-5 complete (v1.7.13); P-6 measurement gate landed; Tracks A-E pending |
 | Reviewer use | GPT-5.5 xhigh (or any other model with code-reading bandwidth) |
-| Maintainer | Xin Zhou |
+| Maintainer | xxzhou |
 | Read time | ~30 min for the full handoff; 5 min for the headline + open questions |
 
 This document is a self-contained handoff so a reviewer who has not

@@ -5,7 +5,7 @@
 | Phase         | P-6 (Performance Phase — re-scoped from "Weight Streaming" in PLAN.md v1.7.x; see proposed D-017 in §10)     |
 | Status        | drafted; pending user review and PLAN.md edits                                                              |
 | Last updated  | 2026-04-27                                                                                                  |
-| Scope owner   | Xin Zhou                                                                                                    |
+| Scope owner   | xxzhou                                                                                                    |
 | Predecessors  | P-1 .. P-5 (all done; per PLAN.md v1.7.12 status header)                                                    |
 | Successors    | P-7 (Speculative — promotion to T1 proposed below), P-8 (Mini-SGLang serving)                              |
 

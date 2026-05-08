@@ -9,7 +9,7 @@ description = "MLX-native LLM inference platform for Apple Silicon"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "Apache-2.0" }
-authors = [{ name = "Xin Zhou", email = "xinchoubiology@gmail.com" }]
+authors = [{ name = "xxzhou", email = "xinchoubiology@gmail.com" }]
 keywords = ["mlx", "llm", "inference", "apple-silicon"]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",

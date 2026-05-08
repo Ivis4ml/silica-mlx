@@ -6,7 +6,7 @@
 | Status | RP-1..RP-3 landed; side-track interim exit reached. RP-1: `4f98648` + `d4ea04d` (repair). RP-2: `60459c7`. RP-3: `1d9ecd7`. Hand-off to D-021 step 3 (P-6.0.5) ready. |
 | Last updated | 2026-04-28 |
 | Trigger | Two real-session UX failures observed against Qwen3.5-35B-A3B-4bit + Qwen3-0.6B during interactive use of the post-HARDENING chat REPL (latest code at `51fbcde`) |
-| Scope owner | Xin Zhou |
+| Scope owner | xxzhou |
 | Predecessor | `plans/CHAT_CLI_HARDENING.md` (F1-F6 closed in code; HARDENING-9 manual acceptance still pending — see §5 sequencing note) |
 | Successor | resume D-021 step 3 (P-6.0.5 measurement expansion); RP-4..RP-6 wait their turn |
 

@@ -5,7 +5,7 @@
 | Phase         | P-6 (Performance Phase) — D-021 step 5                                                                       |
 | Status        | foundation closed at v1.7.19 — sub-units (a)..(b), (c) slices 1/2a/2b, (d), (e), (f), (g), (h) all on disk; (i) synthetic three-rollback closed; (c) slice 3 (multi-request hybrid + sliding batched-spec) deferred as non-blocking performance extension. Foundation gate §6.1 + toolchain attestation §6.3 both pass. |
 | Last updated  | 2026-04-30                                                                                                   |
-| Scope owner   | Xin Zhou                                                                                                     |
+| Scope owner   | xxzhou                                                                                                     |
 | Predecessors  | P-5 complete (v1.7.13); P-6.0.5 measurement expansion closed (v1.7.17); Decision Gate 1 closed (v1.7.18)     |
 | Successors    | D-021 step 6 (C.4 DFlash spike); P-7 closure-in-v0.1-scope is settled here (see §7 OQ-2)                     |
 

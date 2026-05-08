@@ -5,7 +5,7 @@
 | Version      | v1.0.0 (draft)                                                     |
 | Last updated | 2026-04-24                                                         |
 | Status       | opening doc — implementation not yet started                       |
-| Maintainer   | Xin Zhou                                                           |
+| Maintainer   | xxzhou                                                           |
 | Parent unit  | P-3-C (DeltaNet recurrent-state plumbing)                          |
 | Parent docs  | `plans/PLAN.md` §7 P-3; `plans/P3_DELTANET_SURVEY.md`                |
 | Scope        | Design and land the adapter-owned recurrent-state snapshot /      |

@@ -6,7 +6,7 @@
 | Status | drafted; pending sub-unit landings |
 | Last updated | 2026-04-27 |
 | Trigger | GPT-5.5 verification round against `silica.chat` (post v1.7.16) |
-| Scope owner | Xin Zhou |
+| Scope owner | xxzhou |
 | Predecessor | `plans/CHAT_CLI_OPENING.md` (the original C-1..C-8 design doc) |
 | Successor | none — feeds into P-8 (mini-sglang HTTP server) when that phase opens |
 
@@ -150,7 +150,7 @@ hardening for free.
 ### Decision D — full prompt-toolkit `Application` backend deferred (HARDENING-6)
 
 **Date:** 2026-04-27.
-**Author:** Xin Zhou.
+**Author:** xxzhou.
 
 The original sub-unit table for HARDENING-6 called for a "real
 prompt-toolkit `Application` layout that updates per-token". On

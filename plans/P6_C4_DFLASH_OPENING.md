@@ -5,7 +5,7 @@
 | Phase         | P-6 (Performance Phase) — D-021 step 6                                                                       |
 | Status        | (α) closed favourably (see §5.8); F-1 architecture finding triggered §0 / §1 / §2 / §3 / §4 revision; new sub-unit (αβ) added between α and β; awaits user review before (αβ) begins |
 | Last updated  | 2026-05-01 (post-α revision)                                                                                 |
-| Scope owner   | Xin Zhou                                                                                                     |
+| Scope owner   | xxzhou                                                                                                     |
 | Predecessors  | D-021 step 5 spec foundation closed at v1.7.19 (`plans/P6_SPEC_FOUNDATION_OPENING.md` §6.1)                  |
 | Successors    | D-021 step 7 (Track B 3-bit weights); D-021 step 8 (C.5 tree-shape spike, conditional on C.4 outcome)        |
 
