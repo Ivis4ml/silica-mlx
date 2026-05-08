@@ -33,7 +33,7 @@ const Hero = ({ tweaks }) => {
     return (
       <section className="hero">
         <div className="container">
-          <div className="hero-eyebrow"><span className="dot"></span>Status v1.7.33: P-6 performance phase closed · P-8 OpenAI HTTP server shipped · M-9 cleared</div>
+          <div className="hero-eyebrow"><span className="dot"></span>Status v1.7.35 · silica-mlx 1.0 release candidate · P-6 closed · P-8 OpenAI HTTP server shipped · M-9 cleared</div>
           <h1>
             Continuous-batching<br/>
             LLM serving,<br/>
@@ -62,7 +62,7 @@ const Hero = ({ tweaks }) => {
   return (
     <section className="hero">
       <div className="container">
-        <div className="hero-eyebrow"><span className="dot"></span>Status v1.7.33: P-6 performance phase closed · P-8 OpenAI HTTP server shipped · M-9 cleared</div>
+        <div className="hero-eyebrow"><span className="dot"></span>Status v1.7.35 · silica-mlx 1.0 release candidate · P-6 closed · P-8 OpenAI HTTP server shipped · M-9 cleared</div>
         <h1>Continuous-batching LLM serving, <em>native to Apple Silicon.</em></h1>
         <p className="hero-sub">
           The vLLM scheduler core, the radix prefix cache, and the memory-budget admission ladder — ported to MLX's unified-memory model on M5 Pro 48 GB. The 35-cycle P-6 autoresearch loop closed in May 2026 with every <em>server-throughput</em> acceptance gate cleared 3.4-5.5× over the cycle-1 baseline: 232 tok/s on dense Qwen3.5-27B-4bit at B=64 (48 GB ceiling), 791.8 tok/s on MoE Qwen3.5-35B-A3B-4bit at B=128. <strong>Single-user latency at B=1 is ~20 tok/s, bandwidth-capped and unchanged by this phase</strong>; D-022 closed the small-B research line at v1.7.28 with β/γ/δ measurement-anchored negatives. Two parameter changes carried the aggregate result; 17 custom-kernel attempts closed without a load-bearing E2E win. <strong>P-8 closed at v1.7.33:</strong> <code>silica serve</code> boots a single-process FastAPI server fronting one loaded model — chat / completions / models endpoints, SSE streaming, <code>X-Silica-Session-ID</code> cross-request prefix reuse, bearer auth + token-bucket rate limit, OpenAI-shaped error envelope.
@@ -137,7 +137,7 @@ const Footer = () => (
       </div>
       <div className="foot-bottom">
         <div>Apache-2.0 · Target hardware: M5 Pro 48 GB</div>
-        <div className="mono">v1.7.33 · P-6 closed · P-8 OpenAI HTTP server shipped · M-9 cleared</div>
+        <div className="mono">v1.7.35 · silica-mlx 1.0 RC · P-6 closed · P-8 shipped · M-9 cleared</div>
       </div>
     </div>
   </footer>
