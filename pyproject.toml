@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "silica-mlx"
-version = "0.0.1"
+version = "1.0.0"
 description = "MLX-native LLM inference platform for Apple Silicon"
 readme = "README.md"
 requires-python = ">=3.12"

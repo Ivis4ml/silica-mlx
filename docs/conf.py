@@ -26,9 +26,9 @@ copyright = "2026, Xin Zhou"
 try:
     import silica  # noqa: F401
 
-    release = getattr(silica, "__version__", "0.0.1")
+    release = getattr(silica, "__version__", "1.0.0")
 except Exception:
-    release = "0.0.1"
+    release = "1.0.0"
 version = release
 
 # ---------------------------------------------------------------------------
