@@ -219,7 +219,10 @@ class _FakeAdapterWithTokenizer:
 def test_sampling_params_uses_schema_defaults_when_config_empty() -> None:
     """An empty ``state.config`` produces the schema defaults
     documented at the call site (temperature=0.7, top_p=0.9,
-    top_k=None, max_tokens=1024)."""
+    top_k=None, max_tokens=8192). The max_tokens default was
+    raised from 1024 to 8192 at v1.7.36 so a single turn
+    comfortably holds reasoning + a long reply on Qwen3 /
+    Qwen3.5 / Gemma 4 reasoning models."""
     state = ChatCliState()
     state.config.clear()
     adapter = _FakeAdapterWithTokenizer()
@@ -227,7 +230,7 @@ def test_sampling_params_uses_schema_defaults_when_config_empty() -> None:
     assert params.temperature == 0.7
     assert params.top_p == 0.9
     assert params.top_k is None
-    assert params.max_tokens == 1024
+    assert params.max_tokens == 8192
     assert params.stop_token_ids == ()
 
 

@@ -83,10 +83,12 @@ from silica.chat.cli.toolbar import (
 )
 
 DEFAULT_SYSTEM_PROMPT = (
-    "You are a concise assistant. Answer directly: skip preamble, "
-    "skip self-narration, do not over-elaborate. Stop when the "
-    "answer is complete. Reply in the user's language. For code "
-    "questions, show the code first."
+    "You are a concise assistant. When reasoning, keep it brief: "
+    "a few short sentences in plain prose. No headers, no numbered "
+    "lists, no bullet points, no markdown emphasis inside reasoning. "
+    "Answer directly: skip preamble, skip self-narration, do not "
+    "over-elaborate. Stop when the answer is complete. Reply in "
+    "the user's language. For code questions, show the code first."
 )
 """Out-of-the-box system prompt for ``silica chat`` when the user
 does not pass ``--system``.
@@ -732,7 +734,7 @@ def run_chat(args: argparse.Namespace) -> int:
 
         state.stream_state = StreamState.PREFILL
         state.tokens_generated = 0
-        state.max_tokens = int(state.config.get("max_tokens", 1024))
+        state.max_tokens = int(state.config.get("max_tokens", 8192))
         # /continue extends the previous turn — preserve the prior
         # ``last_turn_thinking`` so the streaming callback's
         # ``+= event.text`` accumulates across the boundary and
@@ -780,7 +782,7 @@ def run_chat(args: argparse.Namespace) -> int:
         # first ``</think>`` correctly transitions out instead of
         # leaking the entire reasoning block as a ReplyChunk.
         implicit_thinking = (
-            bool(state.config.get("thinking_mode", True))
+            bool(state.config.get("thinking_mode", False))
             and _model_supports_implicit_thinking(state.model_name)
         )
         # CHAT-CLI-RESPONSE-POLICY RP-2: for /continue, the parser's
@@ -1545,7 +1547,7 @@ def _sampling_params_from_state(
         temperature=float(state.config.get("temperature", 0.7)),
         top_p=float(state.config.get("top_p", 0.9)),
         top_k=top_k_int,
-        max_tokens=int(state.config.get("max_tokens", 1024)),
+        max_tokens=int(state.config.get("max_tokens", 8192)),
         stop_token_ids=eos_ids,
     )
 

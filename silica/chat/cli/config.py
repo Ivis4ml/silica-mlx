@@ -20,11 +20,26 @@ value the rest of the chat code expects. Validation errors raise
 dispatcher catches these and surfaces them to the chat log as a
 red error line.
 
-Defaults match ``plans/CHAT_CLI_OPENING.md`` §6: sampling defaults
-in the chat-app sense (temperature 0.7, top_p 0.9, top_k off,
-max_tokens 1024); ``kv_codec`` defaults to None (fp16) per §6.1;
-``thinking`` defaults to ``auto`` (collapse during stream, expand
-afterwards) per §3.2.1.
+Defaults match ``plans/CHAT_CLI_OPENING.md`` §6 with three v1.7.36
+adjustments: ``max_tokens`` raised from 1024 to **8192** so a
+single turn can comfortably hold reasoning + a long reply
+(Qwen3 / Qwen3.5 / Gemma 4 reasoning models routinely spend
+1-2k tokens inside ``<think>`` before the visible reply
+starts); ``thinking`` flipped from ``auto`` to **``show``**
+so the (now-shorter, see :data:`silica.chat.cli.app.DEFAULT_SYSTEM_PROMPT`)
+reasoning text streams inline as it is generated rather than
+sitting behind a static spinner; and ``thinking_mode`` flipped
+from ``True`` to **``False``** so casual chat does not pay the
+RL-trained "Thinking Process" tax for zero-entropy questions
+(e.g. "I am 50 m from the car wash, drive or walk?"). The
+system prompt alone could not suppress the verbose markdown-
+structured reasoning Qwen3 / Qwen3.5 emit by default; the
+chat-template ``enable_thinking=False`` propagation is the
+actual lever, and surfacing it as the new default brings
+``silica chat`` in line with mainstream chatbot UX (reasoning
+is opt-in via ``/config thinking_mode=on`` for hard problems).
+Sampling defaults are unchanged (temperature 0.7, top_p 0.9,
+top_k off); ``kv_codec`` defaults to None (fp16) per §6.1.
 """
 
 from __future__ import annotations
@@ -214,7 +229,7 @@ CONFIG_SCHEMA: dict[str, ConfigEntry] = {
     ),
     "max_tokens": ConfigEntry(
         key="max_tokens",
-        default=1024,
+        default=8192,
         parse=lambda raw: _bounded_positive_int(
             "max_tokens", raw, lo=1, hi=32768
         ),
@@ -223,25 +238,29 @@ CONFIG_SCHEMA: dict[str, ConfigEntry] = {
     ),
     "thinking": ConfigEntry(
         key="thinking",
-        default="auto",
+        default="show",
         parse=lambda raw: _parse_choice(
             "thinking", raw, THINKING_DISPLAY_CHOICES
         ),
         summary="thinking-block visibility during stream",
         valid_help=(
+            "show = stream inline dimmed-italic (default); "
             "auto = collapse during stream + /expand afterwards; "
-            "show = stream inline dimmed-italic; "
             "hidden = silent (no spinner, no expand)"
         ),
     ),
     "thinking_mode": ConfigEntry(
         key="thinking_mode",
-        default=True,
+        default=False,
         parse=lambda raw: _parse_bool("thinking_mode", raw),
         summary="propagate enable_thinking through the chat template",
         valid_help=(
-            "on enables Qwen3 reasoning mode (default); off disables "
-            "for faster TTFT and shorter total tokens"
+            "off disables Qwen3 reasoning mode (default — the "
+            "model emits an empty <think></think> and goes "
+            "straight to the answer, faster TTFT and shorter "
+            "total tokens); on re-enables reasoning for hard "
+            "problems where the chain of thought materially "
+            "improves the reply"
         ),
     ),
     "thinking_history": ConfigEntry(

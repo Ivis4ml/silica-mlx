@@ -149,7 +149,7 @@ def test_toolbar_plain_mode_contains_all_static_fields() -> None:
         "model=Qwen3-0.6B",
         "MLX",
         "tok/s=",
-        "tokens=0/1024",
+        "tokens=0/8192",
         "ttft=",
         "peak=",
         "kv=",

@@ -201,6 +201,23 @@ def test_thinking_mode_garbage_rejected() -> None:
         parse_config_assignment("thinking_mode=maybe")
 
 
+def test_thinking_mode_default_is_false() -> None:
+    """v1.7.36 default flip: ``thinking_mode`` defaults to
+    ``False`` so casual chat does not pay the RL-trained
+    "Thinking Process" tax for zero-entropy questions. The
+    system prompt cannot reliably suppress the verbose markdown-
+    structured reasoning Qwen3 / Qwen3.5 emit by default; the
+    chat-template ``enable_thinking=False`` propagation is the
+    actual lever, and surfacing it as the new default brings
+    ``silica chat`` in line with mainstream chatbot UX. Power
+    users opt back in via ``/config thinking_mode=on`` for
+    hard problems where the chain of thought materially improves
+    the reply."""
+    from silica.chat.cli.config import CONFIG_SCHEMA
+
+    assert CONFIG_SCHEMA["thinking_mode"].default is False
+
+
 # ---------------------------------------------------------------------------
 # Choice — thinking_history (CHAT-CLI-RESPONSE-POLICY RP-1)
 # ---------------------------------------------------------------------------
@@ -224,6 +241,32 @@ def test_thinking_history_default_is_strip() -> None:
     from silica.chat.cli.config import CONFIG_SCHEMA
 
     assert CONFIG_SCHEMA["thinking_history"].default == "strip"
+
+
+def test_thinking_display_default_is_show() -> None:
+    """v1.7.36 default flip: ``thinking`` display defaults to
+    ``show`` (stream the reasoning text inline as it is generated)
+    rather than the previous ``auto`` (collapse during stream,
+    expand afterwards). Paired with the tightened
+    DEFAULT_SYSTEM_PROMPT — which discourages markdown structure
+    inside reasoning — the visible thinking text stays short
+    enough that streaming it inline is helpful, not noisy."""
+    from silica.chat.cli.config import CONFIG_SCHEMA
+
+    assert CONFIG_SCHEMA["thinking"].default == "show"
+
+
+def test_max_tokens_default_is_8192() -> None:
+    """v1.7.36 default raise: ``max_tokens`` defaults to 8192
+    (was 1024). Qwen3 / Qwen3.5 / Gemma 4 reasoning models
+    routinely spend 1-2k tokens inside the ``<think>`` block
+    before the visible reply starts; a 1024 ceiling truncated
+    them mid-thought far too often. 8192 is comfortable for
+    long replies on a 48 GB envelope without making the
+    accidentally-runaway turn pathological."""
+    from silica.chat.cli.config import CONFIG_SCHEMA
+
+    assert CONFIG_SCHEMA["max_tokens"].default == 8192
 
 
 # ---------------------------------------------------------------------------
@@ -301,8 +344,9 @@ def test_render_schema_help_includes_default_repr() -> None:
     lines = render_schema_help()
     rendered = "\n".join(lines)
     # Defaults shown verbatim; check a couple of representative
-    # entries.
+    # entries. v1.7.36: max_tokens default raised 1024 -> 8192;
+    # thinking default flipped 'auto' -> 'show'.
     assert "0.7" in rendered  # temperature
-    assert "1024" in rendered  # max_tokens
-    assert "'auto'" in rendered  # thinking
+    assert "8192" in rendered  # max_tokens (v1.7.36 default)
+    assert "'show'" in rendered  # thinking (v1.7.36 default)
     assert "none" in rendered  # top_k default

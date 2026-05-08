@@ -79,9 +79,12 @@ class ChatCliState:
     tokens_generated: int = 0
     """Tokens emitted so far in the current turn (resets at turn start)."""
 
-    max_tokens: int = 1024
+    max_tokens: int = 8192
     """Per-turn ``max_tokens`` ceiling, surfaced as ``tokens=N/max``
-    in the toolbar."""
+    in the toolbar. Default raised from 1024 to 8192 at v1.7.36 so
+    a single turn comfortably holds reasoning + a long reply on
+    Qwen3 / Qwen3.5 / Gemma 4 reasoning models. Override via
+    ``/config max_tokens=<n>`` (1..32768)."""
 
     tok_per_sec: float | None = None
     """Live decode tok/s during the current turn; ``None`` between
