@@ -53,6 +53,13 @@ api-manual
 plans-index
 ```
 
+```{toctree}
+:maxdepth: 2
+:caption: Release
+
+release_notes_1_0
+```
+
 ## Indices
 
 - {ref}`genindex`

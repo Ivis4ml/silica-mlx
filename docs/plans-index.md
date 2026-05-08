@@ -479,13 +479,23 @@ read in-editor while iterating.
   `tests/test_server_session_routing.py::test_three_turn_shared_prefix_demo_logs_prefix_hits_after_turn_one`,
   with the smoke logs' `prompt_tokens` growth as supportive
   evidence only (the route's `prefix_hit_tokens` INFO line is
-  not in either log because `silica serve` does not configure
-  the silica.* logger handler — recorded as a (h) follow-up #3
-  in `plans/P8_OPENING.md` §9.4).
+  not in either log because the v1.7.33 capture predates the
+  v1.7.34 (h) follow-up #3 fix that wired
+  `silica.core.logger.setup_logging` into `silica.server.cli._serve()`;
+  see `plans/PLAN.md` §13 v1.7.34 for the closure narrative).
 - [`docs/openai_server.md`](openai_server.md) — user-facing
   surface (boot, auth, rate-limit, `--trust-proxy-headers`,
   routes, X-Silica-Session-ID, error envelope, structured-output
   reservation slot, observability, limitations summary).
+- [`docs/release_notes_1_0.md`](release_notes_1_0.md) —
+  silica-mlx 1.0 release notes (announce draft, internal
+  v1.7.34). TL;DR + per-phase shipped surface (P-0..P-8) +
+  performance facts with model/batch/hardware anchors + M-9
+  acceptance attestation framing (R-f deterministic test
+  load-bearing, manual smoke supportive) + out-of-scope list +
+  install (source editable until PyPI publish is cut) +
+  minimal usage. Anchored to `plans/PLAN.md` §13 v1.7.33 /
+  v1.7.34 changelog and `plans/P8_OPENING.md` §9 disposition.
 
 ## Side track: chat CLI redesign
 
