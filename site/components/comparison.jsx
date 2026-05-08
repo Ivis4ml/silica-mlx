@@ -15,7 +15,7 @@ const Comparison = () => {
     ["KV codec compression", "no", "FP8 / INT8", "limited", "BlockTQ + RaBitQ"],
     ["Hybrid DeltaNet (batched)", "single-req", "no", "no", "yes"],
     ["MoE batched dispatch", "single-req", "yes", "yes", "yes"],
-    ["OpenAI HTTP server", "no", "yes", "yes", "planned"],
+    ["OpenAI HTTP server", "no", "yes", "yes", "yes"],
     ["Speculative decoding", "no", "yes", "yes", "foundation"],
     ["Per-expert MoE residency", "no", "limited", "no", "planned"],
   ];

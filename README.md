@@ -429,8 +429,9 @@ open docs/_build/html/index.html
 
 ## Quickstart
 
-Five entry points: `silica run` (single-shot CLI), `scripts/chat.py`
-(REPL chatbot), the Python API (single request + continuous batching),
+Five entry points: `silica run` (single-shot CLI), `silica chat`
+(REPL chatbot), `silica serve` (OpenAI-compatible HTTP server),
+the Python API (`Engine` + `ChatSession` + `silica.llm.LLM`),
 and `scripts/bench.py` (benchmark harness).
 
 ### 1. CLI — single prompt

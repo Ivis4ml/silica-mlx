@@ -44,6 +44,12 @@ const Highlights = () => {
       body: "Every P-6 server-aggregate acceptance gate cleared 3.4-5.5× over the cycle-1 baseline across a 35-cycle autoresearch loop. Dense Qwen3.5-27B-4bit hits 232 tok/s at B=64; MoE 35B-A3B hits 791.8 tok/s at B=128. Per-row speed still sits near ~20 tok/s at B=1, bandwidth-capped. D-022 closed with β narrow-scope, γ tiny-gain, and δ real-compute-overhead negatives.",
       detail: ["232 tok/s aggregate", "~20 tok/s B=1", "D-022 closed"],
     },
+    {
+      tag: "P-8 · v1.7.33",
+      title: "OpenAI-compatible HTTP server.",
+      body: "silica serve boots a single-process FastAPI server fronting one loaded model: chat / completions / models endpoints, SSE streaming, X-Silica-Session-ID cross-request prefix reuse, bearer auth + token-bucket rate limit, OpenAI-shaped error envelope. silica.llm.LLM gives mlx-lm-style ergonomics over the same engine. M-9 milestone cleared.",
+      detail: ["silica serve", "X-Silica-Session-ID", "M-9 cleared"],
+    },
   ];
 
   return (
@@ -51,7 +57,7 @@ const Highlights = () => {
       <div className="container">
         <div className="section-head">
           <div className="section-eyebrow">What's shipped</div>
-          <h2>Seven load-bearing pieces, behind frozen interfaces.</h2>
+          <h2>Eight load-bearing pieces, behind frozen interfaces.</h2>
           <p>Every architectural decision and acceptance gate lives in <span className="mono">plans/PLAN.md</span>. The interfaces don't move; capabilities slot in below them.</p>
         </div>
 

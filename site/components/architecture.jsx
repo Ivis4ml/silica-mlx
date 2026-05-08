@@ -8,9 +8,9 @@ const Architecture = () => {
     {
       id: "client",
       title: "Client surface",
-      sub: "CLI · ChatSession · Engine.generate · OpenAI HTTP (planned)",
+      sub: "CLI · ChatSession · Engine.generate · OpenAI HTTP server (silica serve, v1.7.33)",
       tone: "muted",
-      pills: ["silica run", "scripts/chat.py", "Engine.generate_batch", "ChatSession"],
+      pills: ["silica run", "silica chat", "silica serve", "Engine.generate_batch", "ChatSession", "silica.llm.LLM"],
     },
     {
       id: "engine",
