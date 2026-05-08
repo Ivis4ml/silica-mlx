@@ -91,9 +91,11 @@ is honest about what is load-bearing vs. supportive:
   engine). Manual smoke is supportive only — `prompt_tokens` grows
   monotonically across shared-`X-Silica-Session-ID` turns. The
   route's `prefix_hit_tokens` INFO log line is not in the captured
-  smoke logs because `silica serve` does not currently call
-  `silica.core.logger.setup_logging`; wiring this is recorded as
-  post-announce (h) follow-up #3.
+  v1.7.33 smoke logs because the capture predates the v1.7.34 (h)
+  follow-up #3 fix that wired `silica.core.logger.setup_logging`
+  into `silica.server.cli._serve()`; future smoke runs surface the
+  INFO line, but the deterministic R-f test remains the canonical
+  load-bearing attestation regardless.
 - **M-9.3** locally behaves like a small serving engine: the
   server-side test suite (eleven `tests/test_server_*.py` files,
   198 tests collected) is clean. Manual openai-SDK surface enumerated
@@ -141,9 +143,6 @@ named follow-on if a real workload demands lifting it.
   / model stack at cycle 23 of the autoresearch loop.
 - **Weight streaming for MoE residency** — stays a stub behind the
   frozen `WeightProvider` interface.
-- **Wiring `silica.core.logger.setup_logging` into `silica serve`**
-  (h follow-up #3) — surfaced during the v1.7.33 disposition smoke
-  capture; the fix is a single call in `silica.server.cli._serve()`.
 
 ## Install
 

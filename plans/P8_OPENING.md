@@ -545,7 +545,7 @@ PR-level adjustments must reference §6.1.2 explicitly.
 | R-c | (c) | `openai` non-streaming round trip succeeds against Qwen3.5-0.8B | Yes (M-9 acceptance #1 dependency) | **MET** — `0ff3ff0` (c) + R-h smoke `qwen3_5_0_8b.log` (283 ms wall, finish_reason=length) |
 | R-d | (d) | `openai` streaming round trip succeeds; chunks concatenate to non-streaming reply | Yes (M-9 acceptance #1 dependency) | **MET** — `5da48a1` (d) SSE + R-h smoke (TTFT 2 ms / total 71 ms / 8 chunks on 0.8B; TTFT 3 ms / 596 ms on 27B-4bit) |
 | R-e | (e) | `/v1/completions` + `/v1/models` round trip via openai client | No (M-9 doesn't require beyond chat) | **MET** — `e4a74fb` (e) + R-h smoke shows both endpoints green via openai SDK |
-| R-f | (f) | N-shared-prefix demo: 3-turn shared-prefix session shows `prefix_hit_tokens > 0` on turn 2+ | Yes (M-9 acceptance #2) | **MET** — `0f4af00` (f) `SessionManager` + the deterministic test `tests/test_server_session_routing.py::test_three_turn_shared_prefix_demo_logs_prefix_hits_after_turn_one` pins `prefix_hit_tokens > 0` on turns 2 + 3 through a near-real engine. Manual smoke shows `prompt_tokens` growth across turns (0.8B 27→48→73; 27B 24→48), supportive but not load-bearing — the route's `prefix_hit_tokens` INFO line is not in the captured log (`silica serve` does not call `setup_logging`, so silica.* logs have no handler attached at runtime). Wiring `setup_logging` into `_serve()` is recorded as an out-of-scope (h) follow-up in §9.4. |
+| R-f | (f) | N-shared-prefix demo: 3-turn shared-prefix session shows `prefix_hit_tokens > 0` on turn 2+ | Yes (M-9 acceptance #2) | **MET** — `0f4af00` (f) `SessionManager` + the deterministic test `tests/test_server_session_routing.py::test_three_turn_shared_prefix_demo_logs_prefix_hits_after_turn_one` pins `prefix_hit_tokens > 0` on turns 2 + 3 through a near-real engine. Manual smoke shows `prompt_tokens` growth across turns (0.8B 27→48→73; 27B 24→48), supportive but not load-bearing — the route's `prefix_hit_tokens` INFO line is not in the captured log because the v1.7.33 capture pre-dated the v1.7.34 (h) follow-up #3 fix; `silica serve` did not yet call `setup_logging` at the time of capture. The fix landed at v1.7.34 (see §9.4); future smoke runs will surface the INFO line. |
 | R-g | (g) | `silica.llm.LLM` round-trips a greedy generation byte-for-byte vs `Engine.generate` | No (PLAN deliverable, not M-9 gate) | **MET** — `2e33886` (g) facade + 18 tests in `tests/test_llm_facade.py` (`uv run pytest tests/test_llm_facade.py` clean); smoke run on Qwen3.5-0.8B confirms `LLM.generate` + `LLM.chat` both work end-to-end |
 | R-h | (h) | server-side test suite passes; manual end-to-end on real Qwen3.5-27B-4bit | Yes (M-9 acceptance #3) | **MET** — `e86a735` (h) + `9eaeaba` follow-up #1 + `776e749` follow-up #2; the eleven `tests/test_server_*.py` files (198 tests) are clean; R-h smoke `qwen3_5_27b_4bit.log` exercises `/healthz`, `/v1/chat/completions` (streaming + non-streaming), `/v1/completions`, and `X-Silica-Session-ID` 2-turn shared-prefix demo on the production-target at ~13.8 tok/s effective decode (the 0.8B sanity log additionally drives `/v1/models` + a 3-turn session). |
 
@@ -569,12 +569,14 @@ The phase closes only when all three M-9 acceptance rows pass:
   2-turn 24 → 48) is supportive only — `prompt_tokens` growth is
   consistent with cache reuse but does not directly attest a hit.
   The route's `prefix_hit_tokens` INFO line is not captured in the
-  smoke logs because `silica serve` does not call
-  `silica.core.logger.setup_logging`; the silica.* logger has no
-  handler attached at runtime, and `--log-level info` configures
-  only uvicorn's loggers. Wiring `setup_logging` into `_serve()`
-  is an out-of-scope (h) follow-up; the deterministic R-f test
-  remains the canonical M-9.2 attestation regardless.
+  v1.7.33 smoke logs because the capture predates the v1.7.34 (h)
+  follow-up #3 fix; at the time of capture `silica serve` did not
+  yet call `silica.core.logger.setup_logging`, the silica.* logger
+  had no handler attached at runtime, and `--log-level info`
+  configured only uvicorn's loggers. The wiring landed at v1.7.34
+  (see §9.4) — future smoke runs will surface the INFO line. The
+  deterministic R-f test remains the canonical M-9.2 attestation
+  regardless.
 - **M-9.3** — locally behaves like a small serving engine (cleared by
   R-h end-to-end on real model). **CLEARED** (v1.7.33). The
   server-side test suite (eleven `tests/test_server_*.py` files,
@@ -695,15 +697,17 @@ Two real-model smoke runs captured at `plans/P8_R_H_SMOKE/`:
 
 **M-9.2 caveat carried in this factbundle.** The route's
 `prefix_hit_tokens` INFO line is **not** present in either log
-because `silica serve` does not call
-`silica.core.logger.setup_logging`, so the silica.* logger
-namespace has no handler attached at runtime — `--log-level info`
-configures only uvicorn's loggers. The deterministic R-f unit
-test (`tests/test_server_session_routing.py::test_three_turn_shared_prefix_demo_logs_prefix_hits_after_turn_one`)
-is the load-bearing M-9.2 attestation, and the `prompt_tokens`
-growth in the smoke logs is supportive evidence consistent with
-cache reuse. Wiring `setup_logging` into `_serve()` is recorded
-as an out-of-scope (h) follow-up below.
+because the v1.7.33 capture predates the v1.7.34 (h) follow-up
+#3 fix. At the time of capture `silica serve` did not yet call
+`silica.core.logger.setup_logging`, the silica.* logger
+namespace had no handler attached at runtime, and `--log-level
+info` configured only uvicorn's loggers. The wiring landed at
+v1.7.34 (see §9.4 closure note); future smoke runs will surface
+the INFO line. The deterministic R-f unit test
+(`tests/test_server_session_routing.py::test_three_turn_shared_prefix_demo_logs_prefix_hits_after_turn_one`)
+remains the load-bearing M-9.2 attestation, and the
+`prompt_tokens` growth in these archived smoke logs is
+supportive evidence consistent with cache reuse.
 
 ### §9.3 M-9 verdict (terminal)
 
@@ -746,11 +750,19 @@ The following items remain post-announce / post-P-8 and are
 - Persistent rate-limit / auth state — in-memory token-bucket and
   in-memory `AuthState`; restart resets both. Redis-backed shared
   state is post-announce.
-- Wiring `silica.core.logger.setup_logging` into the `silica serve`
+- ~~Wiring `silica.core.logger.setup_logging` into the `silica serve`
   CLI so `--log-level` surfaces silica.* INFO logs (including the
-  route's `prefix_hit_tokens` line) to stderr — surfaced during
-  this disposition's smoke capture. The fix is a single
-  `setup_logging(level=args.log_level.upper())` call in
-  `silica.server.cli._serve()` before `uvicorn.run`. Filed as a
-  post-announce (h) follow-up #3; does not block M-9 because the
-  R-f deterministic test is the load-bearing M-9.2 attestation.
+  route's `prefix_hit_tokens` line) to stderr~~ — **closed at
+  v1.7.34 as (h) follow-up #3**. The fix landed as a single
+  `setup_logging(level=...)` call in `silica.server.cli._serve()`
+  before `uvicorn.run`, with uvicorn's `trace` log level mapped
+  to Python `DEBUG` (no Python `logging` analogue exists for
+  `TRACE`). Two new pins in `tests/test_server_cli.py` assert
+  that `setup_logging` is called *before* `uvicorn.run` (so the
+  lifespan's first INFO line is not silently dropped) and that
+  the `trace → DEBUG` mapping holds. The v1.7.33 R-h smoke
+  factbundle is a frozen point-in-time record from before the
+  fix and stays unchanged; future smoke runs will surface the
+  route's `prefix_hit_tokens` INFO line through the wired
+  silica.* handler. See `plans/PLAN.md` §13 v1.7.34 changelog
+  entry for the full closure narrative.

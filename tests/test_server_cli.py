@@ -37,6 +37,35 @@ def _reset_module_config() -> Iterator[None]:
     openai_api._config = None
 
 
+@pytest.fixture(autouse=True)
+def _reset_silica_logger_state() -> Iterator[None]:
+    """Undo any handler / propagate / level mutation that
+    :func:`silica.core.logger.setup_logging` applied to the
+    ``silica`` logger namespace during a test.
+
+    The (h) follow-up #3 fix at v1.7.34 wired ``setup_logging`` into
+    ``cli._serve()`` (so ``--log-level`` actually surfaces silica.*
+    INFO lines). That call has global side effects: it attaches a
+    handler to the ``silica`` logger and sets ``propagate = False``.
+    Without this teardown, any subsequent test that uses pytest's
+    ``caplog`` fixture against silica.* records would silently fail
+    to capture them — concretely, ``tests/test_server_hardening.py``
+    tests that read ``caplog.records`` after running through CLI
+    tests in the same session were the canary that caught this.
+    """
+    import logging
+    silica_root = logging.getLogger("silica")
+    saved_level = silica_root.level
+    saved_propagate = silica_root.propagate
+    saved_handlers = list(silica_root.handlers)
+    yield
+    for handler in list(silica_root.handlers):
+        if handler not in saved_handlers:
+            silica_root.removeHandler(handler)
+    silica_root.setLevel(saved_level)
+    silica_root.propagate = saved_propagate
+
+
 def test_serve_subparser_parses_flags() -> None:
     parser = cli.build_parser()
     args = parser.parse_args(
@@ -163,3 +192,67 @@ def test_serve_smoke_configures_then_runs_uvicorn_with_app_object(
     assert captured["kwargs"]["host"] == "127.0.0.1"
     assert captured["kwargs"]["port"] == 8001
     assert captured["kwargs"]["log_level"] == "warning"
+
+
+def test_serve_wires_silica_setup_logging_with_uppercased_level(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_serve`` must call :func:`silica.core.logger.setup_logging`
+    before booting uvicorn so the silica.* logger namespace gets a
+    handler attached. Without this call the route-level INFO lines
+    (auth / rate-limit denials, ``chat.completions reply`` with
+    ``prefix_hit_tokens=...``) never surface — ``--log-level`` only
+    configures uvicorn's loggers, not silica's. The (h) follow-up #3
+    fix at v1.7.34 closes this gap.
+    """
+    captured: dict[str, Any] = {}
+
+    def _fake_setup_logging(level: str | int = "INFO", **_: Any) -> None:
+        captured["level"] = level
+
+    def _fake_uvicorn_run(_app: Any, **_kwargs: Any) -> None:
+        captured["uvicorn_ran_after_setup"] = "level" in captured
+
+    monkeypatch.setattr(cli, "setup_logging", _fake_setup_logging)
+    monkeypatch.setattr(uvicorn, "run", _fake_uvicorn_run)
+
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        ["serve", "--model", "Qwen/Qwen3.5-0.8B", "--log-level", "info"]
+    )
+    rc = cli._serve(args)
+
+    assert rc == 0
+    # silica accepts uppercase Python logging level names; the CLI
+    # uppercases uvicorn's lowercase form before forwarding.
+    assert captured["level"] == "INFO"
+    # ``setup_logging`` runs before ``uvicorn.run`` — wiring the logger
+    # AFTER uvicorn starts would mean the lifespan startup hook's
+    # ``server.startup begin`` line is silently dropped.
+    assert captured["uvicorn_ran_after_setup"] is True
+
+
+def test_serve_maps_uvicorn_trace_level_to_silica_debug(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Uvicorn's ``trace`` log level has no Python ``logging`` analogue
+    (Python's logging tops out at DEBUG = 10). The CLI must map
+    ``trace`` to ``DEBUG`` rather than uppercasing to ``TRACE`` —
+    ``logging.Logger.setLevel('TRACE')`` would raise on Python 3.4+.
+    """
+    captured: dict[str, Any] = {}
+
+    def _fake_setup_logging(level: str | int = "INFO", **_: Any) -> None:
+        captured["level"] = level
+
+    monkeypatch.setattr(cli, "setup_logging", _fake_setup_logging)
+    monkeypatch.setattr(uvicorn, "run", lambda *_a, **_kw: None)
+
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        ["serve", "--model", "Qwen/Qwen3.5-0.8B", "--log-level", "trace"]
+    )
+    rc = cli._serve(args)
+
+    assert rc == 0
+    assert captured["level"] == "DEBUG"

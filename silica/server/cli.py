@@ -57,6 +57,7 @@ import sys
 from collections.abc import Sequence
 from typing import Any
 
+from silica.core.logger import setup_logging
 from silica.core.sampling import SamplingParams
 from silica.engine import Engine
 from silica.models.factory import adapter_for_repo
@@ -306,6 +307,18 @@ def _serve(args: argparse.Namespace) -> int:
     if error is not None:
         print(f"silica serve: error: {error}", file=sys.stderr)
         return 2
+
+    # Wire silica.* loggers to stderr at the requested level. Without
+    # this call the ``silica`` logger namespace has ``propagate=False``
+    # and no handler attached, so route-level INFO lines (auth /
+    # rate-limit denials, ``chat.completions reply`` with
+    # ``prefix_hit_tokens=...``, lifespan boot / shutdown) never
+    # surface, even with ``--log-level info``. ``--log-level``
+    # without this call only configures uvicorn's loggers.
+    # ``setup_logging`` accepts Python logging level names; uvicorn's
+    # ``trace`` has no Python equivalent so we map it to ``DEBUG``.
+    silica_log_level = "DEBUG" if args.log_level == "trace" else args.log_level.upper()
+    setup_logging(level=silica_log_level)
 
     from silica.server import openai_api
 
