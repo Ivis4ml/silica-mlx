@@ -1,0 +1,63 @@
+/* chat.css */
+.repl {
+  background: var(--code-bg);
+  border-radius: var(--r-3);
+  border: 1px solid var(--rule);
+  overflow: hidden;
+  box-shadow: 0 30px 80px -30px rgba(12,12,14,0.4);
+  font-family: var(--font-mono);
+  color: var(--code-fg);
+}
+.repl-bar {
+  display: flex; align-items: center; gap: 18px;
+  padding: 11px 16px;
+  background: rgba(255,255,255,0.04);
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+  font-size: 11.5px;
+}
+.repl-dots { display: inline-flex; gap: 6px; }
+.repl-dots span {
+  width: 11px; height: 11px; border-radius: 50%;
+  background: rgba(255,255,255,0.18);
+}
+.repl-dots span:nth-child(1) { background: #ff6058; }
+.repl-dots span:nth-child(2) { background: #ffbe2f; }
+.repl-dots span:nth-child(3) { background: #28c941; }
+.repl-title { color: rgba(237,237,238,0.85); flex: 1; }
+.repl-meta { color: rgba(237,237,238,0.4); }
+.repl-body {
+  padding: 22px 28px;
+  min-height: 460px;
+  max-height: 460px;
+  overflow-y: auto;
+  font-size: 13.5px;
+  line-height: 1.7;
+}
+.repl-body::-webkit-scrollbar { width: 8px; }
+.repl-body::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 4px; }
+.repl-line { margin-bottom: 6px; white-space: pre-wrap; }
+.repl-sys { color: rgba(237,237,238,0.45); }
+.repl-prompt { color: var(--accent); margin-right: 8px; user-select: none; }
+.repl-user .repl-text { color: rgba(237,237,238,0.95); }
+.repl-asst-text { color: var(--code-fg); display: block; padding-left: 18px; margin: 4px 0 14px; border-left: 1px dashed rgba(255,255,255,0.12); }
+.repl-metrics { display: block; padding: 10px 14px; margin: 6px 0 18px; background: rgba(140,132,255,0.06); border-radius: 8px; font-size: 11.5px; line-height: 1.7; color: rgba(237,237,238,0.7); }
+.repl-mkv { display: inline-block; margin-right: 14px; }
+.repl-mk { color: rgba(237,237,238,0.45); }
+.repl-mv { color: var(--accent-2); font-weight: 500; }
+.repl-cursor {
+  display: inline-block;
+  width: 8px; height: 14px;
+  background: var(--accent);
+  vertical-align: text-bottom;
+  margin-left: 2px;
+  animation: blink 1s steps(2) infinite;
+}
+.repl-cursor-input { width: 9px; height: 16px; }
+@keyframes blink { 50% { opacity: 0; } }
+.repl-input {
+  border-top: 1px solid rgba(255,255,255,0.08);
+  padding: 14px 28px;
+  font-size: 13.5px;
+  display: flex; align-items: center; gap: 8px;
+  color: rgba(237,237,238,0.6);
+}

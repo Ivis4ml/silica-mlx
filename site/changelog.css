@@ -1,0 +1,80 @@
+/* changelog.css */
+.rmap {
+  border: 1px solid var(--rule);
+  border-radius: var(--r-3);
+  background: var(--paper);
+  overflow: hidden;
+}
+.rmap-row {
+  display: grid;
+  grid-template-columns: 80px 280px 1fr 110px;
+  gap: 24px;
+  padding: 22px 28px;
+  border-bottom: 1px solid var(--rule);
+  align-items: center;
+  transition: background 0.2s;
+}
+.rmap-row:last-child { border-bottom: none; }
+.rmap-row:hover { background: var(--paper-2); }
+.rmap-code { color: var(--accent); font-size: 13px; }
+.rmap-t { font-family: var(--font-display); font-size: 18px; font-weight: 500; letter-spacing: -0.018em; }
+.rmap-d { color: var(--ink-2); font-size: 14px; line-height: 1.55; }
+.rmap-st {
+  text-align: center;
+  font-size: 10.5px; padding: 4px 10px;
+  border-radius: 999px;
+  text-transform: uppercase; letter-spacing: 0.06em;
+  background: var(--paper-2); border: 1px solid var(--rule); color: var(--ink-3);
+}
+.rmap-in-flight .rmap-st { background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent); border-color: transparent; }
+.rmap-RC .rmap-st { background: color-mix(in srgb, var(--ok) 14%, transparent); color: var(--ok); border-color: transparent; }
+@media (max-width: 880px) {
+  .rmap-row { grid-template-columns: 1fr 1fr; gap: 8px; padding: 16px 18px; }
+  .rmap-d { grid-column: 1 / -1; }
+}
+
+.rel-timeline { display: flex; flex-direction: column; gap: 0; }
+.rel-row {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  gap: 36px;
+  padding: 32px 0;
+  border-top: 1px solid var(--rule);
+  position: relative;
+}
+.rel-row:first-child { border-top: none; padding-top: 12px; }
+.rel-side { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+.rel-v { font-size: 16px; font-weight: 500; color: var(--ink); letter-spacing: -0.01em; }
+.rel-d { font-size: 12px; color: var(--ink-3); }
+.rel-st {
+  font-size: 10px; padding: 3px 9px;
+  border-radius: 999px;
+  text-transform: uppercase; letter-spacing: 0.06em;
+  margin-top: 4px;
+}
+.rel-st-gate { background: var(--accent-soft); color: var(--accent); }
+.rel-st-ship { background: color-mix(in srgb, var(--ok) 14%, transparent); color: var(--ok); }
+.rel-t {
+  font-family: var(--font-display);
+  font-size: clamp(22px, 2.2vw, 28px);
+  font-weight: 500; letter-spacing: -0.022em;
+  margin: 0 0 16px;
+  line-height: 1.18;
+}
+.rel-bullets { padding-left: 0; list-style: none; margin: 0; }
+.rel-bullets li {
+  position: relative;
+  padding-left: 22px;
+  margin-bottom: 8px;
+  font-size: 14.5px;
+  color: var(--ink-2);
+  line-height: 1.55;
+}
+.rel-bullets li::before {
+  content: ""; position: absolute; left: 4px; top: 9px;
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent);
+}
+@media (max-width: 720px) {
+  .rel-row { grid-template-columns: 1fr; gap: 14px; }
+}

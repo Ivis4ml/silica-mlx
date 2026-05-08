@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 88 88" width="88" height="88" role="img" aria-label="silica-mlx">
+  <g stroke="#0c0c0e" stroke-width="5" stroke-linecap="round" fill="none">
+    <path d="M44 72 V 50"></path>
+    <path d="M44 50 C 44 38, 22 38, 22 22"></path>
+    <path d="M44 50 V 22"></path>
+    <path d="M44 50 C 44 38, 66 38, 66 22"></path>
+  </g>
+  <circle cx="44" cy="72" r="8" fill="#4f4afe"></circle>
+  <circle cx="22" cy="22" r="6" fill="#0c0c0e"></circle>
+  <circle cx="44" cy="22" r="6" fill="#0c0c0e"></circle>
+  <circle cx="66" cy="22" r="6" fill="#0c0c0e"></circle>
+</svg>

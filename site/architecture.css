@@ -1,0 +1,78 @@
+/* architecture.css */
+.layers {
+  display: flex; flex-direction: column;
+  gap: 0;
+  border: 1px solid var(--rule);
+  border-radius: var(--r-3);
+  overflow: hidden;
+  background: var(--paper);
+}
+.layer {
+  display: grid;
+  grid-template-columns: 80px minmax(220px, 280px) 1fr;
+  gap: 32px;
+  align-items: center;
+  padding: 26px 32px;
+  border-bottom: 1px solid var(--rule);
+  position: relative;
+  transition: background 0.2s, padding 0.2s;
+}
+.layer:last-child { border-bottom: none; }
+.layer:hover { background: var(--paper-2); padding-left: 38px; }
+.layer-n { color: var(--ink-4); font-size: 12px; }
+.layer-title { font-family: var(--font-display); font-size: 22px; font-weight: 500; letter-spacing: -0.02em; }
+.layer-comp { color: var(--ink-3); font-size: 12px; margin-top: 4px; }
+.layer-desc { color: var(--ink-2); font-size: 14.5px; line-height: 1.55; }
+.layer::before {
+  content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+}
+.layer-v::before { background: var(--accent); }
+.layer-a::before { background: color-mix(in oklch, var(--accent) 60%, #ffb38c); }
+.layer-b::before { background: color-mix(in oklch, var(--accent) 50%, #4cc26b); }
+.layer-g::before { background: var(--ink-3); }
+@media (max-width: 880px) {
+  .layer { grid-template-columns: 60px 1fr; gap: 12px; padding: 20px 18px; }
+  .layer-desc { grid-column: 1 / -1; padding-left: 0; }
+}
+
+.sched-frame {
+  border: 1px solid var(--rule);
+  border-radius: var(--r-3);
+  background: var(--paper);
+  padding: 24px;
+}
+.sched-svg { width: 100%; height: auto; display: block; }
+.sched-foot {
+  display: flex; justify-content: space-between;
+  font-size: 11px; color: var(--ink-3);
+  text-transform: uppercase; letter-spacing: 0.04em;
+  border-top: 1px solid var(--rule);
+  margin-top: 14px; padding-top: 14px;
+  flex-wrap: wrap; gap: 12px;
+}
+
+.dec-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 16px;
+}
+@media (max-width: 720px) { .dec-grid { grid-template-columns: 1fr; } }
+.dec-card {
+  border: 1px solid var(--rule);
+  border-radius: var(--r-3);
+  padding: 24px 26px;
+  background: var(--paper);
+  transition: border-color 0.15s, transform 0.15s;
+}
+.dec-card:hover { border-color: var(--ink-3); transform: translateY(-2px); }
+.dec-n {
+  font-size: 11px; color: var(--accent);
+  text-transform: uppercase; letter-spacing: 0.06em;
+}
+.dec-t {
+  font-family: var(--font-display);
+  font-size: 19px; font-weight: 500;
+  letter-spacing: -0.018em;
+  margin: 10px 0 8px;
+}
+.dec-b { color: var(--ink-2); font-size: 14px; line-height: 1.55; }
