@@ -76,6 +76,7 @@ from silica.chat.cli.thinking_parser import (
     ThinkingChunk,
     ThinkingParser,
 )
+from silica.chat.cli.thinking_scroll import ThinkingScrollWindow
 from silica.chat.cli.toolbar import (
     render_codec_hint,
     render_showcase,
@@ -829,6 +830,17 @@ def run_chat(args: argparse.Namespace) -> int:
             start_in_thinking=parser_start_thinking
         )
         thinking_started_at: list[float] = []  # mutable for closure write
+        # v1.7.38: in-place fixed-height scroll window for ``thinking="show"``.
+        # Replaces the v1.7.36 wall-of-text path on TTY-capable terminals so
+        # the magenta indicator + last 6 lines of reasoning render in a
+        # rolling region rather than scrolling the prompt off the top.
+        # ``scroll_enabled`` short-circuits to False (and ``scroll_active``
+        # below stays False) on non-TTY / TERM=dumb / NO_COLOR invocations,
+        # which keeps the wall-of-text fallback for piped capture.
+        thinking_scroll = ThinkingScrollWindow(palette=palette)
+        scroll_active = (
+            thinking_display == "show" and thinking_scroll.scroll_enabled
+        )
         prefix_emitted: list[bool] = [False]
         reply_emitted: list[bool] = [False]
         fence_parser = CodeFenceParser()
@@ -920,7 +932,12 @@ def run_chat(args: argparse.Namespace) -> int:
                     _clear_phase_indicator()
                     state.stream_state = StreamState.THINKING
                     thinking_started_at.append(time.monotonic())
-                    if thinking_display != "hidden":
+                    if scroll_active:
+                        # The scroll window writes its own magenta
+                        # ``⠋ thinking...`` header; the legacy phase
+                        # indicator would duplicate it.
+                        thinking_scroll.start()
+                    elif thinking_display != "hidden":
                         _print_phase_indicator(
                             "thinking", "magenta", palette
                         )
@@ -932,13 +949,20 @@ def run_chat(args: argparse.Namespace) -> int:
                     # token-precise figures need a tokeniser-level
                     # intercept that does not exist today.
                     state.last_turn_reasoning_chars += len(event.text)
-                    if thinking_display == "show":
+                    if scroll_active:
+                        thinking_scroll.feed(event.text)
+                    elif thinking_display == "show":
                         _write_generation_text(
                             palette.colorize(event.text, "grey", dim=True)
                         )
                 elif isinstance(event, ExitThinking):
                     live_toolbar.clear()
                     _clear_phase_indicator()
+                    if scroll_active:
+                        # Wipe the rolling region so the trailing
+                        # ``thought for Xs`` summary lands on the
+                        # line where the scroll started, not below it.
+                        thinking_scroll.clear()
                     if thinking_started_at and thinking_display != "hidden":
                         elapsed = time.monotonic() - thinking_started_at[-1]
                         _write_generation_text(
@@ -1012,6 +1036,12 @@ def run_chat(args: argparse.Namespace) -> int:
                     StreamState.THINKING,
                 ):
                     _clear_phase_indicator()
+                if scroll_active:
+                    # v1.7.38: idempotent — wipes the rolling region
+                    # if the abort interrupted a thinking block, no-op
+                    # otherwise. Without this the abort marker would
+                    # land below leftover ⠋ thinking + reasoning rows.
+                    thinking_scroll.clear()
                 # Clear the toolbar line before printing the abort
                 # marker so the marker lands on a fresh line rather
                 # than overlapping the toolbar text. The backend
@@ -1044,6 +1074,8 @@ def run_chat(args: argparse.Namespace) -> int:
                     StreamState.THINKING,
                 ):
                     _clear_phase_indicator()
+                if scroll_active:
+                    thinking_scroll.clear()
                 live_toolbar.clear()
                 sys.stdout.write(
                     "\n"
@@ -1070,6 +1102,14 @@ def run_chat(args: argparse.Namespace) -> int:
                     state.last_turn_visible_chars += len(event.text)
                     _emit_assistant_prefix_once()
                     _emit_reply_text(event.text)
+            # v1.7.38: turn ended without an ExitThinking (max_tokens
+            # hit mid-reasoning) leaves the scroll region rendered.
+            # ``clear()`` is idempotent — when ExitThinking fired
+            # earlier the rendered_lines counter is already zero and
+            # this becomes a no-op. The empty-reply ``(no reply — try
+            # /expand…)`` line then lands cleanly.
+            if scroll_active:
+                thinking_scroll.clear()
             # Drain any text the fence parser held back. A truncated
             # fence yields a final ExitFence so the highlighter
             # still gets to emit; a held-back partial-open marker
